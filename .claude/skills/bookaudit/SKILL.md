@@ -1,0 +1,1 @@
+../../../skills/bookaudit/SKILL.md

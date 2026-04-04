@@ -59,7 +59,7 @@ In practice:
 ## Repository Layout
 
 - `scripts/`: reusable Python logic
-- `skills/`: skill packages for each step of the bookkeeping workflow (Codex + Claude Code compatible)
+- `skills/`: skill packages for each step of the bookkeeping workflow (Codex, Claude Code, and opencode compatible)
 - `.claude/skills/`: Claude Code project-level entry points (symlinks into `skills/`)
 - `schemas/`: JSON schemas for shared artifacts
 - `templates/`: starter artifact files
@@ -82,10 +82,11 @@ Do not treat it as live accounting data.
 
 ## Skill Compatibility
 
-Each skill under `skills/` works with both Codex and Claude Code:
+Each skill under `skills/` works with Codex, Claude Code, and opencode:
 
 - **Codex** — reads `skills/<name>/SKILL.md` and uses `skills/<name>/agents/openai.yaml`
 - **Claude Code** — reads `.claude/skills/<name>/SKILL.md`, which symlinks back to the same content
+- **opencode** — reads `.opencode/skills/<name>/SKILL.md`, which symlinks back to the same content
 
 No duplication; one source of truth per skill.
 

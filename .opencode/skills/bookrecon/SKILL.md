@@ -1,0 +1,1 @@
+../../../skills/bookrecon/SKILL.md

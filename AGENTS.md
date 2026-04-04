@@ -208,16 +208,18 @@ Local validation has already confirmed these general lessons:
 
 ## Skill Compatibility
 
-Each bookkeeping skill under `skills/` is designed to work with both Codex and Claude Code.
+Each bookkeeping skill under `skills/` is designed to work with Codex, Claude Code, and opencode.
 
 - **Codex** loads skills from `skills/<name>/SKILL.md` and uses `skills/<name>/agents/openai.yaml` for the interface definition.
 - **Claude Code** loads skills from `.claude/skills/<name>/SKILL.md`. Each file there is a symlink back into `skills/`, so the content stays in one place.
+- **opencode** loads skills from `.opencode/skills/<name>/SKILL.md`. Each file there is a symlink back into `skills/`, mirroring the Claude Code structure.
 
 When adding or renaming a skill:
 
 1. Add or rename the package under `skills/`.
 2. Add or rename the corresponding symlink under `.claude/skills/`.
-3. Keep both in sync.
+3. Add or rename the corresponding symlink under `.opencode/skills/`.
+4. Keep all three in sync.
 
 ## Source Of Truth
 

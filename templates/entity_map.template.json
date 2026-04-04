@@ -1,0 +1,13 @@
+{
+  "schema_version": "1.0",
+  "company_slug": "example",
+  "generated_at": "2026-04-04T00:00:00Z",
+  "as_of_period": null,
+  "financial_accounts": [],
+  "income_accounts": [],
+  "vat_types": [],
+  "warehouses": [],
+  "items": [],
+  "contacts": [],
+  "notes": []
+}

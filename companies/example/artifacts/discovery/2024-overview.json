@@ -1,0 +1,100 @@
+{
+  "year": 2024,
+  "company_id": "0123456789abcdef0123456789abcdef",
+  "company_name": "Example Company OÜ",
+  "technical_findings": [
+    "Synthetic worked example only; this file is not fetched from live Simplbooks.",
+    "Recurring webshop invoices are modeled from WooCommerce summaries.",
+    "Stripe and PayPal are modeled as settlement layers rather than separate sales posting bases."
+  ],
+  "counts": {
+    "financial_accounts": 1,
+    "income_accounts": 4,
+    "vat_types": 2,
+    "warehouses": 1,
+    "invoices": 1,
+    "invoice_rows": 2,
+    "purchases": 3,
+    "purchase_rows": 3,
+    "receipts": 2,
+    "payments": 1
+  },
+  "monthly": {
+    "invoices": {
+      "2024-01": {
+        "count": 1,
+        "sum": 150.0,
+        "vat": 30.0,
+        "total_sum": 180.0
+      }
+    },
+    "purchases": {
+      "2024-01": {
+        "count": 3,
+        "sum": 51.1,
+        "vat": 9.0,
+        "total_sum": 60.1
+      }
+    },
+    "receipts": {
+      "2024-01": {
+        "count": 2,
+        "sum": 173.9,
+        "vat": 0.0,
+        "total_sum": 173.9
+      }
+    },
+    "payments": {
+      "2024-01": {
+        "count": 1,
+        "sum": 54.0,
+        "vat": 0.0,
+        "total_sum": 54.0
+      }
+    }
+  },
+  "patterns": {
+    "invoice_income_accounts": {
+      "3000": 1,
+      "3040": 1
+    },
+    "purchase_accounts": {
+      "5000": 2,
+      "5100": 1
+    },
+    "vat_type_usage": {
+      "20": 2,
+      "0": 2
+    }
+  },
+  "samples": {
+    "invoices": [
+      {
+        "number": "EX-2024-01",
+        "created": "2024-01-31",
+        "total_sum": 180.0
+      }
+    ],
+    "purchases": [
+      {
+        "vendor": "Printful Inc.",
+        "created": "2024-01-31",
+        "total_sum": 54.0
+      }
+    ],
+    "receipts": [
+      {
+        "description": "Stripe incoming summary",
+        "income_date": "2024-01-31",
+        "income_sum": 108.5
+      }
+    ],
+    "payments": [
+      {
+        "description": "Printful payment summary",
+        "payment_date": "2024-01-31",
+        "payment_sum": 54.0
+      }
+    ]
+  }
+}

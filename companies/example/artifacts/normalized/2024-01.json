@@ -1,0 +1,390 @@
+{
+  "schema_version": "1.0",
+  "company_slug": "example",
+  "period": "2024-01",
+  "base_currency": "EUR",
+  "generated_at": "2026-04-04T00:00:00Z",
+  "sources": [
+    {
+      "source_id": "src-woo-sales-2024-01",
+      "path": "companies/example/source/woo-sales-summary-2024-01.csv",
+      "sha256": "0009134b72bb036e18c4d75a2e84110a913821095c1559d8216fcee874435ff3",
+      "source_type": "csv",
+      "source_system": "woocommerce",
+      "covered_from": "2024-01-01",
+      "covered_until": "2024-01-31",
+      "canonical": true,
+      "parser_name": "synthetic_example",
+      "parser_notes": "Synthetic publishable source used for the public example workspace.",
+      "preferred_over": []
+    },
+    {
+      "source_id": "src-stripe-payouts-2024-01",
+      "path": "companies/example/source/stripe-payouts-2024-01.csv",
+      "sha256": "d13a4c61368946510eb96b364ca4b5bbb2528368fcbd32be1370905e141cbb46",
+      "source_type": "csv",
+      "source_system": "stripe",
+      "covered_from": "2024-01-01",
+      "covered_until": "2024-01-31",
+      "canonical": true,
+      "parser_name": "synthetic_example",
+      "parser_notes": "Synthetic publishable source used for the public example workspace.",
+      "preferred_over": []
+    },
+    {
+      "source_id": "src-paypal-transactions-2024-01",
+      "path": "companies/example/source/paypal-transactions-2024-01.csv",
+      "sha256": "1f3de22abdab0c39249944b5b7272e04534f8b068ad04be2ec58d2183f57f1cb",
+      "source_type": "csv",
+      "source_system": "paypal",
+      "covered_from": "2024-01-01",
+      "covered_until": "2024-01-31",
+      "canonical": true,
+      "parser_name": "synthetic_example",
+      "parser_notes": "Synthetic publishable source used for the public example workspace.",
+      "preferred_over": []
+    },
+    {
+      "source_id": "src-printful-orders-2024-01",
+      "path": "companies/example/source/printful-orders-2024-01.csv",
+      "sha256": "0b9b14fa053b47e551235d9261cc304633af68df682a343485bee4840d879f2c",
+      "source_type": "csv",
+      "source_system": "printful",
+      "covered_from": "2024-01-01",
+      "covered_until": "2024-01-31",
+      "canonical": true,
+      "parser_name": "synthetic_example",
+      "parser_notes": "Synthetic publishable source used for the public example workspace.",
+      "preferred_over": []
+    },
+    {
+      "source_id": "src-bank-transactions-2024-01",
+      "path": "companies/example/source/bank-transactions-2024-01.csv",
+      "sha256": "f04cbb110a965aa7b2185c798e6fee8938ff7a2c110f805f4e56ccd398874414",
+      "source_type": "csv",
+      "source_system": "bank",
+      "covered_from": "2024-01-01",
+      "covered_until": "2024-01-31",
+      "canonical": true,
+      "parser_name": "synthetic_example",
+      "parser_notes": "Synthetic publishable source used for the public example workspace.",
+      "preferred_over": []
+    }
+  ],
+  "records": {
+    "sales": [
+      {
+        "record_id": "sale:woo:2024-01:summary",
+        "source_system": "woocommerce",
+        "source_type": "csv",
+        "event_type": "sale",
+        "event_date": "2024-01-31",
+        "settlement_date": null,
+        "description": "WooCommerce January 2024 sales summary",
+        "external_ref": "woo-2024-01",
+        "currency": "EUR",
+        "gross_amount": 180.0,
+        "net_amount": 150.0,
+        "vat_amount": 30.0,
+        "fee_amount": 0.0,
+        "shipping_amount": 12.0,
+        "quantity": 2,
+        "sku": null,
+        "warehouse_id": "1",
+        "channel": "woo",
+        "country_code": null,
+        "attributes": {
+          "order_count": 2,
+          "posting_basis": "merchant"
+        },
+        "source_refs": [
+          {
+            "source_id": "src-woo-sales-2024-01",
+            "path": "companies/example/source/woo-sales-summary-2024-01.csv",
+            "row_ref": "lines 2-3",
+            "page_ref": null,
+            "notes": "Synthetic month summary source."
+          }
+        ]
+      }
+    ],
+    "refunds": [],
+    "fees": [
+      {
+        "record_id": "fee:stripe:2024-01",
+        "source_system": "stripe",
+        "source_type": "csv",
+        "event_type": "processor_fee",
+        "event_date": "2024-01-31",
+        "settlement_date": "2024-01-12",
+        "description": "Stripe January 2024 processor fee summary",
+        "external_ref": "po_001",
+        "currency": "EUR",
+        "gross_amount": 3.5,
+        "net_amount": 3.5,
+        "vat_amount": 0.0,
+        "fee_amount": 3.5,
+        "shipping_amount": 0.0,
+        "quantity": null,
+        "sku": null,
+        "warehouse_id": null,
+        "channel": "stripe",
+        "country_code": null,
+        "attributes": {
+          "fee_source": "processor_statement"
+        },
+        "source_refs": [
+          {
+            "source_id": "src-stripe-payouts-2024-01",
+            "path": "companies/example/source/stripe-payouts-2024-01.csv",
+            "row_ref": "line 2",
+            "page_ref": null,
+            "notes": "Synthetic processor fee evidence."
+          }
+        ]
+      },
+      {
+        "record_id": "fee:paypal:2024-01",
+        "source_system": "paypal",
+        "source_type": "csv",
+        "event_type": "processor_fee",
+        "event_date": "2024-01-31",
+        "settlement_date": "2024-01-23",
+        "description": "PayPal January 2024 processor fee summary",
+        "external_ref": "pp_001",
+        "currency": "EUR",
+        "gross_amount": 2.6,
+        "net_amount": 2.6,
+        "vat_amount": 0.0,
+        "fee_amount": 2.6,
+        "shipping_amount": 0.0,
+        "quantity": null,
+        "sku": null,
+        "warehouse_id": null,
+        "channel": "paypal",
+        "country_code": null,
+        "attributes": {
+          "fee_source": "processor_statement"
+        },
+        "source_refs": [
+          {
+            "source_id": "src-paypal-transactions-2024-01",
+            "path": "companies/example/source/paypal-transactions-2024-01.csv",
+            "row_ref": "line 2",
+            "page_ref": null,
+            "notes": "Synthetic processor fee evidence."
+          }
+        ]
+      }
+    ],
+    "payouts": [
+      {
+        "record_id": "payout:stripe:2024-01",
+        "source_system": "stripe",
+        "source_type": "csv",
+        "event_type": "payout",
+        "event_date": "2024-01-12",
+        "settlement_date": "2024-01-12",
+        "description": "Stripe January 2024 payout",
+        "external_ref": "po_001",
+        "currency": "EUR",
+        "gross_amount": 108.5,
+        "net_amount": 108.5,
+        "vat_amount": 0.0,
+        "fee_amount": 3.5,
+        "shipping_amount": 0.0,
+        "quantity": null,
+        "sku": null,
+        "warehouse_id": null,
+        "channel": "stripe",
+        "country_code": null,
+        "attributes": {
+          "gross_collected_amount": 112.0
+        },
+        "source_refs": [
+          {
+            "source_id": "src-stripe-payouts-2024-01",
+            "path": "companies/example/source/stripe-payouts-2024-01.csv",
+            "row_ref": "line 2",
+            "page_ref": null,
+            "notes": "Synthetic payout evidence."
+          }
+        ]
+      },
+      {
+        "record_id": "payout:paypal:2024-01",
+        "source_system": "paypal",
+        "source_type": "csv",
+        "event_type": "payout",
+        "event_date": "2024-01-23",
+        "settlement_date": "2024-01-23",
+        "description": "PayPal January 2024 payout",
+        "external_ref": "pp_001",
+        "currency": "EUR",
+        "gross_amount": 65.4,
+        "net_amount": 65.4,
+        "vat_amount": 0.0,
+        "fee_amount": 2.6,
+        "shipping_amount": 0.0,
+        "quantity": null,
+        "sku": null,
+        "warehouse_id": null,
+        "channel": "paypal",
+        "country_code": null,
+        "attributes": {
+          "gross_collected_amount": 68.0
+        },
+        "source_refs": [
+          {
+            "source_id": "src-paypal-transactions-2024-01",
+            "path": "companies/example/source/paypal-transactions-2024-01.csv",
+            "row_ref": "line 2",
+            "page_ref": null,
+            "notes": "Synthetic payout evidence."
+          }
+        ]
+      }
+    ],
+    "bank_transactions": [
+      {
+        "record_id": "bank:stripe:2024-01-12",
+        "source_system": "bank",
+        "source_type": "csv",
+        "event_type": "bank_transaction",
+        "event_date": "2024-01-12",
+        "settlement_date": "2024-01-12",
+        "description": "Stripe payout received to bank",
+        "external_ref": "STRIPE-PO-001",
+        "currency": "EUR",
+        "gross_amount": 108.5,
+        "net_amount": 108.5,
+        "vat_amount": 0.0,
+        "fee_amount": 0.0,
+        "shipping_amount": 0.0,
+        "quantity": null,
+        "sku": null,
+        "warehouse_id": null,
+        "channel": "stripe",
+        "country_code": null,
+        "attributes": {
+          "bank_side": "credit"
+        },
+        "source_refs": [
+          {
+            "source_id": "src-bank-transactions-2024-01",
+            "path": "companies/example/source/bank-transactions-2024-01.csv",
+            "row_ref": "line 2",
+            "page_ref": null,
+            "notes": "Synthetic imported bank transaction."
+          }
+        ]
+      },
+      {
+        "record_id": "bank:printful:2024-01-20",
+        "source_system": "bank",
+        "source_type": "csv",
+        "event_type": "bank_transaction",
+        "event_date": "2024-01-20",
+        "settlement_date": "2024-01-20",
+        "description": "Printful debit from bank",
+        "external_ref": "PRINTFUL-PF-2401-001",
+        "currency": "EUR",
+        "gross_amount": -54.0,
+        "net_amount": -54.0,
+        "vat_amount": 0.0,
+        "fee_amount": 0.0,
+        "shipping_amount": 0.0,
+        "quantity": null,
+        "sku": null,
+        "warehouse_id": null,
+        "channel": "printful",
+        "country_code": null,
+        "attributes": {
+          "bank_side": "debit"
+        },
+        "source_refs": [
+          {
+            "source_id": "src-bank-transactions-2024-01",
+            "path": "companies/example/source/bank-transactions-2024-01.csv",
+            "row_ref": "line 3",
+            "page_ref": null,
+            "notes": "Synthetic imported bank transaction."
+          }
+        ]
+      },
+      {
+        "record_id": "bank:paypal:2024-01-23",
+        "source_system": "bank",
+        "source_type": "csv",
+        "event_type": "bank_transaction",
+        "event_date": "2024-01-23",
+        "settlement_date": "2024-01-23",
+        "description": "PayPal payout received to bank",
+        "external_ref": "PAYPAL-PP-001",
+        "currency": "EUR",
+        "gross_amount": 65.4,
+        "net_amount": 65.4,
+        "vat_amount": 0.0,
+        "fee_amount": 0.0,
+        "shipping_amount": 0.0,
+        "quantity": null,
+        "sku": null,
+        "warehouse_id": null,
+        "channel": "paypal",
+        "country_code": null,
+        "attributes": {
+          "bank_side": "credit"
+        },
+        "source_refs": [
+          {
+            "source_id": "src-bank-transactions-2024-01",
+            "path": "companies/example/source/bank-transactions-2024-01.csv",
+            "row_ref": "line 4",
+            "page_ref": null,
+            "notes": "Synthetic imported bank transaction."
+          }
+        ]
+      }
+    ],
+    "purchase_expenses": [
+      {
+        "record_id": "purchase:printful:2024-01",
+        "source_system": "printful",
+        "source_type": "csv",
+        "event_type": "purchase_expense",
+        "event_date": "2024-01-20",
+        "settlement_date": "2024-01-20",
+        "description": "Printful January fulfillment and storage",
+        "external_ref": "PF-2401-001",
+        "currency": "EUR",
+        "gross_amount": 54.0,
+        "net_amount": 45.0,
+        "vat_amount": 9.0,
+        "fee_amount": 0.0,
+        "shipping_amount": 0.0,
+        "quantity": 1,
+        "sku": null,
+        "warehouse_id": "1",
+        "channel": "printful",
+        "country_code": "EE",
+        "attributes": {
+          "vendor_name": "Printful Inc.",
+          "purchase_category": "fulfillment"
+        },
+        "source_refs": [
+          {
+            "source_id": "src-printful-orders-2024-01",
+            "path": "companies/example/source/printful-orders-2024-01.csv",
+            "row_ref": "line 2",
+            "page_ref": null,
+            "notes": "Synthetic Printful cost evidence."
+          }
+        ]
+      }
+    ],
+    "inventory_movements": [],
+    "manual_adjustments": [],
+    "other": []
+  },
+  "exceptions": []
+}

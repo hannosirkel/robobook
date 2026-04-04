@@ -1,0 +1,236 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.books/schemas/submission-log.schema.json",
+  "title": "Simplbooks Submission Log",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "company_slug",
+    "period",
+    "generated_at",
+    "batch_id",
+    "mode",
+    "request_log",
+    "rollback_plan"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "company_slug": {
+      "type": "string",
+      "pattern": "^[a-z0-9-]+$"
+    },
+    "period": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}$"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "batch_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "mode": {
+      "type": "string",
+      "enum": [
+        "dry-run",
+        "write"
+      ]
+    },
+    "request_log": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/request_entry"
+      }
+    },
+    "rollback_plan": {
+      "$ref": "#/$defs/rollback_plan"
+    },
+    "summary": {
+      "$ref": "#/$defs/summary"
+    }
+  },
+  "$defs": {
+    "request_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "action_idempotency_key",
+        "sent_at",
+        "method",
+        "endpoint",
+        "payload",
+        "http_status",
+        "response_body",
+        "success"
+      ],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "dry-run",
+            "write"
+          ]
+        },
+        "action_idempotency_key": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sent_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "method": {
+          "type": "string",
+          "enum": [
+            "GET",
+            "POST",
+            "PUT",
+            "DELETE"
+          ]
+        },
+        "endpoint": {
+          "type": "string",
+          "minLength": 1
+        },
+        "payload": {},
+        "http_status": {
+          "type": "integer"
+        },
+        "response_body": {},
+        "inserted_id": {
+          "type": [
+            "string",
+            "integer",
+            "null"
+          ]
+        },
+        "success": {
+          "type": "boolean"
+        },
+        "stopped_batch": {
+          "type": "boolean"
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "rollback_candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action_idempotency_key",
+        "original_endpoint",
+        "inserted_id",
+        "suggested_method",
+        "suggested_endpoint",
+        "depends_on",
+        "notes"
+      ],
+      "properties": {
+        "action_idempotency_key": {
+          "type": "string",
+          "minLength": 1
+        },
+        "original_endpoint": {
+          "type": "string",
+          "minLength": 1
+        },
+        "inserted_id": {
+          "type": [
+            "string",
+            "integer",
+            "null"
+          ]
+        },
+        "suggested_method": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "GET",
+            "POST",
+            "PUT",
+            "DELETE",
+            null
+          ]
+        },
+        "suggested_endpoint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "depends_on": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "rollback_plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "supported",
+        "notes",
+        "reversal_candidates"
+      ],
+      "properties": {
+        "supported": {
+          "type": "boolean"
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "reversal_candidates": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/rollback_candidate"
+          }
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "attempted_actions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "successful_actions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failed_actions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "stopped_on_failure": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

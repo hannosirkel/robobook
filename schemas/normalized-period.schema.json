@@ -1,0 +1,396 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.books/schemas/normalized-period.schema.json",
+  "title": "Normalized Bookkeeping Period",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "company_slug",
+    "period",
+    "base_currency",
+    "generated_at",
+    "sources",
+    "records",
+    "exceptions"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "company_slug": {
+      "type": "string",
+      "pattern": "^[a-z0-9-]+$"
+    },
+    "period": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}$"
+    },
+    "base_currency": {
+      "type": "string",
+      "pattern": "^[A-Z]{3}$"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "sources": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/source_manifest_entry"
+      }
+    },
+    "records": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sales",
+        "refunds",
+        "fees",
+        "payouts",
+        "bank_transactions",
+        "purchase_expenses",
+        "inventory_movements",
+        "manual_adjustments",
+        "other"
+      ],
+      "properties": {
+        "sales": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/normalized_record"
+          }
+        },
+        "refunds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/normalized_record"
+          }
+        },
+        "fees": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/normalized_record"
+          }
+        },
+        "payouts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/normalized_record"
+          }
+        },
+        "bank_transactions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/normalized_record"
+          }
+        },
+        "purchase_expenses": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/normalized_record"
+          }
+        },
+        "inventory_movements": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/normalized_record"
+          }
+        },
+        "manual_adjustments": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/normalized_record"
+          }
+        },
+        "other": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/normalized_record"
+          }
+        }
+      }
+    },
+    "exceptions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/exception"
+      }
+    }
+  },
+  "$defs": {
+    "source_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_id"
+      ],
+      "properties": {
+        "source_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "row_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "page_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "notes": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "source_manifest_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_id",
+        "path",
+        "sha256",
+        "source_type",
+        "covered_from",
+        "covered_until",
+        "canonical",
+        "parser_name"
+      ],
+      "properties": {
+        "source_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "source_type": {
+          "type": "string",
+          "enum": [
+            "csv",
+            "xml",
+            "xlsx",
+            "pdf",
+            "json",
+            "manual",
+            "other"
+          ]
+        },
+        "source_system": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "covered_from": {
+          "type": "string",
+          "format": "date"
+        },
+        "covered_until": {
+          "type": "string",
+          "format": "date"
+        },
+        "canonical": {
+          "type": "boolean"
+        },
+        "parser_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "parser_notes": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "preferred_over": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "normalized_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "record_id",
+        "source_system",
+        "source_type",
+        "event_type",
+        "event_date",
+        "description",
+        "currency",
+        "gross_amount",
+        "net_amount",
+        "vat_amount",
+        "fee_amount",
+        "shipping_amount",
+        "source_refs"
+      ],
+      "properties": {
+        "record_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_system": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "event_type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "event_date": {
+          "type": "string",
+          "format": "date"
+        },
+        "settlement_date": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date"
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1
+        },
+        "external_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "currency": {
+          "type": "string",
+          "pattern": "^[A-Z]{3}$"
+        },
+        "gross_amount": {
+          "type": "number"
+        },
+        "net_amount": {
+          "type": "number"
+        },
+        "vat_amount": {
+          "type": "number"
+        },
+        "fee_amount": {
+          "type": "number"
+        },
+        "shipping_amount": {
+          "type": "number"
+        },
+        "quantity": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "sku": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "warehouse_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "channel": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "country_code": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[A-Z]{2}$"
+        },
+        "attributes": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "source_refs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/source_ref"
+          }
+        }
+      }
+    },
+    "exception": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "exception_id",
+        "severity",
+        "reason",
+        "blocking",
+        "source_refs"
+      ],
+      "properties": {
+        "exception_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "severity": {
+          "type": "string",
+          "enum": [
+            "info",
+            "warn",
+            "error"
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "blocking": {
+          "type": "boolean"
+        },
+        "suggested_follow_up": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/source_ref"
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.books/schemas/company-profile.schema.json",
+  "title": "Simplbooks Company Profile",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "company_name",
+    "company_slug",
+    "simplbooks_company_id",
+    "base_currency",
+    "vat_registered"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "company_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "company_slug": {
+      "type": "string",
+      "pattern": "^[a-z0-9-]+$"
+    },
+    "simplbooks_company_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "description": {
+      "type": "string"
+    },
+    "base_currency": {
+      "type": "string",
+      "pattern": "^[A-Z]{3}$"
+    },
+    "vat_registered": {
+      "type": "boolean"
+    },
+    "oss_registered": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "default_warehouse_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "bank_account_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "cash_account_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "policy_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "notes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

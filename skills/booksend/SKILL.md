@@ -1,0 +1,73 @@
+---
+name: booksend
+description: Use this skill to dry-run or execute an approved Simplbooks action batch in stable dependency order, update `companies/<company>/artifacts/actions/<period>.yaml` with response metadata, and write `companies/<company>/artifacts/submissions/<period>.json` with request logs and a batch-level rollback plan.
+---
+
+# Booksend
+
+## Overview
+
+Use this skill after `bookchecker` and before `bookaudit`.
+It is the submit-capable step in the workflow, with a dry-run default and explicit write guardrails.
+
+## When To Use It
+
+Use this skill when the task involves:
+
+- reviewing or executing `companies/<company>/artifacts/actions/<period>.yaml`
+- writing `companies/<company>/artifacts/submissions/<period>.json`
+- resuming a partially submitted month without resending already successful actions
+- capturing exact request and response metadata for the batch
+
+Do not use this skill for source parsing, reconciliation, draft generation, or post-submit audit.
+
+## Workflow
+
+1. Start from `actions/<period>.yaml` and `actions/<period>.check.md`.
+2. Default to `--mode dry-run`.
+3. Require `approval_status: approved` or `submitted`, a passing check report that matches the batch ID and current action-file SHA, and `--confirm-write` before `--mode write`.
+4. Use `scripts/booksend.py` as the main entrypoint.
+5. Let the runner translate draft schemas into live Simplbooks `create` payloads instead of posting the draft payloads directly.
+6. Keep execution order dependency-stable and stop on the first hard failure unless `--continue-on-error` is explicit.
+7. Preserve the updated action file and submission log together so reruns remain auditable.
+
+## Commands
+
+Dry-run a checked batch:
+
+```bash
+python3 scripts/booksend.py \
+  --company-dir companies/example \
+  --period 2024-01
+```
+
+Execute a checked and approved batch:
+
+```bash
+python3 scripts/booksend.py \
+  --company-dir companies/example \
+  --period 2024-01 \
+  --mode write \
+  --confirm-write
+```
+
+## Current Submit Scope
+
+Implemented write targets:
+
+- `invoices/create`
+- `purchases/create`
+- `incomings/create`
+- `payments/create`
+
+## Guardrails
+
+- `booksend` defaults to dry-run.
+- Write mode requires a passing `bookchecker` report and explicit confirmation.
+- Already successful actions are skipped on rerun instead of being resent.
+- Automatic rollback is not implemented; the submission log carries a manual reversal plan only.
+- Master-data creation endpoints stay blocked unless separately approved.
+
+## References
+
+- Read `references/booksend.md` for the execution model, output semantics, and current limits.

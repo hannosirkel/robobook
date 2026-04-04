@@ -1,0 +1,26 @@
+{
+  "year": 2024,
+  "company_id": "REPLACE_ME",
+  "company_name": "Example Company OÜ",
+  "technical_findings": [],
+  "counts": {
+    "financial_accounts": 0,
+    "income_accounts": 0,
+    "vat_types": 0,
+    "warehouses": 0,
+    "invoices": 0,
+    "invoice_rows": 0,
+    "purchases": 0,
+    "purchase_rows": 0,
+    "receipts": 0,
+    "payments": 0
+  },
+  "monthly": {
+    "invoices": {},
+    "purchases": {},
+    "receipts": {},
+    "payments": {}
+  },
+  "patterns": {},
+  "samples": {}
+}

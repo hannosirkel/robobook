@@ -1,0 +1,28 @@
+schema_version: "1.0"
+company_slug: "example"
+period: "2024-01"
+generated_at: "2026-04-04T00:00:00Z"
+batch_id: "example-2024-01-draft"
+approval_status: "draft"
+source_summary: "Replace with a short batch summary."
+recon_ref: "companies/example/artifacts/recon/2024-01.json"
+actions:
+  - idempotency_key: "example-2024-01-sales-summary"
+    period: "2024-01"
+    action_type: "create_invoice_summary"
+    method: "POST"
+    endpoint: "invoices/create"
+    payload: {}
+    source_refs:
+      - path: "companies/example/artifacts/normalized/2024-01.json"
+        record_ref: "sales:summary"
+        note: "Replace with real source references."
+    reason: "Replace with the accounting rationale."
+    confidence: "medium"
+    depends_on: []
+    expected_effect: "Create the draft month summary in Simplbooks."
+    review_notes: []
+    executed_at: null
+    response_status: null
+    response_body: null
+    inserted_id: null

@@ -1,0 +1,2 @@
+invoice_date,invoice_no,gross_eur,net_eur,vat_eur,description
+2024-01-20,PF-2401-001,54.00,45.00,9.00,"January fulfillment and storage"

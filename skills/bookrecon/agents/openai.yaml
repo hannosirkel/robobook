@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bookrecon"
+  short_description: "Reconcile normalized month-level bookkeeping"
+  default_prompt: "Use $bookrecon to reconcile companies/example/artifacts/normalized/2024-01.json and write companies/example/artifacts/recon/2024-01.json."

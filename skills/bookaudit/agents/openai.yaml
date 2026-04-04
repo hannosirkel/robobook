@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bookaudit"
+  short_description: "Audit live Simplbooks state against source evidence"
+  default_prompt: "Use $bookaudit to audit companies/example/artifacts/normalized/2024-01.json against the final January 2024 Simplbooks state and write companies/example/artifacts/audits/2024-01.md."

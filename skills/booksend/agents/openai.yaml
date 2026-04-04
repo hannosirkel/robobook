@@ -1,0 +1,4 @@
+interface:
+  display_name: "Booksend"
+  short_description: "Dry-run or execute checked Simplbooks batches"
+  default_prompt: "Use $booksend to dry-run companies/example/artifacts/actions/2024-01.yaml, update its response metadata safely, and write companies/example/artifacts/submissions/2024-01.json without sending live writes unless I explicitly approve it."

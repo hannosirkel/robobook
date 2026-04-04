@@ -1,0 +1,23 @@
+{
+  "schema_version": "1.0",
+  "company_slug": "example",
+  "period": "2024-01",
+  "generated_at": "2026-04-04T00:00:00Z",
+  "batch_id": "example-2024-01-draft",
+  "mode": "dry-run",
+  "request_log": [],
+  "rollback_plan": {
+    "supported": false,
+    "notes": [
+      "Automatic rollback is not implemented by default.",
+      "Use inserted IDs and reverse dependency order for any manual reversal plan."
+    ],
+    "reversal_candidates": []
+  },
+  "summary": {
+    "attempted_actions": 0,
+    "successful_actions": 0,
+    "failed_actions": 0,
+    "stopped_on_failure": false
+  }
+}

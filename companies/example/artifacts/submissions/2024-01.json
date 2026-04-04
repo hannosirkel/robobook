@@ -1,0 +1,479 @@
+{
+  "schema_version": "1.0",
+  "company_slug": "example",
+  "period": "2024-01",
+  "generated_at": "2026-04-04T00:00:00Z",
+  "batch_id": "example-2024-01-draft",
+  "mode": "dry-run",
+  "request_log": [
+    {
+      "mode": "dry-run",
+      "action_idempotency_key": "example-2024-01-sales-woo",
+      "sent_at": "2026-04-04T00:00:00Z",
+      "method": "POST",
+      "endpoint": "invoices/create",
+      "payload": {
+        "Invoice": {
+          "client_id": 2001,
+          "created": "2024-01-31",
+          "transaction_date": "2024-01-31",
+          "currency_name": "EUR",
+          "currency_rate": 1,
+          "row_sum_with_vat": true,
+          "additional_info": "Monthly Woo sales summary"
+        },
+        "Tasks": [
+          {
+            "Task": {
+              "income_account_id": 300,
+              "vat_type_id": 20,
+              "warehouse_id": 1,
+              "name": "WooCommerce product sales summary",
+              "unit": "summary",
+              "amount": 1,
+              "price_per_unit": 168.0,
+              "vat": 20,
+              "discount": 0,
+              "contents": "WooCommerce product sales summary"
+            }
+          },
+          {
+            "Task": {
+              "income_account_id": 304,
+              "vat_type_id": 20,
+              "name": "WooCommerce shipping summary",
+              "unit": "summary",
+              "amount": 1,
+              "price_per_unit": 12.0,
+              "vat": 20,
+              "discount": 0,
+              "contents": "WooCommerce shipping summary"
+            }
+          }
+        ]
+      },
+      "http_status": 0,
+      "response_body": {
+        "dry_run": true,
+        "validated": true,
+        "endpoint": "invoices/create",
+        "method": "POST",
+        "idempotency_key": "example-2024-01-sales-woo",
+        "payload_preview": {
+          "Invoice": {
+            "client_id": 2001,
+            "created": "2024-01-31",
+            "transaction_date": "2024-01-31",
+            "currency_name": "EUR",
+            "currency_rate": 1,
+            "row_sum_with_vat": true,
+            "additional_info": "Monthly Woo sales summary"
+          },
+          "Tasks": [
+            {
+              "Task": {
+                "income_account_id": 300,
+                "vat_type_id": 20,
+                "warehouse_id": 1,
+                "name": "WooCommerce product sales summary",
+                "unit": "summary",
+                "amount": 1,
+                "price_per_unit": 168.0,
+                "vat": 20,
+                "discount": 0,
+                "contents": "WooCommerce product sales summary"
+              }
+            },
+            {
+              "Task": {
+                "income_account_id": 304,
+                "vat_type_id": 20,
+                "name": "WooCommerce shipping summary",
+                "unit": "summary",
+                "amount": 1,
+                "price_per_unit": 12.0,
+                "vat": 20,
+                "discount": 0,
+                "contents": "WooCommerce shipping summary"
+              }
+            }
+          ]
+        }
+      },
+      "inserted_id": null,
+      "success": true,
+      "stopped_batch": false,
+      "notes": [
+        "Dry-run only: request shape validated locally; no Simplbooks mutation was attempted."
+      ]
+    },
+    {
+      "mode": "dry-run",
+      "action_idempotency_key": "example-2024-01-fees-stripe",
+      "sent_at": "2026-04-04T00:00:01Z",
+      "method": "POST",
+      "endpoint": "purchases/create",
+      "payload": {
+        "Purchase": {
+          "client_id": 2002,
+          "created": "2024-01-31",
+          "transaction_date": "2024-01-31",
+          "currency_name": "EUR",
+          "currency_rate": 1,
+          "row_sum_with_vat": true,
+          "vat": 0.0,
+          "comments": "Stripe fee summary"
+        },
+        "PurchaseRows": [
+          {
+            "PurchaseRow": {
+              "expense_account_id": 500,
+              "vat_type_id": 0,
+              "name": "Stripe processor fee summary",
+              "unit": "summary",
+              "amount": 1,
+              "sum": 3.5,
+              "vat": 0,
+              "discount": 0
+            }
+          }
+        ]
+      },
+      "http_status": 0,
+      "response_body": {
+        "dry_run": true,
+        "validated": true,
+        "endpoint": "purchases/create",
+        "method": "POST",
+        "idempotency_key": "example-2024-01-fees-stripe",
+        "payload_preview": {
+          "Purchase": {
+            "client_id": 2002,
+            "created": "2024-01-31",
+            "transaction_date": "2024-01-31",
+            "currency_name": "EUR",
+            "currency_rate": 1,
+            "row_sum_with_vat": true,
+            "vat": 0.0,
+            "comments": "Stripe fee summary"
+          },
+          "PurchaseRows": [
+            {
+              "PurchaseRow": {
+                "expense_account_id": 500,
+                "vat_type_id": 0,
+                "name": "Stripe processor fee summary",
+                "unit": "summary",
+                "amount": 1,
+                "sum": 3.5,
+                "vat": 0,
+                "discount": 0
+              }
+            }
+          ]
+        }
+      },
+      "inserted_id": null,
+      "success": true,
+      "stopped_batch": false,
+      "notes": [
+        "Dry-run only: request shape validated locally; no Simplbooks mutation was attempted."
+      ]
+    },
+    {
+      "mode": "dry-run",
+      "action_idempotency_key": "example-2024-01-fees-paypal",
+      "sent_at": "2026-04-04T00:00:02Z",
+      "method": "POST",
+      "endpoint": "purchases/create",
+      "payload": {
+        "Purchase": {
+          "client_id": 2003,
+          "created": "2024-01-31",
+          "transaction_date": "2024-01-31",
+          "currency_name": "EUR",
+          "currency_rate": 1,
+          "row_sum_with_vat": true,
+          "vat": 0.0,
+          "comments": "PayPal fee summary"
+        },
+        "PurchaseRows": [
+          {
+            "PurchaseRow": {
+              "expense_account_id": 500,
+              "vat_type_id": 0,
+              "name": "PayPal processor fee summary",
+              "unit": "summary",
+              "amount": 1,
+              "sum": 2.6,
+              "vat": 0,
+              "discount": 0
+            }
+          }
+        ]
+      },
+      "http_status": 0,
+      "response_body": {
+        "dry_run": true,
+        "validated": true,
+        "endpoint": "purchases/create",
+        "method": "POST",
+        "idempotency_key": "example-2024-01-fees-paypal",
+        "payload_preview": {
+          "Purchase": {
+            "client_id": 2003,
+            "created": "2024-01-31",
+            "transaction_date": "2024-01-31",
+            "currency_name": "EUR",
+            "currency_rate": 1,
+            "row_sum_with_vat": true,
+            "vat": 0.0,
+            "comments": "PayPal fee summary"
+          },
+          "PurchaseRows": [
+            {
+              "PurchaseRow": {
+                "expense_account_id": 500,
+                "vat_type_id": 0,
+                "name": "PayPal processor fee summary",
+                "unit": "summary",
+                "amount": 1,
+                "sum": 2.6,
+                "vat": 0,
+                "discount": 0
+              }
+            }
+          ]
+        }
+      },
+      "inserted_id": null,
+      "success": true,
+      "stopped_batch": false,
+      "notes": [
+        "Dry-run only: request shape validated locally; no Simplbooks mutation was attempted."
+      ]
+    },
+    {
+      "mode": "dry-run",
+      "action_idempotency_key": "example-2024-01-purchase-printful",
+      "sent_at": "2026-04-04T00:00:03Z",
+      "method": "POST",
+      "endpoint": "purchases/create",
+      "payload": {
+        "Purchase": {
+          "client_id": 2004,
+          "created": "2024-01-31",
+          "transaction_date": "2024-01-31",
+          "currency_name": "EUR",
+          "currency_rate": 1,
+          "row_sum_with_vat": true,
+          "vat": 9.0,
+          "comments": "Printful purchase summary"
+        },
+        "PurchaseRows": [
+          {
+            "PurchaseRow": {
+              "expense_account_id": 510,
+              "vat_type_id": 20,
+              "name": "Printful fulfillment and storage summary",
+              "unit": "summary",
+              "amount": 1,
+              "sum": 54.0,
+              "vat": 20,
+              "discount": 0
+            }
+          }
+        ]
+      },
+      "http_status": 0,
+      "response_body": {
+        "dry_run": true,
+        "validated": true,
+        "endpoint": "purchases/create",
+        "method": "POST",
+        "idempotency_key": "example-2024-01-purchase-printful",
+        "payload_preview": {
+          "Purchase": {
+            "client_id": 2004,
+            "created": "2024-01-31",
+            "transaction_date": "2024-01-31",
+            "currency_name": "EUR",
+            "currency_rate": 1,
+            "row_sum_with_vat": true,
+            "vat": 9.0,
+            "comments": "Printful purchase summary"
+          },
+          "PurchaseRows": [
+            {
+              "PurchaseRow": {
+                "expense_account_id": 510,
+                "vat_type_id": 20,
+                "name": "Printful fulfillment and storage summary",
+                "unit": "summary",
+                "amount": 1,
+                "sum": 54.0,
+                "vat": 20,
+                "discount": 0
+              }
+            }
+          ]
+        }
+      },
+      "inserted_id": null,
+      "success": true,
+      "stopped_batch": false,
+      "notes": [
+        "Dry-run only: request shape validated locally; no Simplbooks mutation was attempted."
+      ]
+    },
+    {
+      "mode": "dry-run",
+      "action_idempotency_key": "example-2024-01-incoming-stripe",
+      "sent_at": "2026-04-04T00:00:04Z",
+      "method": "POST",
+      "endpoint": "incomings/create",
+      "payload": {
+        "Incoming": {
+          "income_account_id": 101,
+          "currency_name": "EUR",
+          "currency_rate": 1,
+          "client_id": 2002,
+          "income_sum": 108.5,
+          "income_date": "2024-01-31",
+          "description": "stripe incoming summary"
+        },
+        "invoice_id": 0
+      },
+      "http_status": 0,
+      "response_body": {
+        "dry_run": true,
+        "validated": true,
+        "endpoint": "incomings/create",
+        "method": "POST",
+        "idempotency_key": "example-2024-01-incoming-stripe",
+        "payload_preview": {
+          "Incoming": {
+            "income_account_id": 101,
+            "currency_name": "EUR",
+            "currency_rate": 1,
+            "client_id": 2002,
+            "income_sum": 108.5,
+            "income_date": "2024-01-31",
+            "description": "stripe incoming summary"
+          },
+          "invoice_id": 0
+        }
+      },
+      "inserted_id": null,
+      "success": true,
+      "stopped_batch": false,
+      "notes": [
+        "Dry-run only: request shape validated locally; no Simplbooks mutation was attempted."
+      ]
+    },
+    {
+      "mode": "dry-run",
+      "action_idempotency_key": "example-2024-01-incoming-paypal",
+      "sent_at": "2026-04-04T00:00:05Z",
+      "method": "POST",
+      "endpoint": "incomings/create",
+      "payload": {
+        "Incoming": {
+          "income_account_id": 101,
+          "currency_name": "EUR",
+          "currency_rate": 1,
+          "client_id": 2003,
+          "income_sum": 65.4,
+          "income_date": "2024-01-31",
+          "description": "paypal incoming summary"
+        },
+        "invoice_id": 0
+      },
+      "http_status": 0,
+      "response_body": {
+        "dry_run": true,
+        "validated": true,
+        "endpoint": "incomings/create",
+        "method": "POST",
+        "idempotency_key": "example-2024-01-incoming-paypal",
+        "payload_preview": {
+          "Incoming": {
+            "income_account_id": 101,
+            "currency_name": "EUR",
+            "currency_rate": 1,
+            "client_id": 2003,
+            "income_sum": 65.4,
+            "income_date": "2024-01-31",
+            "description": "paypal incoming summary"
+          },
+          "invoice_id": 0
+        }
+      },
+      "inserted_id": null,
+      "success": true,
+      "stopped_batch": false,
+      "notes": [
+        "Dry-run only: request shape validated locally; no Simplbooks mutation was attempted."
+      ]
+    },
+    {
+      "mode": "dry-run",
+      "action_idempotency_key": "example-2024-01-payment-printful",
+      "sent_at": "2026-04-04T00:00:06Z",
+      "method": "POST",
+      "endpoint": "payments/create",
+      "payload": {
+        "Payment": {
+          "income_account_id": 101,
+          "currency_name": "EUR",
+          "currency_rate": 1,
+          "client_id": 2004,
+          "payment_sum": 54.0,
+          "payment_date": "2024-01-31",
+          "description": "printful payment summary"
+        },
+        "purchase_id": 0
+      },
+      "http_status": 0,
+      "response_body": {
+        "dry_run": true,
+        "validated": true,
+        "endpoint": "payments/create",
+        "method": "POST",
+        "idempotency_key": "example-2024-01-payment-printful",
+        "payload_preview": {
+          "Payment": {
+            "income_account_id": 101,
+            "currency_name": "EUR",
+            "currency_rate": 1,
+            "client_id": 2004,
+            "payment_sum": 54.0,
+            "payment_date": "2024-01-31",
+            "description": "printful payment summary"
+          },
+          "purchase_id": 0
+        }
+      },
+      "inserted_id": null,
+      "success": true,
+      "stopped_batch": false,
+      "notes": [
+        "Dry-run only: request shape validated locally; no Simplbooks mutation was attempted."
+      ]
+    }
+  ],
+  "rollback_plan": {
+    "supported": false,
+    "notes": [
+      "No successful write actions are recorded in this batch yet.",
+      "There is currently nothing to reverse."
+    ],
+    "reversal_candidates": []
+  },
+  "summary": {
+    "attempted_actions": 7,
+    "successful_actions": 7,
+    "failed_actions": 0,
+    "stopped_on_failure": false
+  }
+}

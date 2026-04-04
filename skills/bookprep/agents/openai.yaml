@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bookprep"
+  short_description: "Normalize month-level bookkeeping sources"
+  default_prompt: "Use $bookprep to normalize companies/example source files for 2024-01 and write companies/example/artifacts/normalized/2024-01.json."

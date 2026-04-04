@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bookdisco"
+  short_description: "Inspect historical Simplbooks bookkeeping"
+  default_prompt: "Use $bookdisco to inspect 2022 and 2023 in Simplbooks for companies/example and write the discovery artifacts under companies/example/artifacts/."

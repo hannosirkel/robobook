@@ -1,0 +1,24 @@
+{
+  "schema_version": "1.0",
+  "company_name": "Example Company OÜ",
+  "company_slug": "example",
+  "simplbooks_company_id": "0123456789abcdef0123456789abcdef",
+  "description": "Synthetic example webshop using WooCommerce for recurring sales, Stripe and PayPal for settlements, and Printful for fulfillment costs.",
+  "base_currency": "EUR",
+  "vat_registered": true,
+  "oss_registered": false,
+  "default_warehouse_ids": [
+    "1"
+  ],
+  "bank_account_ids": [
+    "101"
+  ],
+  "cash_account_ids": [],
+  "policy_refs": [
+    "companies/example/artifacts/policy_memo.md"
+  ],
+  "notes": [
+    "This profile is synthetic and publishable.",
+    "Bank transactions are assumed to be imported into Simplbooks before monthly skills-flow actions are reviewed."
+  ]
+}

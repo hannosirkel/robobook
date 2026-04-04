@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bookchecker"
+  short_description: "Review draft Simplbooks action batches"
+  default_prompt: "Use $bookchecker to review companies/example/artifacts/actions/2024-01.yaml against companies/example/artifacts/recon/2024-01.json and write companies/example/artifacts/actions/2024-01.check.md."

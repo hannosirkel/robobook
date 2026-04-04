@@ -1,0 +1,452 @@
+from __future__ import annotations
+
+import copy
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+
+import booksend  # noqa: E402
+from simplbooks_api import SimplbooksError  # noqa: E402
+
+
+def invoice_action(
+    *,
+    key: str = "example-2024-01-sales-paypal",
+    response_status: int | None = None,
+    executed_at: str | None = None,
+    response_body: dict | None = None,
+    inserted_id: str | int | None = None,
+) -> dict:
+    return {
+        "idempotency_key": key,
+        "period": "2024-01",
+        "action_type": "create_invoice_summary",
+        "method": "POST",
+        "endpoint": "invoices/create",
+        "payload": {
+            "draft_schema": "invoice_summary_v1",
+            "document_type": "invoice",
+            "document_date": "2024-01-31",
+            "currency": "EUR",
+            "counterparty": {
+                "contact_id": "2001",
+                "display_name_hint": "Monthly paypal sales summary",
+            },
+            "totals": {
+                "gross_amount": 120.0,
+                "vat_amount": 20.0,
+                "shipping_amount": 10.0,
+            },
+            "line_items": [
+                {
+                    "line_role": "sales_revenue",
+                    "description": "paypal taxable sales summary",
+                    "gross_amount": 110.0,
+                    "vat_amount_hint": 20.0,
+                    "suggested_income_account_id": "3000",
+                    "suggested_vat_type_id": "22",
+                    "warehouse_id_hint": None,
+                },
+                {
+                    "line_role": "sales_shipping",
+                    "description": "paypal shipping summary",
+                    "gross_amount": 10.0,
+                    "vat_amount_hint": 0.0,
+                    "suggested_income_account_id": "3010",
+                    "suggested_vat_type_id": "0",
+                    "warehouse_id_hint": None,
+                },
+            ],
+        },
+        "source_refs": [
+            {
+                "path": "companies/example/artifacts/normalized/2024-01.json",
+                "record_ref": "paypal:sale:1",
+                "note": None,
+            }
+        ],
+        "reason": "test",
+        "confidence": "high",
+        "depends_on": [],
+        "expected_effect": "create invoice",
+        "review_notes": [],
+        "executed_at": executed_at,
+        "response_status": response_status,
+        "response_body": response_body,
+        "inserted_id": inserted_id,
+    }
+
+
+def purchase_action(*, key: str = "example-2024-01-purchase-printful") -> dict:
+    return {
+        "idempotency_key": key,
+        "period": "2024-01",
+        "action_type": "create_purchase_summary",
+        "method": "POST",
+        "endpoint": "purchases/create",
+        "payload": {
+            "draft_schema": "purchase_summary_v1",
+            "document_type": "purchase",
+            "document_date": "2024-01-31",
+            "currency": "EUR",
+            "counterparty": {
+                "contact_id": "2002",
+                "display_name_hint": "printful purchase summary",
+            },
+            "totals": {
+                "gross_amount": 30.0,
+                "vat_amount": 0.0,
+            },
+            "line_items": [
+                {
+                    "line_role": "purchase_expense",
+                    "description": "printful fulfillment summary",
+                    "gross_amount": 30.0,
+                    "vat_amount_hint": 0.0,
+                    "suggested_expense_account_id": "6020",
+                    "suggested_vat_type_id": "0",
+                    "article_id_hint": None,
+                }
+            ],
+        },
+        "source_refs": [
+            {
+                "path": "companies/example/artifacts/normalized/2024-01.json",
+                "record_ref": "printful:expense:1",
+                "note": None,
+            }
+        ],
+        "reason": "test",
+        "confidence": "high",
+        "depends_on": [],
+        "expected_effect": "create purchase",
+        "review_notes": [],
+        "executed_at": None,
+        "response_status": None,
+        "response_body": None,
+        "inserted_id": None,
+    }
+
+
+def incoming_action(
+    *,
+    key: str = "example-2024-01-incoming-paypal",
+    depends_on: list[str] | None = None,
+    response_status: int | None = None,
+    executed_at: str | None = None,
+    response_body: dict | None = None,
+    inserted_id: str | int | None = None,
+) -> dict:
+    return {
+        "idempotency_key": key,
+        "period": "2024-01",
+        "action_type": "create_incoming_summary",
+        "method": "POST",
+        "endpoint": "incomings/create",
+        "payload": {
+            "draft_schema": "cash_settlement_v1",
+            "document_type": "incoming",
+            "document_date": "2024-01-31",
+            "currency": "EUR",
+            "counterparty": {
+                "contact_id": "2001",
+                "display_name_hint": "paypal incoming summary",
+            },
+            "counterparty_hint": "paypal",
+            "bank_account_id": "101",
+            "amount": 116.0,
+            "record_count": 1,
+        },
+        "source_refs": [
+            {
+                "path": "companies/example/artifacts/normalized/2024-01.json",
+                "record_ref": "paypal:payout:1",
+                "note": None,
+            }
+        ],
+        "reason": "test",
+        "confidence": "high",
+        "depends_on": depends_on or ["example-2024-01-sales-paypal"],
+        "expected_effect": "create incoming",
+        "review_notes": [],
+        "executed_at": executed_at,
+        "response_status": response_status,
+        "response_body": response_body,
+        "inserted_id": inserted_id,
+    }
+
+
+def payment_action(
+    *,
+    key: str = "example-2024-01-payment-printful",
+    depends_on: list[str] | None = None,
+) -> dict:
+    return {
+        "idempotency_key": key,
+        "period": "2024-01",
+        "action_type": "create_payment_summary",
+        "method": "POST",
+        "endpoint": "payments/create",
+        "payload": {
+            "draft_schema": "cash_settlement_v1",
+            "document_type": "payment",
+            "document_date": "2024-01-31",
+            "currency": "EUR",
+            "counterparty": {
+                "contact_id": "2002",
+                "display_name_hint": "printful payment summary",
+            },
+            "counterparty_hint": "printful",
+            "bank_account_id": "101",
+            "amount": 30.0,
+            "linked_purchase_action": "example-2024-01-purchase-printful",
+            "record_count": 1,
+        },
+        "source_refs": [
+            {
+                "path": "companies/example/artifacts/normalized/2024-01.json",
+                "record_ref": "bank:printful:1",
+                "note": None,
+            }
+        ],
+        "reason": "test",
+        "confidence": "high",
+        "depends_on": depends_on or ["example-2024-01-purchase-printful"],
+        "expected_effect": "create payment",
+        "review_notes": [],
+        "executed_at": None,
+        "response_status": None,
+        "response_body": None,
+        "inserted_id": None,
+    }
+
+
+def make_batch(*, approval_status: str = "approved", actions: list[dict] | None = None) -> dict:
+    return {
+        "schema_version": "1.0",
+        "company_slug": "example",
+        "period": "2024-01",
+        "generated_at": "2026-04-04T00:00:00Z",
+        "batch_id": "example-2024-01-draft",
+        "approval_status": approval_status,
+        "source_summary": "test",
+        "recon_ref": "companies/example/artifacts/recon/2024-01.json",
+        "actions": actions or [invoice_action(), incoming_action()],
+    }
+
+
+class FakeClient:
+    def __init__(self, responses: list[dict]) -> None:
+        self.responses = list(responses)
+        self.calls: list[dict] = []
+
+    def request(self, path: str, *, method: str = "GET", payload: dict | None = None) -> dict:
+        self.calls.append({"path": path, "method": method, "payload": payload})
+        if not self.responses:
+            raise AssertionError("No fake responses left for request")
+        return self.responses.pop(0)
+
+
+class BooksendTests(unittest.TestCase):
+    def test_dry_run_updates_actions_and_uses_translated_payloads(self) -> None:
+        batch = make_batch(approval_status="draft")
+
+        updated_batch, submission = booksend.execute_batch(
+            action_batch=copy.deepcopy(batch),
+            mode="dry-run",
+        )
+
+        self.assertEqual(updated_batch["approval_status"], "draft")
+        self.assertEqual(submission["mode"], "dry-run")
+        self.assertEqual(submission["summary"]["attempted_actions"], 2)
+        self.assertEqual(submission["summary"]["successful_actions"], 2)
+        self.assertEqual(submission["summary"]["failed_actions"], 0)
+        self.assertEqual(len(submission["request_log"]), 2)
+        self.assertEqual(submission["request_log"][0]["endpoint"], "invoices/create")
+        self.assertEqual(submission["request_log"][0]["payload"]["Invoice"]["client_id"], 2001)
+        self.assertEqual(submission["request_log"][1]["endpoint"], "incomings/create")
+        self.assertEqual(submission["request_log"][1]["payload"]["invoice_id"], 0)
+        self.assertEqual(updated_batch["actions"][0]["response_status"], 0)
+        self.assertTrue(updated_batch["actions"][0]["response_body"]["dry_run"])
+        self.assertFalse(submission["rollback_plan"]["supported"])
+        self.assertEqual(submission["rollback_plan"]["reversal_candidates"], [])
+
+    def test_dry_run_resolves_payment_purchase_id_from_prior_action_lookup(self) -> None:
+        prior_purchase = purchase_action(key="example-2024-01-purchase-jajaa")
+        prior_purchase["payload"]["counterparty"]["display_name_hint"] = "jajaa purchase summary"
+        prior_purchase["payload"]["vendor_hint"] = "jajaa"
+        prior_purchase["inserted_id"] = 712
+
+        action = payment_action(key="example-2024-03-payment-jajaa", depends_on=[])
+        action["period"] = "2024-03"
+        action["depends_on"] = []
+        action["payload"]["document_date"] = "2024-03-31"
+        action["payload"]["counterparty"]["display_name_hint"] = "jajaa payment summary"
+        action["payload"]["counterparty_hint"] = "jajaa"
+        action["payload"]["amount"] = 12.0
+        action["payload"]["linked_purchase_action"] = "example-2024-01-purchase-jajaa"
+
+        batch = make_batch(actions=[action])
+        batch["period"] = "2024-03"
+        batch["batch_id"] = "example-2024-03-draft"
+
+        _, submission = booksend.execute_batch(
+            action_batch=copy.deepcopy(batch),
+            mode="dry-run",
+            reference_lookup={"example-2024-01-purchase-jajaa": prior_purchase},
+        )
+
+        self.assertEqual(submission["request_log"][0]["endpoint"], "payments/create")
+        self.assertEqual(submission["request_log"][0]["payload"]["purchase_id"], 712)
+
+    def test_load_prior_action_lookup_reads_earlier_action_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            company_dir = tmp / "companies" / "example"
+            actions_dir = company_dir / "artifacts" / "actions"
+            actions_dir.mkdir(parents=True)
+
+            booksend.write_yaml(
+                actions_dir / "2024-01.yaml",
+                {
+                    "actions": [
+                        purchase_action(key="example-2024-01-purchase-jajaa"),
+                    ]
+                },
+            )
+            current_action_path = actions_dir / "2024-03.yaml"
+            booksend.write_yaml(current_action_path, {"actions": [payment_action(key="example-2024-03-payment-jajaa")]})
+
+            lookup = booksend.load_prior_action_lookup(
+                company_dir=company_dir,
+                action_path=current_action_path,
+                period="2024-03",
+            )
+
+        self.assertIn("example-2024-01-purchase-jajaa", lookup)
+        self.assertNotIn("example-2024-03-payment-jajaa", lookup)
+
+    def test_write_mode_preconditions_require_confirmation_and_fresh_check_binding(self) -> None:
+        batch = make_batch(approval_status="approved")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            action_path = tmp / "actions.yaml"
+            action_path.write_text("batch: current\n", encoding="utf-8")
+            check_path = tmp / "actions.check.md"
+
+            with self.assertRaisesRegex(SimplbooksError, "confirm-write"):
+                booksend.validate_run_preconditions(
+                    action_batch=batch,
+                    action_path=action_path,
+                    period="2024-01",
+                    mode="write",
+                    confirm_write=False,
+                    check_report={"result": "pass", "batch_id": batch["batch_id"], "action_file_sha256": booksend.file_sha256(action_path)},
+                    check_path=check_path,
+                )
+
+            with self.assertRaisesRegex(SimplbooksError, "fresh check report"):
+                booksend.validate_run_preconditions(
+                    action_batch=batch,
+                    action_path=action_path,
+                    period="2024-01",
+                    mode="write",
+                    confirm_write=True,
+                    check_report={"result": "pass", "batch_id": "stale-batch", "action_file_sha256": booksend.file_sha256(action_path)},
+                    check_path=check_path,
+                )
+
+            with self.assertRaisesRegex(SimplbooksError, "current action file contents"):
+                booksend.validate_run_preconditions(
+                    action_batch=batch,
+                    action_path=action_path,
+                    period="2024-01",
+                    mode="write",
+                    confirm_write=True,
+                    check_report={"result": "pass", "batch_id": batch["batch_id"], "action_file_sha256": "0" * 64},
+                    check_path=check_path,
+                )
+
+    def test_write_stops_on_first_failure_in_stable_order(self) -> None:
+        batch = make_batch(
+            actions=[
+                invoice_action(),
+                purchase_action(),
+                payment_action(),
+            ]
+        )
+        client = FakeClient(
+            responses=[
+                {"_http_status": 201, "invoice_id": 501},
+                {"_http_status": 400, "error": "bad payload"},
+            ]
+        )
+
+        updated_batch, submission = booksend.execute_batch(
+            action_batch=copy.deepcopy(batch),
+            mode="write",
+            client=client,
+        )
+
+        self.assertEqual([call["path"] for call in client.calls], ["invoices/create", "purchases/create"])
+        self.assertEqual(submission["summary"]["attempted_actions"], 2)
+        self.assertEqual(submission["summary"]["successful_actions"], 1)
+        self.assertEqual(submission["summary"]["failed_actions"], 1)
+        self.assertTrue(submission["summary"]["stopped_on_failure"])
+        self.assertTrue(submission["request_log"][-1]["stopped_batch"])
+        self.assertEqual(updated_batch["actions"][2]["executed_at"], None)
+        self.assertEqual(updated_batch["approval_status"], "approved")
+
+    def test_write_rerun_skips_successful_actions_and_marks_batch_submitted(self) -> None:
+        prior_success = {
+            "_http_status": 201,
+            "invoice_id": 501,
+        }
+        batch = make_batch(
+            actions=[
+                invoice_action(
+                    response_status=201,
+                    executed_at="2026-04-04T00:00:00Z",
+                    response_body=prior_success,
+                    inserted_id=501,
+                ),
+                incoming_action(),
+            ]
+        )
+        client = FakeClient(
+            responses=[
+                {"_http_status": 201, "incoming_id": 601},
+            ]
+        )
+
+        updated_batch, submission = booksend.execute_batch(
+            action_batch=copy.deepcopy(batch),
+            mode="write",
+            client=client,
+        )
+
+        self.assertEqual([call["path"] for call in client.calls], ["incomings/create"])
+        self.assertEqual(client.calls[0]["payload"]["invoice_id"], 501)
+        self.assertEqual(updated_batch["approval_status"], "submitted")
+        self.assertEqual(submission["summary"]["attempted_actions"], 1)
+        self.assertEqual(submission["summary"]["successful_actions"], 1)
+        self.assertEqual(len(submission["rollback_plan"]["reversal_candidates"]), 2)
+
+        candidates = {
+            item["action_idempotency_key"]: item
+            for item in submission["rollback_plan"]["reversal_candidates"]
+        }
+        self.assertIn("example-2024-01-incoming-paypal", candidates)
+        self.assertIn("example-2024-01-sales-paypal", candidates)
+        self.assertEqual(candidates["example-2024-01-incoming-paypal"]["depends_on"], [])
+        self.assertEqual(candidates["example-2024-01-sales-paypal"]["depends_on"], ["example-2024-01-incoming-paypal"])
+
+
+if __name__ == "__main__":
+    unittest.main()

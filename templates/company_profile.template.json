@@ -1,0 +1,15 @@
+{
+  "schema_version": "1.0",
+  "company_name": "Example Company OÜ",
+  "company_slug": "example",
+  "simplbooks_company_id": "REPLACE_ME",
+  "description": "Replace with a short non-secret business description.",
+  "base_currency": "EUR",
+  "vat_registered": true,
+  "oss_registered": null,
+  "default_warehouse_ids": [],
+  "bank_account_ids": [],
+  "cash_account_ids": [],
+  "policy_refs": [],
+  "notes": []
+}

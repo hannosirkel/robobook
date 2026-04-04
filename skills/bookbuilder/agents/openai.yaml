@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bookbuilder"
+  short_description: "Build draft Simplbooks action batches"
+  default_prompt: "Use $bookbuilder to turn companies/example/artifacts/normalized/2024-01.json and companies/example/artifacts/recon/2024-01.json into companies/example/artifacts/actions/2024-01.yaml without submitting anything."

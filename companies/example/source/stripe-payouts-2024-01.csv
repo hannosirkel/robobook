@@ -1,0 +1,2 @@
+payout_date,payout_id,gross_collected_eur,fees_eur,net_payout_eur,order_refs
+2024-01-12,po_001,112.00,3.50,108.50,"1001 partial,1002 partial"

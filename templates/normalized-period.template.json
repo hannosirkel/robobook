@@ -1,0 +1,20 @@
+{
+  "schema_version": "1.0",
+  "company_slug": "example",
+  "period": "2024-01",
+  "base_currency": "EUR",
+  "generated_at": "2026-04-04T00:00:00Z",
+  "sources": [],
+  "records": {
+    "sales": [],
+    "refunds": [],
+    "fees": [],
+    "payouts": [],
+    "bank_transactions": [],
+    "purchase_expenses": [],
+    "inventory_movements": [],
+    "manual_adjustments": [],
+    "other": []
+  },
+  "exceptions": []
+}

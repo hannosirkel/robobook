@@ -1,0 +1,120 @@
+{
+  "schema_version": "1.0",
+  "company_slug": "example",
+  "generated_at": "2026-04-04T00:00:00Z",
+  "as_of_period": "2024-01",
+  "financial_accounts": [
+    {
+      "id": "101",
+      "code": "1010",
+      "name": "Main bank account",
+      "status": "active",
+      "extra": {},
+      "notes": [
+        "Used as the imported bank account for incomings and payments in the example flow."
+      ]
+    }
+  ],
+  "income_accounts": [
+    {
+      "id": "300",
+      "code": "3000",
+      "name": "E-commerce product sales",
+      "status": "active",
+      "extra": {},
+      "notes": []
+    },
+    {
+      "id": "304",
+      "code": "3040",
+      "name": "Shipping revenue",
+      "status": "active",
+      "extra": {},
+      "notes": []
+    },
+    {
+      "id": "500",
+      "code": "5000",
+      "name": "Processor fees",
+      "status": "active",
+      "extra": {},
+      "notes": []
+    },
+    {
+      "id": "510",
+      "code": "5100",
+      "name": "Fulfillment costs",
+      "status": "active",
+      "extra": {},
+      "notes": []
+    }
+  ],
+  "vat_types": [
+    {
+      "id": "20",
+      "code": "20",
+      "name": "20% VAT",
+      "status": "active",
+      "extra": {},
+      "notes": []
+    },
+    {
+      "id": "0",
+      "code": "0",
+      "name": "0% VAT / no VAT",
+      "status": "active",
+      "extra": {},
+      "notes": []
+    }
+  ],
+  "warehouses": [
+    {
+      "id": "1",
+      "code": "MAIN",
+      "name": "Main warehouse",
+      "status": "active",
+      "extra": {},
+      "notes": []
+    }
+  ],
+  "items": [],
+  "contacts": [
+    {
+      "id": "2001",
+      "code": null,
+      "name": "WooCommerce monthly summary",
+      "status": "active",
+      "extra": {},
+      "notes": [
+        "Used as the invoice-summary counterparty in the synthetic example."
+      ]
+    },
+    {
+      "id": "2002",
+      "code": null,
+      "name": "Stripe Payments Europe, Limited",
+      "status": "active",
+      "extra": {},
+      "notes": []
+    },
+    {
+      "id": "2003",
+      "code": null,
+      "name": "PayPal Europe S.a r.l. et Cie, S.C.A.",
+      "status": "active",
+      "extra": {},
+      "notes": []
+    },
+    {
+      "id": "2004",
+      "code": null,
+      "name": "Printful Inc.",
+      "status": "active",
+      "extra": {},
+      "notes": []
+    }
+  ],
+  "notes": [
+    "This is a synthetic entity map for documentation and worked-example purposes."
+  ]
+}

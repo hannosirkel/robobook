@@ -1,0 +1,180 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.books/schemas/year-overview.schema.json",
+  "title": "Simplbooks Discovery Year Overview",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "year",
+    "company_id",
+    "technical_findings",
+    "counts",
+    "monthly",
+    "patterns",
+    "samples"
+  ],
+  "properties": {
+    "year": {
+      "type": "integer",
+      "minimum": 2000
+    },
+    "company_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "company_name": {
+      "type": "string"
+    },
+    "technical_findings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "financial_accounts",
+        "income_accounts",
+        "vat_types",
+        "warehouses",
+        "invoices",
+        "invoice_rows",
+        "purchases",
+        "purchase_rows",
+        "receipts",
+        "payments"
+      ],
+      "properties": {
+        "financial_accounts": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "income_accounts": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "vat_types": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "warehouses": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "invoices": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "invoice_rows": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "purchases": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "purchase_rows": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "receipts": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "payments": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "monthly": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "invoices",
+        "purchases",
+        "receipts",
+        "payments"
+      ],
+      "properties": {
+        "invoices": {
+          "$ref": "#/$defs/month_map"
+        },
+        "purchases": {
+          "$ref": "#/$defs/month_map"
+        },
+        "receipts": {
+          "$ref": "#/$defs/month_map"
+        },
+        "payments": {
+          "$ref": "#/$defs/month_map"
+        }
+      }
+    },
+    "patterns": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/count_map"
+      }
+    },
+    "samples": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "object"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "count_map": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1
+      },
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "month_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "count",
+        "sum",
+        "vat",
+        "total_sum"
+      ],
+      "properties": {
+        "count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sum": {
+          "type": "number"
+        },
+        "vat": {
+          "type": "number"
+        },
+        "total_sum": {
+          "type": "number"
+        }
+      }
+    },
+    "month_map": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "pattern": "^(unknown|[0-9]{4}-[0-9]{2})$"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/month_summary"
+      }
+    }
+  }
+}

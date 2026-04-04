@@ -1,0 +1,4 @@
+interface:
+  display_name: "Simplbooks API"
+  short_description: "Safely inspect and operate the Simplbooks API"
+  default_prompt: "Use $simplbooks-api to inspect Simplbooks for companies/example in read-only mode and save the output under companies/example/artifacts/."

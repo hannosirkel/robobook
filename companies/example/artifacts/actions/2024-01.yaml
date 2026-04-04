@@ -1,0 +1,288 @@
+schema_version: "1.0"
+company_slug: "example"
+period: "2024-01"
+generated_at: "2026-04-04T00:00:00Z"
+batch_id: "example-2024-01-draft"
+approval_status: "draft"
+source_summary: "Synthetic January 2024 worked example combining Woo sales, Stripe and PayPal settlements, processor fees, and one Printful purchase."
+recon_ref: "companies/example/artifacts/recon/2024-01.json"
+actions:
+  - idempotency_key: "example-2024-01-sales-woo"
+    period: "2024-01"
+    action_type: "create_invoice_summary"
+    method: "POST"
+    endpoint: "invoices/create"
+    payload:
+      draft_schema: "invoice_summary_v1"
+      document_type: "invoice"
+      document_date: "2024-01-31"
+      currency: "EUR"
+      summary_scope:
+        channel_or_source: "woo"
+        record_count: 1
+      totals:
+        gross_amount: 180.0
+        vat_amount: 30.0
+        shipping_amount: 12.0
+        fee_amount_observed: 0.0
+      counterparty:
+        contact_id: "2001"
+        display_name_hint: "Monthly Woo sales summary"
+      line_items:
+        - line_role: "product_sales"
+          description: "WooCommerce product sales summary"
+          gross_amount: 168.0
+          vat_amount_hint: 28.0
+          suggested_income_account_id: "300"
+          suggested_vat_type_id: "20"
+          warehouse_id_hint: "1"
+          record_count: 1
+        - line_role: "shipping"
+          description: "WooCommerce shipping summary"
+          gross_amount: 12.0
+          vat_amount_hint: 2.0
+          suggested_income_account_id: "304"
+          suggested_vat_type_id: "20"
+          warehouse_id_hint: null
+          record_count: 1
+    source_refs:
+      - path: "companies/example/artifacts/normalized/2024-01.json"
+        record_ref: "sale:woo:2024-01:summary"
+        note: "Recurring webshop sales posting basis."
+    reason: "Aggregate the recurring WooCommerce sales evidence into one month-level draft invoice summary."
+    confidence: "high"
+    depends_on: []
+    expected_effect: "Create a draft monthly sales summary for WooCommerce in Simplbooks."
+    review_notes:
+      - "Woo is the posting basis for recurring e-commerce sales in the example flow."
+      - "Stripe and PayPal are settlement evidence only for this month."
+    executed_at: null
+    response_status: null
+    response_body: null
+    inserted_id: null
+  - idempotency_key: "example-2024-01-fees-stripe"
+    period: "2024-01"
+    action_type: "create_purchase_summary"
+    method: "POST"
+    endpoint: "purchases/create"
+    payload:
+      draft_schema: "purchase_summary_v1"
+      document_type: "purchase"
+      document_date: "2024-01-31"
+      currency: "EUR"
+      counterparty:
+        contact_id: "2002"
+        display_name_hint: "Stripe fee summary"
+      vendor_hint: "stripe"
+      totals:
+        gross_amount: 3.5
+        vat_amount: 0.0
+      line_items:
+        - line_role: "processor_fee"
+          description: "Stripe processor fee summary"
+          gross_amount: 3.5
+          vat_amount_hint: 0.0
+          suggested_expense_account_id: "500"
+          suggested_vat_type_id: "0"
+          record_count: 1
+    source_refs:
+      - path: "companies/example/artifacts/normalized/2024-01.json"
+        record_ref: "fee:stripe:2024-01"
+        note: "Processor fee evidence from the Stripe payout file."
+    reason: "Group Stripe processor fee evidence into one draft purchase summary."
+    confidence: "high"
+    depends_on: []
+    expected_effect: "Create a draft Stripe fee purchase summary in Simplbooks."
+    review_notes:
+      - "Processor fee amount comes from the Stripe payout export."
+    executed_at: null
+    response_status: null
+    response_body: null
+    inserted_id: null
+  - idempotency_key: "example-2024-01-fees-paypal"
+    period: "2024-01"
+    action_type: "create_purchase_summary"
+    method: "POST"
+    endpoint: "purchases/create"
+    payload:
+      draft_schema: "purchase_summary_v1"
+      document_type: "purchase"
+      document_date: "2024-01-31"
+      currency: "EUR"
+      counterparty:
+        contact_id: "2003"
+        display_name_hint: "PayPal fee summary"
+      vendor_hint: "paypal"
+      totals:
+        gross_amount: 2.6
+        vat_amount: 0.0
+      line_items:
+        - line_role: "processor_fee"
+          description: "PayPal processor fee summary"
+          gross_amount: 2.6
+          vat_amount_hint: 0.0
+          suggested_expense_account_id: "500"
+          suggested_vat_type_id: "0"
+          record_count: 1
+    source_refs:
+      - path: "companies/example/artifacts/normalized/2024-01.json"
+        record_ref: "fee:paypal:2024-01"
+        note: "Processor fee evidence from the PayPal export."
+    reason: "Group PayPal processor fee evidence into one draft purchase summary."
+    confidence: "high"
+    depends_on: []
+    expected_effect: "Create a draft PayPal fee purchase summary in Simplbooks."
+    review_notes:
+      - "Processor fee amount comes from the PayPal transaction export."
+    executed_at: null
+    response_status: null
+    response_body: null
+    inserted_id: null
+  - idempotency_key: "example-2024-01-purchase-printful"
+    period: "2024-01"
+    action_type: "create_purchase_summary"
+    method: "POST"
+    endpoint: "purchases/create"
+    payload:
+      draft_schema: "purchase_summary_v1"
+      document_type: "purchase"
+      document_date: "2024-01-31"
+      currency: "EUR"
+      counterparty:
+        contact_id: "2004"
+        display_name_hint: "Printful purchase summary"
+      vendor_hint: "printful"
+      totals:
+        gross_amount: 54.0
+        vat_amount: 9.0
+      line_items:
+        - line_role: "purchase_expense"
+          description: "Printful fulfillment and storage summary"
+          gross_amount: 54.0
+          vat_amount_hint: 9.0
+          suggested_expense_account_id: "510"
+          suggested_vat_type_id: "20"
+          warehouse_id_hint: "1"
+          record_count: 1
+    source_refs:
+      - path: "companies/example/artifacts/normalized/2024-01.json"
+        record_ref: "purchase:printful:2024-01"
+        note: "Fulfillment purchase evidence from the Printful export."
+    reason: "Aggregate Printful purchase-expense evidence into one draft purchase summary."
+    confidence: "high"
+    depends_on: []
+    expected_effect: "Create a draft Printful purchase summary in Simplbooks."
+    review_notes:
+      - "Matching bank-debit evidence allows a payment draft later in the batch."
+    executed_at: null
+    response_status: null
+    response_body: null
+    inserted_id: null
+  - idempotency_key: "example-2024-01-incoming-stripe"
+    period: "2024-01"
+    action_type: "create_incoming_summary"
+    method: "POST"
+    endpoint: "incomings/create"
+    payload:
+      draft_schema: "cash_settlement_v1"
+      document_type: "incoming"
+      document_date: "2024-01-31"
+      currency: "EUR"
+      counterparty:
+        contact_id: "2002"
+        display_name_hint: "Stripe incoming summary"
+      counterparty_hint: "stripe"
+      bank_account_id: "101"
+      amount: 108.5
+      bank_receipt_total_hint: 108.5
+      record_count: 1
+    source_refs:
+      - path: "companies/example/artifacts/normalized/2024-01.json"
+        record_ref: "payout:stripe:2024-01"
+        note: "Processor payout evidence."
+      - path: "companies/example/artifacts/normalized/2024-01.json"
+        record_ref: "bank:stripe:2024-01-12"
+        note: "Matching bank receipt evidence."
+    reason: "Draft the Stripe payout incoming based on processor payout and bank receipt evidence."
+    confidence: "high"
+    depends_on:
+      - "example-2024-01-sales-woo"
+      - "example-2024-01-fees-stripe"
+    expected_effect: "Create a draft Stripe incoming summary in Simplbooks."
+    review_notes:
+      - "Incoming links back to the monthly sales summary for settlement continuity."
+    executed_at: null
+    response_status: null
+    response_body: null
+    inserted_id: null
+  - idempotency_key: "example-2024-01-incoming-paypal"
+    period: "2024-01"
+    action_type: "create_incoming_summary"
+    method: "POST"
+    endpoint: "incomings/create"
+    payload:
+      draft_schema: "cash_settlement_v1"
+      document_type: "incoming"
+      document_date: "2024-01-31"
+      currency: "EUR"
+      counterparty:
+        contact_id: "2003"
+        display_name_hint: "PayPal incoming summary"
+      counterparty_hint: "paypal"
+      bank_account_id: "101"
+      amount: 65.4
+      bank_receipt_total_hint: 65.4
+      record_count: 1
+    source_refs:
+      - path: "companies/example/artifacts/normalized/2024-01.json"
+        record_ref: "payout:paypal:2024-01"
+        note: "Processor payout evidence."
+      - path: "companies/example/artifacts/normalized/2024-01.json"
+        record_ref: "bank:paypal:2024-01-23"
+        note: "Matching bank receipt evidence."
+    reason: "Draft the PayPal payout incoming based on processor payout and bank receipt evidence."
+    confidence: "high"
+    depends_on:
+      - "example-2024-01-sales-woo"
+      - "example-2024-01-fees-paypal"
+    expected_effect: "Create a draft PayPal incoming summary in Simplbooks."
+    review_notes:
+      - "Incoming links back to the monthly sales summary for settlement continuity."
+    executed_at: null
+    response_status: null
+    response_body: null
+    inserted_id: null
+  - idempotency_key: "example-2024-01-payment-printful"
+    period: "2024-01"
+    action_type: "create_payment_summary"
+    method: "POST"
+    endpoint: "payments/create"
+    payload:
+      draft_schema: "cash_settlement_v1"
+      document_type: "payment"
+      document_date: "2024-01-31"
+      currency: "EUR"
+      counterparty:
+        contact_id: "2004"
+        display_name_hint: "Printful payment summary"
+      counterparty_hint: "printful"
+      bank_account_id: "101"
+      amount: 54.0
+      linked_purchase_action: "example-2024-01-purchase-printful"
+      linked_purchase_period: "2024-01"
+      record_count: 1
+    source_refs:
+      - path: "companies/example/artifacts/normalized/2024-01.json"
+        record_ref: "bank:printful:2024-01-20"
+        note: "Matching supplier bank-debit evidence."
+    reason: "Draft the Printful payment summary from the supplier bank debit linked to the purchase summary."
+    confidence: "high"
+    depends_on:
+      - "example-2024-01-purchase-printful"
+    expected_effect: "Create a draft Printful payment summary in Simplbooks."
+    review_notes:
+      - "This example shows supplier payment drafting after bank import and purchase matching."
+    executed_at: null
+    response_status: null
+    response_body: null
+    inserted_id: null

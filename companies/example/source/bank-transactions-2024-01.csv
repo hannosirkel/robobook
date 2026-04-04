@@ -1,0 +1,4 @@
+transaction_date,reference,amount_eur,counterparty
+2024-01-12,STRIPE-PO-001,108.50,Stripe
+2024-01-20,PRINTFUL-PF-2401-001,-54.00,Printful Inc.
+2024-01-23,PAYPAL-PP-001,65.40,PayPal

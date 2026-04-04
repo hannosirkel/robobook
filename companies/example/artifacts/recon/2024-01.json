@@ -1,0 +1,114 @@
+{
+  "schema_version": "1.0",
+  "company_slug": "example",
+  "period": "2024-01",
+  "generated_at": "2026-04-04T00:00:00Z",
+  "currency": "EUR",
+  "approve_for_build": true,
+  "blocking_issue_count": 0,
+  "checks": [
+    {
+      "check_id": "sales-vs-processor-gross",
+      "name": "Woo sales match processor gross collections once fees are accounted for",
+      "status": "pass",
+      "lhs_label": "Woo gross sales",
+      "lhs_amount": 180.0,
+      "rhs_label": "Stripe and PayPal net payouts plus processor fees",
+      "rhs_amount": 180.0,
+      "delta": 0.0,
+      "threshold": 0.01,
+      "notes": [
+        "Woo is the posting basis for invoices in this example month.",
+        "Processor rows are settlement and fee evidence, not duplicate invoice evidence."
+      ],
+      "evidence_refs": [
+        {
+          "artifact_path": "companies/example/artifacts/normalized/2024-01.json",
+          "record_refs": [
+            "sale:woo:2024-01:summary",
+            "payout:stripe:2024-01",
+            "payout:paypal:2024-01",
+            "fee:stripe:2024-01",
+            "fee:paypal:2024-01"
+          ],
+          "notes": "Synthetic reconciliation evidence."
+        }
+      ]
+    },
+    {
+      "check_id": "processor-payouts-vs-bank",
+      "name": "Processor payouts match imported bank receipts",
+      "status": "pass",
+      "lhs_label": "Processor payouts",
+      "lhs_amount": 173.9,
+      "rhs_label": "Imported bank receipts",
+      "rhs_amount": 173.9,
+      "delta": 0.0,
+      "threshold": 0.01,
+      "notes": [
+        "Bank transactions are assumed to be imported to Simplbooks before the monthly draft flow is reviewed."
+      ],
+      "evidence_refs": [
+        {
+          "artifact_path": "companies/example/artifacts/normalized/2024-01.json",
+          "record_refs": [
+            "payout:stripe:2024-01",
+            "payout:paypal:2024-01",
+            "bank:stripe:2024-01-12",
+            "bank:paypal:2024-01-23"
+          ],
+          "notes": null
+        }
+      ]
+    },
+    {
+      "check_id": "printful-purchase-vs-bank",
+      "name": "Printful purchase evidence matches the supplier bank debit",
+      "status": "pass",
+      "lhs_label": "Printful purchase gross",
+      "lhs_amount": 54.0,
+      "rhs_label": "Imported bank debit",
+      "rhs_amount": 54.0,
+      "delta": 0.0,
+      "threshold": 0.01,
+      "notes": [
+        "This allows both a purchase draft and a payment draft in the example batch."
+      ],
+      "evidence_refs": [
+        {
+          "artifact_path": "companies/example/artifacts/normalized/2024-01.json",
+          "record_refs": [
+            "purchase:printful:2024-01",
+            "bank:printful:2024-01-20"
+          ],
+          "notes": null
+        }
+      ]
+    },
+    {
+      "check_id": "source-coverage",
+      "name": "Required recurring source systems are present",
+      "status": "pass",
+      "lhs_label": null,
+      "lhs_amount": null,
+      "rhs_label": null,
+      "rhs_amount": null,
+      "delta": null,
+      "threshold": null,
+      "notes": [
+        "WooCommerce, Stripe, PayPal, Printful, and bank sources are all present in the synthetic example."
+      ],
+      "evidence_refs": [
+        {
+          "artifact_path": "companies/example/artifacts/normalized/2024-01.json",
+          "record_refs": [],
+          "notes": "See the source manifest."
+        }
+      ]
+    }
+  ],
+  "exceptions": [],
+  "notes": [
+    "Synthetic example month approved for build."
+  ]
+}

@@ -24,7 +24,9 @@ Real company work stays inside ignored `companies/<company>/` folders.
 - `temp/`
   - optional local scratch intake area for ad hoc review, gitignored and not canonical company storage
 - `skills/`
-  - skill packages for the bookkeeping workflow
+  - skill packages for the bookkeeping workflow; each package contains a `SKILL.md` and an `agents/openai.yaml`
+- `.claude/skills/`
+  - Claude Code project-level skill entry points; each entry is a directory with a `SKILL.md` symlink into `skills/`
 - `companies/<company>/`
   - company-local bookkeeping workspace
 - `companies/<company>/METADATA.md`
@@ -203,6 +205,19 @@ Local validation has already confirmed these general lessons:
 - Audit logic must use accounting/business dates, not insertion timestamps.
 - Historical years are clue sets, not unquestionable target behavior.
 - Fulfillment partner behavior may vary by partner and by year.
+
+## Skill Compatibility
+
+Each bookkeeping skill under `skills/` is designed to work with both Codex and Claude Code.
+
+- **Codex** loads skills from `skills/<name>/SKILL.md` and uses `skills/<name>/agents/openai.yaml` for the interface definition.
+- **Claude Code** loads skills from `.claude/skills/<name>/SKILL.md`. Each file there is a symlink back into `skills/`, so the content stays in one place.
+
+When adding or renaming a skill:
+
+1. Add or rename the package under `skills/`.
+2. Add or rename the corresponding symlink under `.claude/skills/`.
+3. Keep both in sync.
 
 ## Source Of Truth
 

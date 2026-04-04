@@ -1,6 +1,6 @@
 # Books Tooling
 
-This repository contains reusable scripts, schemas, templates, and Codex skills
+This repository contains reusable scripts, schemas, templates, and AI agent skills
 for month-by-month bookkeeping work in Simplbooks.
 
 It is built for a practical split:
@@ -59,7 +59,8 @@ In practice:
 ## Repository Layout
 
 - `scripts/`: reusable Python logic
-- `skills/`: Codex skill packages for each step of the bookkeeping workflow
+- `skills/`: skill packages for each step of the bookkeeping workflow (Codex + Claude Code compatible)
+- `.claude/skills/`: Claude Code project-level entry points (symlinks into `skills/`)
 - `schemas/`: JSON schemas for shared artifacts
 - `templates/`: starter artifact files
 - `plans/`: design and implementation plans
@@ -78,6 +79,15 @@ In practice:
 
 Use it to understand the shape of the workflow and the expected artifact layout.
 Do not treat it as live accounting data.
+
+## Skill Compatibility
+
+Each skill under `skills/` works with both Codex and Claude Code:
+
+- **Codex** — reads `skills/<name>/SKILL.md` and uses `skills/<name>/agents/openai.yaml`
+- **Claude Code** — reads `.claude/skills/<name>/SKILL.md`, which symlinks back to the same content
+
+No duplication; one source of truth per skill.
 
 ## Setup
 

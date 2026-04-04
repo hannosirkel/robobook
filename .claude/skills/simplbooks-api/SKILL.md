@@ -1,0 +1,1 @@
+../../../skills/simplbooks-api/SKILL.md

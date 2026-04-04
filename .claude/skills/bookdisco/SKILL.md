@@ -1,0 +1,1 @@
+../../../skills/bookdisco/SKILL.md

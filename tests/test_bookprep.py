@@ -33,6 +33,16 @@ def pdf_source(root: Path, name: str, *, source_system: str) -> bookprep.SourceD
 
 
 class BookprepTests(unittest.TestCase):
+    def test_parser_accepts_woo_tax_allocation_override(self) -> None:
+        args = bookprep.build_parser().parse_args(
+            [
+                "--company-dir", "companies/example", "--period", "2025-11",
+                "--woo-tax-allocation", "reviewed-allocation.json",
+            ]
+        )
+
+        self.assertEqual(args.woo_tax_allocation, "reviewed-allocation.json")
+
     def parse_tax_fixture(self, row: str, *, period: str = "2025-12"):
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)

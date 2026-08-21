@@ -331,6 +331,88 @@ def load_json(path: Path) -> dict[str, Any]:
     return payload
 
 
+def load_allocation(path: Path, *, company_slug: str, year: int) -> dict[str, Any]:
+    """Load a reviewed annual allocation only when it is safe for the company and year."""
+    payload = load_json(path)
+    validation = payload.get("validation")
+    if not isinstance(validation, dict) or validation.get("status") != "pass":
+        raise WooTaxError("Woo tax allocation validation status must be pass.")
+
+    errors = validate_allocation(payload)
+    if payload.get("company_slug") != company_slug:
+        errors.append(f"allocation company_slug does not match {company_slug}")
+    if payload.get("year") != year:
+        errors.append(f"allocation year does not match {year}")
+    if errors:
+        raise WooTaxError(f"Woo tax allocation validation failed: {'; '.join(sorted(set(errors)))}")
+    return payload
+
+
+def allocation_order_id(record: dict[str, Any]) -> str:
+    attributes = record.get("attributes")
+    if isinstance(attributes, dict) and attributes.get("order_id") not in (None, ""):
+        return str(attributes["order_id"])
+    if record.get("external_ref") not in (None, ""):
+        return str(record["external_ref"])
+    return ""
+
+
+def apply_period_allocation(
+    records: dict[str, list[dict[str, Any]]], allocation: dict[str, Any], period: str
+) -> None:
+    """Apply reviewed fixed-gross VAT allocations to matching processor sales in one period."""
+    period_allocations = [
+        item for item in allocation.get("allocations") or []
+        if isinstance(item, dict) and item.get("period") == period
+    ]
+    allocations_by_order: dict[str, list[dict[str, Any]]] = {}
+    for item in period_allocations:
+        order_id = str(item.get("order_id") or "")
+        if order_id:
+            allocations_by_order.setdefault(order_id, []).append(item)
+
+    for sale in records.get("sales") or []:
+        if not isinstance(sale, dict):
+            continue
+        order_id = allocation_order_id(sale)
+        matching = allocations_by_order.get(order_id)
+        if not matching:
+            continue
+
+        fixed_product_gross = sum(
+            (decimal_value(item.get("fixed_product_gross")) for item in matching), Decimal("0")
+        )
+        fixed_shipping_gross = sum(
+            (decimal_value(item.get("fixed_shipping_gross")) for item in matching), Decimal("0")
+        )
+        expected_gross = fixed_product_gross + fixed_shipping_gross
+        processor_gross = decimal_value(sale.get("gross_amount"))
+        if not same_money(expected_gross, processor_gross):
+            raise WooTaxError(
+                f"Woo tax allocation gross for order {order_id} does not match processor gross "
+                f"({money(expected_gross)} != {money(processor_gross)})."
+            )
+
+        product_vat = sum(
+            (decimal_value(item.get("corrected_product_vat")) for item in matching), Decimal("0")
+        )
+        shipping_vat = sum(
+            (decimal_value(item.get("corrected_shipping_vat")) for item in matching), Decimal("0")
+        )
+        attributes = sale.setdefault("attributes", {})
+        if not isinstance(attributes, dict):
+            raise WooTaxError(f"Processor sale for order {order_id} has invalid attributes.")
+        sale["vat_amount"] = decimal_number(product_vat + shipping_vat)
+        attributes["vat_allocation"] = {
+            "fixed_product_gross": decimal_number(fixed_product_gross),
+            "fixed_shipping_gross": decimal_number(fixed_shipping_gross),
+            "product_vat": decimal_number(product_vat),
+            "shipping_vat": decimal_number(shipping_vat),
+            "allocation_path": allocation.get("_allocation_path"),
+            "allocated_order_ids": sorted(str(item["order_id"]) for item in matching),
+        }
+
+
 def annual_totals(payload: dict[str, Any]) -> dict[str, Decimal]:
     totals = build_month_totals(payload.get("allocations") or [])
     return {
@@ -364,12 +446,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not company_slug:
             raise WooTaxError(f"Company slug is missing from {args.company_dir / 'METADATA.md'}.")
         path = args.company_dir / "artifacts" / "vat" / f"{args.year}-woo-tax-allocation.json"
-        artifact = load_json(path)
-        errors = validate_allocation(artifact)
-        if artifact.get("company_slug") != company_slug:
-            errors.append(f"allocation company_slug does not match {company_slug}")
-        if artifact.get("year") != args.year:
-            errors.append(f"allocation year does not match {args.year}")
+        artifact = load_allocation(path, company_slug=company_slug, year=args.year)
+        errors: list[str] = []
         totals = annual_totals(artifact)
         print(json.dumps({"gross": decimal_number(totals["gross"]), "original_vat": decimal_number(totals["original_vat"]), "corrected_vat": decimal_number(totals["corrected_vat"]), "errors": sorted(set(errors))}, sort_keys=True))
         return 1 if errors else 0

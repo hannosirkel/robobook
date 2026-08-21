@@ -21,6 +21,7 @@ from simplbooks_api import (
     resolve_company_name,
     resolve_company_slug,
 )
+import woo_tax
 
 try:
     from pypdf import PdfReader  # type: ignore
@@ -3467,6 +3468,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--period", required=True, help="Target month in YYYY-MM format")
     parser.add_argument("--source-dir", help="Optional source override. Defaults to companies/<company>/source")
     parser.add_argument("--base-currency", help="Override base currency, e.g. EUR")
+    parser.add_argument("--woo-tax-allocation", help="Reviewed annual Woo VAT allocation JSON override")
     parser.add_argument("--output", help="Optional output path for normalized JSON")
     return parser
 
@@ -3496,6 +3498,17 @@ def main() -> int:
         period_end=period_end,
         base_currency=base_currency,
     )
+    if any(source.parser_name == "parse_woo_tax_summary_csv" for source in sources):
+        allocation_path = (
+            Path(args.woo_tax_allocation)
+            if args.woo_tax_allocation
+            else company_dir / "artifacts" / "vat" / f"{period_start.year}-woo-tax-allocation.json"
+        )
+        allocation = woo_tax.load_allocation(
+            allocation_path, company_slug=company_slug, year=period_start.year
+        )
+        allocation["_allocation_path"] = display_path(allocation_path, repo_root)
+        woo_tax.apply_period_allocation(records, allocation, args.period)
     document = build_normalized_document(
         company_slug=company_slug,
         period=args.period,

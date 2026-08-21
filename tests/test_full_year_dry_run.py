@@ -15,6 +15,50 @@ import full_year_dry_run  # noqa: E402
 
 
 class FullYearDryRunTests(unittest.TestCase):
+    def test_full_year_runner_blocks_before_months_when_tax_evidence_has_no_valid_allocation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            company_dir = Path(tmp) / "companies" / "example"
+            source_dir = company_dir / "source" / "2025-pack"
+            source_dir.mkdir(parents=True)
+            (source_dir / "woocommerce-taxes.csv").write_text(
+                "Tax code,Rate,Total tax,Order tax,Shipping tax,Orders\n"
+                "DE-DE-VAT-1,19,19.00,15.00,4.00,1\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(full_year_dry_run.SimplbooksError, "Woo tax allocation"):
+                full_year_dry_run.validate_woo_tax_preflight(
+                    company_dir=company_dir, year=2025, source_dir=source_dir
+                )
+
+    def test_full_year_runner_does_not_block_year_without_woo_tax_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            company_dir = Path(tmp) / "companies" / "example"
+            source_dir = company_dir / "source" / "2025-pack"
+            source_dir.mkdir(parents=True)
+            (source_dir / "stripe.csv").write_text("id,amount\nch_1,10.00\n", encoding="utf-8")
+
+            self.assertIsNone(
+                full_year_dry_run.validate_woo_tax_preflight(
+                    company_dir=company_dir, year=2025, source_dir=source_dir
+                )
+            )
+
+    def test_full_year_runner_passes_validated_allocation_to_bookprep(self) -> None:
+        allocation_path = Path("companies/example/artifacts/vat/2025-woo-tax-allocation.json")
+        cmd = full_year_dry_run.build_step_command(
+            python_executable="python3",
+            company_dir=Path("companies/example"),
+            period="2025-01",
+            step_name="bookprep",
+            script_name="bookprep.py",
+            source_dir=Path("companies/example/source/2025-pack"),
+            force_build=False,
+            woo_tax_allocation=allocation_path,
+        )
+
+        self.assertEqual(cmd[-2:], ["--woo-tax-allocation", str(allocation_path)])
+
     def test_full_year_runner_propagates_reference_artifacts(self) -> None:
         cmd = full_year_dry_run.build_step_command(
             python_executable="python3",

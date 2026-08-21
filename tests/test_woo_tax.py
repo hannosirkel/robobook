@@ -47,7 +47,76 @@ def allocation_fixture() -> dict[str, Any]:
     }
 
 
+def normalized_sales_fixture(*, gross: Decimal, vat: Decimal, order_id: str) -> dict[str, list[dict[str, Any]]]:
+    return {category: [] for category in (
+        "sales", "refunds", "fees", "payouts", "bank_transactions", "purchase_expenses",
+        "purchase_credits", "inventory_movements", "manual_adjustments", "other"
+    )} | {"sales": [{
+        "record_id": f"stripe:{order_id}", "source_system": "stripe", "source_type": "csv",
+        "event_type": "stripe_charge", "event_date": "2025-11-27", "settlement_date": None,
+        "description": f"Order {order_id}", "external_ref": order_id, "currency": "EUR",
+        "gross_amount": float(gross), "net_amount": float(gross - vat), "vat_amount": float(vat),
+        "fee_amount": 0.0, "shipping_amount": 0.0, "quantity": None, "sku": None,
+        "warehouse_id": None, "channel": "stripe", "country_code": "DE",
+        "attributes": {"order_id": order_id},
+        "source_refs": [{"source_id": "stripe", "path": "source/stripe.csv", "row_ref": "csv:2",
+                         "page_ref": None, "notes": None}],
+    }]}
+
+
+def period_allocation_fixture(*, period: str = "2025-11", order_id: str = "EXAMPLE-1") -> dict[str, Any]:
+    payload = allocation_fixture()
+    payload["allocations"] = [{
+        "source_row_id": "woo-tax:2", "order_id": order_id, "period": period,
+        "event_date": "2025-11-27", "country_code": "DE", "processor_ref": "pi_example",
+        "configured_rate": 22, "corrected_rate": 24, "original_order_tax": 11.18,
+        "original_shipping_tax": 11.18, "fixed_product_gross": 62.00,
+        "fixed_shipping_gross": 62.00, "corrected_product_vat": 12.00,
+        "corrected_shipping_vat": 12.00, "source_refs": payload["allocations"][0]["source_refs"],
+    }]
+    return payload
+
+
 class WooTaxTests(unittest.TestCase):
+    def test_apply_period_allocation_changes_vat_not_customer_gross(self) -> None:
+        records = normalized_sales_fixture(
+            gross=Decimal("124.00"), vat=Decimal("22.36"), order_id="EXAMPLE-1"
+        )
+
+        woo_tax.apply_period_allocation(records, period_allocation_fixture(), "2025-11")
+
+        sale = records["sales"][0]
+        self.assertEqual(Decimal(str(sale["gross_amount"])), Decimal("124.00"))
+        self.assertEqual(Decimal(str(sale["vat_amount"])), Decimal("24.00"))
+        self.assertEqual(sale["attributes"]["vat_allocation"]["shipping_vat"], 12.00)
+
+    def test_apply_period_allocation_does_not_tax_unlisted_export_order(self) -> None:
+        records = normalized_sales_fixture(gross=Decimal("50.00"), vat=Decimal("0"), order_id="EXAMPLE-US-1")
+
+        woo_tax.apply_period_allocation(
+            records,
+            period_allocation_fixture(period="2024-02", order_id="EXAMPLE-EU-1"),
+            "2024-02",
+        )
+
+        self.assertEqual(records["sales"][0]["vat_amount"], 0.0)
+
+    def test_apply_period_allocation_rejects_gross_mismatch(self) -> None:
+        records = normalized_sales_fixture(gross=Decimal("123.99"), vat=Decimal("22.36"), order_id="EXAMPLE-1")
+
+        with self.assertRaisesRegex(woo_tax.WooTaxError, "does not match processor gross"):
+            woo_tax.apply_period_allocation(records, period_allocation_fixture(), "2025-11")
+
+    def test_load_allocation_blocks_failed_validation(self) -> None:
+        payload = allocation_fixture()
+        payload["validation"]["status"] = "failed"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "allocation.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaisesRegex(woo_tax.WooTaxError, "validation status"):
+                woo_tax.load_allocation(path, company_slug="example", year=2025)
+
     def test_corrected_component_preserves_fixed_gross(self) -> None:
         net, vat = woo_tax.corrected_component(Decimal("124.00"), Decimal("24"))
         self.assertEqual(vat, Decimal("24.00"))

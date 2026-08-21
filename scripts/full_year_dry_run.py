@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import csv
 import json
 import subprocess
 import sys
@@ -11,7 +12,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from simplbooks_api import SimplbooksError, resolve_company_name
+from simplbooks_api import SimplbooksError, resolve_company_name, resolve_company_slug
+import woo_tax
 
 
 ORIGINAL_SUBPROCESS_RUN = subprocess.run
@@ -44,6 +46,35 @@ def parse_json_output(text: str) -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def source_has_woo_tax_summary(source_dir: Path) -> bool:
+    required_headers = {"Tax code", "Rate", "Total tax", "Order tax", "Shipping tax", "Orders"}
+    if not source_dir.exists():
+        return False
+    for path in sorted(source_dir.rglob("*.csv")):
+        try:
+            with path.open(encoding="utf-8-sig", newline="") as handle:
+                headers = set(next(csv.reader(handle), []))
+        except (OSError, UnicodeDecodeError, csv.Error):
+            continue
+        if headers >= required_headers:
+            return True
+    return False
+
+
+def validate_woo_tax_preflight(company_dir: Path, year: int, source_dir: Path | None) -> Path | None:
+    annual_source_dir = source_dir if source_dir is not None else company_dir / "source"
+    if not source_has_woo_tax_summary(annual_source_dir):
+        return None
+
+    allocation_path = company_dir / "artifacts" / "vat" / f"{year}-woo-tax-allocation.json"
+    company_slug = resolve_company_slug(company_dir=str(company_dir)) or company_dir.name
+    try:
+        woo_tax.load_allocation(allocation_path, company_slug=company_slug, year=year)
+    except woo_tax.WooTaxError as error:
+        raise SimplbooksError(f"Woo tax allocation preflight failed: {error}") from error
+    return allocation_path
 
 
 def extract_api_calls(*, period: str, step_summary: dict[str, Any]) -> list[dict[str, Any]]:
@@ -235,10 +266,13 @@ def build_step_command(
     script_name: str,
     source_dir: Path | None,
     force_build: bool,
+    woo_tax_allocation: Path | None = None,
 ) -> list[str]:
     cmd = [python_executable, f"scripts/{script_name}", "--company-dir", str(company_dir), "--period", period]
     if step_name == "bookprep" and source_dir is not None:
         cmd.extend(["--source-dir", str(source_dir)])
+    if step_name == "bookprep" and woo_tax_allocation is not None:
+        cmd.extend(["--woo-tax-allocation", str(woo_tax_allocation)])
     if step_name == "bookbuilder":
         year = period[:4]
         cmd.extend(
@@ -269,6 +303,7 @@ def run_full_year_dry_run(
     cwd: Path,
 ) -> dict[str, Any]:
     company_name = resolve_company_name(company_dir=str(company_dir))
+    woo_tax_allocation = validate_woo_tax_preflight(company_dir, year, source_dir)
     months: list[dict[str, Any]] = []
     api_calls: list[dict[str, Any]] = []
     overall_success = True
@@ -286,6 +321,7 @@ def run_full_year_dry_run(
                 script_name=script_name,
                 source_dir=source_dir,
                 force_build=force_build,
+                woo_tax_allocation=woo_tax_allocation,
             )
             run = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
             step_summary = {

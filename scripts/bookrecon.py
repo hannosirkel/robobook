@@ -405,10 +405,21 @@ def _balance_type(record: dict[str, Any]) -> str:
     return str((record.get("attributes") or {}).get("balance_type") or "").strip().upper()
 
 
-def _bank_balance_values(records: list[dict[str, Any]]) -> tuple[dict[tuple[str, str], list[Decimal]], dict[tuple[str, str], list[Decimal]], list[str]]:
+def _bank_balance_values(
+    records: list[dict[str, Any]], *, target_period: str
+) -> tuple[
+    dict[tuple[str, str], list[Decimal]],
+    dict[tuple[str, str], list[Decimal]],
+    dict[tuple[str, str], list[dict[str, Any]]],
+    list[str],
+    list[str],
+]:
+    target_start, target_end = parse_period(target_period)
     openings: dict[tuple[str, str], list[Decimal]] = {}
     closings: dict[tuple[str, str], list[Decimal]] = {}
+    supporting_scopes: dict[tuple[str, str], list[dict[str, Any]]] = {}
     errors: list[str] = []
+    notes: list[str] = []
     for record in records:
         attributes = record.get("attributes") or {}
         iban = re.sub(r"\s+", "", str(attributes.get("iban") or attributes.get("account_iban") or "")).upper()
@@ -416,17 +427,60 @@ def _bank_balance_values(records: list[dict[str, Any]]) -> tuple[dict[tuple[str,
         if not iban:
             errors.append(f"CAMT balance {record.get('record_id') or '<unknown>'} has no IBAN.")
             continue
+        ledger = iban, currency
         balance_type = _balance_type(record)
+        scope_from = attributes.get("statement_from")
+        scope_to = attributes.get("statement_to")
+        has_from = scope_from not in (None, "")
+        has_to = scope_to not in (None, "")
+        comparable = not has_from and not has_to
+        if has_from != has_to:
+            errors.append(
+                f"CAMT balance {record.get('record_id') or '<unknown>'} has incomplete statement scope; "
+                "statement_from and statement_to must both be present."
+            )
+        elif has_from and has_to:
+            try:
+                scope_start = date.fromisoformat(str(scope_from))
+                scope_end = date.fromisoformat(str(scope_to))
+            except ValueError:
+                errors.append(
+                    f"CAMT balance {record.get('record_id') or '<unknown>'} has malformed statement scope "
+                    f"{scope_from!r} through {scope_to!r}."
+                )
+            else:
+                if scope_end < scope_start:
+                    errors.append(
+                        f"CAMT balance {record.get('record_id') or '<unknown>'} has reversed statement scope "
+                        f"{scope_from} through {scope_to}."
+                    )
+                elif scope_start == target_start and scope_end == target_end:
+                    comparable = True
+                else:
+                    supporting_scopes.setdefault(ledger, []).append(
+                        {
+                            "statement_from": scope_start.isoformat(),
+                            "statement_to": scope_end.isoformat(),
+                            "balance_type": balance_type or "other",
+                        }
+                    )
+                    notes.append(
+                        f"CAMT {balance_type or 'other'} evidence for {iban}/{currency} covers "
+                        f"{scope_start.isoformat()} through {scope_end.isoformat()} and is deferred to annual verification."
+                    )
+        if not comparable:
+            continue
         if balance_type in {"OPBD", "PRCD", "OPENING"}:
-            openings.setdefault((iban, currency), []).append(decimal_value(record.get("gross_amount")))
+            openings.setdefault(ledger, []).append(decimal_value(record.get("gross_amount")))
         elif balance_type in {"CLBD", "CLOSING"}:
-            closings.setdefault((iban, currency), []).append(decimal_value(record.get("gross_amount")))
-    return openings, closings, errors
+            closings.setdefault(ledger, []).append(decimal_value(record.get("gross_amount")))
+    return openings, closings, supporting_scopes, errors, notes
 
 
 def build_physical_bank_coverage_check(
     *,
     normalized_path_display: str,
+    target_period: str,
     bank_records: list[dict[str, Any]],
     allocations: dict[str, dict[str, Any]],
     bank_balance_records: list[dict[str, Any]] | None = None,
@@ -487,10 +541,12 @@ def build_physical_bank_coverage_check(
     for statement_id in sorted(set(allocations) - set(indexed)):
         errors.append(f"Reviewed bank allocation is stale or outside this period: {statement_id}.")
 
-    openings, closings, balance_errors = _bank_balance_values(bank_balance_records or [])
+    openings, closings, supporting_scopes, balance_errors, scope_notes = _bank_balance_values(
+        bank_balance_records or [], target_period=target_period
+    )
     errors.extend(balance_errors)
     ledgers: list[dict[str, Any]] = []
-    for ledger in sorted(set(ledger_rows) | set(openings) | set(closings)):
+    for ledger in sorted(set(ledger_rows) | set(openings) | set(closings) | set(supporting_scopes)):
         iban, currency = ledger
         rows = ledger_rows.get(ledger, [])
         movement = sum_amount(rows)
@@ -508,8 +564,7 @@ def build_physical_bank_coverage_check(
                 f"CAMT balance continuity mismatch for {iban}/{currency}: opening plus physical movements "
                 f"is {decimal_text(computed)}, closing is {decimal_text(closing)}."
             )
-        ledgers.append(
-            {
+        ledger_summary: dict[str, Any] = {
                 "iban": iban,
                 "currency": currency,
                 "physical_bank_row_count": len(rows),
@@ -525,8 +580,12 @@ def build_physical_bank_coverage_check(
                 "camt_opening_balance": decimal_number(opening),
                 "computed_closing_balance": decimal_number(computed),
                 "camt_closing_balance": decimal_number(closing),
-            }
-        )
+        }
+        if supporting_scopes.get(ledger):
+            ledger_summary["camt_evidence_scopes"] = sorted(
+                supporting_scopes[ledger], key=lambda item: (item["statement_from"], item["statement_to"], item["balance_type"])
+            )
+        ledgers.append(ledger_summary)
 
     coverage = {
         "coverage_ready": not errors,
@@ -539,13 +598,13 @@ def build_physical_bank_coverage_check(
         "ledgers": ledgers,
     }
     if errors:
-        notes = sorted(set(errors))
+        notes = sorted(set(errors + scope_notes))
         status = "warn"
     elif indexed:
-        notes = ["Every physical bank row has one exact reviewed allocation; CAMT balances agree where both endpoints were available."]
+        notes = sorted(set(scope_notes)) or ["Every physical bank row has one exact reviewed allocation; CAMT balances agree where both endpoints were available."]
         status = "pass"
     elif ledgers:
-        notes = ["No physical bank rows were normalized; CAMT balance-only ledgers agree with zero movement."]
+        notes = sorted(set(scope_notes)) or ["No physical bank rows were normalized; CAMT balance-only ledgers agree with zero movement."]
         status = "pass"
     else:
         notes = ["No physical bank rows were normalized for this period."]
@@ -1192,6 +1251,7 @@ def build_recon_document(
 
     physical_bank_check, bank_coverage = build_physical_bank_coverage_check(
         normalized_path_display=normalized_path_display,
+        target_period=str(normalized_payload["period"]),
         bank_records=records.get("bank_transactions", []),
         allocations=bank_allocations or {},
         bank_balance_records=records.get("bank_balances", []),

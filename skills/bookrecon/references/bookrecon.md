@@ -83,7 +83,8 @@ The file follows `schemas/recon-period.schema.json` and includes:
 
 - loads the current period's approved allocations from an annual, source-bound allocation artifact
 - compares immutable statement identity, record locator, period, signed amount, currency, and physical `(IBAN, currency)` ledger
-- totals credits, debits, and net movement per ledger; when CAMT opening and closing balances are both present, verifies opening plus movement equals closing
+- totals credits, debits, and net movement per ledger; verifies opening plus movement equals closing only when the CAMT `statement_from`/`statement_to` scope exactly matches the target month
+- retains annual or other non-month CAMT scopes as supporting evidence for annual verification; malformed or partial scopes are report-only not-ready evidence
 - missing, duplicate, stale, malformed, or incomplete allocation evidence produces `physical-bank-coverage: warn` and `bank_coverage.coverage_ready: false` in Phase A
 
 ### Clearing Continuity

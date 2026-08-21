@@ -112,6 +112,29 @@ class SchemaContractTests(unittest.TestCase):
         self.assertFalse(artifact["bank_coverage"]["coverage_ready"])
         self.assertFalse(artifact["bank_coverage"]["clearing_ready"])
 
+    def test_recon_period_schema_accepts_deferred_camt_evidence_scope(self) -> None:
+        artifact = json.loads((ROOT / "templates/recon-period.template.json").read_text(encoding="utf-8"))
+        artifact["bank_coverage"]["ledgers"] = [{
+            "iban": "EE123",
+            "currency": "EUR",
+            "physical_bank_row_count": 0,
+            "allocated_row_count": 0,
+            "unallocated_row_count": 0,
+            "credit_total": 0,
+            "debit_total": 0,
+            "net_movement": 0,
+            "camt_opening_balance": None,
+            "computed_closing_balance": None,
+            "camt_closing_balance": None,
+            "camt_evidence_scopes": [{
+                "statement_from": "2024-01-01",
+                "statement_to": "2024-12-31",
+                "balance_type": "OPBD",
+            }],
+        }]
+
+        self.assert_artifact_valid(schema_name="recon-period.schema.json", artifact=artifact)
+
     def test_year_overview_template_matches_strict_schema(self) -> None:
         artifact = json.loads((ROOT / "templates/year-overview.template.json").read_text(encoding="utf-8"))
         self.assert_artifact_valid(schema_name="year-overview.schema.json", artifact=artifact)

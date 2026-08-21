@@ -141,6 +141,7 @@ class BookreconTests(unittest.TestCase):
 
         check, coverage = bookrecon.build_physical_bank_coverage_check(
             normalized_path_display="normalized/2024-01.json",
+            target_period="2024-01",
             bank_records=[malformed],
             allocations={},
         )
@@ -194,6 +195,7 @@ class BookreconTests(unittest.TestCase):
     def test_stale_reviewed_allocation_is_report_only_warning(self) -> None:
         check, coverage = bookrecon.build_physical_bank_coverage_check(
             normalized_path_display="normalized/2024-01.json",
+            target_period="2024-01",
             bank_records=[bank_row(record_id="a", amount=20.0)],
             allocations={"archive:obsolete": allocation(statement_id="archive:obsolete", record_id="obsolete", amount=20.0)},
         )
@@ -206,6 +208,7 @@ class BookreconTests(unittest.TestCase):
         bank_records = [bank_row(record_id="a", amount=-30.0)]
         check, coverage = bookrecon.build_physical_bank_coverage_check(
             normalized_path_display="normalized/2024-01.json",
+            target_period="2024-01",
             bank_records=bank_records,
             allocations={
                 "archive:a": allocation(
@@ -229,13 +232,14 @@ class BookreconTests(unittest.TestCase):
             bank_row(record_id="usd", amount=-5.0, iban="EE123", currency="USD"),
         ]
         balances = [
-            record(record_id="open-eur", source_system="bank", event_type="bank_balance", gross_amount=100.0, currency="EUR", attributes={"iban": "EE123", "balance_type": "OPBD"}),
-            record(record_id="close-eur", source_system="bank", event_type="bank_balance", gross_amount=120.0, currency="EUR", attributes={"iban": "EE123", "balance_type": "CLBD"}),
-            record(record_id="open-usd", source_system="bank", event_type="bank_balance", gross_amount=30.0, currency="USD", attributes={"iban": "EE123", "balance_type": "OPBD"}),
-            record(record_id="close-usd", source_system="bank", event_type="bank_balance", gross_amount=25.0, currency="USD", attributes={"iban": "EE123", "balance_type": "CLBD"}),
+            record(record_id="open-eur", source_system="bank", event_type="bank_balance", gross_amount=100.0, currency="EUR", attributes={"iban": "EE123", "balance_type": "OPBD", "statement_from": "2024-01-01", "statement_to": "2024-01-31"}),
+            record(record_id="close-eur", source_system="bank", event_type="bank_balance", gross_amount=120.0, currency="EUR", attributes={"iban": "EE123", "balance_type": "CLBD", "statement_from": "2024-01-01", "statement_to": "2024-01-31"}),
+            record(record_id="open-usd", source_system="bank", event_type="bank_balance", gross_amount=30.0, currency="USD", attributes={"iban": "EE123", "balance_type": "OPBD", "statement_from": "2024-01-01", "statement_to": "2024-01-31"}),
+            record(record_id="close-usd", source_system="bank", event_type="bank_balance", gross_amount=25.0, currency="USD", attributes={"iban": "EE123", "balance_type": "CLBD", "statement_from": "2024-01-01", "statement_to": "2024-01-31"}),
         ]
         check, coverage = bookrecon.build_physical_bank_coverage_check(
             normalized_path_display="normalized/2024-01.json",
+            target_period="2024-01",
             bank_records=bank_records,
             allocations={
                 "archive:eur": allocation(statement_id="archive:eur", record_id="eur", amount=20.0),
@@ -261,6 +265,7 @@ class BookreconTests(unittest.TestCase):
 
         check, coverage = bookrecon.build_physical_bank_coverage_check(
             normalized_path_display="normalized/2024-01.json",
+            target_period="2024-01",
             bank_records=[],
             allocations={},
             bank_balance_records=balances,
@@ -272,6 +277,71 @@ class BookreconTests(unittest.TestCase):
             coverage["ledgers"],
             [{"iban": "EE999", "currency": "EUR", "physical_bank_row_count": 0, "allocated_row_count": 0, "unallocated_row_count": 0, "credit_total": 0.0, "debit_total": 0.0, "net_movement": 0.0, "camt_opening_balance": 100.0, "computed_closing_balance": 100.0, "camt_closing_balance": 100.0}],
         )
+
+    def test_annual_camt_balances_are_deferred_from_monthly_continuity(self) -> None:
+        balances = [
+            record(record_id="annual-open", source_system="bank", event_type="bank_balance", gross_amount=100.0, attributes={"iban": "EE123", "balance_type": "OPBD", "statement_from": "2024-01-01", "statement_to": "2024-12-31"}),
+            record(record_id="annual-close", source_system="bank", event_type="bank_balance", gross_amount=150.0, attributes={"iban": "EE123", "balance_type": "CLBD", "statement_from": "2024-01-01", "statement_to": "2024-12-31"}),
+        ]
+
+        normalized = base_normalized()
+        normalized["records"]["bank_transactions"] = [bank_row(record_id="jan", amount=20.0)]
+        normalized["records"]["bank_balances"] = balances
+        with tempfile.TemporaryDirectory() as tmp:
+            document = bookrecon.build_recon_document(
+                normalized_payload=normalized,
+                normalized_path=Path(tmp) / "2024-01.json",
+                repo_root=Path(tmp),
+                amount_threshold=bookrecon.Decimal("0.5"),
+                quantity_threshold=bookrecon.Decimal("1"),
+                bank_allocations={"archive:jan": allocation(statement_id="archive:jan", record_id="jan", amount=20.0)},
+            )
+
+        check = find_check(document, "physical-bank-coverage")
+        coverage = document["bank_coverage"]
+        self.assertEqual(check["status"], "pass")
+        self.assertTrue(coverage["coverage_ready"])
+        ledger = coverage["ledgers"][0]
+        self.assertIsNone(ledger["camt_opening_balance"])
+        self.assertIsNone(ledger["computed_closing_balance"])
+        self.assertIsNone(ledger["camt_closing_balance"])
+        self.assertEqual(ledger["camt_evidence_scopes"][0]["statement_to"], "2024-12-31")
+        self.assertTrue(any("2024-01-01 through 2024-12-31" in note for note in check["notes"]))
+
+    def test_half_present_camt_scope_is_not_ready_evidence(self) -> None:
+        check, coverage = bookrecon.build_physical_bank_coverage_check(
+            normalized_path_display="normalized/2024-01.json",
+            target_period="2024-01",
+            bank_records=[],
+            allocations={},
+            bank_balance_records=[
+                record(record_id="partial", source_system="bank", event_type="bank_balance", gross_amount=100.0, attributes={"iban": "EE123", "balance_type": "OPBD", "statement_from": "2024-01-01"}),
+            ],
+        )
+
+        self.assertEqual(check["status"], "warn")
+        self.assertFalse(coverage["coverage_ready"])
+        self.assertTrue(any("incomplete statement scope" in note for note in check["notes"]))
+
+    def test_month_scoped_balances_win_when_annual_evidence_coexists(self) -> None:
+        balances = [
+            record(record_id="annual-open", source_system="bank", event_type="bank_balance", gross_amount=100.0, attributes={"iban": "EE123", "balance_type": "OPBD", "statement_from": "2024-01-01", "statement_to": "2024-12-31"}),
+            record(record_id="annual-close", source_system="bank", event_type="bank_balance", gross_amount=150.0, attributes={"iban": "EE123", "balance_type": "CLBD", "statement_from": "2024-01-01", "statement_to": "2024-12-31"}),
+            record(record_id="month-open", source_system="bank", event_type="bank_balance", gross_amount=100.0, attributes={"iban": "EE123", "balance_type": "OPBD", "statement_from": "2024-01-01", "statement_to": "2024-01-31"}),
+            record(record_id="month-close", source_system="bank", event_type="bank_balance", gross_amount=120.0, attributes={"iban": "EE123", "balance_type": "CLBD", "statement_from": "2024-01-01", "statement_to": "2024-01-31"}),
+        ]
+
+        check, coverage = bookrecon.build_physical_bank_coverage_check(
+            normalized_path_display="normalized/2024-01.json",
+            target_period="2024-01",
+            bank_records=[bank_row(record_id="jan", amount=20.0)],
+            allocations={"archive:jan": allocation(statement_id="archive:jan", record_id="jan", amount=20.0)},
+            bank_balance_records=balances,
+        )
+
+        self.assertEqual(check["status"], "pass")
+        self.assertTrue(coverage["coverage_ready"])
+        self.assertEqual(coverage["ledgers"][0]["computed_closing_balance"], 120.0)
 
     def test_clearing_accounts_with_same_provider_currency_have_separate_checks(self) -> None:
         records = base_normalized()["records"]

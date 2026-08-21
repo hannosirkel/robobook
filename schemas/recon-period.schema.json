@@ -120,7 +120,20 @@
         "net_movement": {"type": "number"},
         "camt_opening_balance": {"type": ["number", "null"]},
         "computed_closing_balance": {"type": ["number", "null"]},
-        "camt_closing_balance": {"type": ["number", "null"]}
+        "camt_closing_balance": {"type": ["number", "null"]},
+        "camt_evidence_scopes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["statement_from", "statement_to", "balance_type"],
+            "properties": {
+              "statement_from": {"type": "string", "format": "date"},
+              "statement_to": {"type": "string", "format": "date"},
+              "balance_type": {"type": "string", "minLength": 1}
+            }
+          }
+        }
       }
     },
     "artifact_ref": {

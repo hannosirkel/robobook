@@ -1758,6 +1758,7 @@ def vendor_name_from_text(text: str, *, fallback: str) -> str:
         [
             r"Vedaja/Teenuse pakkuja:\s*([^;\n]+)",
             r"\n(AS Eesti Post)\n",
+            r"\n(SimplBooks O[ÜU])\n(?=[^\n]*(?:Sõpruse|Sopruse|Reg-nr))",
         ],
     )
     if provider:

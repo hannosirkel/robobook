@@ -7,6 +7,8 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
+from document_identity import document_identity
+
 from simplbooks_api import (
     SimplbooksClient,
     SimplbooksError,
@@ -71,6 +73,16 @@ def count_row_patterns(rows: list[dict[str, Any]], field_name: str) -> dict[str,
         if value not in (None, "", 0, "0"):
             counter[str(value)] += 1
     return dict(counter.most_common())
+
+
+def build_document_index(
+    *,
+    invoices: list[dict[str, Any]],
+    purchases: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    index = [document_identity(record, document_type="invoice").to_dict() for record in invoices]
+    index.extend(document_identity(record, document_type="purchase").to_dict() for record in purchases)
+    return index
 
 
 def build_year_overview(client: SimplbooksClient, *, year: int) -> dict[str, Any]:
@@ -168,6 +180,7 @@ def build_year_overview(client: SimplbooksClient, *, year: int) -> dict[str, Any
             "purchase_vat_type_ids": count_row_patterns(purchase_rows, "vat_type_id"),
             "purchase_article_ids": count_row_patterns(purchase_rows, "article_id"),
         },
+        "document_index": build_document_index(invoices=invoices, purchases=purchases),
         "samples": {
             "financial_accounts": financial_accounts[:10],
             "income_accounts": income_accounts[:10],

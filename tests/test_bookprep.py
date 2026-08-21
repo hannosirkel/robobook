@@ -889,6 +889,39 @@ class BookprepTests(unittest.TestCase):
             self.assertEqual(expense["vat_amount"], 33.8)
             self.assertEqual(expense["channel"], "simplbooks-ou")
 
+    def test_simplbooks_invoice_uses_supplier_not_recipient(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = pdf_source(root, "2024.11.28_Simplbooks.pdf", source_system="document")
+            pages = [
+                "Arve nr EE24111268\n"
+                "Kuupäev 18.11.2024\n"
+                "KLIENT\n"
+                "Plepic Games OÜ\n"
+                "Pihlaka 2\n"
+                "Toode/Teenus Hind Kogus Summa KM Kokku\n"
+                "SimplBooks raamatupidamistarkvara teenustasu\n"
+                "Summa km-ta 22% 169.00\n"
+                "KM 22% 37.18\n"
+                "Arve kokku (EUR) 206.18\n"
+                "Maksmisele kuuluv summa 206.18\n"
+                "SimplBooks OÜ\n"
+                "Sõpruse pst. 145, 13425 Tallinn\n"
+                "Reg-nr: 12213296\n"
+            ]
+            with mock.patch.object(bookprep, "extract_pdf_pages", return_value=pages):
+                records, exceptions = bookprep.parse_purchase_invoice_pdf(
+                    source,
+                    period_start=date(2024, 11, 1),
+                    period_end=date(2024, 11, 30),
+                    base_currency="EUR",
+                )
+
+            self.assertFalse(exceptions)
+            expense = records["purchase_expenses"][0]
+            self.assertEqual(expense["attributes"]["vendor_name"], "SimplBooks OÜ")
+            self.assertEqual(expense["external_ref"], "EE24111268")
+
     def test_build_normalized_document_embeds_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

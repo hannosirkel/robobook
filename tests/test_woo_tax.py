@@ -118,6 +118,16 @@ class WooTaxTests(unittest.TestCase):
             Decimal(str(allocation_details["fixed_shipping_gross"])),
             Decimal(str(allocation_details["shipping_net"])) + Decimal(str(allocation_details["shipping_vat"])),
         )
+        self.assertEqual(
+            allocation_details["component_vat_evidence"],
+            [{
+                "order_id": "EXAMPLE-1",
+                "fixed_product_gross": 62.0,
+                "fixed_shipping_gross": 62.0,
+                "product_vat": 12.0,
+                "shipping_vat": 12.0,
+            }],
+        )
 
     def test_apply_period_allocation_does_not_tax_unlisted_export_order(self) -> None:
         records = normalized_sales_fixture(gross=Decimal("50.00"), vat=Decimal("5.00"), order_id="EXAMPLE-US-1")

@@ -246,6 +246,27 @@ class BookcheckerTests(unittest.TestCase):
 
         self.assertTrue(any(item["severity"] == "error" and "VAT profile" in item["summary"] for item in report))
 
+    def test_checker_uses_per_order_rounding_evidence_for_tiny_allocated_components(self) -> None:
+        batch = allocated_action_fixture(line_rate=24, vat_type_id="34")
+        line = batch["actions"][0]["payload"]["line_items"][0]
+        line.update(
+            {
+                "vat_allocation_component": "goods",
+                "gross_amount": 0.12,
+                "vat_amount_hint": 0.04,
+                "vat_allocation_component_evidence": [
+                    {"order_id": f"EXAMPLE-{index}", "gross_amount": 0.03, "vat_amount": 0.01}
+                    for index in range(1, 5)
+                ],
+            }
+        )
+
+        self.assertFalse(bookchecker.evaluate_vat_profiles(batch["actions"], policy_with_24_percent_profile()))
+
+        line["vat_amount_hint"] = 0.03
+        report = bookchecker.evaluate_vat_profiles(batch["actions"], policy_with_24_percent_profile())
+        self.assertTrue(any(item["severity"] == "error" and "rounding evidence" in item["summary"] for item in report))
+
     def test_checker_fails_unproven_foreign_rate(self) -> None:
         action = payment_action(
             key="example-2024-01-payment-vendor",

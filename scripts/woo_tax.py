@@ -494,6 +494,16 @@ def apply_allocation_to_sale(
         "shipping_vat": decimal_number(components["shipping_vat"]),
         "allocation_path": allocation.get("_allocation_path"),
         "allocated_order_ids": sorted(str(item["order_id"]) for item in items),
+        "component_vat_evidence": [
+            {
+                "order_id": str(item["order_id"]),
+                "fixed_product_gross": decimal_number(decimal_value(item.get("fixed_product_gross"))),
+                "fixed_shipping_gross": decimal_number(decimal_value(item.get("fixed_shipping_gross"))),
+                "product_vat": decimal_number(decimal_value(item.get("corrected_product_vat"))),
+                "shipping_vat": decimal_number(decimal_value(item.get("corrected_shipping_vat"))),
+            }
+            for item in sorted(items, key=lambda item: str(item["order_id"]))
+        ],
     }
 
 

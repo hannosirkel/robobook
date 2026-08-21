@@ -1141,6 +1141,38 @@ def build_sales_lines(
                 for record in allocated_records
             )
 
+        def allocated_component_evidence(component: str) -> list[dict[str, Any]]:
+            gross_field = "fixed_product_gross" if component == "goods" else "fixed_shipping_gross"
+            vat_field = "product_vat" if component == "goods" else "shipping_vat"
+            evidence: list[dict[str, Any]] = []
+            for record in allocated_records:
+                allocation = ((record.get("attributes") or {}).get("vat_allocation") or {})
+                entries = allocation.get("component_vat_evidence")
+                if entries is None:
+                    order_ids = allocation.get("allocated_order_ids") or []
+                    if not isinstance(order_ids, list) or len(order_ids) != 1:
+                        raise SimplbooksError(
+                            "Woo VAT allocation requires per-order component rounding evidence for multiple orders."
+                        )
+                    entries = [{
+                        "order_id": order_ids[0],
+                        gross_field: allocation.get(gross_field),
+                        vat_field: allocation.get(vat_field),
+                    }]
+                if not isinstance(entries, list):
+                    raise SimplbooksError("Woo VAT allocation component rounding evidence must be a list.")
+                for entry in entries:
+                    if not isinstance(entry, dict) or not str(entry.get("order_id") or "").strip():
+                        raise SimplbooksError("Woo VAT allocation component rounding evidence requires order IDs.")
+                    evidence.append(
+                        {
+                            "order_id": str(entry["order_id"]),
+                            "gross_amount": decimal_number(abs(decimal_value(entry.get(gross_field)))),
+                            "vat_amount": decimal_number(abs(decimal_value(entry.get(vat_field)))),
+                        }
+                    )
+            return evidence
+
         component_lines = (
             ("goods", f"{direction}_revenue", f"{group_label} allocated {direction} revenue summary", "fixed_product_gross", "product_vat", revenue_account_id, standard_vat_id),
             ("shipping", f"{direction}_shipping", f"{group_label} allocated {direction} shipping summary", "fixed_shipping_gross", "shipping_vat", shipping_account_id, shipping_standard_vat_id),
@@ -1161,6 +1193,7 @@ def build_sales_lines(
                     "warehouse_id_hint": maybe_single_warehouse(allocated_records) or default_warehouse_id,
                     "record_count": len(allocated_records),
                     "vat_allocation_component": component,
+                    "vat_allocation_component_evidence": allocated_component_evidence(component),
                 }
         )
         review_notes.append("Woo VAT allocation evidence keeps goods and shipping VAT in separate draft lines.")

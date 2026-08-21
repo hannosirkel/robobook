@@ -990,29 +990,68 @@ def evaluate_vat_profiles(actions: list[dict[str, Any]], posting_policy: dict[st
                         action_id=action_label(action),
                     )
                 )
+            evidence = line.get("vat_allocation_component_evidence")
+            if not isinstance(evidence, list) or not evidence:
+                findings.append(
+                    make_finding(
+                        section="account_and_vat_review",
+                        severity="error",
+                        summary="VAT profile line lacks per-order component rounding evidence.",
+                        action_id=action_label(action),
+                    )
+                )
+                continue
+
             try:
                 gross_amount = abs(decimal_value(line.get("gross_amount")))
                 vat_amount = abs(decimal_value(line.get("vat_amount_hint")))
                 rate = Decimal(str(profile["rate"]))
-                expected_vat = (gross_amount * rate / (Decimal("100") + rate)).quantize(
-                    TOLERANCE, rounding=ROUND_HALF_UP
-                )
+                evidence_gross = Decimal("0")
+                evidence_vat = Decimal("0")
+                seen_order_ids: set[str] = set()
+                rounding_error = False
+                for item in evidence:
+                    if not isinstance(item, dict):
+                        raise SimplbooksError("component evidence item must be an object")
+                    order_id = str(item.get("order_id") or "").strip()
+                    if not order_id or order_id in seen_order_ids:
+                        raise SimplbooksError("component evidence order IDs must be unique and non-empty")
+                    seen_order_ids.add(order_id)
+                    item_gross = abs(decimal_value(item.get("gross_amount")))
+                    item_vat = abs(decimal_value(item.get("vat_amount")))
+                    if item_gross != item_gross.quantize(TOLERANCE) or item_vat != item_vat.quantize(TOLERANCE):
+                        raise SimplbooksError("component evidence amounts must use whole cents")
+                    evidence_gross += item_gross
+                    evidence_vat += item_vat
+                    expected_item_vat = (item_gross * rate / (Decimal("100") + rate)).quantize(
+                        TOLERANCE, rounding=ROUND_HALF_UP
+                    )
+                    rounding_error = rounding_error or item_vat != expected_item_vat
             except (InvalidOperation, SimplbooksError) as exc:
                 findings.append(
                     make_finding(
                         section="account_and_vat_review",
                         severity="error",
-                        summary=f"VAT profile line has invalid monetary values: {exc}",
+                        summary=f"VAT profile line has invalid component rounding evidence: {exc}",
                         action_id=action_label(action),
                     )
                 )
                 continue
-            if abs(vat_amount - expected_vat) > TOLERANCE:
+            if gross_amount != evidence_gross or vat_amount != evidence_vat:
                 findings.append(
                     make_finding(
                         section="account_and_vat_review",
                         severity="error",
-                        summary="VAT profile rate does not reconstruct the allocated line VAT hint to the cent.",
+                        summary="VAT profile line does not exactly match per-order component rounding evidence.",
+                        action_id=action_label(action),
+                    )
+                )
+            if rounding_error:
+                findings.append(
+                    make_finding(
+                        section="account_and_vat_review",
+                        severity="error",
+                        summary="VAT profile component rounding evidence does not match the effective rate.",
                         action_id=action_label(action),
                     )
                 )

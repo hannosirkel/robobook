@@ -29,9 +29,10 @@ generation, or submission.
 1. Start from `companies/<company>/artifacts/normalized/<period>.json`.
 2. Load `policy_memo.md` and `entity_map.json` when they exist.
 3. Auto-load the previous month’s normalized artifact when available for continuity checks.
-4. Use `scripts/bookrecon.py` as the main entrypoint.
-5. Treat blocking normalized exceptions as blocking recon exceptions.
-6. Stop the pipeline when the recon artifact does not approve the month for build.
+4. Auto-load reviewed annual bank allocations from `artifacts/bank/<year>-allocations.json` when available; use `--bank-allocations` to override the path.
+5. Use `scripts/bookrecon.py` as the main entrypoint.
+6. Treat blocking normalized exceptions as blocking recon exceptions.
+7. Stop the pipeline when the recon artifact does not approve the month for build.
 
 ## Command
 
@@ -60,6 +61,8 @@ Implemented deterministic checks:
 - fulfillment expense totals vs bank debits when partner signals are present
 - inventory quantity evidence when quantity-bearing records exist
 - continuity with the previous period
+- physical-bank allocation coverage and CAMT movement/balance continuity per `(IBAN, currency)`
+- clearing continuity per provider, clearing account, and currency
 
 ## Guardrails
 
@@ -67,6 +70,7 @@ Implemented deterministic checks:
 - Block the month when bank receipts indicate processor activity but no processor-side export was normalized.
 - Keep same-month settlement checks conservative because payout timing can cross month boundaries.
 - Do not promote a month to `bookbuilder` when deterministic checks fail.
+- Phase A bank allocation and clearing findings are report-only: their `warn` checks make `bank_coverage.coverage_ready` false, but do not change legacy `approve_for_build`. Treat `approve_for_build` as the existing draft-build decision only, never as bank write readiness. Later checker/send stages must independently enforce write-capable coverage.
 
 ## References
 

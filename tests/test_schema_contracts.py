@@ -105,6 +105,13 @@ class SchemaContractTests(unittest.TestCase):
         self.assertEqual(artifact["records"]["clearing_transactions"], [])
         self.assertEqual(artifact["records"]["bank_balances"], [])
 
+    def test_recon_period_template_exposes_report_only_bank_write_readiness(self) -> None:
+        artifact = json.loads((ROOT / "templates/recon-period.template.json").read_text(encoding="utf-8"))
+
+        self.assert_artifact_valid(schema_name="recon-period.schema.json", artifact=artifact)
+        self.assertFalse(artifact["bank_coverage"]["coverage_ready"])
+        self.assertFalse(artifact["bank_coverage"]["clearing_ready"])
+
     def test_year_overview_template_matches_strict_schema(self) -> None:
         artifact = json.loads((ROOT / "templates/year-overview.template.json").read_text(encoding="utf-8"))
         self.assert_artifact_valid(schema_name="year-overview.schema.json", artifact=artifact)

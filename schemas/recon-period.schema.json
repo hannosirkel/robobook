@@ -10,6 +10,7 @@
     "period",
     "generated_at",
     "approve_for_build",
+    "bank_coverage",
     "checks",
     "exceptions"
   ],
@@ -43,6 +44,35 @@
       "type": "integer",
       "minimum": 0
     },
+    "bank_coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "coverage_ready",
+        "clearing_ready",
+        "physical_bank_row_count",
+        "allocated_row_count",
+        "unallocated_row_count",
+        "credit_total",
+        "debit_total",
+        "net_movement",
+        "ledgers"
+      ],
+      "properties": {
+        "coverage_ready": {"type": "boolean"},
+        "clearing_ready": {"type": "boolean"},
+        "physical_bank_row_count": {"type": "integer", "minimum": 0},
+        "allocated_row_count": {"type": "integer", "minimum": 0},
+        "unallocated_row_count": {"type": "integer", "minimum": 0},
+        "credit_total": {"type": "number"},
+        "debit_total": {"type": "number"},
+        "net_movement": {"type": "number"},
+        "ledgers": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/bank_ledger"}
+        }
+      }
+    },
     "checks": {
       "type": "array",
       "items": {
@@ -63,6 +93,36 @@
     }
   },
   "$defs": {
+    "bank_ledger": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "iban",
+        "currency",
+        "physical_bank_row_count",
+        "allocated_row_count",
+        "unallocated_row_count",
+        "credit_total",
+        "debit_total",
+        "net_movement",
+        "camt_opening_balance",
+        "computed_closing_balance",
+        "camt_closing_balance"
+      ],
+      "properties": {
+        "iban": {"type": "string", "minLength": 1},
+        "currency": {"type": "string", "pattern": "^[A-Z]{3}$"},
+        "physical_bank_row_count": {"type": "integer", "minimum": 0},
+        "allocated_row_count": {"type": "integer", "minimum": 0},
+        "unallocated_row_count": {"type": "integer", "minimum": 0},
+        "credit_total": {"type": "number"},
+        "debit_total": {"type": "number"},
+        "net_movement": {"type": "number"},
+        "camt_opening_balance": {"type": ["number", "null"]},
+        "computed_closing_balance": {"type": ["number", "null"]},
+        "camt_closing_balance": {"type": ["number", "null"]}
+      }
+    },
     "artifact_ref": {
       "type": "object",
       "additionalProperties": false,

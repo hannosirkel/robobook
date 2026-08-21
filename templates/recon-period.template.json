@@ -6,6 +6,17 @@
   "currency": "EUR",
   "approve_for_build": false,
   "blocking_issue_count": 0,
+  "bank_coverage": {
+    "coverage_ready": false,
+    "clearing_ready": false,
+    "physical_bank_row_count": 0,
+    "allocated_row_count": 0,
+    "unallocated_row_count": 0,
+    "credit_total": 0,
+    "debit_total": 0,
+    "net_movement": 0,
+    "ledgers": []
+  },
   "checks": [],
   "exceptions": [],
   "notes": []

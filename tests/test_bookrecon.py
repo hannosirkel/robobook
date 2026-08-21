@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sys
 import tempfile
 import unittest
@@ -70,7 +72,197 @@ def find_check(document: dict, check_id: str) -> dict:
     raise AssertionError(f"Missing check {check_id}")
 
 
+def bank_row(*, record_id: str, amount: float, iban: str = "EE123", currency: str = "EUR") -> dict:
+    return record(
+        record_id=record_id,
+        source_system="bank",
+        event_type="bank_credit" if amount >= 0 else "bank_debit",
+        gross_amount=amount,
+        currency=currency,
+        description=f"Bank movement {record_id}",
+        attributes={"iban": iban, "archive_identifier": record_id},
+    )
+
+
+def allocation(*, statement_id: str, record_id: str, amount: float, currency: str = "EUR", **overrides: object) -> dict:
+    result: dict = {
+        "statement_id": statement_id,
+        "record_id": record_id,
+        "period": "2024-01",
+        "disposition": "existing_invoice_receipt",
+        "amount": amount,
+        "currency": currency,
+        "target": {"simplbooks_id": "119", "document_type": "invoice"},
+        "review": {"status": "approved", "rationale": "Reviewed against the statement row."},
+    }
+    result.update(overrides)
+    return result
+
+
 class BookreconTests(unittest.TestCase):
+    def test_default_bank_allocation_path_is_year_specific_under_artifacts_bank(self) -> None:
+        normalized_path = Path("companies/example/artifacts/normalized/2024-01.json")
+
+        path = bookrecon.resolve_bank_allocations_path(
+            company_dir=None,
+            normalized_path=normalized_path,
+            period="2024-01",
+            override=None,
+        )
+
+        self.assertEqual(path, Path("companies/example/artifacts/bank/2024-allocations.json"))
+
+    def test_missing_physical_bank_allocation_warns_without_changing_legacy_build_approval(self) -> None:
+        normalized = base_normalized()
+        normalized["records"]["bank_transactions"] = [
+            bank_row(record_id="a", amount=20.0),
+            bank_row(record_id="b", amount=-2.0),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            document = bookrecon.build_recon_document(
+                normalized_payload=normalized,
+                normalized_path=Path(tmp) / "2024-01.json",
+                repo_root=Path(tmp),
+                amount_threshold=bookrecon.Decimal("0.5"),
+                quantity_threshold=bookrecon.Decimal("1"),
+                bank_allocations={"archive:a": allocation(statement_id="archive:a", record_id="a", amount=20.0)},
+            )
+
+        check = find_check(document, "physical-bank-coverage")
+        self.assertEqual(check["status"], "warn")
+        self.assertTrue(any("archive:b" in note for note in check["notes"]))
+        self.assertFalse(document["bank_coverage"]["coverage_ready"])
+        self.assertTrue(document["approve_for_build"])
+
+    def test_duplicate_reviewed_allocation_is_report_only_warning(self) -> None:
+        normalized = base_normalized()
+        normalized["records"]["bank_transactions"] = [bank_row(record_id="a", amount=20.0)]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            normalized_path = root / "2024-01.json"
+            normalized_path.write_text(json.dumps(normalized), encoding="utf-8")
+            allocation_path = root / "2024-allocations.json"
+            allocation_payload = {
+                "schema_version": "1.0",
+                "company_slug": "example",
+                "year": 2024,
+                "normalized_bindings": [{"path": str(normalized_path), "sha256": hashlib.sha256(normalized_path.read_bytes()).hexdigest()}],
+                "allocations": [
+                    allocation(statement_id="archive:a", record_id="a", amount=20.0),
+                    allocation(statement_id="archive:a", record_id="replacement", amount=20.0),
+                ],
+            }
+            allocation_path.write_text(json.dumps(allocation_payload), encoding="utf-8")
+            allocations, allocation_errors = bookrecon.load_period_bank_allocations(
+                allocation_path=allocation_path,
+                normalized_path=normalized_path,
+                period="2024-01",
+            )
+            document = bookrecon.build_recon_document(
+                normalized_payload=normalized,
+                normalized_path=normalized_path,
+                repo_root=root,
+                amount_threshold=bookrecon.Decimal("0.5"),
+                quantity_threshold=bookrecon.Decimal("1"),
+                bank_allocations=allocations,
+                bank_allocation_errors=allocation_errors,
+            )
+
+        check = find_check(document, "physical-bank-coverage")
+        self.assertEqual(check["status"], "warn")
+        self.assertTrue(any("duplicated" in note for note in check["notes"]))
+        self.assertFalse(document["bank_coverage"]["coverage_ready"])
+        self.assertTrue(document["approve_for_build"])
+
+    def test_stale_reviewed_allocation_is_report_only_warning(self) -> None:
+        check, coverage = bookrecon.build_physical_bank_coverage_check(
+            normalized_path_display="normalized/2024-01.json",
+            bank_records=[bank_row(record_id="a", amount=20.0)],
+            allocations={"archive:obsolete": allocation(statement_id="archive:obsolete", record_id="obsolete", amount=20.0)},
+        )
+
+        self.assertEqual(check["status"], "warn")
+        self.assertTrue(any("stale" in note for note in check["notes"]))
+        self.assertFalse(coverage["coverage_ready"])
+
+    def test_exact_reviewed_split_passes_physical_bank_coverage(self) -> None:
+        bank_records = [bank_row(record_id="a", amount=-30.0)]
+        check, coverage = bookrecon.build_physical_bank_coverage_check(
+            normalized_path_display="normalized/2024-01.json",
+            bank_records=bank_records,
+            allocations={
+                "archive:a": allocation(
+                    statement_id="archive:a",
+                    record_id="a",
+                    amount=-30.0,
+                    disposition="reviewed_split",
+                    parts=[{"amount": -10.0}, {"amount": -20.0}],
+                )
+            },
+        )
+
+        self.assertEqual(check["status"], "pass")
+        self.assertTrue(coverage["coverage_ready"])
+        self.assertEqual(coverage["physical_bank_row_count"], 1)
+        self.assertEqual(coverage["allocated_row_count"], 1)
+
+    def test_physical_bank_coverage_separates_iban_currency_ledgers_and_proves_camt_balances(self) -> None:
+        bank_records = [
+            bank_row(record_id="eur", amount=20.0, iban="EE123", currency="EUR"),
+            bank_row(record_id="usd", amount=-5.0, iban="EE123", currency="USD"),
+        ]
+        balances = [
+            record(record_id="open-eur", source_system="bank", event_type="bank_balance", gross_amount=100.0, currency="EUR", attributes={"iban": "EE123", "balance_type": "OPBD"}),
+            record(record_id="close-eur", source_system="bank", event_type="bank_balance", gross_amount=120.0, currency="EUR", attributes={"iban": "EE123", "balance_type": "CLBD"}),
+            record(record_id="open-usd", source_system="bank", event_type="bank_balance", gross_amount=30.0, currency="USD", attributes={"iban": "EE123", "balance_type": "OPBD"}),
+            record(record_id="close-usd", source_system="bank", event_type="bank_balance", gross_amount=25.0, currency="USD", attributes={"iban": "EE123", "balance_type": "CLBD"}),
+        ]
+        check, coverage = bookrecon.build_physical_bank_coverage_check(
+            normalized_path_display="normalized/2024-01.json",
+            bank_records=bank_records,
+            allocations={
+                "archive:eur": allocation(statement_id="archive:eur", record_id="eur", amount=20.0),
+                "archive:usd": allocation(statement_id="archive:usd", record_id="usd", amount=-5.0, currency="USD"),
+            },
+            bank_balance_records=balances,
+        )
+
+        self.assertEqual(check["status"], "pass")
+        self.assertEqual(
+            coverage["ledgers"],
+            [
+                {"iban": "EE123", "currency": "EUR", "physical_bank_row_count": 1, "allocated_row_count": 1, "unallocated_row_count": 0, "credit_total": 20.0, "debit_total": 0.0, "net_movement": 20.0, "camt_opening_balance": 100.0, "computed_closing_balance": 120.0, "camt_closing_balance": 120.0},
+                {"iban": "EE123", "currency": "USD", "physical_bank_row_count": 1, "allocated_row_count": 1, "unallocated_row_count": 0, "credit_total": 0.0, "debit_total": -5.0, "net_movement": -5.0, "camt_opening_balance": 30.0, "computed_closing_balance": 25.0, "camt_closing_balance": 25.0},
+            ],
+        )
+
+    def test_unresolved_clearing_warns_without_changing_legacy_build_approval(self) -> None:
+        normalized = base_normalized()
+        normalized["records"]["clearing_transactions"] = [
+            record(
+                record_id="printful:wallet:1",
+                source_system="printful",
+                event_type="printful_wallet_deposit",
+                gross_amount=-8.21,
+                currency="EUR",
+                attributes={"clearing_provider": "printful", "clearing_account": "printful_wallet"},
+            )
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            document = bookrecon.build_recon_document(
+                normalized_payload=normalized,
+                normalized_path=Path(tmp) / "2024-01.json",
+                repo_root=Path(tmp),
+                amount_threshold=bookrecon.Decimal("0.5"),
+                quantity_threshold=bookrecon.Decimal("1"),
+            )
+
+        check = find_check(document, "clearing-continuity:printful:eur")
+        self.assertEqual(check["status"], "warn")
+        self.assertFalse(document["bank_coverage"]["coverage_ready"])
+        self.assertTrue(document["approve_for_build"])
     def test_processor_classifier_ignores_refs_nested_in_woo_vat_evidence(self) -> None:
         woo_sale = record(
             record_id="woo:1",

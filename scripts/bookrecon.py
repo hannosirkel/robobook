@@ -11,6 +11,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+from bank_allocations import BankAllocationError, bank_ledger_key, load_bank_allocations, period_allocations, statement_identity
 from bookbuilder import planned_sales_groups
 from simplbooks_api import SimplbooksError, resolve_company_name
 
@@ -33,6 +34,8 @@ RECORD_CATEGORIES = (
     "fees",
     "payouts",
     "bank_transactions",
+    "clearing_transactions",
+    "bank_balances",
     "purchase_expenses",
     "purchase_credits",
     "inventory_movements",
@@ -379,6 +382,270 @@ def missing_processor_evidence_exceptions(
             )
         )
     return exceptions
+
+
+def _allocation_amount_matches(allocation: dict[str, Any], expected: Decimal) -> bool:
+    """Return whether the reviewed allocation and every split part prove its bank amount."""
+    try:
+        amount = decimal_value(allocation.get("amount"))
+        if amount != expected:
+            return False
+        if allocation.get("disposition") != "reviewed_split":
+            return True
+        parts = allocation.get("parts")
+        if not isinstance(parts, list) or not parts:
+            return False
+        return sum((decimal_value(part.get("amount")) for part in parts if isinstance(part, dict)), Decimal("0")) == amount
+    except SimplbooksError:
+        return False
+
+
+def _balance_type(record: dict[str, Any]) -> str:
+    return str((record.get("attributes") or {}).get("balance_type") or "").strip().upper()
+
+
+def _bank_balance_values(records: list[dict[str, Any]]) -> tuple[dict[tuple[str, str], list[Decimal]], dict[tuple[str, str], list[Decimal]], list[str]]:
+    openings: dict[tuple[str, str], list[Decimal]] = {}
+    closings: dict[tuple[str, str], list[Decimal]] = {}
+    errors: list[str] = []
+    for record in records:
+        attributes = record.get("attributes") or {}
+        iban = re.sub(r"\s+", "", str(attributes.get("iban") or attributes.get("account_iban") or "")).upper()
+        currency = record_currency(record)
+        if not iban:
+            errors.append(f"CAMT balance {record.get('record_id') or '<unknown>'} has no IBAN.")
+            continue
+        balance_type = _balance_type(record)
+        if balance_type in {"OPBD", "PRCD", "OPENING"}:
+            openings.setdefault((iban, currency), []).append(decimal_value(record.get("gross_amount")))
+        elif balance_type in {"CLBD", "CLOSING"}:
+            closings.setdefault((iban, currency), []).append(decimal_value(record.get("gross_amount")))
+    return openings, closings, errors
+
+
+def build_physical_bank_coverage_check(
+    *,
+    normalized_path_display: str,
+    bank_records: list[dict[str, Any]],
+    allocations: dict[str, dict[str, Any]],
+    bank_balance_records: list[dict[str, Any]] | None = None,
+    allocation_errors: list[str] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Report exact physical-bank allocation coverage without altering the legacy build gate.
+
+    Phase A deliberately exposes deficiencies as a warning and a false readiness bit.
+    Later write-capable stages independently turn the same evidence into hard blocks.
+    """
+    errors = list(allocation_errors or [])
+    indexed: dict[str, tuple[dict[str, Any], tuple[str, str]]] = {}
+    ledger_rows: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for record in bank_records:
+        if str(record.get("source_system") or "").strip() != "bank":
+            continue
+        try:
+            statement_id = statement_identity(record)
+            ledger = bank_ledger_key(record)
+        except BankAllocationError as exc:
+            errors.append(str(exc))
+            continue
+        if statement_id in indexed:
+            errors.append(f"Physical bank statement identity is duplicated: {statement_id}.")
+            continue
+        indexed[statement_id] = (record, ledger)
+        ledger_rows.setdefault(ledger, []).append(record)
+
+    exact_allocated_ids: set[str] = set()
+    allocation_total = Decimal("0")
+    for statement_id, (record, _) in indexed.items():
+        allocation = allocations.get(statement_id)
+        if allocation is None:
+            errors.append(f"Missing reviewed bank allocation for {statement_id}.")
+            continue
+        expected_amount = decimal_value(record.get("gross_amount"))
+        mismatches: list[str] = []
+        if str(allocation.get("statement_id") or "") != statement_id:
+            mismatches.append("statement identity")
+        if str(allocation.get("record_id") or "") != str(record.get("record_id") or ""):
+            mismatches.append("record locator")
+        if str(allocation.get("period") or "") != str(record.get("event_date") or "")[:7]:
+            mismatches.append("period")
+        if str(allocation.get("currency") or "").upper() != record_currency(record):
+            mismatches.append("currency")
+        if not _allocation_amount_matches(allocation, expected_amount):
+            mismatches.append("signed amount or split total")
+        if mismatches:
+            errors.append(f"Reviewed bank allocation does not exactly match {statement_id}: {', '.join(mismatches)}.")
+            continue
+        exact_allocated_ids.add(statement_id)
+        allocation_total += expected_amount
+
+    for statement_id in sorted(set(allocations) - set(indexed)):
+        errors.append(f"Reviewed bank allocation is stale or outside this period: {statement_id}.")
+
+    openings, closings, balance_errors = _bank_balance_values(bank_balance_records or [])
+    errors.extend(balance_errors)
+    ledgers: list[dict[str, Any]] = []
+    for ledger in sorted(ledger_rows):
+        iban, currency = ledger
+        rows = ledger_rows[ledger]
+        movement = sum_amount(rows)
+        opening_values = openings.get(ledger, [])
+        closing_values = closings.get(ledger, [])
+        if len(opening_values) > 1:
+            errors.append(f"CAMT opening balance is ambiguous for {iban}/{currency}.")
+        if len(closing_values) > 1:
+            errors.append(f"CAMT closing balance is ambiguous for {iban}/{currency}.")
+        opening = opening_values[0] if len(opening_values) == 1 else None
+        closing = closing_values[0] if len(closing_values) == 1 else None
+        computed = opening + movement if opening is not None else None
+        if computed is not None and closing is not None and computed != closing:
+            errors.append(
+                f"CAMT balance continuity mismatch for {iban}/{currency}: opening plus physical movements "
+                f"is {decimal_text(computed)}, closing is {decimal_text(closing)}."
+            )
+        ledgers.append(
+            {
+                "iban": iban,
+                "currency": currency,
+                "physical_bank_row_count": len(rows),
+                "allocated_row_count": sum(
+                    1 for record in rows if statement_identity(record) in exact_allocated_ids
+                ),
+                "unallocated_row_count": sum(
+                    1 for record in rows if statement_identity(record) not in exact_allocated_ids
+                ),
+                "credit_total": decimal_number(sum((max(decimal_value(row.get("gross_amount")), Decimal("0")) for row in rows), Decimal("0"))),
+                "debit_total": decimal_number(sum((min(decimal_value(row.get("gross_amount")), Decimal("0")) for row in rows), Decimal("0"))),
+                "net_movement": decimal_number(movement),
+                "camt_opening_balance": decimal_number(opening),
+                "computed_closing_balance": decimal_number(computed),
+                "camt_closing_balance": decimal_number(closing),
+            }
+        )
+
+    coverage = {
+        "coverage_ready": not errors,
+        "physical_bank_row_count": len(indexed),
+        "allocated_row_count": len(exact_allocated_ids),
+        "unallocated_row_count": len(indexed) - len(exact_allocated_ids),
+        "credit_total": decimal_number(sum((max(decimal_value(record.get("gross_amount")), Decimal("0")) for record, _ in indexed.values()), Decimal("0"))),
+        "debit_total": decimal_number(sum((min(decimal_value(record.get("gross_amount")), Decimal("0")) for record, _ in indexed.values()), Decimal("0"))),
+        "net_movement": decimal_number(sum((decimal_value(record.get("gross_amount")) for record, _ in indexed.values()), Decimal("0"))),
+        "ledgers": ledgers,
+    }
+    if errors:
+        notes = sorted(set(errors))
+        status = "warn"
+    elif indexed:
+        notes = ["Every physical bank row has one exact reviewed allocation; CAMT balances agree where both endpoints were available."]
+        status = "pass"
+    else:
+        notes = ["No physical bank rows were normalized for this period."]
+        status = "pass"
+    return (
+        make_check(
+            check_id="physical-bank-coverage",
+            name="Physical bank allocation coverage",
+            status=status,
+            lhs_label="Physical bank net movement",
+            lhs_amount=sum((decimal_value(record.get("gross_amount")) for record, _ in indexed.values()), Decimal("0")),
+            rhs_label="Exactly allocated bank net movement",
+            rhs_amount=allocation_total,
+            delta=sum((decimal_value(record.get("gross_amount")) for record, _ in indexed.values()), Decimal("0")) - allocation_total,
+            notes=notes,
+            evidence_refs=[make_artifact_ref(normalized_path_display, record_refs_list=record_refs(list(bank_records)))],
+        ),
+        coverage,
+    )
+
+
+def _reference_values(value: Any) -> set[str]:
+    if isinstance(value, str):
+        return {value.strip()} if value.strip() else set()
+    if isinstance(value, list):
+        return set().union(*(_reference_values(item) for item in value)) if value else set()
+    if isinstance(value, dict):
+        return set().union(*(_reference_values(item) for item in value.values())) if value else set()
+    return set()
+
+
+def _clearing_balance_value(records: list[dict[str, Any]], names: tuple[str, ...]) -> tuple[Decimal | None, bool]:
+    values = {
+        decimal_value((record.get("attributes") or {}).get(name))
+        for record in records
+        for name in names
+        if (record.get("attributes") or {}).get(name) not in (None, "")
+    }
+    return (next(iter(values)), len(values) == 1) if values else (None, True)
+
+
+def build_clearing_continuity_checks(
+    *,
+    normalized_path_display: str,
+    records: dict[str, list[dict[str, Any]]],
+    allocations: dict[str, dict[str, Any]],
+) -> tuple[list[dict[str, Any]], bool]:
+    """Check provider/account/currency clearing evidence, retaining Phase-A report-only status."""
+    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for record in records.get("clearing_transactions", []):
+        attributes = record.get("attributes") or {}
+        provider = str(attributes.get("clearing_provider") or "").strip().lower() or "unidentified"
+        account = str(attributes.get("clearing_account") or "").strip() or "unidentified"
+        grouped.setdefault((provider, account, record_currency(record)), []).append(record)
+
+    allocation_references = set().union(*(_reference_values(allocation.get("target")) for allocation in allocations.values())) if allocations else set()
+    bridge_references: set[str] = set()
+    for category, category_records in records.items():
+        if category == "clearing_transactions":
+            continue
+        for record in category_records:
+            bridge_references.update(_reference_values((record.get("attributes") or {}).get("clearing_record_ids")))
+            bridge_references.update(_reference_values((record.get("attributes") or {}).get("clearing_reference")))
+
+    results: dict[tuple[str, str], list[tuple[str, list[dict[str, Any]], list[str]]]] = {}
+    for (provider, account, currency), group_records in grouped.items():
+        missing = [
+            str(record.get("record_id") or "<unknown>")
+            for record in group_records
+            if str(record.get("record_id") or "") not in allocation_references | bridge_references
+        ]
+        notes: list[str] = []
+        if missing:
+            notes.append(f"{account}: unresolved clearing movement record(s): {', '.join(sorted(missing))}.")
+        opening, opening_unambiguous = _clearing_balance_value(group_records, ("opening_balance", "clearing_opening_balance"))
+        closing, closing_unambiguous = _clearing_balance_value(group_records, ("closing_balance", "clearing_closing_balance"))
+        movement = sum_amount(group_records)
+        if not opening_unambiguous or not closing_unambiguous:
+            notes.append(f"{account}: clearing balance evidence is ambiguous.")
+        elif opening is not None and closing is not None:
+            computed = opening + movement
+            if computed != closing:
+                notes.append(
+                    f"{account}: opening plus movements is {decimal_text(computed)}, closing is {decimal_text(closing)}."
+                )
+        else:
+            notes.append(f"{account}: no paired opening and closing clearing balances were normalized.")
+        results.setdefault((provider, currency), []).append((account, group_records, notes))
+
+    checks: list[dict[str, Any]] = []
+    ready = True
+    for (provider, currency), account_results in sorted(results.items()):
+        notes = [note for _, _, account_notes in account_results for note in account_notes]
+        status = "pass" if not notes else "warn"
+        ready = ready and status == "pass"
+        group_records = [record for _, records_for_account, _ in account_results for record in records_for_account]
+        checks.append(
+            make_check(
+                check_id=f"clearing-continuity:{provider}:{currency.lower()}",
+                name=f"{provider} clearing continuity ({currency})",
+                status=status,
+                lhs_label="Clearing net movement",
+                lhs_amount=sum_amount(group_records),
+                notes=notes or ["Every clearing movement is linked and opening plus movements equals closing balance."],
+                evidence_refs=[make_artifact_ref(normalized_path_display, record_refs_list=record_refs(group_records))],
+            )
+        )
+    return checks, ready
 
 
 def build_woo_sales_vs_processor_check(
@@ -896,6 +1163,8 @@ def build_recon_document(
     entity_map_path: Path | None = None,
     previous_payload: dict[str, Any] | None = None,
     previous_path: Path | None = None,
+    bank_allocations: dict[str, dict[str, Any]] | None = None,
+    bank_allocation_errors: list[str] | None = None,
 ) -> dict[str, Any]:
     normalized_path_display = display_path(normalized_path, repo_root)
     previous_path_display = display_path(previous_path, repo_root) if previous_path else None
@@ -913,7 +1182,24 @@ def build_recon_document(
         )
     )
 
+    physical_bank_check, bank_coverage = build_physical_bank_coverage_check(
+        normalized_path_display=normalized_path_display,
+        bank_records=records.get("bank_transactions", []),
+        allocations=bank_allocations or {},
+        bank_balance_records=records.get("bank_balances", []),
+        allocation_errors=bank_allocation_errors,
+    )
+    clearing_checks, clearing_ready = build_clearing_continuity_checks(
+        normalized_path_display=normalized_path_display,
+        records=records,
+        allocations=bank_allocations or {},
+    )
+    bank_coverage["clearing_ready"] = clearing_ready
+    bank_coverage["coverage_ready"] = bool(bank_coverage["coverage_ready"] and clearing_ready)
+
     checks: list[dict[str, Any]] = [
+        physical_bank_check,
+        *clearing_checks,
         build_woo_sales_vs_processor_check(
             normalized_path_display=normalized_path_display,
             records=records,
@@ -982,6 +1268,7 @@ def build_recon_document(
         "currency": normalized_payload.get("base_currency"),
         "approve_for_build": blocking_issue_count == 0,
         "blocking_issue_count": blocking_issue_count,
+        "bank_coverage": bank_coverage,
         "checks": sorted_checks,
         "exceptions": sorted_exceptions,
         "notes": notes,
@@ -1024,6 +1311,47 @@ def resolve_entity_map_path(*, company_dir: Path | None, normalized_path: Path, 
     return artifacts_dir / "entity_map.json"
 
 
+def resolve_bank_allocations_path(
+    *, company_dir: Path | None, normalized_path: Path, period: str, override: str | None
+) -> Path | None:
+    if override:
+        return Path(override)
+    year = period[:4]
+    if company_dir is not None:
+        return company_dir / "artifacts" / "bank" / f"{year}-allocations.json"
+    artifacts_dir = inferred_artifacts_dir(normalized_path)
+    if artifacts_dir is None:
+        return None
+    return artifacts_dir / "bank" / f"{year}-allocations.json"
+
+
+def normalized_year_paths(normalized_path: Path, *, period: str) -> list[Path]:
+    """Discover the annual normalized inputs that a reviewed allocation artifact binds."""
+    year = period[:4]
+    if normalized_path.parent.name != "normalized":
+        return [normalized_path]
+    paths = sorted(normalized_path.parent.glob(f"{year}-*.json"))
+    return paths or [normalized_path]
+
+
+def load_period_bank_allocations(
+    *,
+    allocation_path: Path | None,
+    normalized_path: Path,
+    period: str,
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    if allocation_path is None or not allocation_path.exists():
+        return {}, ["Reviewed bank allocation artifact was not available for this period."]
+    try:
+        payload = load_bank_allocations(
+            allocation_path,
+            normalized_year_paths=normalized_year_paths(normalized_path, period=period),
+        )
+        return period_allocations(payload, period), []
+    except BankAllocationError as exc:
+        return {}, [f"Reviewed bank allocation artifact is not usable: {exc}"]
+
+
 def resolve_previous_normalized_path(
     *,
     company_dir: Path | None,
@@ -1063,6 +1391,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--normalized", help="Path to normalized JSON. Defaults to companies/<company>/artifacts/normalized/<period>.json")
     parser.add_argument("--policy-memo", help="Optional path to policy memo markdown")
     parser.add_argument("--entity-map", help="Optional path to entity map JSON")
+    parser.add_argument(
+        "--bank-allocations",
+        help="Reviewed annual bank allocations. Defaults to artifacts/bank/<year>-allocations.json when available",
+    )
     parser.add_argument("--previous-normalized", help="Optional previous-period normalized JSON")
     parser.add_argument("--output", help="Optional output path for recon JSON")
     parser.add_argument("--amount-threshold", default="0.50", help="Allowed absolute amount delta before a deterministic check fails")
@@ -1099,6 +1431,12 @@ def main() -> int:
         period=args.period,
         override=args.previous_normalized,
     )
+    bank_allocations_path = resolve_bank_allocations_path(
+        company_dir=company_dir,
+        normalized_path=normalized_path,
+        period=args.period,
+        override=args.bank_allocations,
+    )
     output_path = resolve_output_path(
         company_dir=company_dir,
         normalized_path=normalized_path,
@@ -1109,6 +1447,11 @@ def main() -> int:
     policy_memo_text = load_optional_text(policy_memo_path)
     entity_map = load_optional_json(entity_map_path)
     previous_payload = load_optional_json(previous_path)
+    period_bank_allocations, bank_allocation_errors = load_period_bank_allocations(
+        allocation_path=bank_allocations_path,
+        normalized_path=normalized_path,
+        period=args.period,
+    )
 
     repo_root = Path.cwd()
     document = build_recon_document(
@@ -1123,6 +1466,8 @@ def main() -> int:
         entity_map_path=entity_map_path if entity_map is not None else None,
         previous_payload=previous_payload,
         previous_path=previous_path if previous_payload is not None else None,
+        bank_allocations=period_bank_allocations,
+        bank_allocation_errors=bank_allocation_errors,
     )
     write_json(output_path, document)
 

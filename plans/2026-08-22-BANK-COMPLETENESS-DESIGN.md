@@ -1,7 +1,7 @@
 # Bank Statement Completeness Design
 
 Date: 2026-08-22
-Status: approved in chat; awaiting written-spec review
+Status: approved
 
 ## Purpose
 
@@ -47,6 +47,8 @@ A clearing movement may support a physical-bank disposition, but it must not be 
 
 Cash-settlement actions use the statement row's business date, currency, amount, source account, and immutable source reference. Monthly-end dates are not permitted for physical cash rows.
 
+A physical bank ledger is identified by `(IBAN, currency)`, not by IBAN alone. A single IBAN may contain EUR, USD, or other currency sub-ledgers. Posting policy therefore resolves `(source IBAN, source currency)` using the canonical key `<IBAN>|<ISO-4217 currency>` to a SimplBooks income account and currency treatment. Legacy IBAN-only mappings remain valid for base-currency rows only and never silently authorize a foreign-currency row. If discovery exposes no separate foreign-currency income account, the reviewed default is the IBAN's existing SimplBooks account with `currency_name` and `currency_rate`; that behavior must pass the first-live-use pilot before later foreign-currency rows continue.
+
 Foreign-currency actions bind the reviewed annual ECB rate cache and retain the source-currency amount. When a receipt is net of a correspondent fee, the invoice settlement and fee allocation must reproduce both the invoiced gross amount and the amount that reached the bank.
 
 ### Posting eligibility
@@ -70,6 +72,8 @@ Write eligibility requires all of the following:
 
 A new `clearing_transactions` category holds processor and supplier-wallet movements such as wallet funding, wallet refunds, processor balance adjustments, and payout bridge entries. Each record identifies its clearing account or provider in structured attributes.
 
+A new `bank_balances` category holds opening, interim, and closing balances from CAMT XML by `(IBAN, currency, balance type, date)`. The richer CSV remains the canonical transaction-row source when it contains the immutable statement references and counterparty detail needed for allocation; the paired CAMT XML is the canonical opening/closing-balance source and does not emit duplicate physical rows.
+
 Normalization de-duplicates alternative representations before either category is emitted. A processor export that describes a physical card charge is supporting evidence for the physical bank row, not another bank row.
 
 ### Reviewed bank allocation
@@ -78,7 +82,7 @@ Each company may provide ignored annual artifacts under:
 
 `companies/<company>/artifacts/bank/<year>-allocations.json`
 
-The shared schema and template define allocations keyed by canonical physical-bank `record_id`. Each allocation contains:
+The shared schema and template define allocations keyed primarily by an immutable `statement_id`, with the current canonical `record_id` retained as a source locator. `statement_id` prefers the bank's archive identifier, account-servicer reference, or entry reference; only when none exists may it use a deterministic composite of IBAN, currency, date, signed amount, counterparty, and description. A re-export may change row numbers without invalidating a reviewed decision when the immutable statement identity remains unchanged. A rebind operation may refresh source hashes and row locators only after proving the same complete statement-ID set and unchanged economic fields; it produces a new reviewable artifact and never silently mutates an approved file. Each allocation contains:
 
 - disposition type;
 - exact amount or split amounts;
@@ -117,6 +121,8 @@ Ambiguous candidates remain unresolved. Fuzzy supplier text alone must not creat
 
 Existing-document matches are bound to the discovery overview's SimplBooks ID and document identity. Generated-document matches are bound to action idempotency keys, including prior-period keys where settlement timing crosses months.
 
+Read-only discovery indexes every invoice, purchase, incoming, and payment—not merely samples. Cash index entries contain SimplBooks ID, object type, linked business-document ID when exposed, business date, amount, currency, account, counterparty, and description. An allocation may bind an existing target from an earlier discovery year, and every discovery overview used by such a target becomes a hashed action-batch reference artifact.
+
 ## Action Generation
 
 ### Receipts
@@ -129,6 +135,8 @@ One physical credit row normally creates one `incomings/create` action. It may s
 - a direct-sale invoice created for reviewed bank sales.
 
 Multiple physical receipts may partially settle the same invoice. The action keeps only its own bank row as physical cash evidence; related sales or clearing records remain supporting references.
+
+The 23 currently generated month-end processor incoming summaries are replaced by exact statement-dated receipts and must be re-reviewed. Dry-run action counts are expected to change.
 
 ### Payments
 
@@ -143,6 +151,8 @@ Reviewed direct sales are grouped into the smallest sensible business document, 
 ### Bank and card fees
 
 Bank charges are represented as supported expense purchases and exact physical payments. A monthly supporting purchase may be settled by multiple fee rows, but each row remains separately represented. Required bank or card-provider contacts and mappings are master data and remain subject to the existing separate approval rule.
+
+Before month building, a master-data preflight lists every missing contact or mapping. It explicitly checks a bank-fee supplier contact and a direct-sale customer policy. A generic private-customer contact may be used for reviewed consumer sales; individual bank payers do not require separate contacts. Missing master data blocks action approval before a live run begins rather than appearing mid-run.
 
 ### Netted fees
 
@@ -192,7 +202,11 @@ For each clearing provider and currency, reconcile opening balance plus inflows 
 - no clearing record masquerades as a physical bank row;
 - no unresolved or medium-confidence accounting decision remains in an approved batch.
 
+Confidence is based on open judgment, not note count. An action is `high` when every contact/account/VAT/bank ID comes from bound policy or discovery, every cash disposition is approved and exact, and no review issue remains. Informational provenance notes do not reduce confidence. `medium` means a specific reviewed limitation or unresolved accounting judgment remains and therefore cannot enter an approved batch; `low` means a required identifier or evidence item is missing.
+
 `booksend` pre-validates the entire batch before its first write. It refuses a batch if its coverage proof, discovery binding, checker hash, approval state, or chronological predecessor state is invalid.
+
+Full-year dry-run orchestration skips months whose successful submission log binds the unchanged action YAML. `--force-build` never overrides the submitted-month freeze.
 
 Live execution order is fixed:
 
@@ -206,6 +220,23 @@ Live execution order is fixed:
 8. proceed to the next month.
 
 All months of an earlier year are submitted before a later year when dependencies cross the year boundary.
+
+Dry-run translation cannot prove server-side behavior for multiple or partial receipts against one invoice or for foreign-currency receipts into a multi-currency IBAN. Before the first live use of each unverified behavior, execution stops for an explicitly approved one-action pilot, refreshes read-only discovery immediately afterward, verifies the created cash transaction, document balance, currency rate, and bank-account effect, and only then permits later actions using that behavior.
+
+## Delivery Phases
+
+Phase A adds physical/clearing normalization, stable allocation identity, complete read-only cash discovery, and report-only bank/clearing coverage. It produces the full decision list without changing submission eligibility.
+
+Phase B adds action generation for reviewed receipt/payment families: distributor receipts and netted fees, existing manual-invoice receipts, direct sales, bank fees, and purchase payments.
+
+Phase C turns the coverage proof into hard checker/send blocks, enforces chronological freeze and pilots, and cleans stale notes. Each phase has an independent test and review checkpoint.
+
+## Out Of Scope
+
+- year-end or periodic FX revaluation of foreign-currency balances;
+- any accounting treatment that requires an unconfirmed generic journal endpoint;
+- automatic approval of rule-proposed allocations;
+- live statement import through the SimplBooks user interface.
 
 ## Warning Review And Documentation
 
@@ -245,6 +276,9 @@ The design is complete when:
 
 - every physical statement row in each target year has exactly one valid accounting disposition;
 - action-derived bank movements equal canonical statement movements by account and currency;
+- for each year and currency, the sum of signed action cash movements equals the sum of signed physical statement rows;
+- the unreferenced physical bank-row count is zero;
+- CAMT opening balance plus canonical movements equals CAMT closing balance by `(IBAN, currency)`;
 - processor and supplier clearing movements do not duplicate bank rows and reconcile completely;
 - all business documents and settlements resolve in chronological order;
 - no unresolved accounting warning remains;

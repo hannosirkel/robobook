@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 
 
@@ -12,7 +13,49 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import posting_policy  # noqa: E402
 
 
+def posting_policy_fixture_with_profiles() -> dict:
+    return {
+        "schema_version": "1.0",
+        "company_slug": "example",
+        "bank_accounts": {},
+        "contacts": {"sales": {"woo": "42"}},
+        "mappings": {
+            "woo-taxable": {
+                "income_account_id": "107",
+                "shipping_income_account_id": "253",
+                "vat_type_id": "25",
+                "shipping_vat_type_id": "24",
+                "warehouse_id": "9",
+            }
+        },
+        "sales_vat_profiles": [
+            {"start": "2025-01-01", "end": "2025-06-30", "rate": 22,
+             "goods_vat_type_id": "25", "shipping_vat_type_id": "24"},
+            {"start": "2025-07-01", "end": None, "rate": 24,
+             "goods_vat_type_id": "34", "shipping_vat_type_id": "33"},
+        ],
+        "supplier_aliases": {},
+    }
+
+
 class PostingPolicyTests(unittest.TestCase):
+    def test_resolve_sales_vat_profile_changes_on_effective_date(self) -> None:
+        policy = posting_policy_fixture_with_profiles()
+
+        self.assertEqual(
+            posting_policy.resolve_sales_vat_profile(policy, event_date=date(2025, 6, 30))["rate"], 22
+        )
+        self.assertEqual(
+            posting_policy.resolve_sales_vat_profile(policy, event_date=date(2025, 7, 1))["rate"], 24
+        )
+
+    def test_policy_rejects_overlapping_sales_vat_profiles(self) -> None:
+        policy = posting_policy_fixture_with_profiles()
+        policy["sales_vat_profiles"][1]["start"] = "2025-06-30"
+
+        with self.assertRaisesRegex(posting_policy.PostingPolicyError, "overlap"):
+            posting_policy.validate_posting_policy(policy)
+
     def test_bank_account_resolution_requires_exact_source_account(self) -> None:
         policy = {"bank_accounts": {"EE-LHV": "3"}}
 

@@ -92,6 +92,30 @@ def record(
     }
 
 
+def policy_with_24_percent_profile() -> dict:
+    return {
+        "schema_version": "1.0", "company_slug": "example", "bank_accounts": {},
+        "contacts": {"sales": {"woo": "42"}, "processors": {}, "suppliers": {}},
+        "mappings": {"woo-taxable": {"income_account_id": "107", "shipping_income_account_id": "253",
+                                      "vat_type_id": "34", "shipping_vat_type_id": "33",
+                                      "warehouse_id": "9"}},
+        "sales_vat_profiles": [{"start": "2025-07-01", "end": None, "rate": 24,
+                                "goods_vat_type_id": "34", "shipping_vat_type_id": "33"}],
+        "supplier_aliases": {},
+    }
+
+
+def allocated_action_fixture(*, line_rate: int, vat_type_id: str) -> dict:
+    return {"actions": [{
+        "idempotency_key": "example-2025-11-woo", "action_type": "create_invoice_summary",
+        "payload": {"document_date": "2025-11-30", "posting_policy_family": "woo-taxable",
+                    "line_items": [{"line_role": "sales_revenue", "gross_amount": 62.00,
+                                    "vat_amount_hint": 12.00, "suggested_vat_type_id": vat_type_id,
+                                    "vat_profile_rate": line_rate,
+                                    "vat_profile_period": "2025-07-01/open"}]}
+    }]}
+
+
 def payment_action(
     *,
     key: str,
@@ -215,6 +239,13 @@ def build_clean_artifacts(tmp: Path, *, recon_approve: bool = True, force: bool 
 
 
 class BookcheckerTests(unittest.TestCase):
+    def test_checker_blocks_vat_type_rate_mismatch(self) -> None:
+        batch = allocated_action_fixture(line_rate=24, vat_type_id="25")
+
+        report = bookchecker.evaluate_vat_profiles(batch["actions"], policy_with_24_percent_profile())
+
+        self.assertTrue(any(item["severity"] == "error" and "VAT profile" in item["summary"] for item in report))
+
     def test_checker_fails_unproven_foreign_rate(self) -> None:
         action = payment_action(
             key="example-2024-01-payment-vendor",

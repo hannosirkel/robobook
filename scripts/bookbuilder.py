@@ -14,7 +14,7 @@ from typing import Any
 
 from document_identity import document_identity, match_existing
 from exchange_rates import ExchangeRateError, lookup_rate
-from posting_policy import PostingPolicyError, load_posting_policy, resolve_bank_account, resolve_contact, resolve_mapping
+from posting_policy import PostingPolicyError, load_posting_policy, resolve_bank_account, resolve_contact, resolve_mapping, resolve_sales_vat_profile
 from reference_artifacts import ReferenceArtifactError, bind_file, validate_discovery
 from simplbooks_api import SimplbooksError, resolve_company_id, resolve_company_name
 
@@ -1123,6 +1123,50 @@ def build_sales_lines(
         + shipping_zero_vat_notes
         + default_warehouse_notes
     )
+
+    allocated_records = [
+        record
+        for record in records
+        if isinstance((record.get("attributes") or {}).get("vat_allocation"), dict)
+    ]
+    unallocated_records = [
+        record
+        for record in records
+        if not isinstance((record.get("attributes") or {}).get("vat_allocation"), dict)
+    ]
+    if allocated_records:
+        def allocated_total(field_name: str) -> Decimal:
+            return sum(
+                abs(decimal_value(((record.get("attributes") or {}).get("vat_allocation") or {}).get(field_name)))
+                for record in allocated_records
+            )
+
+        component_lines = (
+            ("goods", f"{direction}_revenue", f"{group_label} allocated {direction} revenue summary", "fixed_product_gross", "product_vat", revenue_account_id, standard_vat_id),
+            ("shipping", f"{direction}_shipping", f"{group_label} allocated {direction} shipping summary", "fixed_shipping_gross", "shipping_vat", shipping_account_id, shipping_standard_vat_id),
+        )
+        for component, line_role, description, gross_field, vat_field, account_id, vat_type_id in component_lines:
+            gross_amount = allocated_total(gross_field)
+            if gross_amount == 0:
+                continue
+            lines.append(
+                {
+                    "line_role": line_role,
+                    "description": description,
+                    "gross_amount": decimal_number(gross_amount),
+                    "vat_amount_hint": decimal_number(allocated_total(vat_field)),
+                    "shipping_component_gross_amount": decimal_number(gross_amount) if component == "shipping" else 0.0,
+                    "suggested_income_account_id": account_id,
+                    "suggested_vat_type_id": vat_type_id,
+                    "warehouse_id_hint": maybe_single_warehouse(allocated_records) or default_warehouse_id,
+                    "record_count": len(allocated_records),
+                    "vat_allocation_component": component,
+                }
+        )
+        review_notes.append("Woo VAT allocation evidence keeps goods and shipping VAT in separate draft lines.")
+        records = unallocated_records
+        if not records:
+            return lines, review_notes
 
     grouped_by_profile: dict[str, list[dict[str, Any]]] = {"taxable": [], "non_taxable": []}
     for record in records:
@@ -2291,6 +2335,20 @@ def apply_posting_policy(
                     )
                 else:
                     line["warehouse_id_hint"] = None
+                allocation_component = str(line.get("vat_allocation_component") or "")
+                if allocation_component in {"goods", "shipping"}:
+                    try:
+                        profile = resolve_sales_vat_profile(
+                            posting_policy,
+                            event_date=date.fromisoformat(str(payload.get("document_date") or "")),
+                        )
+                    except (PostingPolicyError, ValueError) as exc:
+                        raise SimplbooksError(f"Could not resolve sales VAT profile: {exc}") from exc
+                    line["suggested_vat_type_id"] = profile[
+                        "shipping_vat_type_id" if allocation_component == "shipping" else "goods_vat_type_id"
+                    ]
+                    line["vat_profile_rate"] = profile["rate"]
+                    line["vat_profile_period"] = f"{profile['start']}/{profile['end'] or 'open'}"
             else:
                 line_key = slugify(str(line.get("description") or line_role))
                 line_values = (family_values.get("lines") or {}).get(line_key)

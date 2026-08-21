@@ -9,13 +9,13 @@ import subprocess
 import sys
 import unicodedata
 from collections import Counter, defaultdict
-from datetime import UTC, datetime
-from decimal import Decimal, InvalidOperation
+from datetime import UTC, date, datetime
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
 from exchange_rates import ExchangeRateError, lookup_rate
-from posting_policy import PostingPolicyError, action_policy_errors, load_posting_policy
+from posting_policy import PostingPolicyError, action_policy_errors, load_posting_policy, resolve_sales_vat_profile
 from reference_artifacts import ReferenceArtifactError, validate_discovery, verify_file_binding
 from simplbooks_api import SimplbooksError, resolve_company_id, resolve_company_name
 
@@ -932,6 +932,93 @@ def evaluate_posting_policy(
     return findings
 
 
+def evaluate_vat_profiles(actions: list[dict[str, Any]], posting_policy: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if posting_policy is None:
+        return []
+    findings: list[dict[str, Any]] = []
+    for action in actions:
+        payload = action.get("payload") or {}
+        for line in payload.get("line_items") or []:
+            has_profile_provenance = any(
+                field in line for field in ("vat_profile_rate", "vat_profile_period", "vat_allocation_component")
+            )
+            if not has_profile_provenance:
+                continue
+            try:
+                event_date = date.fromisoformat(str(payload.get("document_date") or ""))
+                profile = resolve_sales_vat_profile(posting_policy, event_date=event_date)
+            except (PostingPolicyError, ValueError) as exc:
+                findings.append(
+                    make_finding(
+                        section="account_and_vat_review",
+                        severity="error",
+                        summary=f"VAT profile cannot be resolved for allocated line: {exc}",
+                        action_id=action_label(action),
+                    )
+                )
+                continue
+
+            expected_period = f"{profile['start']}/{profile['end'] or 'open'}"
+            line_role = str(line.get("line_role") or "")
+            component = str(line.get("vat_allocation_component") or "")
+            is_shipping = component == "shipping" or (not component and line_role.endswith("_shipping"))
+            expected_vat_type_id = profile["shipping_vat_type_id"] if is_shipping else profile["goods_vat_type_id"]
+            if line.get("vat_profile_rate") != profile["rate"]:
+                findings.append(
+                    make_finding(
+                        section="account_and_vat_review",
+                        severity="error",
+                        summary="VAT profile rate does not match the effective posting-policy profile.",
+                        action_id=action_label(action),
+                    )
+                )
+            if str(line.get("vat_profile_period") or "") != expected_period:
+                findings.append(
+                    make_finding(
+                        section="account_and_vat_review",
+                        severity="error",
+                        summary="VAT profile period does not match the effective posting-policy profile.",
+                        action_id=action_label(action),
+                    )
+                )
+            if str(line.get("suggested_vat_type_id") or "") != expected_vat_type_id:
+                findings.append(
+                    make_finding(
+                        section="account_and_vat_review",
+                        severity="error",
+                        summary="VAT profile VAT type does not match the effective goods or shipping mapping.",
+                        action_id=action_label(action),
+                    )
+                )
+            try:
+                gross_amount = abs(decimal_value(line.get("gross_amount")))
+                vat_amount = abs(decimal_value(line.get("vat_amount_hint")))
+                rate = Decimal(str(profile["rate"]))
+                expected_vat = (gross_amount * rate / (Decimal("100") + rate)).quantize(
+                    TOLERANCE, rounding=ROUND_HALF_UP
+                )
+            except (InvalidOperation, SimplbooksError) as exc:
+                findings.append(
+                    make_finding(
+                        section="account_and_vat_review",
+                        severity="error",
+                        summary=f"VAT profile line has invalid monetary values: {exc}",
+                        action_id=action_label(action),
+                    )
+                )
+                continue
+            if abs(vat_amount - expected_vat) > TOLERANCE:
+                findings.append(
+                    make_finding(
+                        section="account_and_vat_review",
+                        severity="error",
+                        summary="VAT profile rate does not reconstruct the allocated line VAT hint to the cent.",
+                        action_id=action_label(action),
+                    )
+                )
+    return findings
+
+
 def evaluate_reference_artifacts(
     action_batch: dict[str, Any],
     *,
@@ -1122,6 +1209,7 @@ def evaluate_action_batch(
     findings.extend(evaluate_exchange_rates(action_batch, exchange_rate_cache=exchange_rate_cache))
     findings.extend(evaluate_unresolved_dependencies(action_batch))
     findings.extend(evaluate_posting_policy(action_batch, posting_policy))
+    findings.extend(evaluate_vat_profiles(action_batch.get("actions") or [], posting_policy))
     findings.extend(
         evaluate_reference_artifacts(
             action_batch,

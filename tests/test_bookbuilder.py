@@ -105,6 +105,44 @@ def find_action(batch: dict, action_type: str, *, endpoint: str | None = None) -
     raise AssertionError(f"Missing action {action_type} {endpoint or ''}")
 
 
+def policy_with_24_percent_profile() -> dict:
+    return {
+        "schema_version": "1.0", "company_slug": "example", "bank_accounts": {},
+        "contacts": {"sales": {"woo": "42"}, "processors": {}, "suppliers": {}},
+        "mappings": {"woo-taxable": {"income_account_id": "107", "shipping_income_account_id": "253",
+                                      "vat_type_id": "34", "shipping_vat_type_id": "33",
+                                      "warehouse_id": "9"}},
+        "sales_vat_profiles": [{"start": "2025-07-01", "end": None, "rate": 24,
+                                "goods_vat_type_id": "34", "shipping_vat_type_id": "33"}],
+        "supplier_aliases": {},
+    }
+
+
+def allocated_sale_fixture(*, product_gross: float, shipping_gross: float,
+                           product_vat: float, shipping_vat: float) -> dict:
+    sale = record(record_id="woo:2025-11", source_system="woo", event_type="woo_monthly_sales",
+                  gross_amount=product_gross + shipping_gross, vat_amount=product_vat + shipping_vat,
+                  shipping_amount=shipping_gross, channel="woo")
+    sale["event_date"] = "2025-11-30"
+    sale["attributes"]["vat_allocation"] = {
+        "fixed_product_gross": product_gross, "fixed_shipping_gross": shipping_gross,
+        "product_vat": product_vat, "shipping_vat": shipping_vat,
+        "allocation_path": "companies/example/artifacts/vat/2025-woo-tax-allocation.json",
+        "allocated_order_ids": ["EXAMPLE-1"],
+    }
+    return sale
+
+
+def build_batch_with_policy(normalized: dict, policy: dict) -> dict:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        return bookbuilder.build_action_batch(
+            normalized_payload=normalized, recon_payload=base_recon(normalized["period"]),
+            normalized_path=root / "normalized.json", recon_path=root / "recon.json",
+            repo_root=root, posting_policy=policy,
+        )
+
+
 def purchase_summary_action(
     *,
     period: str,
@@ -150,6 +188,32 @@ def purchase_summary_action(
 
 
 class BookbuilderTests(unittest.TestCase):
+    def test_builder_blocks_allocated_vat_without_effective_profile(self) -> None:
+        normalized = base_normalized("2025-11")
+        normalized["records"]["sales"] = [allocated_sale_fixture(
+            product_gross=62.00, shipping_gross=62.00, product_vat=12.00, shipping_vat=12.00
+        )]
+        policy = policy_with_24_percent_profile()
+        policy["sales_vat_profiles"][0]["start"] = "2025-12-01"
+
+        with self.assertRaisesRegex(bookbuilder.SimplbooksError, "sales VAT profile"):
+            build_batch_with_policy(normalized, policy)
+
+    def test_builder_preserves_allocated_goods_and_shipping_vat(self) -> None:
+        normalized = base_normalized("2025-11")
+        normalized["records"]["sales"] = [allocated_sale_fixture(
+            product_gross=62.00, shipping_gross=62.00, product_vat=12.00, shipping_vat=12.00
+        )]
+
+        batch = build_batch_with_policy(normalized, policy_with_24_percent_profile())
+        lines = batch["actions"][0]["payload"]["line_items"]
+
+        self.assertEqual([(line["gross_amount"], line["vat_amount_hint"]) for line in lines],
+                         [(62.00, 12.00), (62.00, 12.00)])
+        self.assertEqual([line["suggested_vat_type_id"] for line in lines], ["34", "33"])
+        self.assertEqual([line["vat_profile_rate"] for line in lines], [24, 24])
+        self.assertEqual([line["vat_profile_period"] for line in lines], ["2025-07-01/open", "2025-07-01/open"])
+
     def test_builder_applies_single_month_end_ecb_rate(self) -> None:
         normalized = base_normalized(period="2024-03")
         usd_purchase = record(

@@ -51,6 +51,10 @@ system exports.
 - expects daily aggregate columns such as `Date`, `Gross sales`, `Net sales`, `Taxes`, `Shipping`, and `Total sales`
 - produces `sales` records
 - emits warnings when returns are embedded in aggregate rows because refund-level rows are not available
+- recognizes annual tax-summary columns `Tax code`, `Rate`, `Total tax`, `Order tax`, `Shipping tax`, and `Orders`
+- validates country-coded tax rows, non-negative rates and amounts, positive integral order counts, and component totals
+- produces annual `other` records with `event_type: woo_tax_summary`; these are supporting evidence only and never duplicate sales
+- emits the evidence only in the period containing the covered year's final day
 
 ### PayPal CSV
 

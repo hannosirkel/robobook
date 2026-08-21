@@ -56,6 +56,7 @@ For local review against scratch data, override the intake directory explicitly:
 Implemented deterministic parsers:
 
 - Woo daily sales CSV
+- Woo annual tax-summary CSV as supporting evidence (`other` records only; never sales)
 - PayPal transaction CSV
 - Stripe balance-history CSV
 - Printful `Orders.csv`

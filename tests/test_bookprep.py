@@ -33,6 +33,94 @@ def pdf_source(root: Path, name: str, *, source_system: str) -> bookprep.SourceD
 
 
 class BookprepTests(unittest.TestCase):
+    def parse_tax_fixture(self, row: str, *, period: str = "2025-12"):
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        root = Path(temp_dir.name) / "2025-pack"
+        root.mkdir()
+        path = root / "woocommerce-taxes.csv"
+        path.write_text(
+            "Tax code,Rate,Total tax,Order tax,Shipping tax,Orders\n" + row + "\n",
+            encoding="utf-8",
+        )
+        period_start, period_end = bookprep.parse_period(period)
+        source = bookprep.inspect_source_file(
+            path=path, root_dir=root, period_start=period_start, period_end=period_end
+        )
+        assert source is not None
+        return bookprep.parse_woo_tax_summary_csv(
+            source, period_start=period_start, period_end=period_end, base_currency="EUR"
+        )
+
+    def test_parse_woo_tax_summary_csv_as_annual_supporting_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "2025-pack"
+            root.mkdir()
+            path = root / "woocommerce-taxes.csv"
+            path.write_text(
+                '\ufeff"Tax code",Rate,"Total tax","Order tax","Shipping tax",Orders\n'
+                "DE-DE-VAT-1,19,19.00,15.00,4.00,1\n",
+                encoding="utf-8",
+            )
+            start, end = bookprep.parse_period("2025-12")
+            source = bookprep.inspect_source_file(path=path, root_dir=root, period_start=start, period_end=end)
+            assert source is not None
+            self.assertEqual(source.source_system, "woo")
+            self.assertEqual(source.parser_name, "parse_woo_tax_summary_csv")
+            self.assertEqual(source.covered_from.isoformat(), "2025-01-01")
+            self.assertEqual(source.covered_until.isoformat(), "2025-12-31")
+            records, exceptions = bookprep.parse_woo_tax_summary_csv(
+                source, period_start=start, period_end=end, base_currency="EUR"
+            )
+            self.assertFalse(exceptions)
+            self.assertEqual(records["sales"], [])
+            self.assertEqual(records["other"][0]["event_type"], "woo_tax_summary")
+            self.assertEqual(records["other"][0]["country_code"], "DE")
+            self.assertEqual(records["other"][0]["attributes"]["orders"], 1)
+
+    def test_woo_tax_summary_blocks_component_mismatch(self) -> None:
+        records, exceptions = self.parse_tax_fixture("DE-DE-VAT-1,19,19.01,15.00,4.00,1")
+        self.assertEqual(records["other"], [])
+        self.assertTrue(any(item["blocking"] for item in exceptions))
+
+    def test_woo_tax_summary_emits_only_in_year_end_period(self) -> None:
+        records, exceptions = self.parse_tax_fixture(
+            "DE-DE-VAT-1,19,19.00,15.00,4.00,1", period="2025-05"
+        )
+        self.assertFalse(exceptions)
+        self.assertEqual(records["other"], [])
+
+    def test_woo_tax_summary_blocks_invalid_rate_code_and_count(self) -> None:
+        for row in (
+            "DE-DE-VAT-1,-1,19.00,15.00,4.00,1",
+            "DE-DE-VAT-1,19,-1.00,0.00,-1.00,1",
+            "DE-DE-VAT-1,19,19.00,15.00,4.00,1.5",
+            "Germany-DE-VAT-1,19,19.00,15.00,4.00,1",
+        ):
+            with self.subTest(row=row):
+                records, exceptions = self.parse_tax_fixture(row)
+                self.assertEqual(records["other"], [])
+                self.assertTrue(any(item["blocking"] for item in exceptions))
+
+    def test_woo_tax_summary_blocks_missing_annual_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "woocommerce-taxes.csv"
+            path.write_text(
+                "Tax code,Rate,Total tax,Order tax,Shipping tax,Orders\n"
+                "DE-DE-VAT-1,19,19.00,15.00,4.00,1\n",
+                encoding="utf-8",
+            )
+            start, end = bookprep.parse_period("2025-12")
+            source = bookprep.inspect_source_file(path=path, root_dir=root, period_start=start, period_end=end)
+            assert source is not None
+            self.assertEqual(source.covered_from, start)
+            self.assertEqual(source.covered_until, end)
+            _, exceptions = bookprep.parse_woo_tax_summary_csv(
+                source, period_start=start, period_end=end, base_currency="EUR"
+            )
+            self.assertTrue(any(item["blocking"] for item in exceptions))
+
     def test_choose_canonical_sources_prefers_csv(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

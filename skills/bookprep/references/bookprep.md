@@ -51,6 +51,11 @@ system exports.
 - expects daily aggregate columns such as `Date`, `Gross sales`, `Net sales`, `Taxes`, `Shipping`, and `Total sales`
 - produces `sales` records
 - emits warnings when returns are embedded in aggregate rows because refund-level rows are not available
+- detects Woo Analytics order-summary exports by their full header signature: `Date`, `Order #`, `Status`, `Customer`, `Customer type`, `Product(s)`, `Items sold`, `Coupon(s)`, `Net sales`, and `Attribution`
+- parses order-summary rows as `other` records with `event_type: woo_order_summary`; they are matching evidence, never sales
+- sets every normalized financial amount on order-summary evidence to zero, including gross, net, VAT, fee, and shipping, because that export does not expose customer-paid gross, shipping, and tax losslessly
+- retains only order ID, event date, row reference, status, product summary, item count, observed net sales, customer type, and attribution for reviewed matching; the observed net-sales value stays in `attributes` and is not a financial amount
+- uses the `Customer` column only as part of the export-format signature and does not retain customer names or email addresses in normalized records; raw company exports and their hashes/paths remain inside the ignored company workspace
 - recognizes annual tax-summary columns `Tax code`, `Rate`, `Total tax`, `Order tax`, `Shipping tax`, and `Orders`
 - validates country-coded tax rows, non-negative rates and amounts, positive integral order counts, and component totals
 - produces annual `other` records with `event_type: woo_tax_summary`; these are supporting evidence only and never duplicate sales

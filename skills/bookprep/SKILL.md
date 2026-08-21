@@ -56,6 +56,7 @@ For local review against scratch data, override the intake directory explicitly:
 Implemented deterministic parsers:
 
 - Woo daily sales CSV
+- Woo Analytics order-summary CSV as nonfinancial order-matching evidence (`other` records only)
 - Woo annual tax-summary CSV as supporting evidence (`other` records only; never sales)
 - PayPal transaction CSV
 - Stripe balance-history CSV
@@ -82,6 +83,7 @@ Tracked but not yet parsed:
 - Ignore `.gsheet` accountant work files entirely.
 - Preserve row references when parsing CSV or XML.
 - Preserve page references when parsing PDFs.
+- Keep Woo order-summary evidence nonfinancial: normalized gross, net, VAT, fee, and shipping amounts are zero. Retain only the reviewed matching fields documented in `references/bookprep.md`; do not copy customer names or email addresses into normalized records.
 - Emit exceptions instead of inventing refund or VAT splits that the source does not support directly.
 - Keep canonical source choice explicit via the embedded source manifest.
 

@@ -421,6 +421,16 @@ def apply_allocation_to_sale(
     }
 
 
+def zero_unsupported_sale(sale: dict[str, Any]) -> None:
+    """Preserve customer gross while ensuring unsupported sales are zero-rated."""
+    gross = decimal_value(sale.get("gross_amount"))
+    sale["vat_amount"] = 0.0
+    sale["net_amount"] = decimal_number(gross)
+    attributes = sale.get("attributes")
+    if isinstance(attributes, dict):
+        attributes.pop("vat_allocation", None)
+
+
 def apply_period_allocation(
     records: dict[str, list[dict[str, Any]]], allocation: dict[str, Any], period: str
 ) -> None:
@@ -430,6 +440,9 @@ def apply_period_allocation(
         if isinstance(item, dict) and item.get("period") == period
     ]
     if not period_allocations:
+        for sale in records.get("sales") or []:
+            if isinstance(sale, dict) and is_monthly_woo_summary(sale, period):
+                zero_unsupported_sale(sale)
         return
     allocations_by_order: dict[str, list[dict[str, Any]]] = {}
     for item in period_allocations:
@@ -446,6 +459,9 @@ def apply_period_allocation(
         raise WooTaxError(f"Woo tax allocation found multiple monthly summary sales for {period}.")
     if summary_sales:
         apply_allocation_to_sale(summary_sales[0], period_allocations, allocation, f"monthly summary {period}")
+        for sale in records.get("sales") or []:
+            if isinstance(sale, dict) and sale is not summary_sales[0]:
+                zero_unsupported_sale(sale)
         return
 
     consumed_orders: set[str] = set()
@@ -455,6 +471,7 @@ def apply_period_allocation(
         order_id = allocation_order_id(sale)
         matching = allocations_by_order.get(order_id)
         if not matching:
+            zero_unsupported_sale(sale)
             continue
         if order_id in consumed_orders:
             raise WooTaxError(f"Woo tax allocation for order {order_id} matched more than one processor sale.")

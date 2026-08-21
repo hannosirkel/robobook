@@ -120,7 +120,7 @@ class WooTaxTests(unittest.TestCase):
         )
 
     def test_apply_period_allocation_does_not_tax_unlisted_export_order(self) -> None:
-        records = normalized_sales_fixture(gross=Decimal("50.00"), vat=Decimal("0"), order_id="EXAMPLE-US-1")
+        records = normalized_sales_fixture(gross=Decimal("50.00"), vat=Decimal("5.00"), order_id="EXAMPLE-US-1")
         records["sales"].append(
             normalized_sales_fixture(gross=Decimal("124.00"), vat=Decimal("22.36"), order_id="EXAMPLE-EU-1")["sales"][0]
         )
@@ -132,6 +132,7 @@ class WooTaxTests(unittest.TestCase):
         )
 
         self.assertEqual(records["sales"][0]["vat_amount"], 0.0)
+        self.assertEqual(records["sales"][0]["net_amount"], 50.0)
 
     def test_apply_period_allocation_aggregates_monthly_woo_summary(self) -> None:
         records = monthly_woo_summary_fixture(gross=Decimal("248.00"), vat=Decimal("44.72"), period="2025-11")
@@ -151,7 +152,7 @@ class WooTaxTests(unittest.TestCase):
         self.assertEqual(sale["attributes"]["vat_allocation"]["fixed_shipping_gross"], 124.0)
 
     def test_apply_period_allocation_leaves_unallocated_month_summary_zero_rated(self) -> None:
-        records = monthly_woo_summary_fixture(gross=Decimal("50.00"), vat=Decimal("0"), period="2025-11")
+        records = monthly_woo_summary_fixture(gross=Decimal("50.00"), vat=Decimal("10.00"), period="2025-11")
 
         woo_tax.apply_period_allocation(records, allocation_fixture(), "2025-11")
 

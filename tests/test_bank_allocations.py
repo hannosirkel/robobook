@@ -29,8 +29,8 @@ def bank_record(*, record_id: str = "bank-source:bank:2", archive_id: str = "202
     }
 
 
-def normalized_payload(*records: dict[str, Any]) -> dict[str, Any]:
-    return {"records": {"bank_transactions": list(records)}}
+def normalized_payload(*records: dict[str, Any], period: str = "2024-01") -> dict[str, Any]:
+    return {"period": period, "records": {"bank_transactions": list(records)}}
 
 
 def allocation(*, statement_id: str, record_id: str, amount: float = 330.0, disposition: str = "existing_invoice_receipt", **overrides: Any) -> dict[str, Any]:
@@ -49,6 +49,23 @@ def allocation(*, statement_id: str, record_id: str, amount: float = 330.0, disp
 
 
 class BankAllocationTests(unittest.TestCase):
+    def test_bank_ledger_key_normalizes_physical_bank_iban_and_currency(self) -> None:
+        record = bank_record()
+        record["currency"] = "eur"
+        record["attributes"] = {"customer_account": " ee 123 "}
+
+        self.assertEqual(bank_allocations.bank_ledger_key(record), ("EE123", "EUR"))
+
+    def test_bank_ledger_key_rejects_nonphysical_or_unidentified_rows(self) -> None:
+        record = bank_record()
+        record["source_system"] = "printful"
+        with self.assertRaises(bank_allocations.BankAllocationError):
+            bank_allocations.bank_ledger_key(record)
+        record = bank_record()
+        record["attributes"] = {}
+        with self.assertRaises(bank_allocations.BankAllocationError):
+            bank_allocations.bank_ledger_key(record)
+
     def test_statement_identity_prefers_archive_then_account_servicer_then_entry_reference(self) -> None:
         record = bank_record()
         self.assertEqual(bank_allocations.statement_identity(record), "archive:2024010212345678")
@@ -109,6 +126,101 @@ class BankAllocationTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            with self.assertRaises(bank_allocations.BankAllocationError):
+                bank_allocations.load_bank_allocations(allocation_path, normalized_year_paths=[normalized_path])
+
+    def test_loader_allows_partial_phase_a_artifact_but_completeness_proof_reports_missing_ids(self) -> None:
+        first = bank_record(record_id="bank-source:bank:2", archive_id="one")
+        second = bank_record(record_id="bank-source:bank:3", archive_id="two")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            normalized_path = root / "2024-01.json"
+            normalized_path.write_text(json.dumps(normalized_payload(first, second)), encoding="utf-8")
+            payload = {
+                "schema_version": "1.0",
+                "company_slug": "example",
+                "year": 2024,
+                "normalized_bindings": [{"path": str(normalized_path), "sha256": hashlib.sha256(normalized_path.read_bytes()).hexdigest()}],
+                "allocations": [allocation(statement_id="archive:one", record_id="bank-source:bank:2")],
+            }
+            allocation_path = root / "allocations.json"
+            allocation_path.write_text(json.dumps(payload), encoding="utf-8")
+            loaded = bank_allocations.load_bank_allocations(allocation_path, normalized_year_paths=[normalized_path])
+
+            self.assertEqual(
+                bank_allocations.bank_allocation_coverage_errors(loaded, normalized_year_paths=[normalized_path]),
+                ["missing bank allocation statement_id(s): archive:two"],
+            )
+            with self.assertRaisesRegex(bank_allocations.BankAllocationError, "missing bank allocation statement_id"):
+                bank_allocations.prove_exact_bank_allocation_coverage(loaded, normalized_year_paths=[normalized_path])
+
+    def test_completeness_proof_reports_duplicate_and_extra_ids_deterministically(self) -> None:
+        record = bank_record(archive_id="one")
+        with tempfile.TemporaryDirectory() as tmp:
+            normalized_path = Path(tmp) / "2024-01.json"
+            normalized_path.write_text(json.dumps(normalized_payload(record)), encoding="utf-8")
+            payload = {
+                "schema_version": "1.0",
+                "company_slug": "example",
+                "year": 2024,
+                "normalized_bindings": [{"path": str(normalized_path), "sha256": hashlib.sha256(normalized_path.read_bytes()).hexdigest()}],
+                "allocations": [
+                    allocation(statement_id="archive:one", record_id="bank-source:bank:2"),
+                    allocation(statement_id="archive:one", record_id="bank-source:bank:3"),
+                    allocation(statement_id="archive:extra", record_id="bank-source:bank:4"),
+                ],
+            }
+            self.assertEqual(
+                bank_allocations.bank_allocation_coverage_errors(payload, normalized_year_paths=[normalized_path]),
+                [
+                    "duplicate bank allocation statement_id(s): archive:one",
+                    "extra bank allocation statement_id(s): archive:extra",
+                ],
+            )
+
+    def test_nonbank_rows_do_not_enter_allocation_or_completeness_proof(self) -> None:
+        physical = bank_record(archive_id="physical")
+        wallet = bank_record(record_id="printful:wallet:2", archive_id="wallet")
+        wallet["source_system"] = "BANK"
+        with tempfile.TemporaryDirectory() as tmp:
+            normalized_path = Path(tmp) / "2024-01.json"
+            normalized_path.write_text(json.dumps(normalized_payload(physical, wallet)), encoding="utf-8")
+            payload = {
+                "schema_version": "1.0",
+                "company_slug": "example",
+                "year": 2024,
+                "normalized_bindings": [{"path": str(normalized_path), "sha256": hashlib.sha256(normalized_path.read_bytes()).hexdigest()}],
+                "allocations": [allocation(statement_id="archive:physical", record_id="bank-source:bank:2")],
+            }
+            self.assertEqual(bank_allocations.bank_allocation_coverage_errors(payload, normalized_year_paths=[normalized_path]), [])
+            payload["allocations"] = [allocation(statement_id="archive:wallet", record_id="printful:wallet:2")]
+            allocation_path = Path(tmp) / "allocations.json"
+            allocation_path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaises(bank_allocations.BankAllocationError):
+                bank_allocations.load_bank_allocations(allocation_path, normalized_year_paths=[normalized_path])
+
+    def test_loader_rejects_allocation_or_row_outside_artifact_year(self) -> None:
+        record = bank_record()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            normalized_path = root / "2024-01.json"
+            normalized_path.write_text(json.dumps(normalized_payload(record)), encoding="utf-8")
+            payload = {
+                "schema_version": "1.0",
+                "company_slug": "example",
+                "year": 2024,
+                "normalized_bindings": [{"path": str(normalized_path), "sha256": hashlib.sha256(normalized_path.read_bytes()).hexdigest()}],
+                "allocations": [allocation(statement_id="archive:2024010212345678", record_id="bank-source:bank:2", period="2023-12")],
+            }
+            allocation_path = root / "allocations.json"
+            allocation_path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaises(bank_allocations.BankAllocationError):
+                bank_allocations.load_bank_allocations(allocation_path, normalized_year_paths=[normalized_path])
+
+            normalized_path.write_text(json.dumps(normalized_payload(record, period="2023-12")), encoding="utf-8")
+            payload["allocations"] = [allocation(statement_id="archive:2024010212345678", record_id="bank-source:bank:2")]
+            payload["normalized_bindings"][0]["sha256"] = hashlib.sha256(normalized_path.read_bytes()).hexdigest()
+            allocation_path.write_text(json.dumps(payload), encoding="utf-8")
             with self.assertRaises(bank_allocations.BankAllocationError):
                 bank_allocations.load_bank_allocations(allocation_path, normalized_year_paths=[normalized_path])
 

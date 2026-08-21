@@ -65,6 +65,8 @@ def validate(instance: Any, schema: dict[str, Any], *, root_schema: dict[str, An
                 validate(item, schema["items"], root_schema=root_schema, path=f"{path}[{index}]")
 
     if isinstance(instance, dict):
+        if "minProperties" in schema:
+            assert len(instance) >= schema["minProperties"], f"{path}: too few properties"
         for required in schema.get("required", []):
             assert required in instance, f"{path}: missing required property {required!r}"
         if "propertyNames" in schema:
@@ -139,6 +141,16 @@ class SchemaContractTests(unittest.TestCase):
         artifact = bank_allocation_payload(allocations=[bank_allocation(disposition="ignore")])
         with self.assertRaises(AssertionError):
             self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=artifact)
+
+    def test_bank_allocation_schema_rejects_empty_bindings_and_target(self) -> None:
+        empty_bindings = bank_allocation_payload(allocations=[])
+        empty_bindings["normalized_bindings"] = []
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=empty_bindings)
+
+        empty_target = bank_allocation_payload(allocations=[bank_allocation(target={})])
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=empty_target)
 
     def test_bank_allocation_template_matches_strict_schema(self) -> None:
         artifact = json.loads((ROOT / "templates/bank-allocation.template.json").read_text(encoding="utf-8"))

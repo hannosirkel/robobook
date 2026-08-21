@@ -22,6 +22,7 @@ PROCESSOR_KEYWORDS: dict[str, tuple[str, ...]] = {
 
 FULFILLMENT_KEYWORDS: dict[str, tuple[str, ...]] = {
     "printful": ("printful",),
+    "quartermaster": ("quartermaster",),
     "shipmonk": ("shipmonk",),
     "omnipack": ("omnipack",),
 }
@@ -418,7 +419,7 @@ def build_woo_sales_vs_processor_check(
     notes = []
     if processors:
         notes.append(f"Processor-side sales included: {', '.join(processors)}.")
-    effective_groups, _, matched_processors_by_key = planned_sales_groups(
+    effective_groups, _, matched_processors_by_key, _ = planned_sales_groups(
         records.get("sales", []),
         base_currency=base_currency,
         amount_tolerance=amount_threshold,

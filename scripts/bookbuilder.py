@@ -22,6 +22,7 @@ PROCESSOR_KEYWORDS: dict[str, tuple[str, ...]] = {
 
 FULFILLMENT_KEYWORDS: dict[str, tuple[str, ...]] = {
     "printful": ("printful",),
+    "quartermaster": ("quartermaster",),
     "shipmonk": ("shipmonk",),
     "omnipack": ("omnipack",),
 }
@@ -48,14 +49,21 @@ COUNTERPARTY_KEYWORDS: dict[str, tuple[str, ...]] = {
     "stripe": ("stripe",),
     "woo": ("woo", "webshop", "shop", "store"),
     "printful": ("printful",),
+    "quartermaster": ("quartermaster", "qmlogistics", "qmdirect"),
     "shipmonk": ("shipmonk",),
     "omnipack": ("omnipack",),
+}
+
+CONTACT_ALIASES: dict[str, tuple[str, ...]] = {
+    "omniva": ("AS Eesti Post", "Aktsiaselts Eesti Post", "Eesti Post"),
 }
 
 CONTACT_FALLBACKS: dict[str, tuple[str, ...]] = {
     "paypal": ("stripe",),
     "woo": ("stripe", "paypal"),
 }
+
+ONLINE_SALES_CHANNELS = {"woo", "quartermaster"}
 
 DEFAULT_ACTION_STATUS = {
     "executed_at": None,
@@ -344,6 +352,37 @@ def merge_mapping_hints(
     return merged
 
 
+def unique_labels(values: list[str]) -> tuple[str, ...]:
+    labels: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        label = str(value or "").strip()
+        if not label:
+            continue
+        normalized = normalize_text(label)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        labels.append(label)
+    return tuple(labels)
+
+
+def contact_candidate_labels(
+    *,
+    group_label: str,
+    records: list[dict[str, Any]] | None = None,
+    extra_labels: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    labels = [group_label, *CONTACT_ALIASES.get(slugify(group_label), ()), *extra_labels]
+    for record in records or []:
+        attributes = record.get("attributes") or {}
+        labels.extend(
+            str(attributes.get(key) or "")
+            for key in ("vendor_name", "counterparty_name", "customer_name", "name")
+        )
+    return unique_labels(labels)
+
+
 def preferred_bank_account_id(
     company_profile: dict[str, Any] | None,
     entity_map: dict[str, Any] | None,
@@ -374,42 +413,60 @@ def preferred_contact_id(
     entity_map: dict[str, Any] | None,
     *,
     group_label: str,
+    candidate_labels: tuple[str, ...] = (),
 ) -> tuple[str | None, list[str]]:
     contacts = list((entity_map or {}).get("contacts") or [])
     if not contacts:
         return None, []
 
-    slug = slugify(group_label)
-    tokens = tuple(token for token in slug.split("-") if token)
-    include_keywords = COUNTERPARTY_KEYWORDS.get(slug, ()) + tokens
-    if not include_keywords:
-        include_keywords = (slug,)
+    for label in contact_candidate_labels(group_label=group_label, extra_labels=candidate_labels):
+        slug = slugify(label)
+        tokens = tuple(token for token in slug.split("-") if token)
+        include_keywords = COUNTERPARTY_KEYWORDS.get(slug, ()) + tokens
+        if not include_keywords:
+            include_keywords = (slug,)
 
-    contact_id, ambiguity_note = choose_entity(
-        contacts,
-        include_keywords=include_keywords,
-    )
+        contact_id, ambiguity_note = choose_entity(
+            contacts,
+            include_keywords=include_keywords,
+        )
+        if contact_id is None:
+            if ambiguity_note:
+                continue
+            continue
+        notes: list[str] = []
+        if label != group_label:
+            notes.append(f"Used contact mapping label {label!r} for {group_label!r}.")
+        if ambiguity_note:
+            notes.append(ambiguity_note)
+        return contact_id, notes
+
     notes: list[str] = []
-    if ambiguity_note:
-        notes.append(ambiguity_note)
-    if contact_id is None:
-        notes.append(f"No contact/client mapping matched {group_label!r}.")
-    return contact_id, notes
+    notes.append(f"No contact/client mapping matched {group_label!r}.")
+    return None, notes
 
 
 def preferred_contact_id_with_fallbacks(
     entity_map: dict[str, Any] | None,
     *,
     group_label: str,
+    candidate_labels: tuple[str, ...] = (),
     fallback_labels: tuple[str, ...] = (),
 ) -> tuple[str | None, list[str]]:
-    contact_id, contact_notes = preferred_contact_id(entity_map, group_label=group_label)
+    contact_id, contact_notes = preferred_contact_id(
+        entity_map,
+        group_label=group_label,
+        candidate_labels=candidate_labels,
+    )
     if contact_id is not None:
         return contact_id, contact_notes
 
     notes = [note for note in contact_notes if note != f"No contact/client mapping matched {group_label!r}."]
     for fallback_label in fallback_labels:
-        fallback_contact_id, fallback_notes = preferred_contact_id(entity_map, group_label=fallback_label)
+        fallback_contact_id, fallback_notes = preferred_contact_id(
+            entity_map,
+            group_label=fallback_label,
+        )
         if fallback_contact_id is None:
             continue
         notes.extend(
@@ -444,7 +501,7 @@ def preferred_mapping_hints(entity_map: dict[str, Any] | None) -> dict[str, tupl
     )
     fulfillment_id, fulfillment_note = choose_entity(
         financial_accounts,
-        include_keywords=("fulfillment", "shipping", "postage", "logistics", "printful", "shipmonk", "omnipack", "warehouse"),
+        include_keywords=("fulfillment", "shipping", "postage", "logistics", "printful", "quartermaster", "shipmonk", "omnipack", "warehouse"),
     )
     standard_vat_id, standard_vat_note = choose_entity(
         vat_types,
@@ -479,11 +536,17 @@ def standard_online_sales_mapping(
     entity_map: dict[str, Any] | None,
     *,
     profile_name: str,
+    default_warehouse_keywords: tuple[str, ...] = ("printful", "eu"),
 ) -> dict[str, tuple[str | None, list[str]]]:
     entity_map = entity_map or {}
     financial_accounts = list(entity_map.get("financial_accounts") or [])
     vat_types = list(entity_map.get("vat_types") or [])
     warehouses = list(entity_map.get("warehouses") or [])
+    default_warehouse_id = (
+        find_entity_id(warehouses, include_keywords=default_warehouse_keywords)
+        if default_warehouse_keywords
+        else None
+    )
 
     if profile_name == "taxable":
         return {
@@ -507,7 +570,7 @@ def standard_online_sales_mapping(
                 ),
                 [],
             ),
-            "default_warehouse": (find_entity_id(warehouses, include_keywords=("printful", "eu")), []),
+            "default_warehouse": (default_warehouse_id, []),
         }
 
     return {
@@ -521,7 +584,7 @@ def standard_online_sales_mapping(
             find_entity_id(vat_types, include_keywords=("0%", "teenuste", "eksport"), is_sales=True, vat_percent=0),
             [],
         ),
-        "default_warehouse": (find_entity_id(warehouses, include_keywords=("printful", "eu")), []),
+        "default_warehouse": (default_warehouse_id, []),
     }
 
 
@@ -926,6 +989,21 @@ def payment_action_key(
     return candidate_key
 
 
+def idempotency_suffix(
+    *,
+    group_label: str,
+    currency: str,
+    repeated_labels: set[str],
+    extra_suffix: str | None = None,
+) -> str:
+    parts = [slugify(group_label)]
+    if group_label in repeated_labels:
+        parts.append(slugify(currency))
+    if extra_suffix:
+        parts.append(slugify(extra_suffix))
+    return "-".join(part for part in parts if part)
+
+
 def processor_group_for_record(record: dict[str, Any]) -> str | None:
     return infer_processor(record)
 
@@ -935,7 +1013,12 @@ def planned_sales_groups(
     *,
     base_currency: str,
     amount_tolerance: Decimal | None = None,
-) -> tuple[dict[tuple[str, str], list[dict[str, Any]]], dict[tuple[str, str], list[str]], dict[tuple[str, str], list[str]]]:
+) -> tuple[
+    dict[tuple[str, str], list[dict[str, Any]]],
+    dict[tuple[str, str], list[str]],
+    dict[tuple[str, str], list[str]],
+    dict[tuple[str, str], tuple[str, str]],
+]:
     tolerance = TOLERANCE if amount_tolerance is None else amount_tolerance
     grouped_sales: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for record in records:
@@ -944,6 +1027,7 @@ def planned_sales_groups(
 
     review_notes_by_key: dict[tuple[str, str], list[str]] = defaultdict(list)
     matched_processors_by_key: dict[tuple[str, str], list[str]] = defaultdict(list)
+    posting_basis_by_suppressed_key: dict[tuple[str, str], tuple[str, str]] = {}
     keep_keys = set(grouped_sales)
 
     grouped_by_currency: dict[str, dict[str, dict[tuple[str, str], list[dict[str, Any]]]]] = defaultdict(
@@ -973,15 +1057,17 @@ def planned_sales_groups(
         )
         for key in processor_groups:
             keep_keys.discard(key)
+            posting_basis_by_suppressed_key[key] = merchant_key
 
     planned = {key: grouped_sales[key] for key in sorted(keep_keys)}
-    return planned, review_notes_by_key, matched_processors_by_key
+    return planned, review_notes_by_key, matched_processors_by_key, posting_basis_by_suppressed_key
 
 
 def resolve_sales_contact_id(
     entity_map: dict[str, Any] | None,
     *,
     group_label: str,
+    records: list[dict[str, Any]],
     matched_processor_labels: list[str],
 ) -> tuple[str | None, list[str]]:
     ordered_fallbacks: list[str] = []
@@ -994,6 +1080,7 @@ def resolve_sales_contact_id(
     return preferred_contact_id_with_fallbacks(
         entity_map,
         group_label=group_label,
+        candidate_labels=contact_candidate_labels(group_label=group_label, records=records),
         fallback_labels=tuple(ordered_fallbacks),
     )
 
@@ -1153,7 +1240,15 @@ def build_sales_actions(
     actions: list[dict[str, Any]] = []
     action_ids: dict[tuple[str, str], str] = {}
     action_ids_by_currency: dict[str, list[str]] = defaultdict(list)
-    grouped_sales, planned_notes, matched_processors = planned_sales_groups(records.get("sales", []), base_currency=base_currency)
+    grouped_sales, planned_notes, matched_processors, posting_basis_by_suppressed_key = planned_sales_groups(
+        records.get("sales", []),
+        base_currency=base_currency,
+    )
+    repeated_sales_labels = {
+        label
+        for label, count in Counter(group_label for group_label, _currency in grouped_sales).items()
+        if count > 1
+    }
 
     for (group_label, currency), group_records in sorted(grouped_sales.items()):
         grouped_by_profile = {
@@ -1171,8 +1266,13 @@ def build_sales_actions(
 
             profile_mapping_hints = mapping_hints
             online_sales_override_applied = False
-            if slugify(group_label) == "woo":
-                online_sales_override = standard_online_sales_mapping(entity_map, profile_name=profile_name)
+            if slugify(group_label) in ONLINE_SALES_CHANNELS:
+                default_warehouse_keywords = ("printful", "eu") if slugify(group_label) == "woo" else ()
+                online_sales_override = standard_online_sales_mapping(
+                    entity_map,
+                    profile_name=profile_name,
+                    default_warehouse_keywords=default_warehouse_keywords,
+                )
                 online_sales_override_applied = any(
                     value[0]
                     for key, value in online_sales_override.items()
@@ -1193,6 +1293,7 @@ def build_sales_actions(
             contact_id, contact_notes = resolve_sales_contact_id(
                 entity_map,
                 group_label=group_label,
+                records=profile_records,
                 matched_processor_labels=matched_processor_labels,
             )
             review_notes.extend(contact_notes)
@@ -1204,9 +1305,12 @@ def build_sales_actions(
                 review_notes.append(forced_note)
             review_notes.append(record_count_note(profile_records))
 
-            action_key_suffix = slugify(group_label)
-            if split_profiles:
-                action_key_suffix = f"{action_key_suffix}-{profile_name.replace('_', '-')}"
+            action_key_suffix = idempotency_suffix(
+                group_label=group_label,
+                currency=currency,
+                repeated_labels=repeated_sales_labels,
+                extra_suffix=profile_name.replace("_", "-") if split_profiles else None,
+            )
             idempotency_key = f"{company_slug}-{period}-sales-{action_key_suffix}"
             payload = {
                 "draft_schema": "invoice_summary_v1",
@@ -1255,20 +1359,56 @@ def build_sales_actions(
             action_ids[(group_label, currency)] = action_ids_by_currency[currency][-1]
 
     grouped_refunds: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    refund_evidence_labels: dict[tuple[str, str], set[str]] = defaultdict(set)
     for record in records.get("refunds", []):
-        key = (record_group_label(record, default="refunds"), record_currency(record, base_currency))
-        grouped_refunds[key].append(record)
+        evidence_key = (record_group_label(record, default="refunds"), record_currency(record, base_currency))
+        posting_key = posting_basis_by_suppressed_key.get(evidence_key, evidence_key)
+        grouped_refunds[posting_key].append(record)
+        if posting_key != evidence_key:
+            refund_evidence_labels[posting_key].add(evidence_key[0])
+
+    repeated_refund_labels = {
+        label
+        for label, count in Counter(group_label for group_label, _currency in grouped_refunds).items()
+        if count > 1
+    }
 
     for (group_label, currency), group_records in sorted(grouped_refunds.items()):
         shipping_total = sum_abs_amount(group_records, "shipping_amount")
+        refund_mapping_hints = mapping_hints
+        online_sales_override_applied = False
+        if slugify(group_label) in ONLINE_SALES_CHANNELS:
+            default_warehouse_keywords = ("printful", "eu") if slugify(group_label) == "woo" else ()
+            online_sales_override = standard_online_sales_mapping(
+                entity_map,
+                profile_name="taxable" if any(taxable_profile(record) == "taxable" for record in group_records) else "non_taxable",
+                default_warehouse_keywords=default_warehouse_keywords,
+            )
+            online_sales_override_applied = any(
+                value[0]
+                for key, value in online_sales_override.items()
+                if key in {"revenue_account", "shipping_account"}
+            )
+            refund_mapping_hints = merge_mapping_hints(mapping_hints, online_sales_override)
         lines, review_notes = build_sales_lines(
             records=group_records,
             group_label=group_label,
             direction="refund",
-            shipping_split=policy_prefers_shipping_split(policy_text, shipping_total),
-            mapping_hints=mapping_hints,
+            shipping_split=policy_prefers_shipping_split(policy_text, shipping_total)
+            or (online_sales_override_applied and shipping_total != 0),
+            mapping_hints=refund_mapping_hints,
         )
-        contact_id, contact_notes = preferred_contact_id(entity_map, group_label=group_label)
+        evidence_labels = sorted(refund_evidence_labels.get((group_label, currency), set()))
+        if evidence_labels:
+            review_notes.append(
+                f"Processor-side refund evidence from {', '.join(evidence_labels)} was posted using {group_label} sales mapping."
+            )
+        contact_id, contact_notes = resolve_sales_contact_id(
+            entity_map,
+            group_label=group_label,
+            records=group_records,
+            matched_processor_labels=evidence_labels,
+        )
         review_notes.extend(contact_notes)
         if forced_note:
             review_notes.append(forced_note)
@@ -1281,7 +1421,12 @@ def build_sales_actions(
         else:
             depends_on.extend(action_ids_by_currency.get(currency, []))
 
-        idempotency_key = f"{company_slug}-{period}-refund-{slugify(group_label)}"
+        action_key_suffix = idempotency_suffix(
+            group_label=group_label,
+            currency=currency,
+            repeated_labels=repeated_refund_labels,
+        )
+        idempotency_key = f"{company_slug}-{period}-refund-{action_key_suffix}"
         payload = {
             "draft_schema": "invoice_summary_v1",
             "document_type": "credit_note",
@@ -1304,7 +1449,7 @@ def build_sales_actions(
         }
         confidence = review_confidence(
             notes=review_notes,
-            required_ids=[mapping_hints["revenue_account"][0]],
+            required_ids=[refund_mapping_hints["revenue_account"][0]],
         )
         actions.append(
             make_action(
@@ -1356,6 +1501,11 @@ def build_fee_actions(
             grouped_embedded[key].append(record)
 
     all_keys = sorted(set(grouped_explicit) | set(grouped_embedded))
+    repeated_fee_labels = {
+        label
+        for label, count in Counter(group_label for group_label, _currency in all_keys).items()
+        if count > 1
+    }
     fee_account_id, fee_account_notes = mapping_hints["fee_account"]
     standard_vat_type_id, standard_vat_notes = mapping_hints["standard_vat_type"]
 
@@ -1366,6 +1516,10 @@ def build_fee_actions(
         contact_id, contact_notes = preferred_contact_id_with_fallbacks(
             entity_map,
             group_label=group_label,
+            candidate_labels=contact_candidate_labels(
+                group_label=group_label,
+                records=[*explicit_records, *embedded_records],
+            ),
             fallback_labels=fallback_labels,
         )
         if explicit_records:
@@ -1387,7 +1541,12 @@ def build_fee_actions(
             review_notes.append(forced_note)
         review_notes.append(record_count_note(source_records))
 
-        idempotency_key = f"{company_slug}-{period}-fees-{slugify(group_label)}"
+        action_key_suffix = idempotency_suffix(
+            group_label=group_label,
+            currency=currency,
+            repeated_labels=repeated_fee_labels,
+        )
+        idempotency_key = f"{company_slug}-{period}-fees-{action_key_suffix}"
         payload = {
             "draft_schema": "purchase_summary_v1",
             "document_type": "purchase",
@@ -1452,6 +1611,11 @@ def build_purchase_actions(
     for record in records.get("purchase_expenses", []):
         key = (record_group_label(record, default="expenses"), record_currency(record, base_currency))
         grouped[key].append(record)
+    repeated_purchase_labels = {
+        label
+        for label, count in Counter(group_label for group_label, _currency in grouped).items()
+        if count > 1
+    }
 
     expense_account_id, expense_account_notes = mapping_hints["fulfillment_account"]
     standard_vat_type_id, standard_vat_notes = mapping_hints["standard_vat_type"]
@@ -1461,7 +1625,11 @@ def build_purchase_actions(
     printful_storage_account_id, printful_storage_vat_type_id = printful_storage_mapping(entity_map)
 
     for (group_label, currency), group_records in sorted(grouped.items()):
-        contact_id, contact_notes = preferred_contact_id(entity_map, group_label=group_label)
+        contact_id, contact_notes = preferred_contact_id(
+            entity_map,
+            group_label=group_label,
+            candidate_labels=contact_candidate_labels(group_label=group_label, records=group_records),
+        )
         review_notes = list(expense_account_notes + standard_vat_notes + zero_vat_notes + contact_notes)
         if forced_note:
             review_notes.append(forced_note)
@@ -1483,6 +1651,16 @@ def build_purchase_actions(
                         printful_storage_vat_type_id or zero_vat_type_id or "",
                         "Storage fee for warehoused products",
                     )
+            elif group_label in FULFILLMENT_KEYWORDS:
+                bucket = (
+                    expense_account_id or generic_expense_account_id or "",
+                    (
+                        domestic_purchase_vat_type_id or standard_vat_type_id or ""
+                        if taxable_profile(record) == "taxable"
+                        else no_vat_purchase_vat_type_id or zero_vat_type_id or ""
+                    ),
+                    f"{group_label} fulfillment cost summary",
+                )
             else:
                 bucket = (
                     generic_expense_account_id or expense_account_id or "",
@@ -1520,7 +1698,12 @@ def build_purchase_actions(
         if len(summarize_warehouses(group_records)) > 1:
             review_notes.append("Multiple warehouse IDs appear in this expense action.")
 
-        idempotency_key = f"{company_slug}-{period}-purchase-{slugify(group_label)}"
+        action_key_suffix = idempotency_suffix(
+            group_label=group_label,
+            currency=currency,
+            repeated_labels=repeated_purchase_labels,
+        )
+        idempotency_key = f"{company_slug}-{period}-purchase-{action_key_suffix}"
         payload = {
             "draft_schema": "purchase_summary_v1",
             "document_type": "purchase",
@@ -1588,6 +1771,11 @@ def build_incoming_actions(
             continue
         key = (record_group_label(record, default="receipts"), record_currency(record, base_currency))
         grouped_bank[key].append(record)
+    repeated_incoming_labels = {
+        label
+        for label, count in Counter(group_label for group_label, _currency in grouped_payouts).items()
+        if count > 1
+    }
 
     for (group_label, currency), payout_records in sorted(grouped_payouts.items()):
         payout_total = sum_amount(payout_records, "gross_amount")
@@ -1599,6 +1787,10 @@ def build_incoming_actions(
         contact_id, contact_notes = preferred_contact_id_with_fallbacks(
             entity_map,
             group_label=group_label,
+            candidate_labels=contact_candidate_labels(
+                group_label=group_label,
+                records=[*payout_records, *bank_records],
+            ),
             fallback_labels=fallback_labels,
         )
         review_notes = list(bank_account_notes + contact_notes)
@@ -1619,7 +1811,12 @@ def build_incoming_actions(
             depends_on.append(fee_action_ids[(group_label, currency)])
         depends_on = list(dict.fromkeys(depends_on))
 
-        idempotency_key = f"{company_slug}-{period}-incoming-{slugify(group_label)}"
+        action_key_suffix = idempotency_suffix(
+            group_label=group_label,
+            currency=currency,
+            repeated_labels=repeated_incoming_labels,
+        )
+        idempotency_key = f"{company_slug}-{period}-incoming-{action_key_suffix}"
         payload = {
             "draft_schema": "cash_settlement_v1",
             "document_type": "incoming",
@@ -1753,7 +1950,11 @@ def build_payment_actions(
             )
 
         for candidate, allocated_amount in zip(matched_candidates, allocated_amounts, strict=True):
-            contact_id, contact_notes = preferred_contact_id(entity_map, group_label=group_label)
+            contact_id, contact_notes = preferred_contact_id(
+                entity_map,
+                group_label=group_label,
+                candidate_labels=contact_candidate_labels(group_label=group_label, records=bank_records),
+            )
             if contact_id in (None, "") and candidate.get("contact_id") not in (None, ""):
                 contact_id = str(candidate["contact_id"])
                 contact_notes = list(contact_notes) + [

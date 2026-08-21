@@ -140,3 +140,12 @@ python3 scripts/booksend.py \
   --mode dry-run \
   --output companies/example/artifacts/submissions/2024-01.json
 ```
+
+Full-year dry run:
+
+```bash
+.venv/bin/python scripts/full_year_dry_run.py \
+  --company-dir companies/example \
+  --year 2024 \
+  --source-dir companies/example/source
+```

@@ -283,6 +283,45 @@ class BookreconTests(unittest.TestCase):
         self.assertEqual(usd_check["status"], "pass")
         self.assertEqual(eur_check["status"], "warn")
 
+    def test_quartermaster_is_recognized_as_fulfillment_partner(self) -> None:
+        normalized = base_normalized("2024-10")
+        normalized["records"]["purchase_expenses"].append(
+            record(
+                record_id="quartermaster:expense",
+                source_system="quartermaster",
+                channel="quartermaster",
+                event_type="quartermaster_service_invoice",
+                gross_amount=21.0,
+                description="Quartermaster storage invoice",
+                currency="USD",
+            )
+        )
+        normalized["records"]["bank_transactions"].append(
+            record(
+                record_id="quartermaster:bank",
+                source_system="bank",
+                channel="quartermaster",
+                event_type="bank_debit",
+                gross_amount=-21.0,
+                description="Quartermaster payment",
+                currency="USD",
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            document = bookrecon.build_recon_document(
+                normalized_payload=normalized,
+                normalized_path=Path(tmp) / "2024-10.json",
+                repo_root=Path(tmp),
+                amount_threshold=bookrecon.Decimal("0.5"),
+                quantity_threshold=bookrecon.Decimal("1"),
+            )
+
+        check = find_check(document, "fulfillment-expenses-vs-bank:quartermaster:usd")
+        self.assertEqual(check["status"], "pass")
+        self.assertEqual(check["lhs_amount"], 21.0)
+        self.assertEqual(check["rhs_amount"], 21.0)
+
 
 if __name__ == "__main__":
     unittest.main()

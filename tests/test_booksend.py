@@ -304,6 +304,68 @@ class BooksendTests(unittest.TestCase):
         self.assertEqual(submission["request_log"][0]["endpoint"], "payments/create")
         self.assertEqual(submission["request_log"][0]["payload"]["purchase_id"], 712)
 
+    def test_run_submission_reports_only_current_run_api_calls_on_rerun(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            company_dir = tmp / "companies" / "example"
+            actions_dir = company_dir / "artifacts" / "actions"
+            submissions_dir = company_dir / "artifacts" / "submissions"
+            actions_dir.mkdir(parents=True)
+            submissions_dir.mkdir(parents=True)
+
+            action_path = actions_dir / "2024-01.yaml"
+            batch = make_batch(approval_status="draft")
+            booksend.write_yaml(action_path, batch)
+            action_sha = booksend.file_sha256(action_path)
+            (actions_dir / "2024-01.check.md").write_text(
+                "\n".join(
+                    [
+                        "- Result: `pass`",
+                        f"- Batch ID: `{batch['batch_id']}`",
+                        f"- Action file SHA256: `{action_sha}`",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            first = booksend.run_submission(
+                period="2024-01",
+                company_dir=company_dir,
+                company_id=None,
+                action_override=None,
+                check_override=None,
+                output_override=None,
+                request_log_override=None,
+                token_file=".apikey",
+                mode="dry-run",
+                confirm_write=False,
+                continue_on_error=False,
+                cwd=tmp,
+            )
+            second = booksend.run_submission(
+                period="2024-01",
+                company_dir=company_dir,
+                company_id=None,
+                action_override=None,
+                check_override=None,
+                output_override=None,
+                request_log_override=None,
+                token_file=".apikey",
+                mode="dry-run",
+                confirm_write=False,
+                continue_on_error=False,
+                cwd=tmp,
+            )
+
+            submission = booksend.load_json(submissions_dir / "2024-01.json")
+
+        self.assertEqual(len(first["api_calls"]), 2)
+        self.assertEqual(len(second["api_calls"]), 2)
+        self.assertEqual(len(submission["request_log"]), 4)
+        self.assertEqual(second["api_calls"][0]["endpoint"], "invoices/create")
+        self.assertEqual(second["api_calls"][1]["endpoint"], "incomings/create")
+
     def test_load_prior_action_lookup_reads_earlier_action_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)

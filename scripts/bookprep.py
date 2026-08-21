@@ -40,8 +40,32 @@ SOURCE_TYPE_PRIORITY = {
 
 ROW_EVENT_HEADERS = {
     "woo_sales_csv": {"date", "orders", "gross sales", "returns", "coupons", "net sales", "taxes", "shipping", "total sales"},
+    "woo_monthly_sales_csv": {
+        "date",
+        "number of items sold",
+        "number of orders",
+        "average net sales amount",
+        "coupon amount",
+        "shipping amount",
+        "gross sales amount",
+        "net sales amount",
+        "refund amount",
+    },
     "paypal_csv": {"date", "time", "timezone", "name", "type", "status", "currency", "gross", "fee", "net", "transaction id"},
     "stripe_balance_csv": {"id", "type", "source", "amount", "fee", "net", "currency", "created (utc)", "available on (utc)"},
+    "quartermaster_orders_csv": {
+        "referenceid",
+        "qmlorderid",
+        "email",
+        "name",
+        "status",
+        "ordertype",
+        "carrier",
+        "shippingtype",
+        "trackingnumber",
+        "datesubmitted",
+        "dateshipped",
+    },
     "printful_orders_csv": {
         "date",
         "order",
@@ -85,6 +109,7 @@ class SourceDescriptor:
     canonical: bool = False
     parser_notes: list[str] = field(default_factory=list)
     preferred_over: list[str] = field(default_factory=list)
+    context: dict[str, Any] = field(default_factory=dict)
 
     @property
     def priority(self) -> int:
@@ -167,6 +192,8 @@ def infer_source_system(path: Path, source_type: str, header_names: set[str] | N
         return "paypal"
     if "stripe" in normalized or headers >= ROW_EVENT_HEADERS["stripe_balance_csv"]:
         return "stripe"
+    if "quartermaster" in normalized or "qm_sales" in normalized or headers >= ROW_EVENT_HEADERS["quartermaster_orders_csv"]:
+        return "quartermaster"
     if (
         "printful" in normalized
         or "billing-report" in normalized
@@ -180,7 +207,12 @@ def infer_source_system(path: Path, source_type: str, header_names: set[str] | N
         return "printful"
     if "simplbooks" in normalized:
         return "simplbooks"
-    if "muugiraport" in normalized or "sales report" in normalized or headers >= ROW_EVENT_HEADERS["woo_sales_csv"]:
+    if (
+        "muugiraport" in normalized
+        or "sales report" in normalized
+        or headers >= ROW_EVENT_HEADERS["woo_sales_csv"]
+        or headers >= ROW_EVENT_HEADERS["woo_monthly_sales_csv"]
+    ):
         return "woo"
     if "kontovv" in normalized or source_type == "xml" or headers >= ROW_EVENT_HEADERS["bank_csv"]:
         return "bank"
@@ -193,6 +225,12 @@ def infer_pdf_source_system(text: str, fallback: str) -> str:
     normalized = normalize_ascii(text).lower()
     if "stripe payments europe" in normalized or "stripe processing fees" in normalized:
         return "stripe"
+    if "quartermaster direct" in normalized or "qml picking fee" in normalized:
+        return "quartermaster"
+    if "quartermaster logistics llc" in normalized and (
+        "invoice total" in normalized or "invoice due date" in normalized or "sales report" in normalized
+    ):
+        return "quartermaster"
     if "printful inc" in normalized or "vat report" in normalized:
         return "printful"
     if "simplbooks" in normalized:
@@ -201,7 +239,7 @@ def infer_pdf_source_system(text: str, fallback: str) -> str:
 
 
 def is_ignored_work_file(path: Path) -> bool:
-    return path.suffix.lower() == ".gsheet"
+    return path.suffix.lower() in {".gsheet", ".md"}
 
 
 def parse_decimal(value: Any) -> Decimal:
@@ -227,6 +265,7 @@ def parse_date_value(value: str) -> date:
     text = re.sub(r"\s+", " ", str(value).strip().replace("\ufeff", ""))
     for fmt in (
         "%Y-%m-%d",
+        "%Y.%m.%d",
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%d %H:%M",
         "%d/%m/%Y",
@@ -256,6 +295,18 @@ def sha256_file(path: Path) -> str:
 
 def parse_filename_dates(path: Path) -> tuple[date, date] | None:
     name = normalize_ascii(path.name)
+
+    quartermaster_sales_match = re.search(r"qm_sales_(\d{1,2})(?!\d)", normalize_ascii(path.stem).lower())
+    if quartermaster_sales_match:
+        month = int(quartermaster_sales_match.group(1))
+        year = None
+        for parent in path.parents:
+            parent_match = re.search(r"(20\d{2})", normalize_ascii(parent.name))
+            if parent_match:
+                year = int(parent_match.group(1))
+                break
+        if year is not None and 1 <= month <= 12:
+            return date(year, month, 1), date(year, month, monthrange(year, month)[1])
 
     date_match = re.search(r"(20\d{2})[-_.](\d{2})[-_.](\d{2})", name)
     if date_match:
@@ -364,6 +415,9 @@ def detect_parser(path: Path, source_type: str, source_system: str, header_names
         return "parse_paypal_csv"
     if source_type == "csv" and source_system == "stripe":
         return "parse_stripe_balance_csv"
+    if source_type == "csv" and source_system == "quartermaster":
+        if headers >= ROW_EVENT_HEADERS["quartermaster_orders_csv"]:
+            return "parse_quartermaster_orders_csv"
     if source_type == "csv" and source_system == "printful":
         if headers >= ROW_EVENT_HEADERS["printful_orders_csv"]:
             return "parse_printful_orders_csv"
@@ -380,6 +434,8 @@ def detect_parser(path: Path, source_type: str, source_system: str, header_names
     if source_type == "pdf":
         if source_system == "stripe":
             return "parse_stripe_invoice_pdf"
+        if source_system == "quartermaster":
+            return "parse_quartermaster_pdf"
         if source_system == "printful":
             return "parse_printful_pdf"
         return "parse_purchase_invoice_pdf"
@@ -457,6 +513,154 @@ def inspect_source_file(
     if not descriptor.overlaps(period_start, period_end):
         return None
     return descriptor
+
+
+def parse_purchase_note_entries(text: str) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    blocks = [block.strip() for block in re.split(r"\n\s*\n", text) if block.strip()]
+    for block in blocks:
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if len(lines) < 2:
+            continue
+        heading = lines[0]
+        match = re.fullmatch(r"(\d{4}\.\d{2}\.\d{2})\s+([^:]+):", heading)
+        if not match:
+            continue
+        event_date = parse_date_value(match.group(1))
+        label = match.group(2).strip()
+        body = " ".join(lines[1:]).strip()
+        if not body:
+            continue
+        entries.append(
+            {
+                "event_date": event_date,
+                "label": label,
+                "body": body,
+            }
+        )
+    return entries
+
+
+def purchase_note_tokens(label: str) -> list[str]:
+    stopwords = {"by", "paid", "vat"}
+    tokens = []
+    for token in re.findall(r"[A-Za-z0-9]+", normalize_ascii(label).lower()):
+        if token in stopwords:
+            continue
+        if len(token) == 1:
+            continue
+        tokens.append(token)
+    return tokens
+
+
+def match_purchase_note_target(readme_path: Path, event_date: date, label: str) -> Path | None:
+    candidates = [
+        path
+        for path in sorted(readme_path.parent.iterdir())
+        if path.is_file() and path != readme_path and path.suffix.lower() != ".md"
+    ]
+    date_token = event_date.strftime("%Y.%m.%d")
+    tokens = purchase_note_tokens(label)
+    best_score = 0
+    best_path: Path | None = None
+    for candidate in candidates:
+        stem = normalize_ascii(candidate.stem).lower().replace("_", " ")
+        score = 0
+        if date_token in candidate.stem:
+            score += 10
+        for token in tokens:
+            if token in stem:
+                score += 3
+        if score > best_score:
+            best_score = score
+            best_path = candidate
+    return best_path if best_score >= 10 else None
+
+
+def parse_purchase_note_amounts(note_text: str) -> dict[str, Any] | None:
+    normalized = re.sub(r"\s+", " ", note_text.strip())
+    lower = normalize_ascii(normalized).lower()
+    amounts = [parse_decimal(value) for value in re.findall(r"([0-9]+(?:[.,][0-9]+)?)\s*€", normalized)]
+    if not amounts:
+        return None
+
+    gross_amount: Decimal | None = None
+    vat_amount = Decimal("0")
+    reverse_charge = "reverse-charg" in lower
+
+    explicit_total = re.search(r"=\s*([0-9]+(?:[.,][0-9]+)?)\s*€", normalized)
+    if explicit_total:
+        gross_amount = parse_decimal(explicit_total.group(1))
+
+    vat_match = re.search(r"\+\s*([0-9]+(?:[.,][0-9]+)?)\s*€\s*\(VAT\)", normalized, flags=re.IGNORECASE)
+    if vat_match:
+        vat_amount = parse_decimal(vat_match.group(1))
+        if gross_amount is None and len(amounts) >= 2:
+            gross_amount = amounts[0] + vat_amount
+    elif "vat 0%" in lower or reverse_charge:
+        vat_amount = Decimal("0")
+
+    if gross_amount is None:
+        if vat_amount != 0 and len(amounts) >= 2:
+            gross_amount = amounts[0] + vat_amount
+        else:
+            gross_amount = amounts[-1]
+
+    net_amount = gross_amount - vat_amount
+    return {
+        "gross_amount": gross_amount,
+        "net_amount": net_amount,
+        "vat_amount": vat_amount,
+        "reverse_charge": reverse_charge,
+    }
+
+
+def inspect_purchase_note_markdown(
+    *,
+    path: Path,
+    root_dir: Path,
+    period_start: date,
+    period_end: date,
+) -> list[SourceDescriptor]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return []
+
+    descriptors: list[SourceDescriptor] = []
+    for entry in parse_purchase_note_entries(text):
+        event_date = entry["event_date"]
+        if event_date < period_start or event_date > period_end:
+            continue
+        target_path = match_purchase_note_target(path, event_date, entry["label"])
+        if target_path is None:
+            continue
+        amount_data = parse_purchase_note_amounts(entry["body"])
+        if amount_data is None:
+            continue
+        target_display = display_path(target_path, root_dir)
+        descriptor = SourceDescriptor(
+            path=path,
+            rel_path=f"{display_path(path, root_dir)}#{target_path.name}",
+            source_id=f"{source_id_for_path(path, root_dir=root_dir)}-{slugify(target_path.stem)}",
+            source_type="manual",
+            source_system="manual",
+            covered_from=event_date,
+            covered_until=event_date,
+            canonical_group=canonical_group_for_path(target_path),
+            parser_name="parse_purchase_note_markdown",
+            parser_notes=[f"Manual purchase note covering {target_display}."],
+            context={
+                "event_date": event_date.isoformat(),
+                "label": entry["label"],
+                "body": entry["body"],
+                "target_path": target_display,
+                "target_source_id": source_id_for_path(target_path, root_dir=root_dir),
+                **amount_data,
+            },
+        )
+        descriptors.append(descriptor)
+    return descriptors
 
 
 def choose_canonical_sources(sources: list[SourceDescriptor]) -> list[SourceDescriptor]:
@@ -619,20 +823,43 @@ def parse_woo_sales_csv(
     exceptions: list[dict[str, Any]] = []
     seen_dates: list[date] = []
 
+    def parse_woo_row_date(value: str) -> tuple[date, date]:
+        text = str(value).strip().replace("\ufeff", "")
+        if re.fullmatch(r"\d{4}-\d{1,2}", text):
+            year_text, month_text = text.split("-", 1)
+            year = int(year_text)
+            month = int(month_text)
+            return date(year, month, 1), date(year, month, monthrange(year, month)[1])
+        parsed = parse_date_value(text)
+        return parsed, parsed
+
     for line_no, row in enumerate(rows, start=2):
-        event_date = parse_date_value(row["Date"])
-        if event_date < period_start or event_date > period_end:
+        row_start, row_end = parse_woo_row_date(row["Date"])
+        if not periods_overlap(row_start, row_end, period_start, period_end):
             continue
+        event_date = row_end
         seen_dates.append(event_date)
 
-        gross_sales = parse_decimal(row.get("Gross sales"))
-        returns = parse_decimal(row.get("Returns"))
-        coupons = parse_decimal(row.get("Coupons"))
-        net_sales = parse_decimal(row.get("Net sales"))
-        taxes = parse_decimal(row.get("Taxes"))
-        shipping = parse_decimal(row.get("Shipping"))
-        total_sales = parse_decimal(row.get("Total sales"))
-        orders = parse_decimal(row.get("Orders"))
+        if row.get("Gross sales") not in (None, "") or row.get("Total sales") not in (None, ""):
+            gross_sales = parse_decimal(row.get("Gross sales"))
+            returns = parse_decimal(row.get("Returns"))
+            coupons = parse_decimal(row.get("Coupons"))
+            net_sales = parse_decimal(row.get("Net sales"))
+            taxes = parse_decimal(row.get("Taxes"))
+            shipping = parse_decimal(row.get("Shipping"))
+            total_sales = parse_decimal(row.get("Total sales"))
+            orders = parse_decimal(row.get("Orders"))
+            quantity = None
+        else:
+            gross_sales = parse_decimal(row.get("Gross sales amount"))
+            returns = parse_decimal(row.get("Refund amount"))
+            coupons = parse_decimal(row.get("Coupon amount"))
+            net_sales = parse_decimal(row.get("Net sales amount"))
+            shipping = parse_decimal(row.get("Shipping amount"))
+            total_sales = gross_sales
+            taxes = total_sales - net_sales - shipping + returns
+            orders = parse_decimal(row.get("Number of orders"))
+            quantity = parse_decimal(row.get("Number of items sold"))
 
         if total_sales == 0 and orders == 0 and gross_sales == 0 and returns == 0:
             continue
@@ -643,7 +870,7 @@ def parse_woo_sales_csv(
             record_id=f"{source.source_id}:sales:{line_no}",
             event_type="woo_daily_sales",
             event_date=event_date,
-            description=f"Woo daily sales summary {event_date.isoformat()}",
+            description=f"Woo sales summary {event_date.isoformat()}",
             currency=base_currency,
             gross_amount=total_sales,
             net_amount=net_sales,
@@ -651,6 +878,7 @@ def parse_woo_sales_csv(
             shipping_amount=shipping,
             external_ref=event_date.isoformat(),
             channel="woo",
+            quantity=quantity,
             attributes={
                 "orders": int(orders),
                 "gross_sales": float(gross_sales),
@@ -914,6 +1142,81 @@ def parse_stripe_balance_csv(
 
     update_coverage_from_dates(source, seen_dates)
     return result, exceptions
+
+
+def parse_quartermaster_date_value(value: str) -> date:
+    text = re.sub(r"\s+", " ", str(value).strip().replace("\ufeff", ""))
+    for fmt in (
+        "%m/%d/%Y",
+        "%m/%d/%Y %I:%M %p",
+        "%m/%d/%Y %H:%M",
+    ):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    raise SimplbooksError(f"Unsupported Quartermaster date format: {value!r}")
+
+
+def parse_quartermaster_orders_csv(
+    source: SourceDescriptor,
+    *,
+    period_start: date,
+    period_end: date,
+    base_currency: str,
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    rows, _ = read_csv_rows(source.path)
+    result = parser_result()
+    seen_dates: list[date] = []
+
+    for line_no, row in enumerate(rows, start=2):
+        submitted_text = row.get("DateSubmitted") or ""
+        shipped_text = row.get("DateShipped") or ""
+        if not submitted_text and not shipped_text:
+            continue
+
+        submitted_date = parse_quartermaster_date_value(submitted_text) if submitted_text else None
+        shipped_date = parse_quartermaster_date_value(shipped_text) if shipped_text else None
+        anchor_date = submitted_date or shipped_date
+        if anchor_date is None:
+            continue
+        if anchor_date < period_start or anchor_date > period_end:
+            continue
+        seen_dates.append(anchor_date)
+
+        reference_id = (row.get("ReferenceID") or "").strip()
+        qml_order_id = (row.get("QMLOrderID") or "").strip()
+        description_ref = reference_id or qml_order_id or f"line {line_no}"
+        category, record = make_record(
+            source=source,
+            category="other",
+            record_id=f"{source.source_id}:order:{line_no}",
+            event_type="quartermaster_order_history",
+            event_date=anchor_date,
+            settlement_date=shipped_date,
+            description=f"Quartermaster order history {description_ref}",
+            currency=base_currency,
+            gross_amount=Decimal("0"),
+            net_amount=Decimal("0"),
+            external_ref=reference_id or qml_order_id or None,
+            channel="quartermaster",
+            attributes={
+                "reference_id": reference_id or None,
+                "qml_order_id": qml_order_id or None,
+                "status": row.get("Status"),
+                "order_type": row.get("OrderType"),
+                "carrier": row.get("Carrier"),
+                "shipping_type": row.get("ShippingType"),
+                "tracking_number": row.get("TrackingNumber"),
+                "email": row.get("Email"),
+                "name": row.get("Name"),
+            },
+            row_ref=f"csv:{line_no}",
+        )
+        result[category].append(record)
+
+    update_coverage_from_dates(source, seen_dates)
+    return result, []
 
 
 def parse_bank_csv(
@@ -1422,7 +1725,13 @@ def parse_month_label_period(value: str) -> tuple[date, date]:
 
 
 def vendor_name_from_text(text: str, *, fallback: str) -> str:
-    provider = first_match(text, [r"Vedaja/Teenuse pakkuja:\s*([^;\n]+)"])
+    provider = first_match(
+        text,
+        [
+            r"Vedaja/Teenuse pakkuja:\s*([^;\n]+)",
+            r"\n(AS Eesti Post)\n",
+        ],
+    )
     if provider:
         return provider
 
@@ -1668,6 +1977,204 @@ def parse_stripe_invoice_pdf(
     return result, []
 
 
+def parse_quartermaster_pdf(
+    source: SourceDescriptor,
+    *,
+    period_start: date,
+    period_end: date,
+    base_currency: str,
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    result = parser_result()
+    exceptions: list[dict[str, Any]] = []
+    try:
+        pages = extract_pdf_pages(source.path)
+    except SimplbooksError as exc:
+        return result, [
+            make_pdf_dependency_exception(
+                source,
+                reason=str(exc),
+                suggested_follow_up="Install pypdf in .venv or provide Quartermaster reports in a structured export.",
+            )
+        ]
+
+    full_text = "\n".join(page for page in pages if page.strip())
+    if not full_text.strip():
+        return result, [
+            make_pdf_dependency_exception(
+                source,
+                reason="Quartermaster PDF did not yield readable text.",
+                suggested_follow_up="Provide the original text-based PDF or an OCR/structured copy of the Quartermaster document.",
+            )
+        ]
+
+    normalized = normalize_ascii(full_text).lower()
+
+    if "sales report" in normalized and "quartermaster direct" in normalized:
+        report_date_text = first_match(full_text, [r"Date\s+([0-9]{2}/[0-9]{2}/[0-9]{4})"])
+        report_number = first_match(full_text, [r"S\.R\.\s*No\.\s*([A-Z0-9-]+)"])
+        report_label = first_match(full_text, [r"This represents your sales report for ([A-Za-z]+\s+\d{4})"])
+        sold_match = re.search(
+            r"Sold\s+Copies\s+(\d+)\s+([0-9.,]+)\s+([0-9.,]+)",
+            full_text,
+            flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
+        )
+        fee_match = re.search(
+            r"Picking Fee.*?(\d+)\s+-?([0-9.,]+)\s+-([0-9.,]+)",
+            full_text,
+            flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
+        )
+        report_total_matches = re.findall(r"\$\s*([0-9,]+\.\d{2})", full_text)
+        if report_date_text is None or sold_match is None or fee_match is None:
+            return result, [
+                make_pdf_dependency_exception(
+                    source,
+                    reason="Quartermaster sales report PDF is missing a readable report date, sales total, or picking-fee line.",
+                    suggested_follow_up="Review the Quartermaster sales report layout or add another parser variant.",
+                )
+            ]
+
+        report_date = parse_quartermaster_date_value(report_date_text)
+        if report_date < period_start or report_date > period_end:
+            return result, []
+
+        sold_quantity = parse_decimal(sold_match.group(1))
+        sold_rate = parse_decimal(sold_match.group(2))
+        sold_amount = parse_decimal(sold_match.group(3))
+        fee_quantity = parse_decimal(fee_match.group(1))
+        fee_rate = abs(parse_decimal(fee_match.group(2)))
+        fee_amount = abs(parse_decimal(fee_match.group(3)))
+        report_total = parse_decimal(report_total_matches[-1]) if report_total_matches else None
+        report_scope = report_label or source_period_label(date(report_date.year, report_date.month, 1))
+
+        category, sales_record = make_record(
+            source=source,
+            category="sales",
+            record_id=f"{source.source_id}:sales:{report_number or report_date.isoformat()}",
+            event_type="quartermaster_sales_report",
+            event_date=report_date,
+            description=f"Quartermaster sales report for {report_scope}",
+            currency="USD",
+            gross_amount=sold_amount,
+            net_amount=sold_amount,
+            external_ref=report_number,
+            quantity=sold_quantity,
+            channel="quartermaster",
+            attributes={
+                "report_number": report_number,
+                "vendor_name": "Quartermaster Direct",
+                "unit_rate": float(sold_rate),
+                "report_scope": report_scope,
+                "report_total": float(report_total) if report_total is not None else None,
+            },
+            page_ref=page_ref_containing(pages, report_number),
+        )
+        result[category].append(sales_record)
+
+        category, fee_record = make_record(
+            source=source,
+            category="fees",
+            record_id=f"{source.source_id}:fees:{report_number or report_date.isoformat()}",
+            event_type="quartermaster_picking_fee",
+            event_date=report_date,
+            description=f"Quartermaster picking fees for {report_scope}",
+            currency="USD",
+            gross_amount=fee_amount,
+            net_amount=fee_amount,
+            fee_amount=fee_amount,
+            external_ref=report_number,
+            quantity=fee_quantity,
+            channel="quartermaster",
+            attributes={
+                "report_number": report_number,
+                "vendor_name": "Quartermaster Direct",
+                "unit_rate": float(fee_rate),
+                "report_scope": report_scope,
+            },
+            page_ref=page_ref_containing(pages, "Picking Fee"),
+        )
+        result[category].append(fee_record)
+
+        if report_total is not None and abs((sold_amount - fee_amount) - report_total) > Decimal("0.01"):
+            exceptions.append(
+                make_exception(
+                    source=source,
+                    exception_id=f"{source.source_id}:sales-report-total",
+                    severity="warn",
+                    reason=(
+                        f"Quartermaster sales report total {report_total} USD did not match "
+                        f"sold copies minus picking fees ({sold_amount - fee_amount} USD)."
+                    ),
+                    blocking=False,
+                    page_ref="pdf:1",
+                    suggested_follow_up="Review whether the Quartermaster report contains additional lines that should be normalized.",
+                )
+            )
+
+        update_coverage_from_dates(source, [report_date])
+        return result, exceptions
+
+    if "invoice" in normalized and "quartermaster logistics" in normalized:
+        invoice_date_text = first_match(full_text, [r"Invoice Date\s+([0-9]{2}/[0-9]{2}/[0-9]{4})"])
+        invoice_number = first_match(full_text, [r"Invoice Number\s+([A-Z0-9-]+)"])
+        gross_amount_text = first_match(full_text, [r"Invoice Total\s+\$\s*([0-9.,]+)"])
+        notes_text = first_match(full_text, [r"Notes\s+([^\n]+)"])
+        due_date_text = first_match(full_text, [r"Invoice Due Date\s+([0-9]{2}/[0-9]{2}/[0-9]{4})"])
+        line_labels = re.findall(r"\n([A-Za-z][A-Za-z ]+)\s+Debit\s+\$\s*[0-9.,]+", full_text)
+
+        if invoice_date_text is None or gross_amount_text is None:
+            return result, [
+                make_pdf_dependency_exception(
+                    source,
+                    reason="Quartermaster invoice PDF is missing a readable invoice date or invoice total.",
+                    suggested_follow_up="Review the Quartermaster invoice layout or add another parser variant.",
+                )
+            ]
+
+        invoice_date = parse_quartermaster_date_value(invoice_date_text)
+        if invoice_date < period_start or invoice_date > period_end:
+            return result, []
+
+        gross_amount = parse_decimal(gross_amount_text)
+        description_bits = [notes_text] if notes_text else []
+        if line_labels:
+            description_bits.append(", ".join(label.strip() for label in line_labels))
+        description = " - ".join(bit for bit in description_bits if bit) or f"Quartermaster invoice {invoice_number or source.path.stem}"
+
+        category, record = make_record(
+            source=source,
+            category="purchase_expenses",
+            record_id=f"{source.source_id}:purchase:{slugify(invoice_number or invoice_date.isoformat())}",
+            event_type="quartermaster_service_invoice",
+            event_date=invoice_date,
+            settlement_date=parse_quartermaster_date_value(due_date_text) if due_date_text else None,
+            description=description,
+            currency="USD",
+            gross_amount=gross_amount,
+            net_amount=gross_amount,
+            external_ref=invoice_number,
+            channel="quartermaster",
+            attributes={
+                "invoice_number": invoice_number,
+                "invoice_due_date": parse_quartermaster_date_value(due_date_text).isoformat() if due_date_text else None,
+                "vendor_name": "Quartermaster Logistics LLC",
+                "notes": notes_text,
+                "service_labels": line_labels,
+            },
+            page_ref=page_ref_containing(pages, invoice_number),
+        )
+        result[category].append(record)
+        update_coverage_from_dates(source, [invoice_date])
+        return result, []
+
+    return result, [
+        make_pdf_dependency_exception(
+            source,
+            reason="Quartermaster PDF did not match a supported sales-report or supplier-invoice layout.",
+            suggested_follow_up="Review the PDF layout and extend the Quartermaster parser for this document type.",
+        )
+    ]
+
+
 def parse_printful_pdf(
     source: SourceDescriptor,
     *,
@@ -1875,7 +2382,10 @@ def parse_purchase_invoice_pdf(
         [
             r"Invoice Number\s+([A-Z0-9-]+)",
             r"Invoice #([A-Z0-9-]+)",
+            r"Arve number\s+([A-Z0-9-]+)",
             r"Arve nr\s+([A-Z0-9-]+)",
+            r"Arve\s+([A-Z0-9-]+)\s+Arve kuupaev",
+            r"Arve\s+([A-Z0-9-]+)\s+Arve kuup[aä]ev",
             r"Pileti nr\s+([A-Z0-9-]+)",
         ],
     )
@@ -1884,6 +2394,8 @@ def parse_purchase_invoice_pdf(
         [
             r"Invoice date:\s*([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})",
             r"Issue date:\s*([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})",
+            r"Arve kuupaev:?\s*([0-9.]+)",
+            r"Arve kuup[aä]ev:?\s*([0-9.]+)",
             r"Kuupäev\s+([0-9.]+)",
             r"Ostetud:\s*([0-9.]+\s+[0-9:]+)",
         ],
@@ -1900,6 +2412,22 @@ def parse_purchase_invoice_pdf(
     if event_date < period_start or event_date > period_end:
         return result, []
 
+    balance_summary_match = re.search(
+        r"Euroopa Keskpanga valuutakursid:\s*([0-9.,]+)\s*EUR\s+([0-9.,]+)\s*EUR\s+([0-9.,]+)\s*EUR",
+        full_text,
+        flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
+    )
+    omniva_summary_match = re.search(
+        r"Ridade summa\s+K[aä]ibemaks\s+[UÜ]mardus\s+Kokku\s+EUR\s+([0-9.,]+)\s+([0-9.,]+)\s+([0-9.,]+)\s+([0-9.,]+)",
+        full_text,
+        flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
+    )
+    dpd_summary_match = re.search(
+        r"Summa\s+([0-9.,]+)\s*EUR\s+[0-9.,]+\s*EUR\s+[0-9.,]+\s*EUR\s+([0-9.,]+)\s*EUR\s+([0-9.,]+)\s*EUR",
+        full_text,
+        flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
+    )
+
     gross_amount = first_decimal_match(
         full_text,
         [
@@ -1908,8 +2436,16 @@ def parse_purchase_invoice_pdf(
             r"TOTAL TO BE PAID:\s*€\s*([0-9.,]+)",
             r"Total amount\s+€([0-9.,]+)",
             r"Kokku:\s*([0-9.,]+)\s*EUR",
+            r"Kokku tasuda:\s*([0-9.,]+)\s*EUR",
+            r"Kogusumma KM-ga\s+[0-9.,]+\s+[0-9.,]+\s*EUR\s+[0-9.,]+\s*EUR\s+[0-9.,]+\s*EUR\s+[0-9.,]+\s*EUR\s+([0-9.,]+)\s*EUR",
         ],
     )
+    if gross_amount is None and balance_summary_match:
+        gross_amount = parse_currency_amount(balance_summary_match.group(3))
+    if gross_amount is None and omniva_summary_match:
+        gross_amount = parse_currency_amount(omniva_summary_match.group(4))
+    if gross_amount is None and dpd_summary_match:
+        gross_amount = parse_currency_amount(dpd_summary_match.group(3))
     if gross_amount is None:
         return result, [
             make_pdf_dependency_exception(
@@ -1927,6 +2463,13 @@ def parse_purchase_invoice_pdf(
             r"KM \d+%\s+([0-9.,]+)",
         ],
     ) or Decimal("0")
+    if vat_amount == Decimal("0") and balance_summary_match:
+        vat_amount = parse_currency_amount(balance_summary_match.group(2))
+    if vat_amount == Decimal("0") and omniva_summary_match:
+        vat_amount = parse_currency_amount(omniva_summary_match.group(2))
+    if vat_amount == Decimal("0") and dpd_summary_match:
+        vat_amount = parse_currency_amount(dpd_summary_match.group(2))
+
     net_amount = first_decimal_match(
         full_text,
         [
@@ -1935,6 +2478,12 @@ def parse_purchase_invoice_pdf(
             r"Pileti\(te\) hind .*?:\s*([0-9.,]+)\s*EUR",
         ],
     ) or (gross_amount - vat_amount)
+    if balance_summary_match:
+        net_amount = parse_currency_amount(balance_summary_match.group(1))
+    elif omniva_summary_match:
+        net_amount = parse_currency_amount(omniva_summary_match.group(1))
+    elif dpd_summary_match:
+        net_amount = parse_currency_amount(dpd_summary_match.group(1))
 
     fallback_vendor = normalize_ascii(source.path.stem).strip() or source.source_system or "supplier"
     vendor_name = vendor_name_from_text(full_text, fallback=fallback_vendor)
@@ -1971,10 +2520,59 @@ def parse_purchase_invoice_pdf(
     return result, []
 
 
+def parse_purchase_note_markdown(
+    source: SourceDescriptor,
+    *,
+    period_start: date,
+    period_end: date,
+    base_currency: str,
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    result = parser_result()
+    context = source.context
+    event_date = parse_date_value(str(context.get("event_date") or ""))
+    if event_date < period_start or event_date > period_end:
+        return result, []
+
+    label = str(context.get("label") or "").strip() or source.path.stem
+    note_body = str(context.get("body") or "").strip()
+    vendor_name = label.split(",", 1)[0].strip()
+    gross_amount = parse_decimal(context.get("gross_amount"))
+    net_amount = parse_decimal(context.get("net_amount"))
+    vat_amount = parse_decimal(context.get("vat_amount"))
+    target_source_id = str(context.get("target_source_id") or "")
+
+    category, record = make_record(
+        source=source,
+        category="purchase_expenses",
+        record_id=f"{source.source_id}:purchase:{slugify(target_source_id or vendor_name)}",
+        event_type="purchase_note_markdown",
+        event_date=event_date,
+        description=note_body or f"{vendor_name} manual purchase note",
+        currency=base_currency,
+        gross_amount=gross_amount,
+        net_amount=net_amount,
+        vat_amount=vat_amount,
+        external_ref=target_source_id or None,
+        channel=slugify(vendor_name),
+        attributes={
+            "invoice_number": None,
+            "vendor_name": vendor_name,
+            "manual_note": True,
+            "reverse_charge": bool(context.get("reverse_charge")),
+            "target_source_id": target_source_id or None,
+            "target_path": context.get("target_path"),
+        },
+    )
+    result[category].append(record)
+    update_coverage_from_dates(source, [event_date])
+    return result, []
+
+
 PARSERS: dict[str, Callable[..., tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]]] = {
     "parse_woo_sales_csv": parse_woo_sales_csv,
     "parse_paypal_csv": parse_paypal_csv,
     "parse_stripe_balance_csv": parse_stripe_balance_csv,
+    "parse_quartermaster_orders_csv": parse_quartermaster_orders_csv,
     "parse_printful_orders_csv": parse_printful_orders_csv,
     "parse_printful_wallet_csv": parse_printful_wallet_csv,
     "parse_printful_other_csv": parse_printful_other_csv,
@@ -1982,8 +2580,10 @@ PARSERS: dict[str, Callable[..., tuple[dict[str, list[dict[str, Any]]], list[dic
     "parse_bank_csv": parse_bank_csv,
     "parse_camt_xml": parse_camt_xml,
     "parse_stripe_invoice_pdf": parse_stripe_invoice_pdf,
+    "parse_quartermaster_pdf": parse_quartermaster_pdf,
     "parse_printful_pdf": parse_printful_pdf,
     "parse_purchase_invoice_pdf": parse_purchase_invoice_pdf,
+    "parse_purchase_note_markdown": parse_purchase_note_markdown,
 }
 
 
@@ -1996,6 +2596,16 @@ def inspect_sources(
 ) -> list[SourceDescriptor]:
     sources: list[SourceDescriptor] = []
     for path in sorted(source_dir.rglob("*")):
+        if path.is_file() and path.suffix.lower() == ".md":
+            sources.extend(
+                inspect_purchase_note_markdown(
+                    path=path,
+                    root_dir=root_dir,
+                    period_start=period_start,
+                    period_end=period_end,
+                )
+            )
+            continue
         descriptor = inspect_source_file(
             path=path,
             root_dir=root_dir,

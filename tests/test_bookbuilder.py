@@ -683,6 +683,290 @@ class BookbuilderTests(unittest.TestCase):
         self.assertEqual(payment_action["depends_on"], ["example-2024-01-purchase-acme-supplier-ou"])
         self.assertTrue(any("supplier text" in note for note in payment_action["review_notes"]))
 
+    def test_builder_treats_quartermaster_as_fulfillment_partner_for_purchase_mapping_and_payment(self) -> None:
+        normalized = base_normalized()
+        normalized["records"]["purchase_expenses"].append(
+            record(
+                record_id="quartermaster:invoice:1",
+                source_system="quartermaster",
+                source_type="pdf",
+                event_type="quartermaster_service_invoice",
+                gross_amount=21.0,
+                description="Quartermaster monthly storage invoice",
+                channel="quartermaster",
+                external_ref="00635-00002",
+                attributes={"invoice_number": "00635-00002", "vendor_name": "Quartermaster Logistics LLC"},
+            )
+        )
+        normalized["records"]["bank_transactions"].append(
+            record(
+                record_id="bank:quartermaster:1",
+                source_system="bank",
+                event_type="bank_debit",
+                gross_amount=-21.0,
+                description="Quartermaster Logistics LLC invoice 00635-00002",
+                attributes={"counterparty_name": "Quartermaster Logistics LLC"},
+            )
+        )
+        recon = base_recon()
+        entity_map = {
+            "financial_accounts": [
+                {"id": "612", "name": "Fulfillment and logistics", "code": "6120", "status": None},
+            ],
+            "vat_types": [
+                {"id": "11", "name": "0% Teenuste ühendusesisene soetamine", "extra": {"is_purchase": True, "vat_percent": 0}},
+            ],
+            "contacts": [
+                {"id": "77", "name": "Quartermaster Logistics LLC", "status": None},
+            ],
+            "income_accounts": [{"id": "101", "name": "Main Bank", "code": "101"}],
+        }
+        company_profile = {"bank_account_ids": ["101"]}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            batch = bookbuilder.build_action_batch(
+                normalized_payload=normalized,
+                recon_payload=recon,
+                normalized_path=Path(tmp) / "normalized.json",
+                recon_path=Path(tmp) / "recon.json",
+                repo_root=Path(tmp),
+                entity_map=entity_map,
+                company_profile=company_profile,
+            )
+
+        purchase_action = next(action for action in batch["actions"] if action["idempotency_key"].endswith("purchase-quartermaster"))
+        self.assertEqual(purchase_action["payload"]["counterparty"]["contact_id"], "77")
+        self.assertEqual(purchase_action["payload"]["line_items"][0]["description"], "quartermaster fulfillment cost summary")
+        self.assertEqual(purchase_action["payload"]["line_items"][0]["suggested_expense_account_id"], "612")
+        self.assertEqual(purchase_action["payload"]["line_items"][0]["suggested_vat_type_id"], "11")
+
+        payment_action = next(action for action in batch["actions"] if action["idempotency_key"].endswith("payment-quartermaster"))
+        self.assertEqual(payment_action["depends_on"], ["example-2024-01-purchase-quartermaster"])
+        self.assertEqual(payment_action["payload"]["amount"], 21.0)
+        self.assertEqual(payment_action["payload"]["counterparty"]["contact_id"], "77")
+
+    def test_builder_adds_currency_suffix_when_same_purchase_group_repeats(self) -> None:
+        normalized = base_normalized()
+        eur_record = record(
+            record_id="printful:eur:1",
+            source_system="printful",
+            event_type="printful_order_charge",
+            gross_amount=18.0,
+            description="Printful EUR order charge",
+            channel="printful",
+        )
+        usd_record = record(
+            record_id="printful:usd:1",
+            source_system="printful",
+            event_type="printful_service_charge",
+            gross_amount=30.0,
+            description="Printful USD storage charge",
+            channel="printful",
+        )
+        usd_record["currency"] = "USD"
+        normalized["records"]["purchase_expenses"].extend([eur_record, usd_record])
+        recon = base_recon()
+        entity_map = {
+            "financial_accounts": [
+                {"id": "257", "name": "Imported transport", "code": "5521", "status": None},
+                {"id": "258", "name": "Imported services", "code": "5201", "status": None},
+            ],
+            "vat_types": [
+                {"id": "11", "name": "0% Imported services", "extra": {"is_purchase": True, "vat_percent": 0}},
+            ],
+            "contacts": [{"id": "41", "name": "Printful, Inc.", "status": None}],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            batch = bookbuilder.build_action_batch(
+                normalized_payload=normalized,
+                recon_payload=recon,
+                normalized_path=Path(tmp) / "normalized.json",
+                recon_path=Path(tmp) / "recon.json",
+                repo_root=Path(tmp),
+                entity_map=entity_map,
+            )
+
+        purchase_keys = sorted(
+            action["idempotency_key"]
+            for action in batch["actions"]
+            if action["action_type"] == "create_purchase_summary"
+        )
+        self.assertEqual(
+            purchase_keys,
+            [
+                "example-2024-01-purchase-printful-eur",
+                "example-2024-01-purchase-printful-usd",
+            ],
+        )
+
+    def test_builder_uses_omniva_alias_for_eesti_post_contact(self) -> None:
+        normalized = base_normalized()
+        normalized["records"]["purchase_expenses"].append(
+            record(
+                record_id="purchase:omniva:1",
+                source_system="document",
+                source_type="manual",
+                event_type="purchase_note",
+                gross_amount=82.1,
+                description="Omniva paid by employee",
+                channel="omniva",
+                attributes={"vendor_name": "Omniva"},
+            )
+        )
+        normalized["records"]["bank_transactions"].append(
+            record(
+                record_id="bank:omniva:1",
+                source_system="bank",
+                event_type="bank_debit",
+                gross_amount=-82.1,
+                description="Omniva 09.10.2024",
+            )
+        )
+        recon = base_recon()
+        entity_map = {
+            "financial_accounts": [
+                {"id": "126", "name": "General expenses", "code": "5200", "status": None},
+            ],
+            "vat_types": [
+                {"id": "19", "name": "No VAT", "extra": {"is_purchase": True, "vat_percent": 0}},
+            ],
+            "contacts": [
+                {"id": "17", "name": "Aktsiaselts Eesti Post", "status": None},
+            ],
+            "income_accounts": [{"id": "101", "name": "Main Bank", "code": "101"}],
+        }
+        company_profile = {"bank_account_ids": ["101"]}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            batch = bookbuilder.build_action_batch(
+                normalized_payload=normalized,
+                recon_payload=recon,
+                normalized_path=Path(tmp) / "normalized.json",
+                recon_path=Path(tmp) / "recon.json",
+                repo_root=Path(tmp),
+                entity_map=entity_map,
+                company_profile=company_profile,
+            )
+
+        purchase_action = next(action for action in batch["actions"] if action["idempotency_key"].endswith("purchase-omniva"))
+        payment_action = next(action for action in batch["actions"] if action["idempotency_key"].endswith("payment-omniva"))
+        self.assertEqual(purchase_action["payload"]["counterparty"]["contact_id"], "17")
+        self.assertEqual(payment_action["payload"]["counterparty"]["contact_id"], "17")
+        self.assertTrue(any("Eesti Post" in note for note in purchase_action["review_notes"]))
+
+    def test_builder_posts_processor_refunds_using_merchant_sales_mapping(self) -> None:
+        normalized = base_normalized()
+        normalized["records"]["sales"].append(
+            record(
+                record_id="woo:sale:1",
+                source_system="woocommerce",
+                source_type="csv",
+                event_type="merchant_sales_summary",
+                gross_amount=50.0,
+                description="Woo monthly sales",
+                channel="woo",
+            )
+        )
+        normalized["records"]["sales"].append(
+            record(
+                record_id="paypal:sale:1",
+                source_system="paypal",
+                event_type="paypal_website_payment",
+                gross_amount=50.0,
+                description="PayPal captured sale",
+                channel="paypal",
+            )
+        )
+        normalized["records"]["refunds"].append(
+            record(
+                record_id="paypal:refund:1",
+                source_system="paypal",
+                event_type="paypal_refund",
+                gross_amount=10.0,
+                description="PayPal refund",
+                channel="paypal",
+            )
+        )
+        recon = base_recon()
+        entity_map = {
+            "financial_accounts": [
+                {"id": "109", "name": "Export sales", "code": "4610", "status": None},
+                {"id": "255", "name": "Export shipping", "code": "4994", "status": None},
+            ],
+            "vat_types": [
+                {"id": "12", "name": "0% Kauba eksport", "extra": {"is_sales": True, "vat_percent": 0}},
+                {"id": "13", "name": "0% Teenuste eksport", "extra": {"is_sales": True, "vat_percent": 0}},
+            ],
+            "contacts": [
+                {"id": "29", "name": "Stripe Technology Europe, Limited", "status": None},
+            ],
+            "warehouses": [],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            batch = bookbuilder.build_action_batch(
+                normalized_payload=normalized,
+                recon_payload=recon,
+                normalized_path=Path(tmp) / "normalized.json",
+                recon_path=Path(tmp) / "recon.json",
+                repo_root=Path(tmp),
+                entity_map=entity_map,
+            )
+
+        refund_action = next(action for action in batch["actions"] if action["action_type"] == "create_credit_invoice_summary")
+        self.assertEqual(refund_action["idempotency_key"], "example-2024-01-refund-woo")
+        self.assertEqual(refund_action["payload"]["counterparty"]["contact_id"], "29")
+        self.assertEqual(refund_action["payload"]["line_items"][0]["suggested_income_account_id"], "109")
+        self.assertTrue(any("posted using woo sales mapping" in note for note in refund_action["review_notes"]))
+
+    def test_builder_uses_quartermaster_sales_mapping_and_vendor_contact(self) -> None:
+        normalized = base_normalized()
+        normalized["records"]["sales"].append(
+            record(
+                record_id="quartermaster:sale:1",
+                source_system="quartermaster",
+                source_type="pdf",
+                event_type="quartermaster_sales_report",
+                gross_amount=792.12,
+                description="Quartermaster sales report for October 2024",
+                channel="quartermaster",
+                attributes={"vendor_name": "Quartermaster Direct"},
+            )
+        )
+        recon = base_recon()
+        entity_map = {
+            "financial_accounts": [
+                {"id": "109", "name": "Export sales", "code": "4610", "status": None},
+                {"id": "255", "name": "Export shipping", "code": "4994", "status": None},
+            ],
+            "vat_types": [
+                {"id": "12", "name": "0% Kauba eksport", "extra": {"is_sales": True, "vat_percent": 0}},
+                {"id": "13", "name": "0% Teenuste eksport", "extra": {"is_sales": True, "vat_percent": 0}},
+            ],
+            "contacts": [
+                {"id": "77", "name": "Quartermaster Direct", "status": None},
+            ],
+            "warehouses": [{"id": "6", "name": "Printful EU", "status": None}],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            batch = bookbuilder.build_action_batch(
+                normalized_payload=normalized,
+                recon_payload=recon,
+                normalized_path=Path(tmp) / "normalized.json",
+                recon_path=Path(tmp) / "recon.json",
+                repo_root=Path(tmp),
+                entity_map=entity_map,
+            )
+
+        sales_action = next(action for action in batch["actions"] if action["idempotency_key"].endswith("sales-quartermaster"))
+        line = sales_action["payload"]["line_items"][0]
+        self.assertEqual(sales_action["payload"]["counterparty"]["contact_id"], "77")
+        self.assertEqual(line["suggested_income_account_id"], "109")
+        self.assertEqual(line["suggested_vat_type_id"], "12")
+        self.assertIsNone(line["warehouse_id_hint"])
+
     def test_builder_does_not_link_reimbursement_debit_to_supplier_purchase_without_supplier_match(self) -> None:
         normalized = base_normalized()
         normalized["records"]["purchase_expenses"].append(

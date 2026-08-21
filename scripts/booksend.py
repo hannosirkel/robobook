@@ -677,6 +677,27 @@ def dry_run_response(
     }
 
 
+def api_calls_from_request_log(
+    request_log: list[dict[str, Any]],
+    *,
+    period: str | None = None,
+) -> list[dict[str, Any]]:
+    calls: list[dict[str, Any]] = []
+    for entry in request_log:
+        if not isinstance(entry, dict):
+            continue
+        call = {
+            "action_idempotency_key": str(entry.get("action_idempotency_key") or ""),
+            "method": str(entry.get("method") or "POST"),
+            "endpoint": normalized_endpoint(str(entry.get("endpoint") or "")),
+            "payload": copy.deepcopy(entry.get("payload") or {}),
+        }
+        if period is not None:
+            call["period"] = period
+        calls.append(call)
+    return calls
+
+
 def apply_action_result(action: dict[str, Any], entry: dict[str, Any], *, mode: str) -> None:
     if mode == "dry-run":
         status = action.get("response_status")
@@ -996,6 +1017,8 @@ def run_submission(
         existing_request_log=(existing_submission or {}).get("request_log") or [],
         reference_lookup=reference_lookup,
     )
+    prior_request_count = len((existing_submission or {}).get("request_log") or [])
+    current_request_log = submission["request_log"][prior_request_count:]
 
     write_yaml(action_path, updated_batch)
     write_json(output_path, submission)
@@ -1018,6 +1041,7 @@ def run_submission(
         "failed_actions": submission["summary"]["failed_actions"],
         "stopped_on_failure": submission["summary"]["stopped_on_failure"],
         "rollback_candidates": len(submission["rollback_plan"]["reversal_candidates"]),
+        "api_calls": api_calls_from_request_log(current_request_log, period=period),
     }
 
 

@@ -71,6 +71,26 @@ def find_check(document: dict, check_id: str) -> dict:
 
 
 class BookreconTests(unittest.TestCase):
+    def test_processor_classifier_ignores_refs_nested_in_woo_vat_evidence(self) -> None:
+        woo_sale = record(
+            record_id="woo:1",
+            source_system="woo",
+            channel="woo",
+            event_type="woo_daily_sales",
+            gross_amount=113.0,
+            attributes={
+                "vat_allocation": {
+                    "component_vat_evidence": [
+                        {"order_id": "EXAMPLE-1", "processor_ref": "paypal-reference"}
+                    ]
+                }
+            },
+        )
+
+        self.assertIsNone(bookrecon.infer_processor(woo_sale))
+        stripe_sale = dict(woo_sale, source_system="stripe", channel="stripe", event_type="stripe_charge")
+        self.assertEqual(bookrecon.infer_processor(stripe_sale), "stripe")
+
     def test_supplier_credit_check_reports_total_by_currency(self) -> None:
         normalized = base_normalized()
         normalized["records"]["purchase_credits"].append(

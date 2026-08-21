@@ -295,10 +295,28 @@ def reviewed_allocated_rate(
         raise SimplbooksError("Woo VAT API line lacks usable VAT profile provenance.")
     component = str(line.get("vat_allocation_component") or "")
     vat_type_field = "shipping_vat_type_id" if component == "shipping" else "goods_vat_type_id"
-    profile_period = f"{item_profile.get('start')}/{item_profile.get('end') or 'open'}"
+    try:
+        event_date = date.fromisoformat(str(item.get("event_date") or ""))
+        item_start = date.fromisoformat(str(item_profile.get("start") or ""))
+        item_end = (
+            date.fromisoformat(str(item_profile["end"]))
+            if item_profile.get("end") not in (None, "")
+            else None
+        )
+        line_start_text, line_end_text = str(line.get("vat_profile_period") or "").split("/", 1)
+        line_start = date.fromisoformat(line_start_text)
+        line_end = None if line_end_text == "open" else date.fromisoformat(line_end_text)
+    except (TypeError, ValueError) as exc:
+        raise SimplbooksError("Woo VAT API line has invalid VAT profile dates.") from exc
+    if (
+        event_date < item_start
+        or item_end is not None and event_date > item_end
+        or event_date < line_start
+        or line_end is not None and event_date > line_end
+    ):
+        raise SimplbooksError("Woo VAT API line event date is outside its reviewed VAT profile.")
     if (
         decimal_value(item_profile.get("rate")) != rate
-        or profile_period != str(line.get("vat_profile_period") or "")
         or str(item_profile.get(vat_type_field) or "") != str(line.get("suggested_vat_type_id") or "")
     ):
         raise SimplbooksError("Woo VAT API line VAT profile provenance does not match the reviewed line.")

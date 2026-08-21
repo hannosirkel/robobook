@@ -216,6 +216,26 @@ def purchase_summary_action(
 
 
 class BookbuilderTests(unittest.TestCase):
+    def test_processor_classifier_ignores_refs_nested_in_woo_vat_evidence(self) -> None:
+        woo_sale = record(
+            record_id="woo:sale:1",
+            source_system="woo",
+            channel="woo",
+            event_type="woo_daily_sales",
+            gross_amount=110.0,
+            attributes={
+                "vat_allocation": {
+                    "component_vat_evidence": [
+                        {"order_id": "EXAMPLE-1", "processor_ref": "paypal-reference"}
+                    ]
+                }
+            },
+        )
+
+        self.assertIsNone(bookbuilder.infer_processor(woo_sale))
+        stripe_sale = dict(woo_sale, source_system="stripe", channel="stripe", event_type="stripe_charge")
+        self.assertEqual(bookbuilder.infer_processor(stripe_sale), "stripe")
+
     def test_builder_binds_action_batch_to_allocation_and_tax_source_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -290,6 +310,7 @@ class BookbuilderTests(unittest.TestCase):
                 {
                     "order_id": f"EXAMPLE-{index}", "source_row_id": "woo-tax:2",
                     "processor_ref": f"pi_example_{index}", "country_code": "DE",
+                    "event_date": "2025-11-27",
                     "configured_rate": 22, "corrected_rate": 24,
                     "fixed_product_gross": 0.03, "fixed_shipping_gross": 0.03,
                     "product_vat": 0.01, "shipping_vat": 0.01,
@@ -316,6 +337,7 @@ class BookbuilderTests(unittest.TestCase):
              ("shipping", 0.03, 0.01), ("shipping", 0.03, 0.01)],
         )
         self.assertTrue(all(len(line["vat_allocation_component_evidence"]) == 1 for line in lines))
+        self.assertTrue(all(line["vat_allocation_component_evidence"][0]["event_date"] == "2025-11-27" for line in lines))
         self.assertTrue(all(line["vat_evidence_binding"]["allocation_ref"]["sha256"] == "c" * 64 for line in lines))
         self.assertEqual(action["payload"]["totals"]["vat_amount"], 0.04)
 

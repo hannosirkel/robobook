@@ -220,6 +220,15 @@ def classify_record(record: dict[str, Any], keyword_map: dict[str, tuple[str, ..
 
 
 def infer_processor(record: dict[str, Any]) -> str | None:
+    source_system = str(record.get("source_system") or "").lower()
+    channel = str(record.get("channel") or "").lower()
+    event_type = str(record.get("event_type") or "").lower()
+    if source_system in PROCESSOR_KEYWORDS:
+        return source_system
+    if channel in PROCESSOR_KEYWORDS:
+        return channel
+    if source_system == "woo" or channel == "woo" or event_type.startswith("woo_"):
+        return None
     return classify_record(record, PROCESSOR_KEYWORDS)
 
 

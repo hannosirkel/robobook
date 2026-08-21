@@ -753,6 +753,7 @@ def set_allocated_sale_components(
         "component_vat_evidence": [
             {
                 "order_id": str(item["order_id"]),
+                "event_date": str(item.get("event_date") or ""),
                 "source_row_id": str(item.get("source_row_id") or ""),
                 "processor_ref": str(item.get("processor_ref") or ""),
                 "country_code": str(item.get("country_code") or ""),

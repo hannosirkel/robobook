@@ -184,6 +184,15 @@ def classify_record(record: dict[str, Any], keyword_map: dict[str, tuple[str, ..
 
 
 def infer_processor(record: dict[str, Any]) -> str | None:
+    source_system = str(record.get("source_system") or "").lower()
+    channel = str(record.get("channel") or "").lower()
+    event_type = str(record.get("event_type") or "").lower()
+    if source_system in PROCESSOR_KEYWORDS:
+        return source_system
+    if channel in PROCESSOR_KEYWORDS:
+        return channel
+    if source_system == "woo" or channel == "woo" or event_type.startswith("woo_"):
+        return None
     return classify_record(record, PROCESSOR_KEYWORDS)
 
 
@@ -1195,6 +1204,7 @@ def build_sales_lines(
                     evidence.append(
                         {
                             "order_id": str(entry["order_id"]),
+                            "event_date": str(entry.get("event_date") or ""),
                             "gross_amount": decimal_number(abs(decimal_value(entry.get(gross_field)))),
                             "vat_amount": decimal_number(abs(decimal_value(entry.get(vat_field)))),
                             "source_row_id": entry.get("source_row_id"),

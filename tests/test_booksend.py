@@ -326,8 +326,9 @@ class BooksendTests(unittest.TestCase):
                 "vat_allocation_component_evidence": [
                     {
                         "order_id": f"EXAMPLE-{index}", "gross_amount": 0.03, "vat_amount": 0.01,
+                        "event_date": "2025-11-27",
                         "vat_profile": {
-                            "start": "2025-07-01", "end": None, "rate": 24,
+                            "start": "2025-01-01", "end": "2025-12-31", "rate": 24,
                             "goods_vat_type_id": "34", "shipping_vat_type_id": "33",
                         },
                     }

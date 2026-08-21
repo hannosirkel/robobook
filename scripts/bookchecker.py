@@ -1074,14 +1074,34 @@ def evaluate_vat_profiles(actions: list[dict[str, Any]], posting_policy: dict[st
                     item_profile = item.get("vat_profile")
                     if not isinstance(item_profile, dict):
                         raise SimplbooksError("component evidence lacks VAT profile provenance")
-                    profile_period = f"{item_profile.get('start')}/{item_profile.get('end') or 'open'}"
+                    item_event_date = date.fromisoformat(str(item.get("event_date") or ""))
+                    item_profile_start = date.fromisoformat(str(item_profile.get("start") or ""))
+                    item_profile_end = (
+                        date.fromisoformat(str(item_profile["end"]))
+                        if item_profile.get("end") not in (None, "")
+                        else None
+                    )
+                    if item_event_date < item_profile_start or (
+                        item_profile_end is not None and item_event_date > item_profile_end
+                    ):
+                        raise SimplbooksError("component evidence event date is outside its VAT profile")
+                    if (item_event_date.year, item_event_date.month) != (event_date.year, event_date.month):
+                        raise SimplbooksError("component evidence event date is outside the action period")
+                    item_policy_profile = resolve_sales_vat_profile(
+                        posting_policy,
+                        event_date=item_event_date,
+                    )
                     item_vat_type_id = item_profile.get(
                         "shipping_vat_type_id" if is_shipping else "goods_vat_type_id"
                     )
+                    item_policy_vat_type_id = item_policy_profile[
+                        "shipping_vat_type_id" if is_shipping else "goods_vat_type_id"
+                    ]
                     if (
                         decimal_value(item_profile.get("rate")) != rate
-                        or profile_period != expected_period
                         or str(item_vat_type_id or "") != expected_vat_type_id
+                        or Decimal(str(item_policy_profile["rate"])) != rate
+                        or str(item_policy_vat_type_id or "") != expected_vat_type_id
                     ):
                         raise SimplbooksError("component evidence VAT profile provenance does not match policy")
                     if item_gross != item_gross.quantize(TOLERANCE) or item_vat != item_vat.quantize(TOLERANCE):
@@ -1092,7 +1112,7 @@ def evaluate_vat_profiles(actions: list[dict[str, Any]], posting_policy: dict[st
                         TOLERANCE, rounding=ROUND_HALF_UP
                     )
                     rounding_error = rounding_error or item_vat != expected_item_vat
-            except (InvalidOperation, SimplbooksError) as exc:
+            except (InvalidOperation, PostingPolicyError, SimplbooksError, ValueError) as exc:
                 findings.append(
                     make_finding(
                         section="account_and_vat_review",

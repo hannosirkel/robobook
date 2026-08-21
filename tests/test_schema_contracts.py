@@ -164,6 +164,7 @@ class SchemaContractTests(unittest.TestCase):
                 {
                     "statement_id": "archive:2024010212345678",
                     "record_id": "bank-source:bank:2",
+                    "iban": "EE123",
                     "period": "2024-01",
                     "disposition": "existing_invoice_receipt",
                     "amount": 330.0,
@@ -177,6 +178,12 @@ class SchemaContractTests(unittest.TestCase):
 
     def test_bank_allocation_schema_rejects_ignore(self) -> None:
         artifact = bank_allocation_payload(allocations=[bank_allocation(disposition="ignore")])
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=artifact)
+
+    def test_bank_allocation_schema_requires_iban(self) -> None:
+        artifact = bank_allocation_payload(allocations=[bank_allocation()])
+        del artifact["allocations"][0]["iban"]
         with self.assertRaises(AssertionError):
             self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=artifact)
 
@@ -307,6 +314,7 @@ def bank_allocation(**overrides: Any) -> dict[str, Any]:
     allocation = {
         "statement_id": "archive:2024010212345678",
         "record_id": "bank-source:bank:2",
+        "iban": "EE123",
         "period": "2024-01",
         "disposition": "existing_invoice_receipt",
         "amount": 330.0,

@@ -61,6 +61,13 @@ def _currency(record: dict[str, Any]) -> str:
     return currency
 
 
+def _normalized_iban(value: Any, *, label: str) -> str:
+    iban = re.sub(r"\s+", "", _text(value)).upper()
+    if not iban:
+        raise BankAllocationError(f"{label} requires an IBAN or source account.")
+    return iban
+
+
 def _economic_tuple(record: dict[str, Any]) -> tuple[str, str, Decimal]:
     event_date = _text(record.get("event_date"))
     return event_date, _currency(record), _decimal(record.get("gross_amount"), label="Bank record gross_amount")
@@ -70,11 +77,23 @@ def bank_ledger_key(record: dict[str, Any]) -> tuple[str, str]:
     """Return the normalized physical-bank ledger key of `(IBAN, currency)`."""
     if _text(record.get("source_system")) != "bank":
         raise BankAllocationError("Bank ledger key requires a physical bank record.")
-    iban = _attribute_text(record, "iban", "account_iban", "customer_account")
-    iban = re.sub(r"\s+", "", iban).upper()
-    if not iban:
-        raise BankAllocationError("Physical bank record requires an IBAN or source account.")
+    iban = _normalized_iban(
+        _attribute_text(record, "iban", "account_iban", "customer_account"),
+        label="Physical bank record",
+    )
     return iban, _currency(record)
+
+
+def allocation_key(allocation: dict[str, Any]) -> tuple[str, str, str]:
+    """Return the canonical `(statement_id, IBAN, currency)` allocation key."""
+    statement_id = _text(allocation.get("statement_id"))
+    if not statement_id:
+        raise BankAllocationError("Bank allocation requires statement_id.")
+    iban = _normalized_iban(allocation.get("iban"), label="Bank allocation")
+    currency = _text(allocation.get("currency")).upper()
+    if not re.fullmatch(r"[A-Z]{3}", currency):
+        raise BankAllocationError("Bank allocation currency is invalid.")
+    return statement_id, iban, currency
 
 
 def statement_identity(record: dict[str, Any]) -> str:
@@ -142,8 +161,8 @@ def verify_normalized_bindings(payload: dict[str, Any], normalized_year_paths: l
             raise BankAllocationError(f"Normalized input changed after allocation review: {path}")
 
 
-def _bank_records(paths: list[Path], *, year: int) -> dict[str, dict[str, Any]]:
-    indexed: dict[str, dict[str, Any]] = {}
+def _bank_records(paths: list[Path], *, year: int) -> dict[tuple[str, str, str], dict[str, Any]]:
+    indexed: dict[tuple[str, str, str], dict[str, Any]] = {}
     for path in paths:
         payload = _load_json(path)
         period = _text(payload.get("period"))
@@ -158,27 +177,29 @@ def _bank_records(paths: list[Path], *, year: int) -> dict[str, dict[str, Any]]:
             if _text(record.get("source_system")) != "bank":
                 continue
             identity = statement_identity(record)
-            if identity in indexed:
-                raise BankAllocationError(f"Statement identity occurs in multiple normalized bank records: {identity}")
-            indexed[identity] = record
+            iban, currency = bank_ledger_key(record)
+            key = identity, iban, currency
+            if key in indexed:
+                raise BankAllocationError(f"Bank allocation key occurs in multiple normalized bank records: {key}")
+            indexed[key] = record
     return indexed
 
 
 def validate_unique_record_ids(allocations: list[dict[str, Any]]) -> None:
-    statement_ids: set[str] = set()
+    allocation_keys: set[tuple[str, str, str]] = set()
     record_ids: set[str] = set()
     for allocation in allocations:
         if not isinstance(allocation, dict):
             raise BankAllocationError("Bank allocation must be an object.")
-        statement_id = _text(allocation.get("statement_id"))
         record_id = _text(allocation.get("record_id"))
-        if not statement_id or not record_id:
-            raise BankAllocationError("Bank allocation requires statement_id and record_id.")
-        if statement_id in statement_ids:
-            raise BankAllocationError(f"Bank allocation statement_id is duplicated: {statement_id}")
+        key = allocation_key(allocation)
+        if not record_id:
+            raise BankAllocationError("Bank allocation requires record_id.")
+        if key in allocation_keys:
+            raise BankAllocationError(f"Bank allocation key is duplicated: {key}")
         if record_id in record_ids:
             raise BankAllocationError(f"Bank allocation record_id is duplicated: {record_id}")
-        statement_ids.add(statement_id)
+        allocation_keys.add(key)
         record_ids.add(record_id)
 
 
@@ -223,7 +244,7 @@ def _validate_shape(payload: dict[str, Any]) -> list[dict[str, Any]]:
     allocations = payload.get("allocations")
     if not isinstance(allocations, list):
         raise BankAllocationError("Bank allocations must be a list.")
-    allowed = {"statement_id", "record_id", "period", "disposition", "amount", "currency", "target", "parts", "review"}
+    allowed = {"statement_id", "record_id", "iban", "period", "disposition", "amount", "currency", "target", "parts", "review"}
     required_allocation = allowed - {"parts"}
     for allocation in allocations:
         if not isinstance(allocation, dict) or not required_allocation.issubset(allocation) or set(allocation) - allowed:
@@ -234,6 +255,7 @@ def _validate_shape(payload: dict[str, Any]) -> list[dict[str, Any]]:
             raise BankAllocationError("Bank allocation period does not belong to the allocation year.")
         if not re.fullmatch(r"[A-Z]{3}", _text(allocation.get("currency"))):
             raise BankAllocationError("Bank allocation currency is invalid.")
+        allocation_key(allocation)
         if not isinstance(allocation.get("target"), dict) or not allocation["target"]:
             raise BankAllocationError("Bank allocation target must be a non-empty object.")
         review = allocation.get("review")
@@ -245,13 +267,14 @@ def _validate_shape(payload: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _validate_against_normalized(
-    allocations: list[dict[str, Any]], records: dict[str, dict[str, Any]], *, year: int
+    allocations: list[dict[str, Any]], records: dict[tuple[str, str, str], dict[str, Any]], *, year: int
 ) -> None:
     for allocation in allocations:
-        statement_id = _text(allocation.get("statement_id"))
-        record = records.get(statement_id)
+        key = allocation_key(allocation)
+        statement_id = key[0]
+        record = records.get(key)
         if record is None:
-            raise BankAllocationError(f"Bank allocation statement_id is not present in the normalized inputs: {statement_id}")
+            raise BankAllocationError(f"Bank allocation key is not present in the normalized inputs: {key}")
         if _text(record.get("record_id")) != _text(allocation.get("record_id")):
             raise BankAllocationError(f"Bank allocation record_id is not the current locator for {statement_id}")
         event_date, currency, amount = _economic_tuple(record)
@@ -263,7 +286,7 @@ def _validate_against_normalized(
             raise BankAllocationError(f"Bank statement date does not belong to allocation year for {statement_id}")
         if _text(allocation.get("period")) != event_date[:7]:
             raise BankAllocationError(f"Bank allocation period does not match statement date for {statement_id}")
-        if _text(allocation.get("currency")) != currency or _decimal(allocation.get("amount"), label="Bank allocation amount") != amount:
+        if key[2] != currency or _decimal(allocation.get("amount"), label="Bank allocation amount") != amount:
             raise BankAllocationError(f"Bank allocation economic fields do not match statement row {statement_id}")
 
 
@@ -280,13 +303,13 @@ def load_bank_allocations(path: Path, *, normalized_year_paths: list[Path]) -> d
     return payload
 
 
-def period_allocations(payload: dict[str, Any], period: str) -> dict[str, dict[str, Any]]:
+def period_allocations(payload: dict[str, Any], period: str) -> dict[tuple[str, str, str], dict[str, Any]]:
     allocations = payload.get("allocations") or []
     if not isinstance(allocations, list):
         raise BankAllocationError("Bank allocations must be a list.")
     selected = [item for item in allocations if isinstance(item, dict) and item.get("period") == period]
     validate_unique_record_ids(selected)
-    return {str(item["statement_id"]): item for item in selected}
+    return {allocation_key(item): item for item in selected}
 
 
 def bank_allocation_coverage_errors(
@@ -299,19 +322,19 @@ def bank_allocation_coverage_errors(
     """
     allocations = _validate_shape(payload)
     verify_normalized_bindings(payload, normalized_year_paths)
-    physical_ids = set(_bank_records(normalized_year_paths, year=payload["year"]))
-    allocation_ids = [str(item.get("statement_id") or "") for item in allocations]
-    unique_allocation_ids = set(allocation_ids)
-    duplicates = sorted({statement_id for statement_id in allocation_ids if allocation_ids.count(statement_id) > 1})
-    missing = sorted(physical_ids - unique_allocation_ids)
-    extra = sorted(unique_allocation_ids - physical_ids)
+    physical_keys = set(_bank_records(normalized_year_paths, year=payload["year"]))
+    allocation_keys = [allocation_key(item) for item in allocations]
+    unique_allocation_keys = set(allocation_keys)
+    duplicates = sorted({key for key in allocation_keys if allocation_keys.count(key) > 1})
+    missing = sorted(physical_keys - unique_allocation_keys)
+    extra = sorted(unique_allocation_keys - physical_keys)
     errors: list[str] = []
     if duplicates:
-        errors.append("duplicate bank allocation statement_id(s): " + ", ".join(duplicates))
+        errors.append("duplicate bank allocation key(s): " + ", ".join(map(str, duplicates)))
     if missing:
-        errors.append("missing bank allocation statement_id(s): " + ", ".join(missing))
+        errors.append("missing bank allocation key(s): " + ", ".join(map(str, missing)))
     if extra:
-        errors.append("extra bank allocation statement_id(s): " + ", ".join(extra))
+        errors.append("extra bank allocation key(s): " + ", ".join(map(str, extra)))
     return errors
 
 
@@ -340,13 +363,13 @@ def rebind_bank_allocations(payload: dict[str, Any], normalized_year_paths: list
     new_records = _bank_records(normalized_year_paths, year=payload["year"])
     if set(old_records) != set(new_records):
         raise BankAllocationError("Cannot rebind because the statement-ID set changed.")
-    for statement_id in old_records:
-        if _economic_tuple(old_records[statement_id]) != _economic_tuple(new_records[statement_id]):
-            raise BankAllocationError(f"Cannot rebind because statement economics changed: {statement_id}")
+    for key in old_records:
+        if _economic_tuple(old_records[key]) != _economic_tuple(new_records[key]):
+            raise BankAllocationError(f"Cannot rebind because statement economics changed: {key}")
     rebound = copy.deepcopy(payload)
     rebound["normalized_bindings"] = _bindings_for(normalized_year_paths)
     for allocation in rebound["allocations"]:
-        statement_id = str(allocation["statement_id"])
-        allocation["record_id"] = str(new_records[statement_id].get("record_id") or "")
+        key = allocation_key(allocation)
+        allocation["record_id"] = str(new_records[key].get("record_id") or "")
         allocation["review"]["status"] = "needs_review"
     return rebound

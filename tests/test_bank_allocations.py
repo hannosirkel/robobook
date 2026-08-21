@@ -37,6 +37,7 @@ def allocation(*, statement_id: str, record_id: str, amount: float = 330.0, disp
     result = {
         "statement_id": statement_id,
         "record_id": record_id,
+        "iban": "EE123",
         "period": "2024-01",
         "disposition": disposition,
         "amount": amount,
@@ -148,6 +149,63 @@ class BankAllocationTests(unittest.TestCase):
 
         self.assertEqual(loaded["allocations"][0]["statement_id"], "archive:2024010212345678")
 
+    def test_same_archive_rows_in_distinct_currencies_load_and_prove_complete(self) -> None:
+        eur = bank_record(record_id="bank-source:bank:eur", archive_id="transfer-1", amount=330.0)
+        usd = bank_record(record_id="bank-source:bank:usd", archive_id="transfer-1", amount=-2.0)
+        usd["currency"] = "USD"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            normalized_path = root / "2024-01.json"
+            normalized_path.write_text(json.dumps(normalized_payload(eur, usd)), encoding="utf-8")
+            payload = {
+                "schema_version": "1.0",
+                "company_slug": "example",
+                "year": 2024,
+                "normalized_bindings": [{"path": str(normalized_path), "sha256": hashlib.sha256(normalized_path.read_bytes()).hexdigest()}],
+                "allocations": [
+                    allocation(statement_id="archive:transfer-1", record_id="bank-source:bank:eur", amount=330.0),
+                    allocation(statement_id="archive:transfer-1", record_id="bank-source:bank:usd", amount=-2.0, currency="USD"),
+                ],
+            }
+            allocation_path = root / "allocations.json"
+            allocation_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            loaded = bank_allocations.load_bank_allocations(allocation_path, normalized_year_paths=[normalized_path])
+            bank_allocations.prove_exact_bank_allocation_coverage(loaded, normalized_year_paths=[normalized_path])
+
+        self.assertEqual(
+            set(bank_allocations.period_allocations(loaded, "2024-01")),
+            {("archive:transfer-1", "EE123", "EUR"), ("archive:transfer-1", "EE123", "USD")},
+        )
+
+    def test_duplicate_full_allocation_key_is_rejected(self) -> None:
+        with self.assertRaisesRegex(bank_allocations.BankAllocationError, "allocation key is duplicated"):
+            bank_allocations.validate_unique_record_ids([
+                allocation(statement_id="archive:transfer-1", record_id="bank-source:bank:eur"),
+                allocation(statement_id="archive:transfer-1", record_id="bank-source:bank:replacement"),
+            ])
+
+    def test_wrong_allocation_iban_is_rejected_by_loading_and_coverage(self) -> None:
+        record = bank_record(archive_id="transfer-1")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            normalized_path = root / "2024-01.json"
+            normalized_path.write_text(json.dumps(normalized_payload(record)), encoding="utf-8")
+            payload = {
+                "schema_version": "1.0",
+                "company_slug": "example",
+                "year": 2024,
+                "normalized_bindings": [{"path": str(normalized_path), "sha256": hashlib.sha256(normalized_path.read_bytes()).hexdigest()}],
+                "allocations": [allocation(statement_id="archive:transfer-1", record_id="bank-source:bank:2", iban="EE999")],
+            }
+            allocation_path = root / "allocations.json"
+            allocation_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaisesRegex(bank_allocations.BankAllocationError, "EE999"):
+                bank_allocations.load_bank_allocations(allocation_path, normalized_year_paths=[normalized_path])
+            with self.assertRaisesRegex(bank_allocations.BankAllocationError, "missing bank allocation"):
+                bank_allocations.prove_exact_bank_allocation_coverage(payload, normalized_year_paths=[normalized_path])
+
     def test_load_rejects_changed_economic_identity_despite_matching_statement_id(self) -> None:
         record = bank_record(amount=331.0)
         with tempfile.TemporaryDirectory() as tmp:
@@ -190,9 +248,9 @@ class BankAllocationTests(unittest.TestCase):
 
             self.assertEqual(
                 bank_allocations.bank_allocation_coverage_errors(loaded, normalized_year_paths=[normalized_path]),
-                ["missing bank allocation statement_id(s): archive:two"],
+                ["missing bank allocation key(s): ('archive:two', 'EE123', 'EUR')"],
             )
-            with self.assertRaisesRegex(bank_allocations.BankAllocationError, "missing bank allocation statement_id"):
+            with self.assertRaisesRegex(bank_allocations.BankAllocationError, "missing bank allocation key"):
                 bank_allocations.prove_exact_bank_allocation_coverage(loaded, normalized_year_paths=[normalized_path])
 
     def test_completeness_proof_reports_duplicate_and_extra_ids_deterministically(self) -> None:
@@ -214,8 +272,8 @@ class BankAllocationTests(unittest.TestCase):
             self.assertEqual(
                 bank_allocations.bank_allocation_coverage_errors(payload, normalized_year_paths=[normalized_path]),
                 [
-                    "duplicate bank allocation statement_id(s): archive:one",
-                    "extra bank allocation statement_id(s): archive:extra",
+                    "duplicate bank allocation key(s): ('archive:one', 'EE123', 'EUR')",
+                    "extra bank allocation key(s): ('archive:extra', 'EE123', 'EUR')",
                 ],
             )
 
@@ -286,6 +344,38 @@ class BankAllocationTests(unittest.TestCase):
         self.assertEqual(rebound["allocations"][0]["record_id"], "bank-source:bank:9")
         self.assertEqual(rebound["allocations"][0]["review"]["status"], "needs_review")
 
+    def test_rebind_retains_same_archive_rows_for_each_currency(self) -> None:
+        old_eur = bank_record(record_id="bank-source:bank:eur", archive_id="transfer-1", amount=330.0)
+        old_usd = bank_record(record_id="bank-source:bank:usd", archive_id="transfer-1", amount=-2.0)
+        old_usd["currency"] = "USD"
+        refreshed_eur = bank_record(record_id="bank-source:bank:eur:9", archive_id="transfer-1", amount=330.0)
+        refreshed_usd = bank_record(record_id="bank-source:bank:usd:9", archive_id="transfer-1", amount=-2.0)
+        refreshed_usd["currency"] = "USD"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_path = root / "old.json"
+            old_path.write_text(json.dumps(normalized_payload(old_eur, old_usd)), encoding="utf-8")
+            refreshed_path = root / "refreshed.json"
+            refreshed_path.write_text(json.dumps(normalized_payload(refreshed_eur, refreshed_usd)), encoding="utf-8")
+            payload = {
+                "schema_version": "1.0",
+                "company_slug": "example",
+                "year": 2024,
+                "normalized_bindings": [{"path": str(old_path), "sha256": hashlib.sha256(old_path.read_bytes()).hexdigest()}],
+                "allocations": [
+                    allocation(statement_id="archive:transfer-1", record_id="bank-source:bank:eur", amount=330.0),
+                    allocation(statement_id="archive:transfer-1", record_id="bank-source:bank:usd", amount=-2.0, currency="USD"),
+                ],
+            }
+
+            rebound = bank_allocations.rebind_bank_allocations(payload, normalized_year_paths=[refreshed_path])
+
+        self.assertEqual(
+            {item["currency"]: item["record_id"] for item in rebound["allocations"]},
+            {"EUR": "bank-source:bank:eur:9", "USD": "bank-source:bank:usd:9"},
+        )
+        self.assertTrue(all(item["review"]["status"] == "needs_review" for item in rebound["allocations"]))
+
     def test_rebind_rejects_changed_statement_economics(self) -> None:
         old_record = bank_record()
         changed_record = bank_record(amount=331.0)
@@ -324,7 +414,7 @@ class BankAllocationTests(unittest.TestCase):
                 allocation(statement_id="archive:two", record_id="bank-source:bank:3", period="2024-02"),
             ]
         }
-        self.assertEqual(set(bank_allocations.period_allocations(payload, "2024-01")), {"archive:one"})
+        self.assertEqual(set(bank_allocations.period_allocations(payload, "2024-01")), {("archive:one", "EE123", "EUR")})
 
 
 if __name__ == "__main__":

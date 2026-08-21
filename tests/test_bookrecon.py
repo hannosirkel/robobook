@@ -88,6 +88,7 @@ def allocation(*, statement_id: str, record_id: str, amount: float, currency: st
     result: dict = {
         "statement_id": statement_id,
         "record_id": record_id,
+        "iban": "EE123",
         "period": "2024-01",
         "disposition": "existing_invoice_receipt",
         "amount": amount,
@@ -225,6 +226,33 @@ class BookreconTests(unittest.TestCase):
         self.assertTrue(coverage["coverage_ready"])
         self.assertEqual(coverage["physical_bank_row_count"], 1)
         self.assertEqual(coverage["allocated_row_count"], 1)
+
+    def test_same_archive_rows_in_each_currency_are_two_exact_physical_rows(self) -> None:
+        bank_records = [
+            bank_row(record_id="transfer-eur", amount=330.0, iban=" ee 123 ", currency="EUR"),
+            bank_row(record_id="transfer-usd", amount=-2.0, iban="EE123", currency="USD"),
+        ]
+        for row in bank_records:
+            row["attributes"]["archive_identifier"] = "transfer-1"
+        check, coverage = bookrecon.build_physical_bank_coverage_check(
+            normalized_path_display="normalized/2024-01.json",
+            target_period="2024-01",
+            bank_records=bank_records,
+            allocations={
+                ("archive:transfer-1", "EE123", "EUR"): allocation(
+                    statement_id="archive:transfer-1", record_id="transfer-eur", amount=330.0, iban="EE123"
+                ),
+                ("archive:transfer-1", "EE123", "USD"): allocation(
+                    statement_id="archive:transfer-1", record_id="transfer-usd", amount=-2.0, currency="USD", iban=" EE 123 "
+                ),
+            },
+        )
+
+        self.assertEqual(check["status"], "pass")
+        self.assertTrue(coverage["coverage_ready"])
+        self.assertEqual(coverage["physical_bank_row_count"], 2)
+        self.assertEqual(coverage["allocated_row_count"], 2)
+        self.assertEqual(coverage["unallocated_row_count"], 0)
 
     def test_physical_bank_coverage_separates_iban_currency_ledgers_and_proves_camt_balances(self) -> None:
         bank_records = [

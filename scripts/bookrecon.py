@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from bank_allocations import BankAllocationError, bank_ledger_key, load_bank_allocations, period_allocations, statement_identity
+from bank_allocations import BankAllocationError, allocation_key, bank_ledger_key, load_bank_allocations, period_allocations, statement_identity
 from bookbuilder import planned_sales_groups
 from simplbooks_api import SimplbooksError, resolve_company_name
 
@@ -492,7 +492,7 @@ def build_physical_bank_coverage_check(
     Later write-capable stages independently turn the same evidence into hard blocks.
     """
     errors = list(allocation_errors or [])
-    indexed: dict[str, tuple[dict[str, Any], tuple[str, str]]] = {}
+    indexed: dict[tuple[str, str, str], tuple[dict[str, Any], tuple[str, str]]] = {}
     ledger_rows: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for record in bank_records:
         if record.get("source_system") != "bank":
@@ -507,22 +507,36 @@ def build_physical_bank_coverage_check(
         except BankAllocationError as exc:
             errors.append(str(exc))
             continue
-        if statement_id in indexed:
-            errors.append(f"Physical bank statement identity is duplicated: {statement_id}.")
+        key = statement_id, *ledger
+        if key in indexed:
+            errors.append(f"Physical bank allocation key is duplicated: {key}.")
             continue
-        indexed[statement_id] = (record, ledger)
+        indexed[key] = (record, ledger)
         ledger_rows.setdefault(ledger, []).append(record)
 
-    exact_allocated_ids: set[str] = set()
+    canonical_allocations: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for allocation in allocations.values():
+        try:
+            key = allocation_key(allocation)
+        except BankAllocationError as exc:
+            errors.append(str(exc))
+            continue
+        if key in canonical_allocations:
+            errors.append(f"Reviewed bank allocation key is duplicated: {key}.")
+            continue
+        canonical_allocations[key] = allocation
+
+    exact_allocated_keys: set[tuple[str, str, str]] = set()
     allocation_total = Decimal("0")
-    for statement_id, (record, _) in indexed.items():
-        allocation = allocations.get(statement_id)
+    for key, (record, _) in indexed.items():
+        statement_id = key[0]
+        allocation = canonical_allocations.get(key)
         if allocation is None:
             errors.append(f"Missing reviewed bank allocation for {statement_id}.")
             continue
         expected_amount = decimal_value(record.get("gross_amount"))
         mismatches: list[str] = []
-        if str(allocation.get("statement_id") or "") != statement_id:
+        if allocation_key(allocation) != key:
             mismatches.append("statement identity")
         if str(allocation.get("record_id") or "") != str(record.get("record_id") or ""):
             mismatches.append("record locator")
@@ -535,11 +549,11 @@ def build_physical_bank_coverage_check(
         if mismatches:
             errors.append(f"Reviewed bank allocation does not exactly match {statement_id}: {', '.join(mismatches)}.")
             continue
-        exact_allocated_ids.add(statement_id)
+        exact_allocated_keys.add(key)
         allocation_total += expected_amount
 
-    for statement_id in sorted(set(allocations) - set(indexed)):
-        errors.append(f"Reviewed bank allocation is stale or outside this period: {statement_id}.")
+    for key in sorted(set(canonical_allocations) - set(indexed)):
+        errors.append(f"Reviewed bank allocation is stale or outside this period: {key}.")
 
     openings, closings, supporting_scopes, balance_errors, scope_notes = _bank_balance_values(
         bank_balance_records or [], target_period=target_period
@@ -569,10 +583,10 @@ def build_physical_bank_coverage_check(
                 "currency": currency,
                 "physical_bank_row_count": len(rows),
                 "allocated_row_count": sum(
-                    1 for record in rows if statement_identity(record) in exact_allocated_ids
+                    1 for record in rows if (statement_identity(record), *bank_ledger_key(record)) in exact_allocated_keys
                 ),
                 "unallocated_row_count": sum(
-                    1 for record in rows if statement_identity(record) not in exact_allocated_ids
+                    1 for record in rows if (statement_identity(record), *bank_ledger_key(record)) not in exact_allocated_keys
                 ),
                 "credit_total": decimal_number(sum((max(decimal_value(row.get("gross_amount")), Decimal("0")) for row in rows), Decimal("0"))),
                 "debit_total": decimal_number(sum((min(decimal_value(row.get("gross_amount")), Decimal("0")) for row in rows), Decimal("0"))),
@@ -590,8 +604,8 @@ def build_physical_bank_coverage_check(
     coverage = {
         "coverage_ready": not errors,
         "physical_bank_row_count": len(indexed),
-        "allocated_row_count": len(exact_allocated_ids),
-        "unallocated_row_count": len(indexed) - len(exact_allocated_ids),
+        "allocated_row_count": len(exact_allocated_keys),
+        "unallocated_row_count": len(indexed) - len(exact_allocated_keys),
         "credit_total": decimal_number(sum((max(decimal_value(record.get("gross_amount")), Decimal("0")) for record, _ in indexed.values()), Decimal("0"))),
         "debit_total": decimal_number(sum((min(decimal_value(record.get("gross_amount")), Decimal("0")) for record, _ in indexed.values()), Decimal("0"))),
         "net_movement": decimal_number(sum((decimal_value(record.get("gross_amount")) for record, _ in indexed.values()), Decimal("0"))),

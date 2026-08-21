@@ -149,3 +149,13 @@ Full-year dry run:
   --year 2024 \
   --source-dir companies/example/source
 ```
+
+Annual ECB exchange-rate cache through Frankfurter:
+
+```bash
+.venv/bin/python scripts/exchange_rates.py fetch \
+  --company-dir companies/example \
+  --year 2024 \
+  --base USD \
+  --quote EUR
+```

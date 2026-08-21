@@ -692,6 +692,33 @@ class BookprepTests(unittest.TestCase):
             self.assertEqual(len(records["bank_transactions"]), 1)
             self.assertEqual(len(records["bank_balances"]), 1)
 
+    def test_camt_same_ledger_mismatched_reference_is_blocking_duplicate_risk(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kontovv_primary_2024-01.csv").write_text(
+                "Kliendi konto,Dokumendi number,Kuupäev,Saaja/maksja konto,Saaja/maksja nimi,Deebet/Kreedit (D/C),Summa,Viitenumber,Arhiveerimistunnus,Selgitus,Valuuta\n"
+                "EE00,DOC1,2024-01-02,ACC1,Customer,C,12.00,,ARCH1,Receipt,EUR\n",
+                encoding="utf-8",
+            )
+            (root / "statement_2024-01.xml").write_text(
+                "<Document><BkToCstmrStmt><Stmt><Acct><Id><IBAN>EE00</IBAN></Id><Ccy>EUR</Ccy></Acct>"
+                "<Ntry><Amt Ccy=\"EUR\">12.00</Amt><CdtDbtInd>CRDT</CdtDbtInd><BookgDt><Dt>2024-01-02</Dt></BookgDt><AcctSvcrRef>ARCH2</AcctSvcrRef></Ntry>"
+                "</Stmt></BkToCstmrStmt></Document>",
+                encoding="utf-8",
+            )
+            start, end = bookprep.parse_period("2024-01")
+            sources = bookprep.inspect_sources(source_dir=root, root_dir=root, period_start=start, period_end=end)
+
+            records, exceptions = bookprep.aggregate_results(sources=sources, period_start=start, period_end=end, base_currency="EUR")
+
+            self.assertEqual(len(records["bank_transactions"]), 2)
+            risk = next(item for item in exceptions if "duplicate-risk" in item["exception_id"])
+            self.assertTrue(risk["blocking"])
+            self.assertEqual(risk["severity"], "error")
+            self.assertIn("ARCH2", risk["reason"])
+            self.assertIn("EE00/EUR", risk["reason"])
+            self.assertIn("camt:1", risk["reason"])
+
     def test_camt_for_unrelated_ledger_is_not_suppressed_by_csv(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

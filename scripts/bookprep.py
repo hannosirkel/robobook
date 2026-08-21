@@ -3495,14 +3495,14 @@ def sources_overlap(left: SourceDescriptor, right: SourceDescriptor) -> bool:
     return not (left.covered_until < right.covered_from or right.covered_until < left.covered_from)
 
 
-def camt_record_is_supported_by_canonical_csv(
+def canonical_csv_records_for_camt_record(
     *,
     source: SourceDescriptor,
     camt_record: dict[str, Any],
     existing_bank_records: list[dict[str, Any]],
     source_by_id: dict[str, SourceDescriptor],
     canonical_csv_source_ids: set[str],
-) -> bool:
+) -> list[dict[str, Any]]:
     csv_records = [
         record
         for record in existing_bank_records
@@ -3510,14 +3510,14 @@ def camt_record_is_supported_by_canonical_csv(
     ]
     camt_ledger = physical_bank_ledger(camt_record)
     if camt_ledger is None:
-        return False
+        return []
     matching_csv_records = [
         record
         for record in csv_records
         if physical_bank_ledger(record) == camt_ledger
     ]
     if not matching_csv_records:
-        return False
+        return []
     matching_csv_sources = {
         ref.get("source_id")
         for record in matching_csv_records
@@ -3525,12 +3525,8 @@ def camt_record_is_supported_by_canonical_csv(
         if ref.get("source_id") in canonical_csv_source_ids
     }
     if not any(sources_overlap(source, source_by_id[source_id]) for source_id in matching_csv_sources):
-        return False
-    camt_references = physical_bank_references(camt_record)
-    if not camt_references:
-        return True
-    csv_references = set().union(*(physical_bank_references(record) for record in matching_csv_records))
-    return bool(camt_references & csv_references)
+        return []
+    return matching_csv_records
 
 
 def aggregate_results(
@@ -3583,17 +3579,40 @@ def aggregate_results(
                 base_currency=base_currency,
             )
         if source.parser_name == "parse_camt_xml":
-            supporting_records = [
-                record
-                for record in parsed_records["bank_transactions"]
-                if camt_record_is_supported_by_canonical_csv(
+            supporting_records: list[dict[str, Any]] = []
+            for record in parsed_records["bank_transactions"]:
+                matching_csv_records = canonical_csv_records_for_camt_record(
                     source=source,
                     camt_record=record,
                     existing_bank_records=records["bank_transactions"],
                     source_by_id=source_by_id,
                     canonical_csv_source_ids=canonical_csv_source_ids,
                 )
-            ]
+                camt_references = physical_bank_references(record)
+                csv_references = set().union(
+                    *(physical_bank_references(csv_record) for csv_record in matching_csv_records)
+                )
+                if matching_csv_records and (not camt_references or camt_references & csv_references):
+                    supporting_records.append(record)
+                    continue
+                if matching_csv_records and camt_references:
+                    ledger = physical_bank_ledger(record)
+                    ledger_label = f"{ledger[0]}/{ledger[1]}" if ledger else "unknown ledger"
+                    references = ", ".join(sorted(camt_references))
+                    exceptions.append(
+                        make_exception(
+                            source=source,
+                            exception_id=f"{record['record_id']}:duplicate-risk",
+                            severity="error",
+                            reason=(
+                                f"CAMT record {record['record_id']} with AcctSvcrRef {references} overlaps "
+                                f"canonical CSV ledger {ledger_label} but does not match its immutable references."
+                            ),
+                            blocking=True,
+                            row_ref=(record.get("source_refs") or [{}])[0].get("row_ref"),
+                            suggested_follow_up="Review the paired bank CSV and CAMT statement before assigning this potential duplicate or missing physical-bank row.",
+                        )
+                    )
             if supporting_records:
                 supporting_ids = {id(record) for record in supporting_records}
                 records["bank_transactions"].extend(

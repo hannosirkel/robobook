@@ -83,6 +83,11 @@ class BookprepTests(unittest.TestCase):
         self.assertEqual(records["other"], [])
         self.assertTrue(any(item["blocking"] for item in exceptions))
 
+    def test_woo_tax_summary_blocks_fractional_cent_tax_amounts(self) -> None:
+        records, exceptions = self.parse_tax_fixture("DE-DE-VAT-1,19,19.005,15.004,4.001,1")
+        self.assertEqual(records["other"], [])
+        self.assertTrue(any(item["blocking"] for item in exceptions))
+
     def test_woo_tax_summary_emits_only_in_year_end_period(self) -> None:
         records, exceptions = self.parse_tax_fixture(
             "DE-DE-VAT-1,19,19.00,15.00,4.00,1", period="2025-05"

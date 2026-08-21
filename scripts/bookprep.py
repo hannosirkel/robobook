@@ -1057,6 +1057,10 @@ def parse_woo_tax_summary_csv(
                 and total >= 0
                 and order_tax >= 0
                 and shipping_tax >= 0
+                and all(
+                    value == value.quantize(cents, rounding=ROUND_HALF_UP)
+                    for value in (total, order_tax, shipping_tax)
+                )
                 and orders > 0
                 and orders == orders.to_integral_value()
                 and total.quantize(cents, rounding=ROUND_HALF_UP)

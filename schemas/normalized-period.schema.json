@@ -49,6 +49,8 @@
         "fees",
         "payouts",
         "bank_transactions",
+        "clearing_transactions",
+        "bank_balances",
         "purchase_expenses",
         "purchase_credits",
         "inventory_movements",
@@ -81,6 +83,18 @@
           }
         },
         "bank_transactions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/normalized_record"
+          }
+        },
+        "clearing_transactions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/normalized_record"
+          }
+        },
+        "bank_balances": {
           "type": "array",
           "items": {
             "$ref": "#/$defs/normalized_record"

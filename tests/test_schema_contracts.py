@@ -99,6 +99,12 @@ class SchemaContractTests(unittest.TestCase):
         artifact = json.loads((ROOT / "templates/posting-policy.template.json").read_text(encoding="utf-8"))
         self.assert_artifact_valid(schema_name="posting-policy.schema.json", artifact=artifact)
 
+    def test_normalized_period_template_includes_cash_ledger_categories(self) -> None:
+        artifact = json.loads((ROOT / "templates/normalized-period.template.json").read_text(encoding="utf-8"))
+        self.assert_artifact_valid(schema_name="normalized-period.schema.json", artifact=artifact)
+        self.assertEqual(artifact["records"]["clearing_transactions"], [])
+        self.assertEqual(artifact["records"]["bank_balances"], [])
+
     def test_year_overview_template_matches_strict_schema(self) -> None:
         artifact = json.loads((ROOT / "templates/year-overview.template.json").read_text(encoding="utf-8"))
         self.assert_artifact_valid(schema_name="year-overview.schema.json", artifact=artifact)
@@ -183,7 +189,7 @@ class SchemaContractTests(unittest.TestCase):
 
     def test_generated_action_batch_matches_strict_schema(self) -> None:
         categories = (
-            "sales", "refunds", "fees", "payouts", "bank_transactions", "purchase_expenses",
+            "sales", "refunds", "fees", "payouts", "bank_transactions", "clearing_transactions", "bank_balances", "purchase_expenses",
             "purchase_credits", "inventory_movements", "manual_adjustments", "other",
         )
         normalized = {

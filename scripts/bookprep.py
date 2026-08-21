@@ -914,6 +914,8 @@ def parser_result() -> dict[str, list[dict[str, Any]]]:
         "fees": [],
         "payouts": [],
         "bank_transactions": [],
+        "clearing_transactions": [],
+        "bank_balances": [],
         "purchase_expenses": [],
         "purchase_credits": [],
         "inventory_movements": [],
@@ -1979,6 +1981,7 @@ def parse_bank_csv(
                 "counterparty_name": row.get("Saaja/maksja nimi"),
                 "reference_number": row.get("Viitenumber"),
                 "bank_bic": row.get("Saaja/maksja panga BIC"),
+                "archive_identifier": row.get("Arhiveerimistunnus") or None,
             },
             row_ref=f"csv:{line_no}",
         )
@@ -2220,7 +2223,7 @@ def parse_printful_wallet_csv(
         seen_dates.append(event_date)
         category, record = make_record(
             source=source,
-            category="bank_transactions",
+            category="clearing_transactions",
             record_id=f"{source.source_id}:wallet:{line_no}",
             event_type=event_type,
             event_date=event_date,
@@ -2234,6 +2237,8 @@ def parse_printful_wallet_csv(
             attributes={
                 "action": row.get("Action"),
                 "payment_instrument": payment_instrument,
+                "clearing_provider": "printful",
+                "clearing_account": "printful_wallet",
             },
             row_ref=f"csv:{line_no}",
         )
@@ -2379,6 +2384,55 @@ def parse_camt_xml(
     result = parser_result()
     seen_dates: list[date] = []
 
+    statement = root.find(".//ns:Stmt" if ns else ".//Stmt", ns)
+    account = statement.find("ns:Acct" if ns else "Acct", ns) if statement is not None else None
+    iban = ""
+    account_currency = base_currency
+    if account is not None:
+        iban = (account.findtext("ns:Id/ns:IBAN" if ns else "Id/IBAN", default="", namespaces=ns) or "").strip().upper()
+        account_currency = (account.findtext("ns:Ccy" if ns else "Ccy", default=base_currency, namespaces=ns) or base_currency).strip().upper()
+
+    balance_keys: set[tuple[str, str, str, str]] = set()
+    balance_nodes = root.findall(".//ns:Bal" if ns else ".//Bal", ns)
+    for index, balance in enumerate(balance_nodes, start=1):
+        amount_node = balance.find("ns:Amt" if ns else "Amt", ns)
+        amount = parse_decimal(amount_node.text if amount_node is not None else "0")
+        currency = (amount_node.get("Ccy") if amount_node is not None else None) or account_currency
+        currency = currency.upper()
+        credit_debit = balance.findtext("ns:CdtDbtInd" if ns else "CdtDbtInd", default="", namespaces=ns).strip().upper()
+        if credit_debit == "DBIT":
+            amount = -abs(amount)
+        elif credit_debit == "CRDT":
+            amount = abs(amount)
+        balance_type = balance.findtext("ns:Tp/ns:Cd" if ns else "Tp/Cd", default="other", namespaces=ns).strip() or "other"
+        date_text = balance.findtext("ns:Dt/ns:Dt" if ns else "Dt/Dt", default="", namespaces=ns)
+        if not date_text:
+            date_text = balance.findtext("ns:Dt/ns:DtTm" if ns else "Dt/DtTm", default="", namespaces=ns)
+        balance_date = parse_date_value(date_text)
+        key = (iban, currency, balance_type, balance_date.isoformat())
+        if key in balance_keys:
+            continue
+        balance_keys.add(key)
+        category, record = make_record(
+            source=source,
+            category="bank_balances",
+            record_id=f"{source.source_id}:camt-balance:{iban or 'unknown'}:{currency}:{balance_type}:{balance_date.isoformat()}",
+            event_type="bank_balance",
+            event_date=balance_date,
+            description=f"CAMT {balance_type} balance for {iban or 'unknown account'}",
+            currency=currency,
+            gross_amount=amount,
+            net_amount=amount,
+            attributes={
+                "iban": iban or None,
+                "balance_type": balance_type,
+                "balance_date": balance_date.isoformat(),
+                "credit_debit_indicator": credit_debit or None,
+            },
+            row_ref=f"xml:balance:{index}",
+        )
+        result[category].append(record)
+
     for index, entry in enumerate(root.findall(".//ns:Ntry" if ns else ".//Ntry", ns), start=1):
         amount_text = entry.findtext("ns:Amt" if ns else "Amt", default="0", namespaces=ns)
         amount = parse_decimal(amount_text)
@@ -2425,7 +2479,11 @@ def parse_camt_xml(
             gross_amount=amount,
             net_amount=amount,
             external_ref=reference or None,
-            attributes={"credit_debit_indicator": credit_debit},
+            attributes={
+                "iban": iban or None,
+                "account_servicer_reference": reference or None,
+                "credit_debit_indicator": credit_debit,
+            },
             row_ref=f"xml:{index}",
         )
         result[category].append(record)
@@ -3419,7 +3477,7 @@ def aggregate_results(
     exceptions: list[dict[str, Any]] = missing_canonical_source_exceptions(sources)
 
     for source in sources:
-        if not source.canonical:
+        if not source.canonical and source.parser_name != "parse_camt_xml":
             continue
         parser = PARSERS.get(source.parser_name)
         if parser is None:
@@ -3451,8 +3509,42 @@ def aggregate_results(
                 period_end=period_end,
                 base_currency=base_currency,
             )
-        for category, values in parsed_records.items():
-            records[category].extend(values)
+        if source.canonical:
+            for category, values in parsed_records.items():
+                records[category].extend(values)
+        else:
+            records["bank_balances"].extend(parsed_records["bank_balances"])
+            camt_references = {
+                str(record.get("attributes", {}).get("account_servicer_reference") or "").strip()
+                for record in parsed_records["bank_transactions"]
+            }
+            camt_references.discard("")
+            canonical_references = {
+                str(candidate).strip()
+                for record in records["bank_transactions"]
+                if record.get("source_system") == "bank"
+                for candidate in (
+                    record.get("external_ref"),
+                    (record.get("attributes") or {}).get("archive_identifier"),
+                    (record.get("attributes") or {}).get("account_servicer_reference"),
+                )
+                if str(candidate or "").strip()
+            }
+            unmatched = sorted(camt_references - canonical_references)
+            if unmatched:
+                exceptions.append(
+                    make_exception(
+                        source=source,
+                        exception_id=f"{source.source_id}:camt-reference-mismatch",
+                        severity="warn",
+                        reason="Non-canonical CAMT entries have account-servicer references not present in canonical physical-bank rows: " + ", ".join(unmatched) + ".",
+                        blocking=False,
+                        suggested_follow_up="Review the paired bank CSV and CAMT exports before relying on their balance cross-check.",
+                    )
+                )
+            source.parser_notes.append(
+                "CAMT transaction rows were retained only for immutable-reference cross-checking; CAMT balances were kept as supporting evidence."
+            )
         exceptions.extend(parsed_exceptions)
 
     for category in ("sales", "refunds"):

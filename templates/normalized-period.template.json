@@ -11,6 +11,8 @@
     "fees": [],
     "payouts": [],
     "bank_transactions": [],
+    "clearing_transactions": [],
+    "bank_balances": [],
     "purchase_expenses": [],
     "purchase_credits": [],
     "inventory_movements": [],

@@ -570,6 +570,48 @@ class BookprepTests(unittest.TestCase):
             self.assertEqual(len(records["bank_transactions"]), 2)
             amounts = [record["gross_amount"] for record in records["bank_transactions"]]
             self.assertEqual(amounts, [126.6, -26.62])
+            self.assertTrue(all(record["source_system"] == "bank" for record in records["bank_transactions"]))
+
+    def test_camt_xml_emits_balances_without_duplicate_bank_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kontovv_2024.csv").write_text(
+                "Kliendi konto,Dokumendi number,Kuupäev,Saaja/maksja konto,Saaja/maksja nimi,Deebet/Kreedit (D/C),Summa,Viitenumber,Arhiveerimistunnus,Selgitus,Valuuta\n"
+                "EE00,DOC1,2024-01-02,ACC1,Customer,C,126.60,,ARCH1,Receipt,EUR\n"
+                "EE00,DOC2,2024-01-03,ACC2,Supplier,D,-26.62,,ARCH2,Payment,EUR\n",
+                encoding="utf-8",
+            )
+            (root / "kontovv_2024.xml").write_text(
+                "<Document><BkToCstmrStmt><Stmt><Acct><Id><IBAN>EE00</IBAN></Id><Ccy>EUR</Ccy></Acct>"
+                "<Bal><Tp><Cd>OPBD</Cd></Tp><Amt Ccy=\"EUR\">100.00</Amt><CdtDbtInd>CRDT</CdtDbtInd><Dt><Dt>2024-01-01</Dt></Dt></Bal>"
+                "<Ntry><Amt Ccy=\"EUR\">126.60</Amt><CdtDbtInd>CRDT</CdtDbtInd><BookgDt><Dt>2024-01-02</Dt></BookgDt>"
+                "<NtryDtls><TxDtls><Refs><AcctSvcrRef>ARCH1</AcctSvcrRef></Refs></TxDtls></NtryDtls></Ntry>"
+                "<Ntry><Amt Ccy=\"EUR\">26.62</Amt><CdtDbtInd>DBIT</CdtDbtInd><BookgDt><Dt>2024-01-03</Dt></BookgDt>"
+                "<NtryDtls><TxDtls><Refs><AcctSvcrRef>ARCH2</AcctSvcrRef></Refs></TxDtls></NtryDtls></Ntry>"
+                "</Stmt></BkToCstmrStmt></Document>",
+                encoding="utf-8",
+            )
+            period_start, period_end = bookprep.parse_period("2024-01")
+            sources = bookprep.inspect_sources(
+                source_dir=root,
+                root_dir=root,
+                period_start=period_start,
+                period_end=period_end,
+            )
+
+            records, exceptions = bookprep.aggregate_results(
+                sources=sources,
+                period_start=period_start,
+                period_end=period_end,
+                base_currency="EUR",
+            )
+
+            self.assertFalse(exceptions)
+            self.assertEqual(len(records["bank_transactions"]), 2)
+            self.assertEqual(len(records["bank_balances"]), 1)
+            balance = records["bank_balances"][0]
+            self.assertEqual(balance["attributes"]["iban"], "EE00")
+            self.assertEqual(balance["attributes"]["balance_type"], "OPBD")
 
     def test_parse_paypal_csv_classifies_sales_refunds_and_payouts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1538,7 +1580,7 @@ class BookprepTests(unittest.TestCase):
             self.assertEqual(credit["external_ref"], "108021610")
             self.assertEqual(credit["attributes"]["source_gross_amount"], -11.4)
 
-    def test_parse_printful_wallet_csv_maps_cash_directions_and_preserves_currency(self) -> None:
+    def test_printful_wallet_rows_are_clearing_not_physical_bank(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             csv_path = root / "Wallet.csv"
@@ -1563,11 +1605,13 @@ class BookprepTests(unittest.TestCase):
             )
 
             self.assertFalse(exceptions)
-            self.assertEqual(len(records["bank_transactions"]), 3)
-            amounts = [record["gross_amount"] for record in records["bank_transactions"]]
-            currencies = [record["currency"] for record in records["bank_transactions"]]
+            self.assertEqual(records["bank_transactions"], [])
+            self.assertEqual(len(records["clearing_transactions"]), 3)
+            amounts = [record["gross_amount"] for record in records["clearing_transactions"]]
+            currencies = [record["currency"] for record in records["clearing_transactions"]]
             self.assertEqual(amounts, [-8.21, 3.55, -306.32])
             self.assertEqual(currencies, ["EUR", "EUR", "USD"])
+            self.assertEqual(records["clearing_transactions"][0]["attributes"]["clearing_provider"], "printful")
 
     def test_parse_printful_other_csv_extracts_monthly_service_charge(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

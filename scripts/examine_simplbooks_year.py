@@ -80,10 +80,56 @@ def build_document_index(
     *,
     invoices: list[dict[str, Any]],
     purchases: list[dict[str, Any]],
+    incomings: list[dict[str, Any]] | None = None,
+    payments: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     index = [document_identity(record, document_type="invoice").to_dict() for record in invoices]
     index.extend(document_identity(record, document_type="purchase").to_dict() for record in purchases)
+    index.extend(cash_document_index_entry(record, document_type="incoming") for record in incomings or [])
+    index.extend(cash_document_index_entry(record, document_type="payment") for record in payments or [])
     return index
+
+
+def cash_document_index_entry(record: dict[str, Any], *, document_type: str) -> dict[str, Any]:
+    """Build a stable, read-only discovery entry for a live cash document."""
+    if document_type == "incoming":
+        date_field = "income_date"
+        amount_field = "income_sum"
+        linked_fields = (("invoice_id", "invoice"), ("purchase_id", "purchase"))
+    else:
+        date_field = "payment_date"
+        amount_field = "payment_sum"
+        linked_fields = (("purchase_id", "purchase"), ("invoice_id", "invoice"))
+
+    identity_input = {
+        **record,
+        "transaction_date": None,
+        "event_date": None,
+        "document_date": record.get(date_field),
+        "created": None,
+        "gross_amount": record.get(amount_field, record.get("sum", 0)),
+    }
+    entry = document_identity(identity_input, document_type=document_type).to_dict()
+    linked_document_id = None
+    linked_document_type = None
+    for field_name, candidate_type in linked_fields:
+        value = record.get(field_name)
+        if value not in (None, ""):
+            linked_document_id = str(value)
+            linked_document_type = candidate_type
+            break
+    counterparty = record.get("client_name") or record.get("counterparty_name") or record.get("supplier_name") or ""
+    description = record.get("description") or record.get("comment") or record.get("explanation") or ""
+    entry.update(
+        {
+            "linked_document_id": linked_document_id,
+            "linked_document_type": linked_document_type,
+            "income_account_id": str(record["income_account_id"]) if record.get("income_account_id") not in (None, "") else None,
+            "counterparty": str(counterparty),
+            "description": str(description),
+        }
+    )
+    return entry
 
 
 def build_year_overview(client: SimplbooksClient, *, year: int) -> dict[str, Any]:
@@ -182,7 +228,12 @@ def build_year_overview(client: SimplbooksClient, *, year: int) -> dict[str, Any
             "purchase_vat_type_ids": count_row_patterns(purchase_rows, "vat_type_id"),
             "purchase_article_ids": count_row_patterns(purchase_rows, "article_id"),
         },
-        "document_index": build_document_index(invoices=invoices, purchases=purchases),
+        "document_index": build_document_index(
+            invoices=invoices,
+            purchases=purchases,
+            incomings=receipts,
+            payments=payments,
+        ),
         "samples": {
             "financial_accounts": financial_accounts[:10],
             "income_accounts": income_accounts[:10],

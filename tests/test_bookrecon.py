@@ -71,6 +71,28 @@ def find_check(document: dict, check_id: str) -> dict:
 
 
 class BookreconTests(unittest.TestCase):
+    def test_supplier_credit_check_reports_total_by_currency(self) -> None:
+        normalized = base_normalized()
+        normalized["records"]["purchase_credits"].append(
+            record(
+                record_id="printful:credit:1",
+                source_system="printful",
+                event_type="printful_supplier_credit",
+                gross_amount=113.12,
+                description="Printful supplier credit",
+            )
+        )
+
+        checks = bookrecon.build_purchase_credit_checks(
+            normalized_path_display="normalized/2024-07.json",
+            records=normalized["records"],
+        )
+
+        self.assertEqual(len(checks), 1)
+        self.assertEqual(checks[0]["status"], "pass")
+        self.assertEqual(checks[0]["lhs_amount"], 113.12)
+        self.assertEqual(checks[0]["lhs_label"], "Supplier credits (EUR)")
+
     def test_blocking_normalized_exception_blocks_build(self) -> None:
         normalized = base_normalized()
         normalized["exceptions"].append(

@@ -50,6 +50,7 @@
         "payouts",
         "bank_transactions",
         "purchase_expenses",
+        "purchase_credits",
         "inventory_movements",
         "manual_adjustments",
         "other"
@@ -86,6 +87,12 @@
           }
         },
         "purchase_expenses": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/normalized_record"
+          }
+        },
+        "purchase_credits": {
           "type": "array",
           "items": {
             "$ref": "#/$defs/normalized_record"

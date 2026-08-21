@@ -34,6 +34,7 @@ RECORD_CATEGORIES = (
     "payouts",
     "bank_transactions",
     "purchase_expenses",
+    "purchase_credits",
     "inventory_movements",
     "manual_adjustments",
     "other",
@@ -702,6 +703,39 @@ def build_fulfillment_checks(
     return checks
 
 
+def build_purchase_credit_checks(
+    *,
+    normalized_path_display: str,
+    records: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    credits = records.get("purchase_credits", [])
+    currencies = sorted({record_currency(record) for record in credits})
+    checks: list[dict[str, Any]] = []
+
+    for currency in currencies:
+        currency_credits = [record for record in credits if record_currency(record) == currency]
+        total = sum_amount(currency_credits, "gross_amount")
+        checks.append(
+            make_check(
+                check_id=f"supplier-credits:{currency.lower()}",
+                name=f"Supplier credits ({currency})",
+                status="pass",
+                lhs_label=f"Supplier credits ({currency})",
+                lhs_amount=total,
+                notes=["Supplier credits are preserved separately from purchase expenses for posting."],
+                evidence_refs=[
+                    make_artifact_ref(
+                        normalized_path_display,
+                        record_refs_list=record_refs(currency_credits),
+                        notes="Normalized supplier-credit rows.",
+                    )
+                ],
+            )
+        )
+
+    return checks
+
+
 def build_inventory_check(
     *,
     normalized_path_display: str,
@@ -886,6 +920,10 @@ def build_recon_document(
             normalized_path_display=normalized_path_display,
             records=records,
             amount_threshold=amount_threshold,
+        ),
+        *build_purchase_credit_checks(
+            normalized_path_display=normalized_path_display,
+            records=records,
         ),
         *build_fulfillment_checks(
             normalized_path_display=normalized_path_display,

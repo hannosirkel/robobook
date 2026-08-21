@@ -584,7 +584,7 @@ class BookprepTests(unittest.TestCase):
             self.assertEqual(storage["vat_amount"], 4.62)
             self.assertEqual(storage["event_date"], "2023-01-31")
 
-    def test_parse_printful_orders_csv_nets_same_period_refunds_and_warns_on_refund_only_activity(self) -> None:
+    def test_parse_printful_orders_csv_nets_same_period_refunds_and_normalizes_refund_only_credit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             csv_path = root / "Orders.csv"
@@ -615,7 +615,14 @@ class BookprepTests(unittest.TestCase):
             self.assertEqual(expense["vat_amount"], 1.37)
             self.assertEqual(expense["warehouse_id"], "GB")
             self.assertEqual(expense["external_ref"], "107531681")
-            self.assertTrue(any("refund-only" in item["reason"].lower() for item in exceptions))
+            self.assertFalse(exceptions)
+            self.assertEqual(len(records["purchase_credits"]), 1)
+            credit = records["purchase_credits"][0]
+            self.assertEqual(credit["event_type"], "printful_supplier_credit")
+            self.assertEqual(credit["event_date"], "2024-07-12")
+            self.assertEqual(credit["gross_amount"], 11.4)
+            self.assertEqual(credit["external_ref"], "108021610")
+            self.assertEqual(credit["attributes"]["source_gross_amount"], -11.4)
 
     def test_parse_printful_wallet_csv_maps_cash_directions_and_preserves_currency(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -799,6 +799,7 @@ def parser_result() -> dict[str, list[dict[str, Any]]]:
         "payouts": [],
         "bank_transactions": [],
         "purchase_expenses": [],
+        "purchase_credits": [],
         "inventory_movements": [],
         "manual_adjustments": [],
         "other": [],
@@ -1356,20 +1357,47 @@ def parse_printful_orders_csv(
         gross_amount = group["components"]["Total"]
         if gross_amount <= 0:
             if gross_amount < 0:
-                exceptions.append(
-                    make_exception(
-                        source=source,
-                        exception_id=f"{source.source_id}:refund-overage:{group_key}",
-                        severity="warn",
-                        reason=(
-                            f"Skipped Printful refund-only net activity for {group_key}; current downstream purchase builders "
-                            "cannot safely consume negative purchase-expense rows."
-                        ),
-                        blocking=False,
-                        row_ref=f"csv:{group['line_nos'][0]}",
-                        suggested_follow_up="Review whether this Printful refund reverses a prior-period expense and add a manual adjustment if needed.",
+                representative_label = next((label for label in group["order_labels"] if label), group_key)
+                origin = next(iter(sorted(group["shipping_origins"])), None)
+                vat_amount = abs(group["components"]["VAT"])
+                net_amount = abs(
+                    sum(
+                        group["components"][column]
+                        for column in ("Products", "Discount", "Shipping", "Digitization", "Branding", "Fulfillment fees", "Tax")
                     )
                 )
+                if net_amount == 0:
+                    net_amount = abs(gross_amount) - vat_amount
+                category, record = make_record(
+                    source=source,
+                    category="purchase_credits",
+                    record_id=f"{source.source_id}:credit:{slugify(group_key)}",
+                    event_type="printful_supplier_credit",
+                    event_date=max(group["dates"]),
+                    settlement_date=max(group["dates"]),
+                    description=f"Printful supplier credit for {representative_label}",
+                    currency=group["currency"],
+                    gross_amount=abs(gross_amount),
+                    net_amount=net_amount,
+                    vat_amount=vat_amount,
+                    shipping_amount=abs(group["components"]["Shipping"]),
+                    external_ref=group_key,
+                    warehouse_id=origin,
+                    channel="printful",
+                    attributes={
+                        "vendor_name": "Printful Inc.",
+                        "printful_id": group_key,
+                        "order_labels": group["order_labels"],
+                        "statuses": sorted(item for item in group["statuses"] if item),
+                        "source_gross_amount": float(gross_amount),
+                        "credit_magnitude": float(abs(gross_amount)),
+                        "shipped_from": origin,
+                        "shipped_to": sorted(item for item in group["shipping_destinations"] if item),
+                    },
+                    row_ref=f"csv:{group['line_nos'][0]}",
+                )
+                record["source_refs"] = [make_source_ref(source, row_ref=f"csv:{line_no}") for line_no in group["line_nos"]]
+                result[category].append(record)
             continue
 
         vat_amount = group["components"]["VAT"]

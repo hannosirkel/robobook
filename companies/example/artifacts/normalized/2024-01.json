@@ -382,6 +382,7 @@
         ]
       }
     ],
+    "purchase_credits": [],
     "inventory_movements": [],
     "manual_adjustments": [],
     "other": []

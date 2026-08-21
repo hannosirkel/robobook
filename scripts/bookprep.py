@@ -11,7 +11,7 @@ import unicodedata
 from calendar import monthrange
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable
 from xml.etree import ElementTree
@@ -21,6 +21,7 @@ from simplbooks_api import (
     resolve_company_name,
     resolve_company_slug,
 )
+import woo_tax
 
 try:
     from pypdf import PdfReader  # type: ignore
@@ -40,8 +41,56 @@ SOURCE_TYPE_PRIORITY = {
 
 ROW_EVENT_HEADERS = {
     "woo_sales_csv": {"date", "orders", "gross sales", "returns", "coupons", "net sales", "taxes", "shipping", "total sales"},
+    "woo_monthly_sales_csv": {
+        "date",
+        "number of items sold",
+        "number of orders",
+        "average net sales amount",
+        "coupon amount",
+        "shipping amount",
+        "gross sales amount",
+        "net sales amount",
+        "refund amount",
+    },
+    "woo_tax_summary_csv": {"tax code", "rate", "total tax", "order tax", "shipping tax", "orders"},
+    "woo_order_summary_csv": {
+        "date",
+        "order",
+        "status",
+        "customer",
+        "customer type",
+        "product s",
+        "items sold",
+        "coupon s",
+        "net sales",
+        "attribution",
+    },
     "paypal_csv": {"date", "time", "timezone", "name", "type", "status", "currency", "gross", "fee", "net", "transaction id"},
     "stripe_balance_csv": {"id", "type", "source", "amount", "fee", "net", "currency", "created (utc)", "available on (utc)"},
+    "stripe_payouts_csv": {
+        "payout id",
+        "effective at utc",
+        "currency",
+        "gross",
+        "fee",
+        "net",
+        "reporting category",
+        "balance transaction id",
+        "payout status",
+    },
+    "quartermaster_orders_csv": {
+        "referenceid",
+        "qmlorderid",
+        "email",
+        "name",
+        "status",
+        "ordertype",
+        "carrier",
+        "shippingtype",
+        "trackingnumber",
+        "datesubmitted",
+        "dateshipped",
+    },
     "printful_orders_csv": {
         "date",
         "order",
@@ -85,6 +134,7 @@ class SourceDescriptor:
     canonical: bool = False
     parser_notes: list[str] = field(default_factory=list)
     preferred_over: list[str] = field(default_factory=list)
+    context: dict[str, Any] = field(default_factory=dict)
 
     @property
     def priority(self) -> int:
@@ -147,6 +197,7 @@ def source_type_from_path(path: Path) -> str:
         ".csv": "csv",
         ".xml": "xml",
         ".xlsx": "xlsx",
+        ".xls": "xlsx",
         ".pdf": "pdf",
         ".json": "json",
     }
@@ -155,7 +206,7 @@ def source_type_from_path(path: Path) -> str:
 
 def canonical_group_for_path(path: Path) -> str:
     current = Path(path.name)
-    while current.suffix.lower() in {".gsheet", ".csv", ".xml", ".xlsx", ".pdf", ".json"}:
+    while current.suffix.lower() in {".gsheet", ".csv", ".xml", ".xls", ".xlsx", ".pdf", ".json"}:
         current = Path(current.stem)
     return slugify(current.name)
 
@@ -163,10 +214,17 @@ def canonical_group_for_path(path: Path) -> str:
 def infer_source_system(path: Path, source_type: str, header_names: set[str] | None = None) -> str:
     normalized = normalize_ascii(str(path)).lower()
     headers = header_names or set()
+    if (
+        headers >= ROW_EVENT_HEADERS["woo_tax_summary_csv"]
+        or headers >= ROW_EVENT_HEADERS["woo_order_summary_csv"]
+    ):
+        return "woo"
     if "paypal" in normalized or headers >= ROW_EVENT_HEADERS["paypal_csv"]:
         return "paypal"
     if "stripe" in normalized or headers >= ROW_EVENT_HEADERS["stripe_balance_csv"]:
         return "stripe"
+    if "quartermaster" in normalized or "qm_sales" in normalized or headers >= ROW_EVENT_HEADERS["quartermaster_orders_csv"]:
+        return "quartermaster"
     if (
         "printful" in normalized
         or "billing-report" in normalized
@@ -180,7 +238,13 @@ def infer_source_system(path: Path, source_type: str, header_names: set[str] | N
         return "printful"
     if "simplbooks" in normalized:
         return "simplbooks"
-    if "muugiraport" in normalized or "sales report" in normalized or headers >= ROW_EVENT_HEADERS["woo_sales_csv"]:
+    if (
+        "muugiraport" in normalized
+        or "sales report" in normalized
+        or headers >= ROW_EVENT_HEADERS["woo_tax_summary_csv"]
+        or headers >= ROW_EVENT_HEADERS["woo_sales_csv"]
+        or headers >= ROW_EVENT_HEADERS["woo_monthly_sales_csv"]
+    ):
         return "woo"
     if "kontovv" in normalized or source_type == "xml" or headers >= ROW_EVENT_HEADERS["bank_csv"]:
         return "bank"
@@ -193,6 +257,12 @@ def infer_pdf_source_system(text: str, fallback: str) -> str:
     normalized = normalize_ascii(text).lower()
     if "stripe payments europe" in normalized or "stripe processing fees" in normalized:
         return "stripe"
+    if "quartermaster direct" in normalized or "qml picking fee" in normalized:
+        return "quartermaster"
+    if "quartermaster logistics llc" in normalized and (
+        "invoice total" in normalized or "invoice due date" in normalized or "sales report" in normalized
+    ):
+        return "quartermaster"
     if "printful inc" in normalized or "vat report" in normalized:
         return "printful"
     if "simplbooks" in normalized:
@@ -201,7 +271,7 @@ def infer_pdf_source_system(text: str, fallback: str) -> str:
 
 
 def is_ignored_work_file(path: Path) -> bool:
-    return path.suffix.lower() == ".gsheet"
+    return path.suffix.lower() in {".gsheet", ".md"}
 
 
 def parse_decimal(value: Any) -> Decimal:
@@ -227,6 +297,7 @@ def parse_date_value(value: str) -> date:
     text = re.sub(r"\s+", " ", str(value).strip().replace("\ufeff", ""))
     for fmt in (
         "%Y-%m-%d",
+        "%Y.%m.%d",
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%d %H:%M",
         "%d/%m/%Y",
@@ -256,6 +327,18 @@ def sha256_file(path: Path) -> str:
 
 def parse_filename_dates(path: Path) -> tuple[date, date] | None:
     name = normalize_ascii(path.name)
+
+    quartermaster_sales_match = re.search(r"qm_sales_(\d{1,2})(?!\d)", normalize_ascii(path.stem).lower())
+    if quartermaster_sales_match:
+        month = int(quartermaster_sales_match.group(1))
+        year = None
+        for parent in path.parents:
+            parent_match = re.search(r"(20\d{2})", normalize_ascii(parent.name))
+            if parent_match:
+                year = int(parent_match.group(1))
+                break
+        if year is not None and 1 <= month <= 12:
+            return date(year, month, 1), date(year, month, monthrange(year, month)[1])
 
     date_match = re.search(r"(20\d{2})[-_.](\d{2})[-_.](\d{2})", name)
     if date_match:
@@ -358,12 +441,23 @@ def read_csv_rows(path: Path) -> tuple[list[dict[str, str]], set[str]]:
 
 def detect_parser(path: Path, source_type: str, source_system: str, header_names: set[str] | None = None) -> str:
     headers = header_names or set()
+    if source_system == "printful" and slugify(path.name) == "no-activity-during-period":
+        return "parse_no_activity_marker"
     if source_type == "csv" and source_system == "woo":
+        if headers >= ROW_EVENT_HEADERS["woo_tax_summary_csv"]:
+            return "parse_woo_tax_summary_csv"
+        if headers >= ROW_EVENT_HEADERS["woo_order_summary_csv"]:
+            return "parse_woo_order_summary_csv"
         return "parse_woo_sales_csv"
     if source_type == "csv" and source_system == "paypal":
         return "parse_paypal_csv"
+    if source_type == "csv" and source_system == "stripe" and headers >= ROW_EVENT_HEADERS["stripe_payouts_csv"]:
+        return "parse_stripe_payouts_csv"
     if source_type == "csv" and source_system == "stripe":
         return "parse_stripe_balance_csv"
+    if source_type == "csv" and source_system == "quartermaster":
+        if headers >= ROW_EVENT_HEADERS["quartermaster_orders_csv"]:
+            return "parse_quartermaster_orders_csv"
     if source_type == "csv" and source_system == "printful":
         if headers >= ROW_EVENT_HEADERS["printful_orders_csv"]:
             return "parse_printful_orders_csv"
@@ -380,6 +474,8 @@ def detect_parser(path: Path, source_type: str, source_system: str, header_names
     if source_type == "pdf":
         if source_system == "stripe":
             return "parse_stripe_invoice_pdf"
+        if source_system == "quartermaster":
+            return "parse_quartermaster_pdf"
         if source_system == "printful":
             return "parse_printful_pdf"
         return "parse_purchase_invoice_pdf"
@@ -390,6 +486,53 @@ def detect_parser(path: Path, source_type: str, source_system: str, header_names
     if headers:
         return "unrecognized_structured_source"
     return "unrecognized_source"
+
+
+def infer_pdf_coverage(text: str, source_system: str) -> tuple[date, date] | None:
+    if source_system != "quartermaster" or "sales report" not in normalize_ascii(text).lower():
+        return None
+    match = re.search(r"Date\s+([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        report_date = datetime.strptime(match.group(1), "%m/%d/%Y").date()
+    except ValueError:
+        return None
+    return report_date, report_date
+
+
+def infer_no_activity_marker_coverage(path: Path, *, root_dir: Path) -> tuple[date, date] | None:
+    if slugify(path.name) != "no-activity-during-period":
+        return None
+    try:
+        # Coverage belongs to the logical source-pack path. Resolving a company
+        # symlink here would replace that path with its private canonical target
+        # and discard a logical parent such as ``2025-pack``.
+        relative_parts = path.absolute().relative_to(root_dir.absolute()).parts[:-1]
+    except ValueError:
+        return None
+    directory_names = [*relative_parts, root_dir.name]
+    for directory_name in reversed(directory_names):
+        normalized = normalize_ascii(directory_name).lower()
+        month_match = re.fullmatch(r"(20\d{2})[-_.](0[1-9]|1[0-2])", normalized)
+        if month_match:
+            year = int(month_match.group(1))
+            month = int(month_match.group(2))
+            return date(year, month, 1), month_end(year, month)
+        year_match = re.fullmatch(r"(20\d{2})(?:-pack)?", normalized)
+        if year_match:
+            year = int(year_match.group(1))
+            return date(year, 1, 1), date(year, 12, 31)
+    return None
+
+
+def infer_parent_year_coverage(path: Path) -> tuple[date, date] | None:
+    for parent in path.parents:
+        match = re.fullmatch(r"(20\d{2})(?:-pack)?", normalize_ascii(parent.name).lower())
+        if match:
+            year = int(match.group(1))
+            return date(year, 1, 1), date(year, 12, 31)
+    return None
 
 
 def source_id_for_path(path: Path, *, root_dir: Path) -> str:
@@ -420,6 +563,7 @@ def inspect_source_file(
     source_type = source_type_from_path(path)
     header_names: set[str] | None = None
     parser_notes: list[str] = []
+    content_coverage: tuple[date, date] | None = None
 
     source_system = infer_source_system(path, source_type)
     if source_type == "csv":
@@ -434,12 +578,35 @@ def inspect_source_file(
         except SimplbooksError:
             pass
         else:
-            source_system = infer_pdf_source_system("\n".join(sample_pages[:2]), source_system)
+            sample_text = "\n".join(sample_pages[:2])
+            source_system = infer_pdf_source_system(sample_text, source_system)
+            content_coverage = infer_pdf_coverage(sample_text, source_system)
 
-    coverage = parse_filename_dates(path)
+    is_no_activity_marker = source_system == "printful" and slugify(path.name) == "no-activity-during-period"
+    marker_coverage = infer_no_activity_marker_coverage(path, root_dir=root_dir) if is_no_activity_marker else None
+    is_woo_tax_summary = bool(
+        source_type == "csv"
+        and header_names is not None
+        and header_names >= ROW_EVENT_HEADERS["woo_tax_summary_csv"]
+    )
+    parent_year_coverage = infer_parent_year_coverage(path) if is_woo_tax_summary else None
+    filename_coverage = parse_filename_dates(path)
+    coverage = content_coverage or marker_coverage or parent_year_coverage or filename_coverage
+    annual_coverage = bool(parent_year_coverage)
+    if is_woo_tax_summary and filename_coverage:
+        filename_start, filename_end = filename_coverage
+        annual_coverage = annual_coverage or (
+            filename_start.month == 1
+            and filename_start.day == 1
+            and filename_end.month == 12
+            and filename_end.day == 31
+        )
     if coverage is None:
         coverage = (period_start, period_end)
-        parser_notes.append("Coverage could not be inferred from the filename; assumed target period.")
+        if is_no_activity_marker:
+            parser_notes.append("Zero-activity marker has no explicit period in its path and cannot be used as authoritative evidence.")
+        else:
+            parser_notes.append("Coverage could not be inferred from the filename; assumed target period.")
 
     descriptor = SourceDescriptor(
         path=path,
@@ -450,13 +617,166 @@ def inspect_source_file(
         covered_from=coverage[0],
         covered_until=coverage[1],
         canonical_group=canonical_group_for_path(path),
-        parser_name=detect_parser(path, source_type, source_system, header_names),
+        parser_name=(
+            "unrecognized_source"
+            if is_no_activity_marker and marker_coverage is None
+            else detect_parser(path, source_type, source_system, header_names)
+        ),
         parser_notes=parser_notes,
+        context={"annual_coverage": annual_coverage} if is_woo_tax_summary else {},
     )
 
     if not descriptor.overlaps(period_start, period_end):
         return None
     return descriptor
+
+
+def parse_purchase_note_entries(text: str) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    blocks = [block.strip() for block in re.split(r"\n\s*\n", text) if block.strip()]
+    for block in blocks:
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if len(lines) < 2:
+            continue
+        heading = lines[0]
+        match = re.fullmatch(r"(\d{4}\.\d{2}\.\d{2})\s+([^:]+):", heading)
+        if not match:
+            continue
+        event_date = parse_date_value(match.group(1))
+        label = match.group(2).strip()
+        body = " ".join(lines[1:]).strip()
+        if not body:
+            continue
+        entries.append(
+            {
+                "event_date": event_date,
+                "label": label,
+                "body": body,
+            }
+        )
+    return entries
+
+
+def purchase_note_tokens(label: str) -> list[str]:
+    stopwords = {"by", "paid", "vat"}
+    tokens = []
+    for token in re.findall(r"[A-Za-z0-9]+", normalize_ascii(label).lower()):
+        if token in stopwords:
+            continue
+        if len(token) == 1:
+            continue
+        tokens.append(token)
+    return tokens
+
+
+def match_purchase_note_target(readme_path: Path, event_date: date, label: str) -> Path | None:
+    candidates = [
+        path
+        for path in sorted(readme_path.parent.iterdir())
+        if path.is_file() and path != readme_path and path.suffix.lower() != ".md"
+    ]
+    date_token = event_date.strftime("%Y.%m.%d")
+    tokens = purchase_note_tokens(label)
+    best_score = 0
+    best_path: Path | None = None
+    for candidate in candidates:
+        stem = normalize_ascii(candidate.stem).lower().replace("_", " ")
+        score = 0
+        if date_token in candidate.stem:
+            score += 10
+        for token in tokens:
+            if token in stem:
+                score += 3
+        if score > best_score:
+            best_score = score
+            best_path = candidate
+    return best_path if best_score >= 10 else None
+
+
+def parse_purchase_note_amounts(note_text: str) -> dict[str, Any] | None:
+    normalized = re.sub(r"\s+", " ", note_text.strip())
+    lower = normalize_ascii(normalized).lower()
+    amounts = [parse_decimal(value) for value in re.findall(r"([0-9]+(?:[.,][0-9]+)?)\s*€", normalized)]
+    if not amounts:
+        return None
+
+    gross_amount: Decimal | None = None
+    vat_amount = Decimal("0")
+    reverse_charge = "reverse-charg" in lower
+
+    explicit_total = re.search(r"=\s*([0-9]+(?:[.,][0-9]+)?)\s*€", normalized)
+    if explicit_total:
+        gross_amount = parse_decimal(explicit_total.group(1))
+
+    vat_match = re.search(r"\+\s*([0-9]+(?:[.,][0-9]+)?)\s*€\s*\(VAT\)", normalized, flags=re.IGNORECASE)
+    if vat_match:
+        vat_amount = parse_decimal(vat_match.group(1))
+        if gross_amount is None and len(amounts) >= 2:
+            gross_amount = amounts[0] + vat_amount
+    elif "vat 0%" in lower or reverse_charge:
+        vat_amount = Decimal("0")
+
+    if gross_amount is None:
+        if vat_amount != 0 and len(amounts) >= 2:
+            gross_amount = amounts[0] + vat_amount
+        else:
+            gross_amount = amounts[-1]
+
+    net_amount = gross_amount - vat_amount
+    return {
+        "gross_amount": gross_amount,
+        "net_amount": net_amount,
+        "vat_amount": vat_amount,
+        "reverse_charge": reverse_charge,
+    }
+
+
+def inspect_purchase_note_markdown(
+    *,
+    path: Path,
+    root_dir: Path,
+    period_start: date,
+    period_end: date,
+) -> list[SourceDescriptor]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return []
+
+    descriptors: list[SourceDescriptor] = []
+    for entry in parse_purchase_note_entries(text):
+        event_date = entry["event_date"]
+        if event_date < period_start or event_date > period_end:
+            continue
+        target_path = match_purchase_note_target(path, event_date, entry["label"])
+        if target_path is None:
+            continue
+        amount_data = parse_purchase_note_amounts(entry["body"])
+        if amount_data is None:
+            continue
+        target_display = display_path(target_path, root_dir)
+        descriptor = SourceDescriptor(
+            path=path,
+            rel_path=f"{display_path(path, root_dir)}#{target_path.name}",
+            source_id=f"{source_id_for_path(path, root_dir=root_dir)}-{slugify(target_path.stem)}",
+            source_type="manual",
+            source_system="manual",
+            covered_from=event_date,
+            covered_until=event_date,
+            canonical_group=canonical_group_for_path(target_path),
+            parser_name="parse_purchase_note_markdown",
+            parser_notes=[f"Manual purchase note covering {target_display}."],
+            context={
+                "event_date": event_date.isoformat(),
+                "label": entry["label"],
+                "body": entry["body"],
+                "target_path": target_display,
+                "target_source_id": source_id_for_path(target_path, root_dir=root_dir),
+                **amount_data,
+            },
+        )
+        descriptors.append(descriptor)
+    return descriptors
 
 
 def choose_canonical_sources(sources: list[SourceDescriptor]) -> list[SourceDescriptor]:
@@ -595,10 +915,21 @@ def parser_result() -> dict[str, list[dict[str, Any]]]:
         "payouts": [],
         "bank_transactions": [],
         "purchase_expenses": [],
+        "purchase_credits": [],
         "inventory_movements": [],
         "manual_adjustments": [],
         "other": [],
     }
+
+
+def parse_no_activity_marker(
+    source: SourceDescriptor,
+    *,
+    period_start: date,
+    period_end: date,
+    base_currency: str,
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    return parser_result(), []
 
 
 def update_coverage_from_dates(source: SourceDescriptor, dates: list[date]) -> None:
@@ -619,20 +950,43 @@ def parse_woo_sales_csv(
     exceptions: list[dict[str, Any]] = []
     seen_dates: list[date] = []
 
+    def parse_woo_row_date(value: str) -> tuple[date, date]:
+        text = str(value).strip().replace("\ufeff", "")
+        if re.fullmatch(r"\d{4}-\d{1,2}", text):
+            year_text, month_text = text.split("-", 1)
+            year = int(year_text)
+            month = int(month_text)
+            return date(year, month, 1), date(year, month, monthrange(year, month)[1])
+        parsed = parse_date_value(text)
+        return parsed, parsed
+
     for line_no, row in enumerate(rows, start=2):
-        event_date = parse_date_value(row["Date"])
-        if event_date < period_start or event_date > period_end:
+        row_start, row_end = parse_woo_row_date(row["Date"])
+        if not periods_overlap(row_start, row_end, period_start, period_end):
             continue
+        event_date = row_end
         seen_dates.append(event_date)
 
-        gross_sales = parse_decimal(row.get("Gross sales"))
-        returns = parse_decimal(row.get("Returns"))
-        coupons = parse_decimal(row.get("Coupons"))
-        net_sales = parse_decimal(row.get("Net sales"))
-        taxes = parse_decimal(row.get("Taxes"))
-        shipping = parse_decimal(row.get("Shipping"))
-        total_sales = parse_decimal(row.get("Total sales"))
-        orders = parse_decimal(row.get("Orders"))
+        if row.get("Gross sales") not in (None, "") or row.get("Total sales") not in (None, ""):
+            gross_sales = parse_decimal(row.get("Gross sales"))
+            returns = parse_decimal(row.get("Returns"))
+            coupons = parse_decimal(row.get("Coupons"))
+            net_sales = parse_decimal(row.get("Net sales"))
+            taxes = parse_decimal(row.get("Taxes"))
+            shipping = parse_decimal(row.get("Shipping"))
+            total_sales = parse_decimal(row.get("Total sales"))
+            orders = parse_decimal(row.get("Orders"))
+            quantity = None
+        else:
+            gross_sales = parse_decimal(row.get("Gross sales amount"))
+            returns = parse_decimal(row.get("Refund amount"))
+            coupons = parse_decimal(row.get("Coupon amount"))
+            net_sales = parse_decimal(row.get("Net sales amount"))
+            shipping = parse_decimal(row.get("Shipping amount"))
+            total_sales = gross_sales
+            taxes = total_sales - net_sales - shipping + returns
+            orders = parse_decimal(row.get("Number of orders"))
+            quantity = parse_decimal(row.get("Number of items sold"))
 
         if total_sales == 0 and orders == 0 and gross_sales == 0 and returns == 0:
             continue
@@ -643,7 +997,7 @@ def parse_woo_sales_csv(
             record_id=f"{source.source_id}:sales:{line_no}",
             event_type="woo_daily_sales",
             event_date=event_date,
-            description=f"Woo daily sales summary {event_date.isoformat()}",
+            description=f"Woo sales summary {event_date.isoformat()}",
             currency=base_currency,
             gross_amount=total_sales,
             net_amount=net_sales,
@@ -651,11 +1005,13 @@ def parse_woo_sales_csv(
             shipping_amount=shipping,
             external_ref=event_date.isoformat(),
             channel="woo",
+            quantity=quantity,
             attributes={
                 "orders": int(orders),
                 "gross_sales": float(gross_sales),
                 "returns": float(returns),
                 "coupons": float(coupons),
+                "is_monthly_summary": row_start != row_end,
             },
             row_ref=f"csv:{line_no}",
         )
@@ -678,9 +1034,298 @@ def parse_woo_sales_csv(
     return result, exceptions
 
 
+def parse_woo_order_summary_csv(
+    source: SourceDescriptor,
+    *,
+    period_start: date,
+    period_end: date,
+    base_currency: str,
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    """Retain Woo order-summary rows as nonfinancial supporting evidence.
+
+    The Woo Analytics order export exposes net sales but omits customer-paid
+    gross, shipping, and tax. Treating it as a sale would duplicate a complete
+    merchant or processor export and invent a gross amount, so its amounts stay
+    in attributes for order matching only.
+    """
+    rows, _ = read_csv_rows(source.path)
+    result = parser_result()
+    exceptions: list[dict[str, Any]] = []
+    seen_dates: list[date] = []
+
+    for line_no, row in enumerate(rows, start=2):
+        row_ref = f"csv:{line_no}"
+        try:
+            event_date = parse_date_value(row.get("Date", ""))
+            order_id = str(row.get("Order #") or "").strip()
+            net_sales = parse_decimal(row.get("Net sales"))
+            items_sold = parse_decimal(row.get("Items sold"))
+            if (
+                not order_id
+                or not net_sales.is_finite()
+                or not items_sold.is_finite()
+                or items_sold < 0
+                or items_sold != items_sold.to_integral_value()
+            ):
+                raise SimplbooksError("invalid Woo order summary row")
+        except (InvalidOperation, SimplbooksError, ValueError):
+            exceptions.append(
+                make_exception(
+                    source=source,
+                    exception_id=f"{source.source_id}:invalid-order-summary:{line_no}",
+                    severity="warn",
+                    reason="Woo order-summary row has an invalid date, order number, net-sales value, or item count.",
+                    blocking=False,
+                    row_ref=row_ref,
+                    suggested_follow_up="Re-export the Woo order report if this row is needed for order matching.",
+                )
+            )
+            continue
+
+        seen_dates.append(event_date)
+        if not periods_overlap(event_date, event_date, period_start, period_end):
+            continue
+
+        _, record = make_record(
+            source=source,
+            category="other",
+            record_id=f"{source.source_id}:woo-order:{line_no}",
+            event_type="woo_order_summary",
+            event_date=event_date,
+            description=f"Woo order-summary evidence {order_id}",
+            currency=base_currency,
+            gross_amount=Decimal("0"),
+            net_amount=Decimal("0"),
+            external_ref=order_id,
+            channel="woo",
+            attributes={
+                "order_id": order_id,
+                "status": str(row.get("Status") or "").strip(),
+                "product_summary": str(row.get("Product(s)") or "").strip(),
+                "items_sold": float(items_sold),
+                "observed_net_sales": float(net_sales),
+                "customer_type": str(row.get("Customer type") or "").strip(),
+                "attribution": str(row.get("Attribution") or "").strip(),
+                "nonfinancial_supporting_evidence": True,
+            },
+            row_ref=row_ref,
+        )
+        result["other"].append(record)
+
+    update_coverage_from_dates(source, seen_dates)
+    return result, exceptions
+
+
+def parse_woo_tax_summary_csv(
+    source: SourceDescriptor,
+    *,
+    period_start: date,
+    period_end: date,
+    base_currency: str,
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    result = parser_result()
+    exceptions: list[dict[str, Any]] = []
+
+    if not source.context.get("annual_coverage"):
+        exceptions.append(
+            make_exception(
+                source=source,
+                exception_id=f"{source.source_id}:missing-annual-coverage",
+                severity="error",
+                reason="Woo tax summary lacks annual coverage in its filename or source-pack directory.",
+                blocking=True,
+                suggested_follow_up="Place the export in a year-bearing source pack or rename it to include the covered year.",
+            )
+        )
+        return result, exceptions
+
+    if period_end != source.covered_until:
+        return result, exceptions
+
+    rows, _ = read_csv_rows(source.path)
+    cents = Decimal("0.01")
+    for line_no, row in enumerate(rows, start=2):
+        try:
+            rate = parse_decimal(row.get("Rate"))
+            total = parse_decimal(row.get("Total tax"))
+            order_tax = parse_decimal(row.get("Order tax"))
+            shipping_tax = parse_decimal(row.get("Shipping tax"))
+            orders = parse_decimal(row.get("Orders"))
+            tax_code = row.get("Tax code", "").strip()
+            country_match = re.fullmatch(r"([A-Z]{2})-[A-Z]{2}-VAT-[A-Za-z0-9-]+", tax_code)
+            valid_numbers = all(value.is_finite() for value in (rate, total, order_tax, shipping_tax, orders))
+            valid_row = (
+                bool(country_match)
+                and valid_numbers
+                and rate >= 0
+                and total >= 0
+                and order_tax >= 0
+                and shipping_tax >= 0
+                and all(
+                    value == value.quantize(cents, rounding=ROUND_HALF_UP)
+                    for value in (total, order_tax, shipping_tax)
+                )
+                and orders > 0
+                and orders == orders.to_integral_value()
+                and total.quantize(cents, rounding=ROUND_HALF_UP)
+                == (order_tax + shipping_tax).quantize(cents, rounding=ROUND_HALF_UP)
+            )
+        except (InvalidOperation, SimplbooksError, ValueError):
+            valid_row = False
+            country_match = None
+
+        if not valid_row:
+            exceptions.append(
+                make_exception(
+                    source=source,
+                    exception_id=f"{source.source_id}:invalid-tax-row:{line_no}",
+                    severity="error",
+                    reason="Woo tax row has an invalid code, count, rate, or component total.",
+                    blocking=True,
+                    row_ref=f"csv:{line_no}",
+                    suggested_follow_up="Export a corrected Woo tax summary before rebuilding this year.",
+                )
+            )
+            continue
+
+        _, record = make_record(
+            source=source,
+            category="other",
+            record_id=f"{source.source_id}:woo-tax:{line_no}",
+            event_type="woo_tax_summary",
+            event_date=source.covered_until,
+            description=f"Woo annual tax summary {tax_code}",
+            currency=base_currency,
+            gross_amount=Decimal("0"),
+            net_amount=Decimal("0"),
+            vat_amount=total,
+            external_ref=tax_code,
+            channel="woo",
+            country_code=country_match.group(1),
+            attributes={
+                "tax_code": tax_code,
+                "configured_rate": float(rate),
+                "order_tax": float(order_tax),
+                "shipping_tax": float(shipping_tax),
+                "total_tax": float(total),
+                "orders": int(orders),
+                "annual_evidence": True,
+            },
+            row_ref=f"csv:{line_no}",
+        )
+        result["other"].append(record)
+
+    return result, exceptions
+
+
+def discover_canonical_woo_tax_evidence(
+    *, source_dir: Path, root_dir: Path, year: int
+) -> list[dict[str, Any]]:
+    if not source_dir.exists():
+        return []
+    tax_sources: list[SourceDescriptor] = []
+    for path in sorted(source_dir.rglob("*")):
+        if not path.is_file() or path.suffix.lower() != ".csv":
+            continue
+        source = inspect_source_file(
+            path=path,
+            root_dir=root_dir,
+            period_start=date(year, 1, 1),
+            period_end=date(year, 12, 31),
+        )
+        if source is not None and source.parser_name == "parse_woo_tax_summary_csv":
+            tax_sources.append(source)
+    return canonical_woo_tax_evidence(choose_canonical_sources(tax_sources), year=year)
+
+
+def canonical_woo_tax_evidence(
+    sources: list[SourceDescriptor], *, year: int
+) -> list[dict[str, Any]]:
+    """Parse canonical annual Woo tax CSVs into evidence independent of allocation JSON."""
+    period_start = date(year, 12, 1)
+    period_end = date(year, 12, 31)
+    evidence: list[dict[str, Any]] = []
+    tax_sources = [
+        source
+        for source in sources
+        if source.canonical and source.parser_name == "parse_woo_tax_summary_csv"
+    ]
+    for source in tax_sources:
+        if source.covered_from != date(year, 1, 1) or source.covered_until != period_end:
+            raise SimplbooksError(
+                f"Canonical Woo tax source {source.rel_path} does not cover the requested year {year}."
+            )
+        records, exceptions = parse_woo_tax_summary_csv(
+            source,
+            period_start=period_start,
+            period_end=period_end,
+            base_currency="EUR",
+        )
+        blocking = [item for item in exceptions if item.get("blocking")]
+        if blocking:
+            raise SimplbooksError(
+                f"Canonical Woo tax source {source.rel_path} is invalid: {blocking[0].get('reason')}"
+            )
+        rows: list[dict[str, Any]] = []
+        for record in records["other"]:
+            attributes = record.get("attributes") or {}
+            source_ref = (record.get("source_refs") or [{}])[0]
+            rows.append(
+                {
+                    "source_row_id": str(record.get("record_id") or ""),
+                    "row_ref": str(source_ref.get("row_ref") or ""),
+                    "country_code": str(record.get("country_code") or ""),
+                    "tax_code": str(attributes.get("tax_code") or ""),
+                    "configured_rate": attributes.get("configured_rate"),
+                    "order_tax": attributes.get("order_tax"),
+                    "shipping_tax": attributes.get("shipping_tax"),
+                    "total_tax": attributes.get("total_tax"),
+                    "orders": attributes.get("orders"),
+                }
+            )
+        if not rows:
+            raise SimplbooksError(f"Canonical Woo tax source {source.rel_path} contains no tax rows.")
+        manifest = source.manifest_entry()
+        evidence.append(
+            {
+                "source_id": source.source_id,
+                "path": source.rel_path,
+                "sha256": manifest["sha256"],
+                "year": year,
+                "rows": rows,
+            }
+        )
+    return evidence
+
+
+def load_bound_woo_tax_allocation(
+    *,
+    allocation_path: Path,
+    sources: list[SourceDescriptor],
+    company_slug: str,
+    year: int,
+    repo_root: Path,
+) -> dict[str, Any]:
+    tax_evidence = canonical_woo_tax_evidence(sources, year=year)
+    if not tax_evidence:
+        raise SimplbooksError("Woo tax allocation requires nonempty canonical Woo tax evidence.")
+    allocation = woo_tax.load_allocation(
+        allocation_path,
+        company_slug=company_slug,
+        year=year,
+        tax_evidence=tax_evidence,
+    )
+    allocation["_allocation_path"] = display_path(allocation_path, repo_root)
+    return allocation
+
+
 def paypal_category(row: dict[str, str], gross_amount: Decimal) -> str:
     type_value = row.get("Type", "").strip().lower()
-    if "withdrawal" in type_value or "transfer" in type_value or "payout" in type_value or "deposit" in type_value:
+    if "withdrawal" in type_value or "payout" in type_value:
+        return "payouts"
+    if "deposit" in type_value or "currency conversion" in type_value or type_value in {"general payment", "payment reversal"}:
+        return "other"
+    if "transfer" in type_value:
         return "payouts"
     if "refund" in type_value or "reversal" in type_value or "chargeback" in type_value or gross_amount < 0:
         return "refunds"
@@ -780,6 +1425,144 @@ def stripe_category(row: dict[str, str], amount: Decimal) -> str:
     return "sales"
 
 
+def parse_stripe_payouts_csv(
+    source: SourceDescriptor,
+    *,
+    period_start: date,
+    period_end: date,
+    base_currency: str,
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    rows, _ = read_csv_rows(source.path)
+    result = parser_result()
+    exceptions: list[dict[str, Any]] = []
+    seen_dates: list[date] = []
+    seen_payout_ids: set[str] = set()
+
+    for line_no, row in enumerate(rows, start=2):
+        payout_id = (row.get("payout_id") or "").strip()
+        effective_at = (row.get("effective_at_utc") or "").strip()
+        if not effective_at:
+            exceptions.append(
+                make_exception(
+                    source=source,
+                    exception_id=f"{source.source_id}:missing-effective-date:{line_no}",
+                    severity="error",
+                    reason="Stripe payout row has no effective_at_utc date.",
+                    blocking=True,
+                    row_ref=f"csv:{line_no}",
+                    suggested_follow_up="Re-export Stripe payout history with effective dates.",
+                )
+            )
+            continue
+
+        event_date = parse_date_value(effective_at)
+        if event_date < period_start or event_date > period_end:
+            continue
+        seen_dates.append(event_date)
+
+        if payout_id and payout_id in seen_payout_ids:
+            exceptions.append(
+                make_exception(
+                    source=source,
+                    exception_id=f"{source.source_id}:duplicate:{payout_id}",
+                    severity="warn",
+                    reason=f"Skipped duplicate Stripe payout row {payout_id}.",
+                    blocking=False,
+                    row_ref=f"csv:{line_no}",
+                )
+            )
+            continue
+        if payout_id:
+            seen_payout_ids.add(payout_id)
+
+        status = normalize_ascii(row.get("payout_status") or "").strip().lower()
+        reversed_at = (row.get("payout_reversed_at_utc") or "").strip()
+        if status in {"failed", "canceled", "cancelled"}:
+            exceptions.append(
+                make_exception(
+                    source=source,
+                    exception_id=f"{source.source_id}:skipped-status:{line_no}",
+                    severity="warn",
+                    reason=f"Skipped Stripe payout with non-settled status {row.get('payout_status')!r}.",
+                    blocking=False,
+                    row_ref=f"csv:{line_no}",
+                )
+            )
+            continue
+        if reversed_at or status != "paid":
+            reason = (
+                "Stripe payout was reversed and requires explicit reconciliation."
+                if reversed_at
+                else f"Stripe payout has pending or unknown status {row.get('payout_status')!r}."
+            )
+            exceptions.append(
+                make_exception(
+                    source=source,
+                    exception_id=f"{source.source_id}:unsettled:{line_no}",
+                    severity="error",
+                    reason=reason,
+                    blocking=True,
+                    row_ref=f"csv:{line_no}",
+                    suggested_follow_up="Resolve the payout status in Stripe or provide evidence of the reversal before reconciliation.",
+                )
+            )
+            continue
+
+        reporting_category = normalize_ascii(row.get("reporting_category") or "").strip().lower()
+        if reporting_category != "payout":
+            exceptions.append(
+                make_exception(
+                    source=source,
+                    exception_id=f"{source.source_id}:unexpected-category:{line_no}",
+                    severity="error",
+                    reason=f"Stripe payout export row has unexpected reporting category {row.get('reporting_category')!r}.",
+                    blocking=True,
+                    row_ref=f"csv:{line_no}",
+                )
+            )
+            continue
+
+        gross = abs(parse_decimal(row.get("gross")))
+        fee = abs(parse_decimal(row.get("fee")))
+        net = abs(parse_decimal(row.get("net")))
+        currency = (row.get("currency") or base_currency).strip().upper()
+        expected_arrival = (row.get("payout_expected_arrival_date") or "").strip()
+        settlement_date = parse_date_value(expected_arrival) if expected_arrival else event_date
+        description = (row.get("payout_description") or row.get("description") or "Stripe payout").strip()
+
+        category, record = make_record(
+            source=source,
+            category="payouts",
+            record_id=f"{source.source_id}:payout:{payout_id or line_no}",
+            event_type="stripe_payout",
+            event_date=event_date,
+            settlement_date=settlement_date,
+            description=description,
+            currency=currency,
+            gross_amount=gross,
+            net_amount=net,
+            fee_amount=fee,
+            external_ref=payout_id or None,
+            channel="stripe",
+            attributes={
+                "stripe_export_type": "payouts_history",
+                "stripe_payout_id": payout_id or None,
+                "stripe_balance_transaction_id": row.get("balance_transaction_id") or None,
+                "payout_status": row.get("payout_status") or None,
+                "payout_type": row.get("payout_type") or None,
+                "payout_destination_id": row.get("payout_destination_id") or None,
+                "trace_id": row.get("trace_id") or None,
+                "trace_id_status": row.get("trace_id_status") or None,
+                "application_fee": row.get("application_fee") or None,
+            },
+            row_ref=f"csv:{line_no}",
+        )
+        result[category].append(record)
+
+    update_coverage_from_dates(source, seen_dates)
+    return result, exceptions
+
+
 def parse_stripe_balance_csv(
     source: SourceDescriptor,
     *,
@@ -792,8 +1575,167 @@ def parse_stripe_balance_csv(
     exceptions: list[dict[str, Any]] = []
     seen_dates: list[date] = []
     seen_transaction_ids: set[str] = set()
+    is_charges_export = bool(rows and "Created date (UTC)" in rows[0])
 
     for line_no, row in enumerate(rows, start=2):
+        if is_charges_export:
+            transaction_id = (row.get("id") or "").strip()
+            if transaction_id and transaction_id in seen_transaction_ids:
+                exceptions.append(
+                    make_exception(
+                        source=source,
+                        exception_id=f"{source.source_id}:duplicate:{transaction_id}",
+                        severity="warn",
+                        reason=f"Skipped duplicate Stripe charges-export row for transaction {transaction_id}.",
+                        blocking=False,
+                        row_ref=f"csv:{line_no}",
+                    )
+                )
+                continue
+            if transaction_id:
+                seen_transaction_ids.add(transaction_id)
+
+            event_date = parse_date_value(row["Created date (UTC)"])
+            amount = parse_decimal(row.get("Amount"))
+            fee = abs(parse_decimal(row.get("Fee")))
+            refunded = abs(parse_decimal(row.get("Amount Refunded")))
+            refunded_date_raw = (row.get("Refunded date (UTC)") or "").strip()
+            refunded_date = parse_date_value(refunded_date_raw) if refunded and refunded_date_raw else None
+            charge_in_period = period_start <= event_date <= period_end
+            refund_in_period = refunded_date is not None and period_start <= refunded_date <= period_end
+            if not charge_in_period and not refund_in_period:
+                continue
+
+            status = normalize_ascii(row.get("Status") or "").strip().lower()
+            successful_statuses = {"paid", "succeeded", "refunded", "partially refunded"}
+            skipped_statuses = {"failed", "canceled", "cancelled"}
+            if status in skipped_statuses:
+                exceptions.append(
+                    make_exception(
+                        source=source,
+                        exception_id=f"{source.source_id}:skipped-status:{line_no}",
+                        severity="warn",
+                        reason=f"Skipped Stripe charge with non-successful status {row.get('Status')!r}.",
+                        blocking=False,
+                        row_ref=f"csv:{line_no}",
+                    )
+                )
+                continue
+            if amount != 0 and status not in successful_statuses:
+                exceptions.append(
+                    make_exception(
+                        source=source,
+                        exception_id=f"{source.source_id}:unapproved-status:{line_no}",
+                        severity="error",
+                        reason=f"Stripe charge has pending or unknown status {row.get('Status')!r}; it cannot be normalized as a completed sale.",
+                        blocking=True,
+                        row_ref=f"csv:{line_no}",
+                        suggested_follow_up="Resolve the charge status in Stripe or provide a final-status export.",
+                    )
+                )
+                continue
+            if refunded > abs(amount):
+                exceptions.append(
+                    make_exception(
+                        source=source,
+                        exception_id=f"{source.source_id}:refund-exceeds-charge:{line_no}",
+                        severity="error",
+                        reason=f"Stripe refunded amount {refunded} exceeds charge amount {abs(amount)}.",
+                        blocking=True,
+                        row_ref=f"csv:{line_no}",
+                        suggested_follow_up="Verify the Stripe charge and refund export values.",
+                    )
+                )
+                continue
+            currency = row.get("Currency", "").strip().upper() or base_currency
+            payment_intent_id = (row.get("PaymentIntent ID") or "").strip()
+            external_ref = payment_intent_id or transaction_id or None
+            customer_ref = (
+                row.get("customer_name (metadata)")
+                or row.get("customer_email (metadata)")
+                or row.get("order_id (metadata)")
+                or row.get("Description")
+                or "unknown reference"
+            )
+            description = f"Stripe charge - {customer_ref}"
+            attributes = {
+                "stripe_balance_transaction_id": transaction_id,
+                "stripe_source_id": payment_intent_id or transaction_id,
+                "stripe_export_type": "charges",
+                "status": row.get("Status"),
+                "payment_type": row.get("payment_type (metadata)"),
+                "site_url": row.get("site_url (metadata)"),
+                "order_id": row.get("order_id (metadata)"),
+                "order_key": row.get("order_key (metadata)"),
+                "customer_email": row.get("customer_email (metadata)"),
+                "customer_name": row.get("customer_name (metadata)"),
+            }
+
+            tax_amount = abs(parse_decimal(row.get("tax_amount (metadata)"))) / Decimal("100")
+            if charge_in_period and amount != 0:
+                seen_dates.append(event_date)
+                category_name, record = make_record(
+                    source=source,
+                    category="sales",
+                    record_id=f"{source.source_id}:sales:{line_no}",
+                    event_type="stripe_charge",
+                    event_date=event_date,
+                    settlement_date=event_date,
+                    description=description,
+                    currency=currency,
+                    gross_amount=amount,
+                    net_amount=amount - fee,
+                    vat_amount=tax_amount,
+                    fee_amount=fee,
+                    external_ref=external_ref,
+                    channel="stripe",
+                    country_code=(row.get("Card Address Country") or row.get("Shipping Address Country") or "").strip().upper() or None,
+                    attributes=attributes,
+                    row_ref=f"csv:{line_no}",
+                )
+                result[category_name].append(record)
+
+            if refunded and not refunded_date_raw and charge_in_period:
+                exceptions.append(
+                    make_exception(
+                        source=source,
+                        exception_id=f"{source.source_id}:refund-date-missing:{line_no}",
+                        severity="error",
+                        reason="Stripe charge reports a refunded amount but has no refund date.",
+                        blocking=True,
+                        row_ref=f"csv:{line_no}",
+                        suggested_follow_up="Export Stripe charges with the Refunded date (UTC) column populated.",
+                    )
+                )
+            elif refunded and refunded_date is not None:
+                if refund_in_period:
+                    seen_dates.append(refunded_date)
+                    refund_tax = Decimal("0")
+                    if amount != 0:
+                        refund_tax = (tax_amount * refunded / abs(amount)).quantize(
+                            Decimal("0.01"), rounding=ROUND_HALF_UP
+                        )
+                    category_name, record = make_record(
+                        source=source,
+                        category="refunds",
+                        record_id=f"{source.source_id}:refunds:{line_no}",
+                        event_type="stripe_refund",
+                        event_date=refunded_date,
+                        settlement_date=refunded_date,
+                        description=f"Stripe refund - {customer_ref}",
+                        currency=currency,
+                        gross_amount=-refunded,
+                        net_amount=-refunded,
+                        vat_amount=-refund_tax,
+                        external_ref=external_ref,
+                        channel="stripe",
+                        country_code=(row.get("Card Address Country") or row.get("Shipping Address Country") or "").strip().upper() or None,
+                        attributes=attributes,
+                        row_ref=f"csv:{line_no}",
+                    )
+                    result[category_name].append(record)
+            continue
+
         event_date = parse_date_value(row["Created (UTC)"])
         if event_date < period_start or event_date > period_end:
             continue
@@ -842,6 +1784,7 @@ def parse_stripe_balance_csv(
                 attributes={
                     "stripe_balance_transaction_id": transaction_id,
                     "stripe_source_id": row.get("Source"),
+                    "stripe_export_type": "balance_history",
                     "order_id": row.get("order_id (metadata)"),
                 },
                 row_ref=f"csv:{line_no}",
@@ -870,6 +1813,7 @@ def parse_stripe_balance_csv(
                 attributes={
                     "stripe_balance_transaction_id": transaction_id,
                     "stripe_source_id": row.get("Source"),
+                    "stripe_export_type": "balance_history",
                     "order_id": row.get("order_id (metadata)"),
                 },
                 row_ref=f"csv:{line_no}",
@@ -900,6 +1844,7 @@ def parse_stripe_balance_csv(
             attributes={
                 "stripe_balance_transaction_id": transaction_id,
                 "stripe_source_id": row.get("Source"),
+                "stripe_export_type": "balance_history",
                 "reason": row.get("reason (metadata)"),
                 "payment_type": row.get("payment_type (metadata)"),
                 "site_url": row.get("site_url (metadata)"),
@@ -914,6 +1859,81 @@ def parse_stripe_balance_csv(
 
     update_coverage_from_dates(source, seen_dates)
     return result, exceptions
+
+
+def parse_quartermaster_date_value(value: str) -> date:
+    text = re.sub(r"\s+", " ", str(value).strip().replace("\ufeff", ""))
+    for fmt in (
+        "%m/%d/%Y",
+        "%m/%d/%Y %I:%M %p",
+        "%m/%d/%Y %H:%M",
+    ):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    raise SimplbooksError(f"Unsupported Quartermaster date format: {value!r}")
+
+
+def parse_quartermaster_orders_csv(
+    source: SourceDescriptor,
+    *,
+    period_start: date,
+    period_end: date,
+    base_currency: str,
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    rows, _ = read_csv_rows(source.path)
+    result = parser_result()
+    seen_dates: list[date] = []
+
+    for line_no, row in enumerate(rows, start=2):
+        submitted_text = row.get("DateSubmitted") or ""
+        shipped_text = row.get("DateShipped") or ""
+        if not submitted_text and not shipped_text:
+            continue
+
+        submitted_date = parse_quartermaster_date_value(submitted_text) if submitted_text else None
+        shipped_date = parse_quartermaster_date_value(shipped_text) if shipped_text else None
+        anchor_date = submitted_date or shipped_date
+        if anchor_date is None:
+            continue
+        if anchor_date < period_start or anchor_date > period_end:
+            continue
+        seen_dates.append(anchor_date)
+
+        reference_id = (row.get("ReferenceID") or "").strip()
+        qml_order_id = (row.get("QMLOrderID") or "").strip()
+        description_ref = reference_id or qml_order_id or f"line {line_no}"
+        category, record = make_record(
+            source=source,
+            category="other",
+            record_id=f"{source.source_id}:order:{line_no}",
+            event_type="quartermaster_order_history",
+            event_date=anchor_date,
+            settlement_date=shipped_date,
+            description=f"Quartermaster order history {description_ref}",
+            currency=base_currency,
+            gross_amount=Decimal("0"),
+            net_amount=Decimal("0"),
+            external_ref=reference_id or qml_order_id or None,
+            channel="quartermaster",
+            attributes={
+                "reference_id": reference_id or None,
+                "qml_order_id": qml_order_id or None,
+                "status": row.get("Status"),
+                "order_type": row.get("OrderType"),
+                "carrier": row.get("Carrier"),
+                "shipping_type": row.get("ShippingType"),
+                "tracking_number": row.get("TrackingNumber"),
+                "email": row.get("Email"),
+                "name": row.get("Name"),
+            },
+            row_ref=f"csv:{line_no}",
+        )
+        result[category].append(record)
+
+    update_coverage_from_dates(source, seen_dates)
+    return result, []
 
 
 def parse_bank_csv(
@@ -1053,20 +2073,47 @@ def parse_printful_orders_csv(
         gross_amount = group["components"]["Total"]
         if gross_amount <= 0:
             if gross_amount < 0:
-                exceptions.append(
-                    make_exception(
-                        source=source,
-                        exception_id=f"{source.source_id}:refund-overage:{group_key}",
-                        severity="warn",
-                        reason=(
-                            f"Skipped Printful refund-only net activity for {group_key}; current downstream purchase builders "
-                            "cannot safely consume negative purchase-expense rows."
-                        ),
-                        blocking=False,
-                        row_ref=f"csv:{group['line_nos'][0]}",
-                        suggested_follow_up="Review whether this Printful refund reverses a prior-period expense and add a manual adjustment if needed.",
+                representative_label = next((label for label in group["order_labels"] if label), group_key)
+                origin = next(iter(sorted(group["shipping_origins"])), None)
+                vat_amount = abs(group["components"]["VAT"])
+                net_amount = abs(
+                    sum(
+                        group["components"][column]
+                        for column in ("Products", "Discount", "Shipping", "Digitization", "Branding", "Fulfillment fees", "Tax")
                     )
                 )
+                if net_amount == 0:
+                    net_amount = abs(gross_amount) - vat_amount
+                category, record = make_record(
+                    source=source,
+                    category="purchase_credits",
+                    record_id=f"{source.source_id}:credit:{slugify(group_key)}",
+                    event_type="printful_supplier_credit",
+                    event_date=max(group["dates"]),
+                    settlement_date=max(group["dates"]),
+                    description=f"Printful supplier credit for {representative_label}",
+                    currency=group["currency"],
+                    gross_amount=abs(gross_amount),
+                    net_amount=net_amount,
+                    vat_amount=vat_amount,
+                    shipping_amount=abs(group["components"]["Shipping"]),
+                    external_ref=group_key,
+                    warehouse_id=origin,
+                    channel="printful",
+                    attributes={
+                        "vendor_name": "Printful Inc.",
+                        "printful_id": group_key,
+                        "order_labels": group["order_labels"],
+                        "statuses": sorted(item for item in group["statuses"] if item),
+                        "source_gross_amount": float(gross_amount),
+                        "credit_magnitude": float(abs(gross_amount)),
+                        "shipped_from": origin,
+                        "shipped_to": sorted(item for item in group["shipping_destinations"] if item),
+                    },
+                    row_ref=f"csv:{group['line_nos'][0]}",
+                )
+                record["source_refs"] = [make_source_ref(source, row_ref=f"csv:{line_no}") for line_no in group["line_nos"]]
+                result[category].append(record)
             continue
 
         vat_amount = group["components"]["VAT"]
@@ -1422,7 +2469,14 @@ def parse_month_label_period(value: str) -> tuple[date, date]:
 
 
 def vendor_name_from_text(text: str, *, fallback: str) -> str:
-    provider = first_match(text, [r"Vedaja/Teenuse pakkuja:\s*([^;\n]+)"])
+    provider = first_match(
+        text,
+        [
+            r"Vedaja/Teenuse pakkuja:\s*([^;\n]+)",
+            r"\n(AS Eesti Post)\n",
+            r"\n(SimplBooks O[ÜU])\n(?=[^\n]*(?:Sõpruse|Sopruse|Reg-nr))",
+        ],
+    )
     if provider:
         return provider
 
@@ -1668,6 +2722,209 @@ def parse_stripe_invoice_pdf(
     return result, []
 
 
+def parse_quartermaster_pdf(
+    source: SourceDescriptor,
+    *,
+    period_start: date,
+    period_end: date,
+    base_currency: str,
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    result = parser_result()
+    exceptions: list[dict[str, Any]] = []
+    try:
+        pages = extract_pdf_pages(source.path)
+    except SimplbooksError as exc:
+        return result, [
+            make_pdf_dependency_exception(
+                source,
+                reason=str(exc),
+                suggested_follow_up="Install pypdf in .venv or provide Quartermaster reports in a structured export.",
+            )
+        ]
+
+    full_text = "\n".join(page for page in pages if page.strip())
+    if not full_text.strip():
+        return result, [
+            make_pdf_dependency_exception(
+                source,
+                reason="Quartermaster PDF did not yield readable text.",
+                suggested_follow_up="Provide the original text-based PDF or an OCR/structured copy of the Quartermaster document.",
+            )
+        ]
+
+    normalized = normalize_ascii(full_text).lower()
+
+    if "sales report" in normalized and "quartermaster direct" in normalized:
+        report_date_text = first_match(full_text, [r"Date\s+([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})"])
+        report_number = first_match(full_text, [r"S\.R\.\s*No\.\s*([A-Z0-9-]+)"])
+        report_label = first_match(full_text, [r"This represents your sales report for ([A-Za-z]+\s+\d{4})"])
+        sold_matches = re.findall(
+            r"Sold\s+Copies\s+(\d+)\s+([0-9.,]+)\s+([0-9.,]+)",
+            full_text,
+            flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
+        )
+        fee_match = re.search(
+            r"Picking Fee.*?(\d+)\s+-?([0-9.,]+)\s+-([0-9.,]+)",
+            full_text,
+            flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
+        )
+        report_total_matches = re.findall(r"\$\s*([0-9,]+\.\d{2})", full_text)
+        if report_date_text is not None and "no sales for this pay period" in normalized:
+            report_date = parse_quartermaster_date_value(report_date_text)
+            if period_start <= report_date <= period_end:
+                update_coverage_from_dates(source, [report_date])
+            return result, []
+        if report_date_text is None or not sold_matches or fee_match is None:
+            return result, [
+                make_pdf_dependency_exception(
+                    source,
+                    reason="Quartermaster sales report PDF is missing a readable report date, sales total, or picking-fee line.",
+                    suggested_follow_up="Review the Quartermaster sales report layout or add another parser variant.",
+                )
+            ]
+
+        report_date = parse_quartermaster_date_value(report_date_text)
+        if report_date < period_start or report_date > period_end:
+            return result, []
+
+        sold_quantity = sum((parse_decimal(match[0]) for match in sold_matches), Decimal("0"))
+        sold_amount = sum((parse_decimal(match[2]) for match in sold_matches), Decimal("0"))
+        sold_rate = sold_amount / sold_quantity if sold_quantity else Decimal("0")
+        fee_quantity = parse_decimal(fee_match.group(1))
+        fee_rate = abs(parse_decimal(fee_match.group(2)))
+        fee_amount = abs(parse_decimal(fee_match.group(3)))
+        report_total = parse_decimal(report_total_matches[-1]) if report_total_matches else None
+        report_scope = report_label or source_period_label(date(report_date.year, report_date.month, 1))
+
+        category, sales_record = make_record(
+            source=source,
+            category="sales",
+            record_id=f"{source.source_id}:sales:{report_number or report_date.isoformat()}",
+            event_type="quartermaster_sales_report",
+            event_date=report_date,
+            description=f"Quartermaster sales report for {report_scope}",
+            currency="USD",
+            gross_amount=sold_amount,
+            net_amount=sold_amount,
+            external_ref=report_number,
+            quantity=sold_quantity,
+            channel="quartermaster",
+            attributes={
+                "report_number": report_number,
+                "vendor_name": "Quartermaster Direct",
+                "unit_rate": float(sold_rate),
+                "report_scope": report_scope,
+                "report_total": float(report_total) if report_total is not None else None,
+            },
+            page_ref=page_ref_containing(pages, report_number),
+        )
+        result[category].append(sales_record)
+
+        category, fee_record = make_record(
+            source=source,
+            category="fees",
+            record_id=f"{source.source_id}:fees:{report_number or report_date.isoformat()}",
+            event_type="quartermaster_picking_fee",
+            event_date=report_date,
+            description=f"Quartermaster picking fees for {report_scope}",
+            currency="USD",
+            gross_amount=fee_amount,
+            net_amount=fee_amount,
+            fee_amount=fee_amount,
+            external_ref=report_number,
+            quantity=fee_quantity,
+            channel="quartermaster",
+            attributes={
+                "report_number": report_number,
+                "vendor_name": "Quartermaster Direct",
+                "unit_rate": float(fee_rate),
+                "report_scope": report_scope,
+            },
+            page_ref=page_ref_containing(pages, "Picking Fee"),
+        )
+        result[category].append(fee_record)
+
+        if report_total is not None and abs((sold_amount - fee_amount) - report_total) > Decimal("0.01"):
+            exceptions.append(
+                make_exception(
+                    source=source,
+                    exception_id=f"{source.source_id}:sales-report-total",
+                    severity="warn",
+                    reason=(
+                        f"Quartermaster sales report total {report_total} USD did not match "
+                        f"sold copies minus picking fees ({sold_amount - fee_amount} USD)."
+                    ),
+                    blocking=False,
+                    page_ref="pdf:1",
+                    suggested_follow_up="Review whether the Quartermaster report contains additional lines that should be normalized.",
+                )
+            )
+
+        update_coverage_from_dates(source, [report_date])
+        return result, exceptions
+
+    if "invoice" in normalized and "quartermaster logistics" in normalized:
+        invoice_date_text = first_match(full_text, [r"Invoice Date\s+([0-9]{2}/[0-9]{2}/[0-9]{4})"])
+        invoice_number = first_match(full_text, [r"Invoice Number\s+([A-Z0-9-]+)"])
+        gross_amount_text = first_match(full_text, [r"Invoice Total\s+\$\s*([0-9.,]+)"])
+        notes_text = first_match(full_text, [r"Notes\s+([^\n]+)"])
+        due_date_text = first_match(full_text, [r"Invoice Due Date\s+([0-9]{2}/[0-9]{2}/[0-9]{4})"])
+        line_labels = re.findall(r"\n([A-Za-z][A-Za-z ]+)\s+Debit\s+\$\s*[0-9.,]+", full_text)
+
+        if invoice_date_text is None or gross_amount_text is None:
+            return result, [
+                make_pdf_dependency_exception(
+                    source,
+                    reason="Quartermaster invoice PDF is missing a readable invoice date or invoice total.",
+                    suggested_follow_up="Review the Quartermaster invoice layout or add another parser variant.",
+                )
+            ]
+
+        invoice_date = parse_quartermaster_date_value(invoice_date_text)
+        if invoice_date < period_start or invoice_date > period_end:
+            return result, []
+
+        gross_amount = parse_decimal(gross_amount_text)
+        description_bits = [notes_text] if notes_text else []
+        if line_labels:
+            description_bits.append(", ".join(label.strip() for label in line_labels))
+        description = " - ".join(bit for bit in description_bits if bit) or f"Quartermaster invoice {invoice_number or source.path.stem}"
+
+        category, record = make_record(
+            source=source,
+            category="purchase_expenses",
+            record_id=f"{source.source_id}:purchase:{slugify(invoice_number or invoice_date.isoformat())}",
+            event_type="quartermaster_service_invoice",
+            event_date=invoice_date,
+            settlement_date=parse_quartermaster_date_value(due_date_text) if due_date_text else None,
+            description=description,
+            currency="USD",
+            gross_amount=gross_amount,
+            net_amount=gross_amount,
+            external_ref=invoice_number,
+            channel="quartermaster",
+            attributes={
+                "invoice_number": invoice_number,
+                "invoice_due_date": parse_quartermaster_date_value(due_date_text).isoformat() if due_date_text else None,
+                "vendor_name": "Quartermaster Logistics LLC",
+                "notes": notes_text,
+                "service_labels": line_labels,
+            },
+            page_ref=page_ref_containing(pages, invoice_number),
+        )
+        result[category].append(record)
+        update_coverage_from_dates(source, [invoice_date])
+        return result, []
+
+    return result, [
+        make_pdf_dependency_exception(
+            source,
+            reason="Quartermaster PDF did not match a supported sales-report or supplier-invoice layout.",
+            suggested_follow_up="Review the PDF layout and extend the Quartermaster parser for this document type.",
+        )
+    ]
+
+
 def parse_printful_pdf(
     source: SourceDescriptor,
     *,
@@ -1875,7 +3132,11 @@ def parse_purchase_invoice_pdf(
         [
             r"Invoice Number\s+([A-Z0-9-]+)",
             r"Invoice #([A-Z0-9-]+)",
+            r"([A-Z0-9-]+)\s+Arve nr\.?:",
+            r"Arve number\s+([A-Z0-9-]+)",
             r"Arve nr\s+([A-Z0-9-]+)",
+            r"Arve\s+([A-Z0-9-]+)\s+Arve kuupaev",
+            r"Arve\s+([A-Z0-9-]+)\s+Arve kuup[aä]ev",
             r"Pileti nr\s+([A-Z0-9-]+)",
         ],
     )
@@ -1884,7 +3145,10 @@ def parse_purchase_invoice_pdf(
         [
             r"Invoice date:\s*([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})",
             r"Issue date:\s*([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})",
+            r"Arve kuupaev:?\s*([0-9.]+)",
+            r"Arve kuup[aä]ev:?\s*([0-9.]+)",
             r"Kuupäev\s+([0-9.]+)",
+            r"Maksja:\s*[^\n]+\s+([0-9]{2}\.[0-9]{2}\.[0-9]{4})",
             r"Ostetud:\s*([0-9.]+\s+[0-9:]+)",
         ],
     )
@@ -1900,6 +3164,27 @@ def parse_purchase_invoice_pdf(
     if event_date < period_start or event_date > period_end:
         return result, []
 
+    balance_summary_match = re.search(
+        r"Euroopa Keskpanga valuutakursid:\s*([0-9.,]+)\s*EUR\s+([0-9.,]+)\s*EUR\s+([0-9.,]+)\s*EUR",
+        full_text,
+        flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
+    )
+    omniva_summary_match = re.search(
+        r"Ridade summa\s+K[aä]ibemaks\s+[UÜ]mardus\s+Kokku\s+EUR\s+([0-9.,]+)\s+([0-9.,]+)\s+([0-9.,]+)\s+([0-9.,]+)",
+        full_text,
+        flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
+    )
+    dpd_summary_match = re.search(
+        r"Summa\s+([0-9.,]+)\s*EUR\s+[0-9.,]+\s*EUR\s+[0-9.,]+\s*EUR\s+([0-9.,]+)\s*EUR\s+([0-9.,]+)\s*EUR",
+        full_text,
+        flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
+    )
+    jajaa_summary_match = re.search(
+        r"KM-ta\s+([0-9.,]+)\s+\d+%\s+KM%\s+KMsumma\s+([0-9.,]+)\s+Kokku\s+([0-9.,]+)",
+        full_text,
+        flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
+    )
+
     gross_amount = first_decimal_match(
         full_text,
         [
@@ -1908,8 +3193,18 @@ def parse_purchase_invoice_pdf(
             r"TOTAL TO BE PAID:\s*€\s*([0-9.,]+)",
             r"Total amount\s+€([0-9.,]+)",
             r"Kokku:\s*([0-9.,]+)\s*EUR",
+            r"Kokku tasuda:\s*([0-9.,]+)\s*EUR",
+            r"Kogusumma KM-ga\s+[0-9.,]+\s+[0-9.,]+\s*EUR\s+[0-9.,]+\s*EUR\s+[0-9.,]+\s*EUR\s+[0-9.,]+\s*EUR\s+([0-9.,]+)\s*EUR",
         ],
     )
+    if gross_amount is None and balance_summary_match:
+        gross_amount = parse_currency_amount(balance_summary_match.group(3))
+    if gross_amount is None and omniva_summary_match:
+        gross_amount = parse_currency_amount(omniva_summary_match.group(4))
+    if gross_amount is None and dpd_summary_match:
+        gross_amount = parse_currency_amount(dpd_summary_match.group(3))
+    if gross_amount is None and jajaa_summary_match:
+        gross_amount = parse_currency_amount(jajaa_summary_match.group(3))
     if gross_amount is None:
         return result, [
             make_pdf_dependency_exception(
@@ -1927,6 +3222,15 @@ def parse_purchase_invoice_pdf(
             r"KM \d+%\s+([0-9.,]+)",
         ],
     ) or Decimal("0")
+    if vat_amount == Decimal("0") and balance_summary_match:
+        vat_amount = parse_currency_amount(balance_summary_match.group(2))
+    if vat_amount == Decimal("0") and omniva_summary_match:
+        vat_amount = parse_currency_amount(omniva_summary_match.group(2))
+    if vat_amount == Decimal("0") and dpd_summary_match:
+        vat_amount = parse_currency_amount(dpd_summary_match.group(2))
+    if vat_amount == Decimal("0") and jajaa_summary_match:
+        vat_amount = parse_currency_amount(jajaa_summary_match.group(2))
+
     net_amount = first_decimal_match(
         full_text,
         [
@@ -1935,6 +3239,14 @@ def parse_purchase_invoice_pdf(
             r"Pileti\(te\) hind .*?:\s*([0-9.,]+)\s*EUR",
         ],
     ) or (gross_amount - vat_amount)
+    if balance_summary_match:
+        net_amount = parse_currency_amount(balance_summary_match.group(1))
+    elif omniva_summary_match:
+        net_amount = parse_currency_amount(omniva_summary_match.group(1))
+    elif dpd_summary_match:
+        net_amount = parse_currency_amount(dpd_summary_match.group(1))
+    elif jajaa_summary_match:
+        net_amount = parse_currency_amount(jajaa_summary_match.group(1))
 
     fallback_vendor = normalize_ascii(source.path.stem).strip() or source.source_system or "supplier"
     vendor_name = vendor_name_from_text(full_text, fallback=fallback_vendor)
@@ -1971,10 +3283,63 @@ def parse_purchase_invoice_pdf(
     return result, []
 
 
+def parse_purchase_note_markdown(
+    source: SourceDescriptor,
+    *,
+    period_start: date,
+    period_end: date,
+    base_currency: str,
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    result = parser_result()
+    context = source.context
+    event_date = parse_date_value(str(context.get("event_date") or ""))
+    if event_date < period_start or event_date > period_end:
+        return result, []
+
+    label = str(context.get("label") or "").strip() or source.path.stem
+    note_body = str(context.get("body") or "").strip()
+    vendor_name = label.split(",", 1)[0].strip()
+    gross_amount = parse_decimal(context.get("gross_amount"))
+    net_amount = parse_decimal(context.get("net_amount"))
+    vat_amount = parse_decimal(context.get("vat_amount"))
+    target_source_id = str(context.get("target_source_id") or "")
+
+    category, record = make_record(
+        source=source,
+        category="purchase_expenses",
+        record_id=f"{source.source_id}:purchase:{slugify(target_source_id or vendor_name)}",
+        event_type="purchase_note_markdown",
+        event_date=event_date,
+        description=note_body or f"{vendor_name} manual purchase note",
+        currency=base_currency,
+        gross_amount=gross_amount,
+        net_amount=net_amount,
+        vat_amount=vat_amount,
+        external_ref=target_source_id or None,
+        channel=slugify(vendor_name),
+        attributes={
+            "invoice_number": None,
+            "vendor_name": vendor_name,
+            "manual_note": True,
+            "reverse_charge": bool(context.get("reverse_charge")),
+            "target_source_id": target_source_id or None,
+            "target_path": context.get("target_path"),
+        },
+    )
+    result[category].append(record)
+    update_coverage_from_dates(source, [event_date])
+    return result, []
+
+
 PARSERS: dict[str, Callable[..., tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]]] = {
+    "parse_no_activity_marker": parse_no_activity_marker,
     "parse_woo_sales_csv": parse_woo_sales_csv,
+    "parse_woo_order_summary_csv": parse_woo_order_summary_csv,
+    "parse_woo_tax_summary_csv": parse_woo_tax_summary_csv,
     "parse_paypal_csv": parse_paypal_csv,
+    "parse_stripe_payouts_csv": parse_stripe_payouts_csv,
     "parse_stripe_balance_csv": parse_stripe_balance_csv,
+    "parse_quartermaster_orders_csv": parse_quartermaster_orders_csv,
     "parse_printful_orders_csv": parse_printful_orders_csv,
     "parse_printful_wallet_csv": parse_printful_wallet_csv,
     "parse_printful_other_csv": parse_printful_other_csv,
@@ -1982,8 +3347,10 @@ PARSERS: dict[str, Callable[..., tuple[dict[str, list[dict[str, Any]]], list[dic
     "parse_bank_csv": parse_bank_csv,
     "parse_camt_xml": parse_camt_xml,
     "parse_stripe_invoice_pdf": parse_stripe_invoice_pdf,
+    "parse_quartermaster_pdf": parse_quartermaster_pdf,
     "parse_printful_pdf": parse_printful_pdf,
     "parse_purchase_invoice_pdf": parse_purchase_invoice_pdf,
+    "parse_purchase_note_markdown": parse_purchase_note_markdown,
 }
 
 
@@ -1996,6 +3363,16 @@ def inspect_sources(
 ) -> list[SourceDescriptor]:
     sources: list[SourceDescriptor] = []
     for path in sorted(source_dir.rglob("*")):
+        if path.is_file() and path.suffix.lower() == ".md":
+            sources.extend(
+                inspect_purchase_note_markdown(
+                    path=path,
+                    root_dir=root_dir,
+                    period_start=period_start,
+                    period_end=period_end,
+                )
+            )
+            continue
         descriptor = inspect_source_file(
             path=path,
             root_dir=root_dir,
@@ -2078,6 +3455,170 @@ def aggregate_results(
             records[category].extend(values)
         exceptions.extend(parsed_exceptions)
 
+    for category in ("sales", "refunds"):
+        charges_records = [
+            record
+            for record in records[category]
+            if record.get("attributes", {}).get("stripe_export_type") == "charges"
+        ]
+        balance_records = [
+            record
+            for record in records[category]
+            if record.get("attributes", {}).get("stripe_export_type") == "balance_history"
+        ]
+        if not charges_records or not balance_records:
+            continue
+
+        def stripe_immutable_identities(record: dict[str, Any]) -> set[tuple[str, str]]:
+            attributes = record.get("attributes", {})
+            identities: set[tuple[str, str]] = set()
+            for value in (
+                attributes.get("stripe_balance_transaction_id"),
+                attributes.get("stripe_source_id"),
+                record.get("external_ref"),
+            ):
+                normalized = str(value or "").strip()
+                if normalized.startswith("ch_"):
+                    identities.add(("charge", normalized))
+                elif normalized.startswith("pi_"):
+                    identities.add(("payment_intent", normalized))
+            return identities
+
+        charge_identities = [stripe_immutable_identities(record) for record in charges_records]
+        charge_signatures = {
+            (record.get("event_date"), abs(float(record.get("gross_amount") or 0)), record.get("currency"))
+            for record in charges_records
+        }
+        charge_order_ids = {
+            str(record.get("attributes", {}).get("order_id") or "").strip()
+            for record in charges_records
+            if str(record.get("attributes", {}).get("order_id") or "").strip()
+        }
+        superseded_records = []
+        possible_duplicate_records = []
+        for record in balance_records:
+            identities = stripe_immutable_identities(record)
+            signature = (record.get("event_date"), abs(float(record.get("gross_amount") or 0)), record.get("currency"))
+            order_id = str(record.get("attributes", {}).get("order_id") or "").strip()
+            if any(identities & candidate for candidate in charge_identities):
+                superseded_records.append(record)
+            elif signature in charge_signatures or (order_id and order_id in charge_order_ids):
+                possible_duplicate_records.append(record)
+
+        charges_source_id = charges_records[0]["source_refs"][0]["source_id"]
+        charges_source = next(source for source in sources if source.source_id == charges_source_id)
+        if possible_duplicate_records:
+            exceptions.append(
+                make_exception(
+                    source=charges_source,
+                    exception_id=f"{charges_source.source_id}:{category}:possible-balance-history-duplicate",
+                    severity="warn",
+                    reason=f"Possible duplicate Stripe {category} rows share a date, amount, and currency across Charges and Balance History exports, but no immutable identifier matched; both records were retained.",
+                    blocking=False,
+                )
+            )
+        if not superseded_records:
+            continue
+
+        superseded_ids = {id(record) for record in superseded_records}
+        records[category] = [record for record in records[category] if id(record) not in superseded_ids]
+        removed_source_ids = {
+            record["source_refs"][0]["source_id"] for record in superseded_records
+        }
+        for source in sources:
+            if source.source_id in removed_source_ids:
+                source.parser_notes.append(
+                    f"Stripe Balance History {category} rows were superseded by the Charges export; fee and payout rows remain authoritative."
+                )
+        exceptions.append(
+            make_exception(
+                source=charges_source,
+                exception_id=f"{charges_source.source_id}:{category}:balance-history-superseded",
+                severity="warn",
+                reason=f"Stripe Balance History {category} rows were superseded by the Charges export to prevent duplicate normalization; fee and payout evidence was retained.",
+                blocking=False,
+            )
+        )
+
+    payout_history_records = [
+        record
+        for record in records["payouts"]
+        if record.get("attributes", {}).get("stripe_export_type") == "payouts_history"
+    ]
+    balance_payout_records = [
+        record
+        for record in records["payouts"]
+        if record.get("attributes", {}).get("stripe_export_type") == "balance_history"
+    ]
+    if payout_history_records and balance_payout_records:
+        def payout_immutable_identities(record: dict[str, Any]) -> set[tuple[str, str]]:
+            attributes = record.get("attributes", {})
+            export_type = attributes.get("stripe_export_type")
+            payout_id = (
+                attributes.get("stripe_payout_id")
+                if export_type == "payouts_history"
+                else attributes.get("stripe_source_id")
+            )
+            balance_transaction_id = attributes.get("stripe_balance_transaction_id")
+            identities = set()
+            if payout_id and str(payout_id).strip():
+                identities.add(("payout", str(payout_id).strip()))
+            if balance_transaction_id and str(balance_transaction_id).strip():
+                identities.add(("balance_transaction", str(balance_transaction_id).strip()))
+            return identities
+
+        authoritative_identities = [
+            payout_immutable_identities(record) for record in payout_history_records
+        ]
+        authoritative_signatures = {
+            (record.get("event_date"), abs(float(record.get("gross_amount") or 0)), record.get("currency"))
+            for record in payout_history_records
+        }
+        superseded_payouts = []
+        possible_duplicate_payouts = []
+        for record in balance_payout_records:
+            identities = payout_immutable_identities(record)
+            signature = (record.get("event_date"), abs(float(record.get("gross_amount") or 0)), record.get("currency"))
+            if any(identities & candidate for candidate in authoritative_identities):
+                superseded_payouts.append(record)
+            elif signature in authoritative_signatures:
+                possible_duplicate_payouts.append(record)
+
+        payout_source_id = payout_history_records[0]["source_refs"][0]["source_id"]
+        payout_source = next(source for source in sources if source.source_id == payout_source_id)
+        if possible_duplicate_payouts:
+            exceptions.append(
+                make_exception(
+                    source=payout_source,
+                    exception_id=f"{payout_source.source_id}:possible-balance-history-payout-duplicate",
+                    severity="warn",
+                    reason="Possible duplicate Stripe payouts share a date, amount, and currency across Payouts History and Balance History, but no immutable identifier matched; both records were retained.",
+                    blocking=False,
+                )
+            )
+        if superseded_payouts:
+            superseded_ids = {id(record) for record in superseded_payouts}
+            records["payouts"] = [
+                record for record in records["payouts"] if id(record) not in superseded_ids
+            ]
+            removed_source_ids = {
+                record["source_refs"][0]["source_id"] for record in superseded_payouts
+            }
+            for source in sources:
+                if source.source_id in removed_source_ids:
+                    source.parser_notes.append(
+                        "Stripe Balance History payout rows were superseded by matching Payouts History rows; fee rows remain authoritative."
+                    )
+            exceptions.append(
+                make_exception(
+                    source=payout_source,
+                    exception_id=f"{payout_source.source_id}:balance-history-payouts-superseded",
+                    severity="warn",
+                    reason="Matching Stripe Balance History payout rows were superseded by the Payouts History export to prevent duplicate normalization; fee evidence was retained.",
+                    blocking=False,
+                )
+            )
+
     if not any(records.values()):
         exceptions.append(
             {
@@ -2132,6 +3673,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--period", required=True, help="Target month in YYYY-MM format")
     parser.add_argument("--source-dir", help="Optional source override. Defaults to companies/<company>/source")
     parser.add_argument("--base-currency", help="Override base currency, e.g. EUR")
+    parser.add_argument("--woo-tax-allocation", help="Reviewed annual Woo VAT allocation JSON override")
     parser.add_argument("--output", help="Optional output path for normalized JSON")
     return parser
 
@@ -2161,6 +3703,20 @@ def main() -> int:
         period_end=period_end,
         base_currency=base_currency,
     )
+    if any(source.parser_name == "parse_woo_tax_summary_csv" for source in sources):
+        allocation_path = (
+            Path(args.woo_tax_allocation)
+            if args.woo_tax_allocation
+            else company_dir / "artifacts" / "vat" / f"{period_start.year}-woo-tax-allocation.json"
+        )
+        allocation = load_bound_woo_tax_allocation(
+            allocation_path=allocation_path,
+            sources=sources,
+            company_slug=company_slug,
+            year=period_start.year,
+            repo_root=repo_root,
+        )
+        woo_tax.apply_period_allocation(records, allocation, args.period)
     document = build_normalized_document(
         company_slug=company_slug,
         period=args.period,

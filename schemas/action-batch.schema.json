@@ -11,6 +11,9 @@
     "generated_at",
     "batch_id",
     "approval_status",
+    "already_present",
+    "unresolved_dependencies",
+    "reference_artifacts",
     "actions"
   ],
   "properties": {
@@ -54,6 +57,19 @@
         "null"
       ]
     },
+    "already_present": {
+      "type": "array",
+      "items": {"type": "object"}
+    },
+    "unresolved_dependencies": {
+      "type": "array",
+      "items": {"type": "object"}
+    },
+    "reference_artifacts": {
+      "type": "array",
+      "minItems": 2,
+      "items": {"$ref": "#/$defs/reference_artifact"}
+    },
     "actions": {
       "type": "array",
       "items": {
@@ -62,6 +78,25 @@
     }
   },
   "$defs": {
+    "reference_artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path", "sha256"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "posting_policy",
+            "discovery_overview",
+            "exchange_rates",
+            "woo_tax_allocation",
+            "woo_tax_source"
+          ]
+        },
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+      }
+    },
     "source_ref": {
       "type": "object",
       "additionalProperties": false,

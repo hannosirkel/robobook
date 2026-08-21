@@ -55,6 +55,8 @@ In practice:
 - Woo sales normally become the recurring monthly sales invoice basis.
 - Stripe and PayPal normally behave as settlement layers, not a second invoice basis.
 - Printful normally becomes purchase-side evidence and can also drive payment drafts when the bank debit is present.
+- Printful refund-only months remain separate supplier-credit drafts instead of being netted into expenses.
+- Foreign-currency month summaries use one period-end ECB rate (or the latest prior business day) from an annual Frankfurter cache.
 
 ## Repository Layout
 
@@ -131,6 +133,14 @@ python3 scripts/bookbuilder.py \
   --output companies/example/artifacts/actions/2024-01.yaml
 ```
 
+With `--company-dir`, the builder automatically looks for:
+
+- `artifacts/posting_policy.json` for exact bank, contact, and posting mappings
+- `artifacts/reference/ecb-rates-<year>.json` for reviewed foreign-currency rates
+- `artifacts/discovery/<year>-overview.json` for live duplicate suppression
+
+Missing explicit contacts remain blocking dependencies. Master-data creation is kept in a separately approved draft and is never performed implicitly.
+
 Dry-run submit:
 
 ```bash
@@ -139,4 +149,23 @@ python3 scripts/booksend.py \
   --period 2024-01 \
   --mode dry-run \
   --output companies/example/artifacts/submissions/2024-01.json
+```
+
+Full-year dry run:
+
+```bash
+.venv/bin/python scripts/full_year_dry_run.py \
+  --company-dir companies/example \
+  --year 2024 \
+  --source-dir companies/example/source
+```
+
+Annual ECB exchange-rate cache through Frankfurter:
+
+```bash
+.venv/bin/python scripts/exchange_rates.py fetch \
+  --company-dir companies/example \
+  --year 2024 \
+  --base USD \
+  --quote EUR
 ```

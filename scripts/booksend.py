@@ -7,13 +7,21 @@ import hashlib
 import json
 import re
 from collections import defaultdict
-from datetime import UTC, datetime
-from decimal import Decimal, InvalidOperation
+from datetime import UTC, date, datetime
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
 from bookbuilder import write_yaml
 from bookchecker import load_yaml
+from exchange_rates import ExchangeRateError, lookup_rate
+from posting_policy import PostingPolicyError, action_policy_errors, load_posting_policy
+from reference_artifacts import (
+    ReferenceArtifactError,
+    required_action_binding_kinds,
+    validate_discovery,
+    verify_file_binding,
+)
 from simplbooks_api import (
     SimplbooksClient,
     SimplbooksError,
@@ -196,6 +204,10 @@ def action_successfully_submitted(action: dict[str, Any]) -> bool:
 
 
 def validate_action_shape(action: dict[str, Any]) -> None:
+    if str(action.get("action_type") or "") == "manual_inventory_writeoff":
+        raise SimplbooksError(
+            "manual inventory write-off actions are UI-only and must not be submitted through Simplbooks API."
+        )
     endpoint = normalized_endpoint(str(action.get("endpoint") or ""))
     if endpoint not in ALLOWED_ENDPOINTS:
         raise SimplbooksError(
@@ -235,6 +247,87 @@ def rounded_rate(gross_amount: Decimal, vat_amount: Decimal | None) -> float | N
     if taxable_base <= 0:
         return None
     return float((vat_amount / taxable_base * Decimal("100")).quantize(Decimal("0.01")))
+
+
+def reviewed_allocated_rate(
+    line: dict[str, Any], *, gross_amount: Decimal, vat_amount: Decimal | None
+) -> float:
+    evidence = line.get("vat_allocation_component_evidence")
+    if not isinstance(evidence, list) or len(evidence) != 1:
+        raise SimplbooksError(
+            "Woo VAT API line must represent exactly one order component so reviewed rounding can be preserved."
+        )
+    if vat_amount is None:
+        raise SimplbooksError("Woo VAT API line requires a reviewed vat_amount_hint.")
+    item = evidence[0]
+    if not isinstance(item, dict):
+        raise SimplbooksError("Woo VAT API line has invalid per-order component evidence.")
+    binding = line.get("vat_evidence_binding")
+    allocation_ref = binding.get("allocation_ref") if isinstance(binding, dict) else None
+    tax_source_refs = binding.get("tax_source_refs") if isinstance(binding, dict) else None
+    valid_binding = (
+        isinstance(allocation_ref, dict)
+        and bool(str(allocation_ref.get("path") or "").strip())
+        and bool(re.fullmatch(r"[a-f0-9]{64}", str(allocation_ref.get("sha256") or "")))
+        and isinstance(tax_source_refs, list)
+        and bool(tax_source_refs)
+        and all(
+            isinstance(source_ref, dict)
+            and bool(str(source_ref.get("source_id") or "").strip())
+            and bool(str(source_ref.get("path") or "").strip())
+            and bool(re.fullmatch(r"[a-f0-9]{64}", str(source_ref.get("sha256") or "")))
+            and isinstance(source_ref.get("row_refs"), list)
+            and bool(source_ref.get("row_refs"))
+            for source_ref in tax_source_refs
+        )
+    )
+    if not valid_binding:
+        raise SimplbooksError("Woo VAT API line lacks a usable allocation and tax-source evidence binding.")
+    evidence_gross = abs(decimal_value(item.get("gross_amount")))
+    evidence_vat = abs(decimal_value(item.get("vat_amount")))
+    if evidence_gross != gross_amount or evidence_vat != vat_amount:
+        raise SimplbooksError("Woo VAT API line does not match its reviewed per-order component evidence.")
+    rate = decimal_value(line.get("vat_profile_rate"))
+    if rate < 0:
+        raise SimplbooksError("Woo VAT API line has an invalid reviewed VAT profile rate.")
+    item_profile = item.get("vat_profile")
+    if not isinstance(item_profile, dict):
+        raise SimplbooksError("Woo VAT API line lacks usable VAT profile provenance.")
+    component = str(line.get("vat_allocation_component") or "")
+    vat_type_field = "shipping_vat_type_id" if component == "shipping" else "goods_vat_type_id"
+    try:
+        event_date = date.fromisoformat(str(item.get("event_date") or ""))
+        item_start = date.fromisoformat(str(item_profile.get("start") or ""))
+        item_end = (
+            date.fromisoformat(str(item_profile["end"]))
+            if item_profile.get("end") not in (None, "")
+            else None
+        )
+        line_start_text, line_end_text = str(line.get("vat_profile_period") or "").split("/", 1)
+        line_start = date.fromisoformat(line_start_text)
+        line_end = None if line_end_text == "open" else date.fromisoformat(line_end_text)
+    except (TypeError, ValueError) as exc:
+        raise SimplbooksError("Woo VAT API line has invalid VAT profile dates.") from exc
+    if (
+        event_date < item_start
+        or item_end is not None and event_date > item_end
+        or event_date < line_start
+        or line_end is not None and event_date > line_end
+    ):
+        raise SimplbooksError("Woo VAT API line event date is outside its reviewed VAT profile.")
+    if (
+        decimal_value(item_profile.get("rate")) != rate
+        or str(item_profile.get(vat_type_field) or "") != str(line.get("suggested_vat_type_id") or "")
+    ):
+        raise SimplbooksError("Woo VAT API line VAT profile provenance does not match the reviewed line.")
+    expected_vat = (gross_amount * rate / (Decimal("100") + rate)).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+    if vat_amount != expected_vat:
+        raise SimplbooksError(
+            "Woo VAT API payload cannot preserve the approved per-order VAT total at the reviewed rate."
+        )
+    return float(rate)
 
 
 def compact_dict(payload: dict[str, Any]) -> dict[str, Any]:
@@ -309,7 +402,15 @@ def translate_invoice_payload(
                 "unit": "summary",
                 "amount": 1,
                 "price_per_unit": decimal_number(gross_amount),
-                "vat": rounded_rate(abs(gross_amount), vat_amount),
+                "vat": (
+                    reviewed_allocated_rate(
+                        line,
+                        gross_amount=abs(gross_amount),
+                        vat_amount=vat_amount,
+                    )
+                    if line.get("vat_allocation_component") not in (None, "")
+                    else rounded_rate(abs(gross_amount), vat_amount)
+                ),
                 "discount": 0,
                 "contents": str(line.get("description") or f"Line {index}"),
             }
@@ -324,7 +425,7 @@ def translate_invoice_payload(
             "created": document_date,
             "transaction_date": document_date,
             "currency_name": currency,
-            "currency_rate": 1,
+            "currency_rate": reviewed_currency_rate(payload),
             "row_sum_with_vat": True,
             "additional_info": str(counterparty.get("display_name_hint") or action_id(action)),
         }
@@ -357,7 +458,20 @@ def translate_invoice_payload(
     }
 
 
-def translate_purchase_payload(action: dict[str, Any]) -> dict[str, Any]:
+def reviewed_currency_rate(payload: dict[str, Any], *, base_currency: str = "EUR") -> float:
+    currency = str(payload.get("currency") or base_currency).strip().upper()
+    if currency == base_currency.upper():
+        return 1.0
+    raw_rate = payload.get("currency_rate")
+    if raw_rate in (None, ""):
+        raise SimplbooksError(f"Foreign-currency action is missing a reviewed currency_rate for {currency}.")
+    rate = decimal_value(raw_rate)
+    if rate <= 0:
+        raise SimplbooksError(f"Foreign-currency action has invalid reviewed currency_rate {raw_rate!r} for {currency}.")
+    return decimal_number(rate)
+
+
+def translate_purchase_payload(action: dict[str, Any], *, credit: bool = False) -> dict[str, Any]:
     payload = action.get("payload") or {}
     counterparty = payload.get("counterparty") or {}
     document_date = str(payload.get("document_date") or "")
@@ -366,8 +480,16 @@ def translate_purchase_payload(action: dict[str, Any]) -> dict[str, Any]:
     rows = []
     for index, line in enumerate(payload.get("line_items") or [], start=1):
         gross_amount = decimal_value(line.get("gross_amount"))
+        if credit:
+            if gross_amount <= 0:
+                raise SimplbooksError(f"{action_id(action)} credit line {index} must contain a positive reviewed magnitude.")
+            if line.get("article_id_hint") not in (None, "") or line.get("warehouse_id_hint") not in (None, ""):
+                raise SimplbooksError(
+                    f"{action_id(action)} credit line {index} is inventory-linked and requires original stock-batch handling."
+                )
         vat_amount_hint = line.get("vat_amount_hint")
         vat_amount = None if vat_amount_hint in (None, "") else abs(decimal_value(vat_amount_hint))
+        posted_amount = -gross_amount if credit else gross_amount
         row = compact_dict(
             {
                 "expense_account_id": api_id(
@@ -387,7 +509,7 @@ def translate_purchase_payload(action: dict[str, Any]) -> dict[str, Any]:
                 "name": str(line.get("description") or f"Line {index}"),
                 "unit": "summary",
                 "amount": 1,
-                "sum": decimal_number(gross_amount),
+                "sum": decimal_number(posted_amount),
                 "vat": rounded_rate(gross_amount, vat_amount),
                 "discount": 0,
             }
@@ -402,9 +524,13 @@ def translate_purchase_payload(action: dict[str, Any]) -> dict[str, Any]:
             "created": document_date,
             "transaction_date": document_date,
             "currency_name": currency,
-            "currency_rate": 1,
+            "currency_rate": reviewed_currency_rate(payload),
             "row_sum_with_vat": True,
-            "vat": payload.get("totals", {}).get("vat_amount"),
+            "vat": (
+                -abs(decimal_number(decimal_value(payload.get("totals", {}).get("vat_amount"))) or 0)
+                if credit
+                else payload.get("totals", {}).get("vat_amount")
+            ),
             "comments": str(counterparty.get("display_name_hint") or action_id(action)),
         }
     )
@@ -433,7 +559,7 @@ def translate_cash_settlement_payload(
     common = {
         "income_account_id": api_id(payload.get("bank_account_id"), field_name=f"{action_id(action)} bank_account_id"),
         "currency_name": currency,
-        "currency_rate": 1,
+        "currency_rate": reviewed_currency_rate(payload),
         "client_id": api_id(counterparty.get("contact_id"), field_name=f"{action_id(action)} client_id"),
     }
 
@@ -502,9 +628,36 @@ def translate_action_for_api(
     *,
     lookup: dict[str, dict[str, Any]],
     allow_unresolved_dependencies: bool = False,
+    exchange_rate_cache: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if str(action.get("action_type") or "") == "manual_inventory_writeoff":
+        raise SimplbooksError(
+            "manual inventory write-off actions are UI-only and must not be translated for Simplbooks API submission."
+        )
     payload = action.get("payload") or {}
     draft_schema = str(payload.get("draft_schema") or "")
+    currency = str(payload.get("currency") or "EUR").upper()
+    if currency != "EUR" and exchange_rate_cache is not None:
+        requested_date = str(payload.get("currency_rate_requested_date") or payload.get("document_date") or "")
+        document_date = str(payload.get("document_date") or "")
+        if requested_date != document_date:
+            raise SimplbooksError(f"{action_id(action)} reviewed rate requested date must equal document date.")
+        try:
+            resolution = lookup_rate(
+                exchange_rate_cache,
+                requested_date=date.fromisoformat(requested_date),
+                base=currency,
+                quote="EUR",
+            )
+        except (ExchangeRateError, ValueError) as exc:
+            raise SimplbooksError(f"{action_id(action)} ECB cache validation failed: {exc}") from exc
+        if (
+            decimal_value(payload.get("currency_rate")) != resolution.rate
+            or str(payload.get("currency_rate_effective_date") or "") != resolution.effective_date.isoformat()
+            or str(payload.get("currency_rate_provider") or "") != resolution.provider
+            or str(payload.get("currency_rate_source_url") or "") != resolution.source_url
+        ):
+            raise SimplbooksError(f"{action_id(action)} reviewed rate does not match the annual ECB cache.")
 
     if draft_schema == "invoice_summary_v1":
         return translate_invoice_payload(
@@ -514,6 +667,8 @@ def translate_action_for_api(
         )
     if draft_schema == "purchase_summary_v1":
         return translate_purchase_payload(action)
+    if draft_schema == "purchase_credit_summary_v1":
+        return translate_purchase_payload(action, credit=True)
     if draft_schema == "cash_settlement_v1":
         return translate_cash_settlement_payload(
             action,
@@ -524,6 +679,11 @@ def translate_action_for_api(
     raise SimplbooksError(
         f"Action {action_id(action)} uses unsupported draft_schema {draft_schema!r} for live Simplbooks submission."
     )
+
+
+def translate_action(action: dict[str, Any], *, lookup: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Compatibility entry point for local action translation checks."""
+    return translate_action_for_api(action, lookup=lookup)
 
 
 def validate_run_preconditions(
@@ -677,6 +837,27 @@ def dry_run_response(
     }
 
 
+def api_calls_from_request_log(
+    request_log: list[dict[str, Any]],
+    *,
+    period: str | None = None,
+) -> list[dict[str, Any]]:
+    calls: list[dict[str, Any]] = []
+    for entry in request_log:
+        if not isinstance(entry, dict):
+            continue
+        call = {
+            "action_idempotency_key": str(entry.get("action_idempotency_key") or ""),
+            "method": str(entry.get("method") or "POST"),
+            "endpoint": normalized_endpoint(str(entry.get("endpoint") or "")),
+            "payload": copy.deepcopy(entry.get("payload") or {}),
+        }
+        if period is not None:
+            call["period"] = period
+        calls.append(call)
+    return calls
+
+
 def apply_action_result(action: dict[str, Any], entry: dict[str, Any], *, mode: str) -> None:
     if mode == "dry-run":
         status = action.get("response_status")
@@ -816,6 +997,44 @@ def load_prior_action_lookup(
     return lookup
 
 
+def verify_submission_reference_artifacts(
+    action_batch: dict[str, Any],
+    *,
+    cwd: Path,
+    period: str,
+    company_id: str,
+) -> None:
+    bindings = action_batch.get("reference_artifacts") or []
+    by_kind: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for binding in bindings:
+        if not isinstance(binding, dict):
+            raise SimplbooksError("Action reference binding must be an object.")
+        by_kind[str(binding.get("kind") or "")].append(binding)
+
+    missing = [
+        kind
+        for kind in sorted(required_action_binding_kinds(action_batch))
+        if not by_kind.get(kind)
+    ]
+    if missing:
+        raise SimplbooksError(
+            "Write mode action batch is not bound to required artifact(s): " + ", ".join(missing)
+        )
+
+    for binding in bindings:
+        kind = str(binding.get("kind") or "")
+        try:
+            bound_path = verify_file_binding(binding, cwd=cwd)
+            if kind == "discovery_overview":
+                validate_discovery(
+                    load_json(bound_path),
+                    year=int(period[:4]),
+                    company_id=company_id,
+                )
+        except ReferenceArtifactError as exc:
+            raise SimplbooksError(str(exc)) from exc
+
+
 def execute_batch(
     *,
     action_batch: dict[str, Any],
@@ -824,6 +1043,8 @@ def execute_batch(
     client: Any | None = None,
     existing_request_log: list[dict[str, Any]] | None = None,
     reference_lookup: dict[str, dict[str, Any]] | None = None,
+    exchange_rate_cache: dict[str, Any] | None = None,
+    posting_policy: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     ordered_actions = stable_execution_order(list(action_batch.get("actions") or []))
     lookup = dict(reference_lookup or {})
@@ -834,16 +1055,44 @@ def execute_batch(
     failed_actions = 0
     stopped_on_failure = False
 
+    has_foreign_actions = any(
+        str((action.get("payload") or {}).get("currency") or "EUR").upper() != "EUR"
+        for action in ordered_actions
+    )
+    if mode == "write" and has_foreign_actions and exchange_rate_cache is None:
+        raise SimplbooksError("Write mode requires the annual ECB cache for foreign-currency actions.")
+
+    pretranslated: dict[str, dict[str, Any]] = {}
     for action in ordered_actions:
         validate_action_shape(action)
+        if posting_policy is not None:
+            try:
+                policy_errors = action_policy_errors(action, posting_policy)
+            except PostingPolicyError as exc:
+                policy_errors = [str(exc)]
+            if policy_errors:
+                raise SimplbooksError(f"{action_id(action)} posting-policy mismatch: {policy_errors[0]}")
 
+        pretranslated[action_id(action)] = translate_action_for_api(
+            action,
+            lookup=lookup,
+            allow_unresolved_dependencies=True,
+            exchange_rate_cache=exchange_rate_cache,
+        )
+
+    for action in ordered_actions:
         if action_successfully_submitted(action):
             continue
 
-        translated = translate_action_for_api(
-            action,
-            lookup=lookup,
-            allow_unresolved_dependencies=(mode == "dry-run"),
+        translated = (
+            pretranslated[action_id(action)]
+            if mode == "dry-run"
+            else translate_action_for_api(
+                action,
+                lookup=lookup,
+                allow_unresolved_dependencies=False,
+                exchange_rate_cache=exchange_rate_cache,
+            )
         )
         translated_endpoint = normalized_endpoint(str(translated.get("endpoint") or ""))
         translated_payload = copy.deepcopy(translated.get("payload") or {})
@@ -961,6 +1210,16 @@ def run_submission(
         check_report=check_report,
         check_path=check_path,
     )
+    if mode == "write":
+        if company_dir is None:
+            raise SimplbooksError("Write mode requires --company-dir for bound reference verification.")
+        resolved_company_id = resolve_company_id(company_id, company_dir=str(company_dir))
+        verify_submission_reference_artifacts(
+            action_batch,
+            cwd=cwd,
+            period=period,
+            company_id=resolved_company_id,
+        )
 
     company_slug = str(
         action_batch.get("company_slug")
@@ -977,6 +1236,22 @@ def run_submission(
         company_dir=company_dir,
         action_path=action_path,
         period=period,
+    )
+    exchange_rate_cache_path = (
+        company_dir / "artifacts" / "reference" / f"ecb-rates-{period[:4]}.json"
+        if company_dir is not None
+        else None
+    )
+    exchange_rate_cache = (
+        load_json(exchange_rate_cache_path)
+        if exchange_rate_cache_path is not None and exchange_rate_cache_path.exists()
+        else None
+    )
+    posting_policy_path = company_dir / "artifacts" / "posting_policy.json" if company_dir is not None else None
+    posting_policy = (
+        load_posting_policy(posting_policy_path)
+        if posting_policy_path is not None and posting_policy_path.exists()
+        else None
     )
 
     if mode == "write" and client is None:
@@ -995,7 +1270,11 @@ def run_submission(
         client=client,
         existing_request_log=(existing_submission or {}).get("request_log") or [],
         reference_lookup=reference_lookup,
+        exchange_rate_cache=exchange_rate_cache,
+        posting_policy=posting_policy,
     )
+    prior_request_count = len((existing_submission or {}).get("request_log") or [])
+    current_request_log = submission["request_log"][prior_request_count:]
 
     write_yaml(action_path, updated_batch)
     write_json(output_path, submission)
@@ -1018,6 +1297,7 @@ def run_submission(
         "failed_actions": submission["summary"]["failed_actions"],
         "stopped_on_failure": submission["summary"]["stopped_on_failure"],
         "rollback_candidates": len(submission["rollback_plan"]["reversal_candidates"]),
+        "api_calls": api_calls_from_request_log(current_request_log, period=period),
     }
 
 

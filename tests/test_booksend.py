@@ -133,6 +133,28 @@ def purchase_action(*, key: str = "example-2024-01-purchase-printful") -> dict:
     }
 
 
+def purchase_credit_action() -> dict:
+    action = purchase_action(key="example-2024-07-purchase-credit-printful")
+    action["period"] = "2024-07"
+    action["action_type"] = "create_purchase_credit_summary"
+    action["payload"]["draft_schema"] = "purchase_credit_summary_v1"
+    action["payload"]["document_type"] = "purchase_credit"
+    action["payload"]["document_date"] = "2024-07-31"
+    action["payload"]["currency"] = "USD"
+    action["payload"]["currency_rate"] = 0.9241
+    action["payload"]["currency_rate_provider"] = "ECB"
+    action["payload"]["currency_rate_effective_date"] = "2024-07-31"
+    action["payload"]["totals"]["gross_amount"] = 113.12
+    action["payload"]["line_items"][0].update(
+        {
+            "line_role": "purchase_credit",
+            "gross_amount": 113.12,
+            "warehouse_id_hint": None,
+        }
+    )
+    return action
+
+
 def incoming_action(
     *,
     key: str = "example-2024-01-incoming-paypal",
@@ -253,6 +275,162 @@ class FakeClient:
 
 
 class BooksendTests(unittest.TestCase):
+    def test_sender_rejects_manual_inventory_writeoff_before_translation(self) -> None:
+        action = invoice_action()
+        action["action_type"] = "manual_inventory_writeoff"
+
+        with self.assertRaisesRegex(SimplbooksError, "manual inventory"):
+            booksend.translate_action(action, lookup={})
+
+        client = FakeClient(responses=[])
+        with self.assertRaisesRegex(SimplbooksError, "manual inventory"):
+            booksend.execute_batch(action_batch=make_batch(actions=[action]), mode="write", client=client)
+        self.assertEqual(client.calls, [])
+
+    def test_sender_prevalidates_entire_batch_before_any_client_call(self) -> None:
+        manual_action = invoice_action(key="example-2024-01-manual-inventory")
+        manual_action["action_type"] = "manual_inventory_writeoff"
+
+        for mode in ("dry-run", "write"):
+            with self.subTest(mode=mode):
+                client = FakeClient(responses=[{"_http_status": 201, "invoice_id": 501}])
+                with self.assertRaisesRegex(SimplbooksError, "manual inventory"):
+                    booksend.execute_batch(
+                        action_batch=make_batch(actions=[invoice_action(), manual_action]),
+                        mode=mode,
+                        client=client,
+                    )
+                self.assertEqual(client.calls, [])
+
+    def test_sender_copies_reviewed_rate_and_translates_supplier_credit(self) -> None:
+        translated = booksend.translate_action_for_api(purchase_credit_action(), lookup={})
+
+        self.assertEqual(translated["payload"]["Purchase"]["currency_rate"], 0.9241)
+        self.assertEqual(translated["payload"]["PurchaseRows"][0]["PurchaseRow"]["sum"], -113.12)
+
+    def test_sender_preserves_reviewed_rate_and_per_order_rounding_lines(self) -> None:
+        action = invoice_action()
+        action["payload"]["totals"].update({"gross_amount": 0.06, "vat_amount": 0.02, "shipping_amount": 0.0})
+        action["payload"]["line_items"] = [
+            {
+                "line_role": "sales_revenue",
+                "description": f"Woo order EXAMPLE-{index} goods",
+                "gross_amount": 0.03,
+                "vat_amount_hint": 0.01,
+                "suggested_income_account_id": "3000",
+                "suggested_vat_type_id": "34",
+                "warehouse_id_hint": None,
+                "vat_allocation_component": "goods",
+                "vat_profile_rate": 24,
+                "vat_profile_period": "2025-07-01/open",
+                "vat_allocation_component_evidence": [
+                    {
+                        "order_id": f"EXAMPLE-{index}", "gross_amount": 0.03, "vat_amount": 0.01,
+                        "event_date": "2025-11-27",
+                        "vat_profile": {
+                            "start": "2025-01-01", "end": "2025-12-31", "rate": 24,
+                            "goods_vat_type_id": "34", "shipping_vat_type_id": "33",
+                        },
+                    }
+                ],
+                "vat_evidence_binding": {
+                    "allocation_ref": {"path": "allocation.json", "sha256": "c" * 64},
+                    "tax_source_refs": [{
+                        "source_id": "woo-tax", "path": "woocommerce-taxes.csv",
+                        "sha256": "a" * 64, "row_refs": ["csv:2"],
+                    }],
+                },
+            }
+            for index in (1, 2)
+        ]
+
+        translated = booksend.translate_action_for_api(action, lookup={})
+        tasks = [item["Task"] for item in translated["payload"]["Tasks"]]
+
+        self.assertEqual([task["vat"] for task in tasks], [24.0, 24.0])
+        self.assertEqual([task["price_per_unit"] for task in tasks], [0.03, 0.03])
+
+        unbound = copy.deepcopy(action)
+        unbound["payload"]["line_items"][0].pop("vat_evidence_binding")
+        with self.assertRaisesRegex(SimplbooksError, "evidence binding"):
+            booksend.translate_action_for_api(unbound, lookup={})
+
+        action["payload"]["line_items"] = [{
+            **action["payload"]["line_items"][0],
+            "gross_amount": 0.06,
+            "vat_amount_hint": 0.02,
+            "vat_allocation_component_evidence": [
+                {"order_id": "EXAMPLE-1", "gross_amount": 0.03, "vat_amount": 0.01},
+                {"order_id": "EXAMPLE-2", "gross_amount": 0.03, "vat_amount": 0.01},
+            ],
+        }]
+        with self.assertRaisesRegex(SimplbooksError, "one order component"):
+            booksend.translate_action_for_api(action, lookup={})
+
+    def test_write_reference_verification_requires_woo_tax_bindings(self) -> None:
+        action = invoice_action()
+        action["payload"]["line_items"][0]["vat_allocation_component"] = "goods"
+        batch = make_batch(actions=[action])
+        batch["reference_artifacts"] = []
+
+        with self.assertRaisesRegex(SimplbooksError, "woo_tax_allocation"):
+            booksend.verify_submission_reference_artifacts(
+                batch,
+                cwd=ROOT,
+                period="2024-01",
+                company_id="EXAMPLE-ID",
+            )
+
+    def test_sender_rejects_foreign_action_without_reviewed_rate(self) -> None:
+        action = purchase_action()
+        action["payload"]["currency"] = "USD"
+
+        with self.assertRaisesRegex(SimplbooksError, "reviewed currency_rate"):
+            booksend.translate_action_for_api(action, lookup={})
+
+    def test_sender_rejects_reviewed_rate_that_differs_from_cache(self) -> None:
+        action = purchase_credit_action()
+        action["payload"]["currency_rate"] = 999
+        action["payload"]["currency_rate_requested_date"] = "2024-07-31"
+        action["payload"]["currency_rate_effective_date"] = "2024-07-31"
+        action["payload"]["currency_rate_source_url"] = "https://api.frankfurter.dev/v2/rates?providers=ECB"
+        cache = {
+            "provider": "ECB",
+            "year": 2024,
+            "base": "USD",
+            "quote": "EUR",
+            "source_url": "https://api.frankfurter.dev/v2/rates?providers=ECB",
+            "rates": [{"date": "2024-07-31", "base": "USD", "quote": "EUR", "rate": "0.92"}],
+        }
+
+        with self.assertRaisesRegex(SimplbooksError, "does not match"):
+            booksend.translate_action_for_api(action, lookup={}, exchange_rate_cache=cache)
+
+    def test_sender_rejects_rate_requested_for_different_document_date(self) -> None:
+        action = purchase_credit_action()
+        action["payload"]["currency_rate_requested_date"] = "2024-01-31"
+        action["payload"]["currency_rate_effective_date"] = "2024-01-31"
+        source_url = "https://api.frankfurter.dev/v2/rates?providers=ECB"
+        action["payload"]["currency_rate_source_url"] = source_url
+        cache = {
+            "provider": "ECB",
+            "year": 2024,
+            "base": "USD",
+            "quote": "EUR",
+            "source_url": source_url,
+            "rates": [{"date": "2024-01-31", "base": "USD", "quote": "EUR", "rate": "0.9241"}],
+        }
+
+        with self.assertRaisesRegex(SimplbooksError, "document date"):
+            booksend.translate_action_for_api(action, lookup={}, exchange_rate_cache=cache)
+
+    def test_sender_rejects_inventory_linked_supplier_credit(self) -> None:
+        action = purchase_credit_action()
+        action["payload"]["line_items"][0]["warehouse_id_hint"] = "6"
+
+        with self.assertRaisesRegex(SimplbooksError, "inventory-linked"):
+            booksend.translate_action_for_api(action, lookup={})
+
     def test_dry_run_updates_actions_and_uses_translated_payloads(self) -> None:
         batch = make_batch(approval_status="draft")
 
@@ -303,6 +481,68 @@ class BooksendTests(unittest.TestCase):
 
         self.assertEqual(submission["request_log"][0]["endpoint"], "payments/create")
         self.assertEqual(submission["request_log"][0]["payload"]["purchase_id"], 712)
+
+    def test_run_submission_reports_only_current_run_api_calls_on_rerun(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            company_dir = tmp / "companies" / "example"
+            actions_dir = company_dir / "artifacts" / "actions"
+            submissions_dir = company_dir / "artifacts" / "submissions"
+            actions_dir.mkdir(parents=True)
+            submissions_dir.mkdir(parents=True)
+
+            action_path = actions_dir / "2024-01.yaml"
+            batch = make_batch(approval_status="draft")
+            booksend.write_yaml(action_path, batch)
+            action_sha = booksend.file_sha256(action_path)
+            (actions_dir / "2024-01.check.md").write_text(
+                "\n".join(
+                    [
+                        "- Result: `pass`",
+                        f"- Batch ID: `{batch['batch_id']}`",
+                        f"- Action file SHA256: `{action_sha}`",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            first = booksend.run_submission(
+                period="2024-01",
+                company_dir=company_dir,
+                company_id=None,
+                action_override=None,
+                check_override=None,
+                output_override=None,
+                request_log_override=None,
+                token_file=".apikey",
+                mode="dry-run",
+                confirm_write=False,
+                continue_on_error=False,
+                cwd=tmp,
+            )
+            second = booksend.run_submission(
+                period="2024-01",
+                company_dir=company_dir,
+                company_id=None,
+                action_override=None,
+                check_override=None,
+                output_override=None,
+                request_log_override=None,
+                token_file=".apikey",
+                mode="dry-run",
+                confirm_write=False,
+                continue_on_error=False,
+                cwd=tmp,
+            )
+
+            submission = booksend.load_json(submissions_dir / "2024-01.json")
+
+        self.assertEqual(len(first["api_calls"]), 2)
+        self.assertEqual(len(second["api_calls"]), 2)
+        self.assertEqual(len(submission["request_log"]), 4)
+        self.assertEqual(second["api_calls"][0]["endpoint"], "invoices/create")
+        self.assertEqual(second["api_calls"][1]["endpoint"], "incomings/create")
 
     def test_load_prior_action_lookup_reads_earlier_action_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -64,6 +64,7 @@ Implemented deterministic checks:
 - A blocked recon month should fail the checker.
 - Do not treat low-confidence draft actions as submit-ready.
 - Keep the report with the action batch so reruns remain auditable.
+- Fail company batches whose normalized evidence still points to disposable `temp/` source paths.
 
 ## References
 

@@ -71,6 +71,48 @@ def find_check(document: dict, check_id: str) -> dict:
 
 
 class BookreconTests(unittest.TestCase):
+    def test_processor_classifier_ignores_refs_nested_in_woo_vat_evidence(self) -> None:
+        woo_sale = record(
+            record_id="woo:1",
+            source_system="woo",
+            channel="woo",
+            event_type="woo_daily_sales",
+            gross_amount=113.0,
+            attributes={
+                "vat_allocation": {
+                    "component_vat_evidence": [
+                        {"order_id": "EXAMPLE-1", "processor_ref": "paypal-reference"}
+                    ]
+                }
+            },
+        )
+
+        self.assertIsNone(bookrecon.infer_processor(woo_sale))
+        stripe_sale = dict(woo_sale, source_system="stripe", channel="stripe", event_type="stripe_charge")
+        self.assertEqual(bookrecon.infer_processor(stripe_sale), "stripe")
+
+    def test_supplier_credit_check_reports_total_by_currency(self) -> None:
+        normalized = base_normalized()
+        normalized["records"]["purchase_credits"].append(
+            record(
+                record_id="printful:credit:1",
+                source_system="printful",
+                event_type="printful_supplier_credit",
+                gross_amount=113.12,
+                description="Printful supplier credit",
+            )
+        )
+
+        checks = bookrecon.build_purchase_credit_checks(
+            normalized_path_display="normalized/2024-07.json",
+            records=normalized["records"],
+        )
+
+        self.assertEqual(len(checks), 1)
+        self.assertEqual(checks[0]["status"], "pass")
+        self.assertEqual(checks[0]["lhs_amount"], 113.12)
+        self.assertEqual(checks[0]["lhs_label"], "Supplier credits (EUR)")
+
     def test_blocking_normalized_exception_blocks_build(self) -> None:
         normalized = base_normalized()
         normalized["exceptions"].append(
@@ -282,6 +324,45 @@ class BookreconTests(unittest.TestCase):
         eur_check = find_check(document, "fulfillment-expenses-vs-bank:printful:eur")
         self.assertEqual(usd_check["status"], "pass")
         self.assertEqual(eur_check["status"], "warn")
+
+    def test_quartermaster_is_recognized_as_fulfillment_partner(self) -> None:
+        normalized = base_normalized("2024-10")
+        normalized["records"]["purchase_expenses"].append(
+            record(
+                record_id="quartermaster:expense",
+                source_system="quartermaster",
+                channel="quartermaster",
+                event_type="quartermaster_service_invoice",
+                gross_amount=21.0,
+                description="Quartermaster storage invoice",
+                currency="USD",
+            )
+        )
+        normalized["records"]["bank_transactions"].append(
+            record(
+                record_id="quartermaster:bank",
+                source_system="bank",
+                channel="quartermaster",
+                event_type="bank_debit",
+                gross_amount=-21.0,
+                description="Quartermaster payment",
+                currency="USD",
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            document = bookrecon.build_recon_document(
+                normalized_payload=normalized,
+                normalized_path=Path(tmp) / "2024-10.json",
+                repo_root=Path(tmp),
+                amount_threshold=bookrecon.Decimal("0.5"),
+                quantity_threshold=bookrecon.Decimal("1"),
+            )
+
+        check = find_check(document, "fulfillment-expenses-vs-bank:quartermaster:usd")
+        self.assertEqual(check["status"], "pass")
+        self.assertEqual(check["lhs_amount"], 21.0)
+        self.assertEqual(check["rhs_amount"], 21.0)
 
 
 if __name__ == "__main__":

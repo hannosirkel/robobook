@@ -7,10 +7,12 @@
   "required": [
     "year",
     "company_id",
+    "retrieved_at",
     "technical_findings",
     "counts",
     "monthly",
     "patterns",
+    "document_index",
     "samples"
   ],
   "properties": {
@@ -24,6 +26,10 @@
     },
     "company_name": {
       "type": "string"
+    },
+    "retrieved_at": {
+      "type": "string",
+      "format": "date-time"
     },
     "technical_findings": {
       "type": "array",
@@ -119,6 +125,12 @@
         "$ref": "#/$defs/count_map"
       }
     },
+    "document_index": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/document_identity"
+      }
+    },
     "samples": {
       "type": "object",
       "additionalProperties": {
@@ -130,6 +142,28 @@
     }
   },
   "$defs": {
+    "document_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "document_type",
+        "supplier_name",
+        "external_number",
+        "document_date",
+        "currency",
+        "gross_amount",
+        "simplbooks_id"
+      ],
+      "properties": {
+        "document_type": {"type": "string", "minLength": 1},
+        "supplier_name": {"type": "string"},
+        "external_number": {"type": ["string", "null"]},
+        "document_date": {"type": "string"},
+        "currency": {"type": "string", "minLength": 3, "maxLength": 3},
+        "gross_amount": {"type": "number"},
+        "simplbooks_id": {"type": ["string", "null"]}
+      }
+    },
     "count_map": {
       "type": "object",
       "propertyNames": {

@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 from calendar import monthrange
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
@@ -29,6 +30,7 @@ PROCESSOR_KEYWORDS: dict[str, tuple[str, ...]] = {
 
 FULFILLMENT_KEYWORDS: dict[str, tuple[str, ...]] = {
     "printful": ("printful",),
+    "quartermaster": ("quartermaster",),
     "shipmonk": ("shipmonk",),
     "omnipack": ("omnipack",),
 }
@@ -566,16 +568,16 @@ def effective_invoice_posting_records(
     dict[tuple[str, str], list[str]],
     dict[tuple[str, str], list[str]],
 ]:
-    sales_groups, sales_notes, sales_matched_processors = planned_sales_groups(
+    sales_groups, sales_notes, sales_matched_processors, refund_posting_basis = planned_sales_groups(
         records["sales"],
         base_currency=base_currency,
         amount_tolerance=Decimal("0.50"),
     )
-    refund_groups, _, _ = planned_sales_groups(
-        records["refunds"],
-        base_currency=base_currency,
-        amount_tolerance=Decimal("0.50"),
-    )
+    refund_groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for record in records["refunds"]:
+        evidence_key = (record_group_label(record, default="refunds"), record_currency(record, base_currency))
+        posting_key = refund_posting_basis.get(evidence_key, evidence_key)
+        refund_groups[posting_key].append(record)
     effective_sales = [record for group_records in sales_groups.values() for record in group_records]
     effective_refunds = [record for group_records in refund_groups.values() for record in group_records]
     return sales_groups, effective_sales, effective_refunds, sales_notes, sales_matched_processors

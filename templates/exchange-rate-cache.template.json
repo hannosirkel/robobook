@@ -1,0 +1,12 @@
+{
+  "schema_version": "1.0",
+  "provider": "ECB",
+  "year": 2024,
+  "base": "USD",
+  "quote": "EUR",
+  "source_url": "https://api.frankfurter.dev/v2/rates?from=2024-01-01&to=2024-12-31&base=USD&quotes=EUR&providers=ECB",
+  "retrieved_at": "2026-08-21T00:00:00Z",
+  "rates": [
+    {"date": "2024-01-02", "base": "USD", "quote": "EUR", "rate": "0.9112"}
+  ]
+}

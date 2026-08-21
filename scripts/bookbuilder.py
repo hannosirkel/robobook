@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import re
 import unicodedata
@@ -12,7 +13,11 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-from simplbooks_api import SimplbooksError, resolve_company_name
+from document_identity import document_identity, match_existing
+from exchange_rates import ExchangeRateError, lookup_rate
+from posting_policy import PostingPolicyError, load_posting_policy, resolve_bank_account, resolve_contact, resolve_mapping, resolve_sales_vat_profile
+from reference_artifacts import ReferenceArtifactError, bind_file, validate_discovery, verify_file_binding
+from simplbooks_api import SimplbooksError, resolve_company_id, resolve_company_name
 
 
 PROCESSOR_KEYWORDS: dict[str, tuple[str, ...]] = {
@@ -22,6 +27,7 @@ PROCESSOR_KEYWORDS: dict[str, tuple[str, ...]] = {
 
 FULFILLMENT_KEYWORDS: dict[str, tuple[str, ...]] = {
     "printful": ("printful",),
+    "quartermaster": ("quartermaster",),
     "shipmonk": ("shipmonk",),
     "omnipack": ("omnipack",),
 }
@@ -48,14 +54,21 @@ COUNTERPARTY_KEYWORDS: dict[str, tuple[str, ...]] = {
     "stripe": ("stripe",),
     "woo": ("woo", "webshop", "shop", "store"),
     "printful": ("printful",),
+    "quartermaster": ("quartermaster", "qmlogistics", "qmdirect"),
     "shipmonk": ("shipmonk",),
     "omnipack": ("omnipack",),
+}
+
+CONTACT_ALIASES: dict[str, tuple[str, ...]] = {
+    "omniva": ("AS Eesti Post", "Aktsiaselts Eesti Post", "Eesti Post"),
 }
 
 CONTACT_FALLBACKS: dict[str, tuple[str, ...]] = {
     "paypal": ("stripe",),
     "woo": ("stripe", "paypal"),
 }
+
+ONLINE_SALES_CHANNELS = {"woo", "quartermaster"}
 
 DEFAULT_ACTION_STATUS = {
     "executed_at": None,
@@ -171,6 +184,15 @@ def classify_record(record: dict[str, Any], keyword_map: dict[str, tuple[str, ..
 
 
 def infer_processor(record: dict[str, Any]) -> str | None:
+    source_system = str(record.get("source_system") or "").lower()
+    channel = str(record.get("channel") or "").lower()
+    event_type = str(record.get("event_type") or "").lower()
+    if source_system in PROCESSOR_KEYWORDS:
+        return source_system
+    if channel in PROCESSOR_KEYWORDS:
+        return channel
+    if source_system == "woo" or channel == "woo" or event_type.startswith("woo_"):
+        return None
     return classify_record(record, PROCESSOR_KEYWORDS)
 
 
@@ -344,6 +366,37 @@ def merge_mapping_hints(
     return merged
 
 
+def unique_labels(values: list[str]) -> tuple[str, ...]:
+    labels: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        label = str(value or "").strip()
+        if not label:
+            continue
+        normalized = normalize_text(label)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        labels.append(label)
+    return tuple(labels)
+
+
+def contact_candidate_labels(
+    *,
+    group_label: str,
+    records: list[dict[str, Any]] | None = None,
+    extra_labels: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    labels = [group_label, *CONTACT_ALIASES.get(slugify(group_label), ()), *extra_labels]
+    for record in records or []:
+        attributes = record.get("attributes") or {}
+        labels.extend(
+            str(attributes.get(key) or "")
+            for key in ("vendor_name", "counterparty_name", "customer_name", "name")
+        )
+    return unique_labels(labels)
+
+
 def preferred_bank_account_id(
     company_profile: dict[str, Any] | None,
     entity_map: dict[str, Any] | None,
@@ -374,42 +427,60 @@ def preferred_contact_id(
     entity_map: dict[str, Any] | None,
     *,
     group_label: str,
+    candidate_labels: tuple[str, ...] = (),
 ) -> tuple[str | None, list[str]]:
     contacts = list((entity_map or {}).get("contacts") or [])
     if not contacts:
         return None, []
 
-    slug = slugify(group_label)
-    tokens = tuple(token for token in slug.split("-") if token)
-    include_keywords = COUNTERPARTY_KEYWORDS.get(slug, ()) + tokens
-    if not include_keywords:
-        include_keywords = (slug,)
+    for label in contact_candidate_labels(group_label=group_label, extra_labels=candidate_labels):
+        slug = slugify(label)
+        tokens = tuple(token for token in slug.split("-") if token)
+        include_keywords = COUNTERPARTY_KEYWORDS.get(slug, ()) + tokens
+        if not include_keywords:
+            include_keywords = (slug,)
 
-    contact_id, ambiguity_note = choose_entity(
-        contacts,
-        include_keywords=include_keywords,
-    )
+        contact_id, ambiguity_note = choose_entity(
+            contacts,
+            include_keywords=include_keywords,
+        )
+        if contact_id is None:
+            if ambiguity_note:
+                continue
+            continue
+        notes: list[str] = []
+        if label != group_label:
+            notes.append(f"Used contact mapping label {label!r} for {group_label!r}.")
+        if ambiguity_note:
+            notes.append(ambiguity_note)
+        return contact_id, notes
+
     notes: list[str] = []
-    if ambiguity_note:
-        notes.append(ambiguity_note)
-    if contact_id is None:
-        notes.append(f"No contact/client mapping matched {group_label!r}.")
-    return contact_id, notes
+    notes.append(f"No contact/client mapping matched {group_label!r}.")
+    return None, notes
 
 
 def preferred_contact_id_with_fallbacks(
     entity_map: dict[str, Any] | None,
     *,
     group_label: str,
+    candidate_labels: tuple[str, ...] = (),
     fallback_labels: tuple[str, ...] = (),
 ) -> tuple[str | None, list[str]]:
-    contact_id, contact_notes = preferred_contact_id(entity_map, group_label=group_label)
+    contact_id, contact_notes = preferred_contact_id(
+        entity_map,
+        group_label=group_label,
+        candidate_labels=candidate_labels,
+    )
     if contact_id is not None:
         return contact_id, contact_notes
 
     notes = [note for note in contact_notes if note != f"No contact/client mapping matched {group_label!r}."]
     for fallback_label in fallback_labels:
-        fallback_contact_id, fallback_notes = preferred_contact_id(entity_map, group_label=fallback_label)
+        fallback_contact_id, fallback_notes = preferred_contact_id(
+            entity_map,
+            group_label=fallback_label,
+        )
         if fallback_contact_id is None:
             continue
         notes.extend(
@@ -444,7 +515,7 @@ def preferred_mapping_hints(entity_map: dict[str, Any] | None) -> dict[str, tupl
     )
     fulfillment_id, fulfillment_note = choose_entity(
         financial_accounts,
-        include_keywords=("fulfillment", "shipping", "postage", "logistics", "printful", "shipmonk", "omnipack", "warehouse"),
+        include_keywords=("fulfillment", "shipping", "postage", "logistics", "printful", "quartermaster", "shipmonk", "omnipack", "warehouse"),
     )
     standard_vat_id, standard_vat_note = choose_entity(
         vat_types,
@@ -479,11 +550,17 @@ def standard_online_sales_mapping(
     entity_map: dict[str, Any] | None,
     *,
     profile_name: str,
+    default_warehouse_keywords: tuple[str, ...] = ("printful", "eu"),
 ) -> dict[str, tuple[str | None, list[str]]]:
     entity_map = entity_map or {}
     financial_accounts = list(entity_map.get("financial_accounts") or [])
     vat_types = list(entity_map.get("vat_types") or [])
     warehouses = list(entity_map.get("warehouses") or [])
+    default_warehouse_id = (
+        find_entity_id(warehouses, include_keywords=default_warehouse_keywords)
+        if default_warehouse_keywords
+        else None
+    )
 
     if profile_name == "taxable":
         return {
@@ -507,7 +584,7 @@ def standard_online_sales_mapping(
                 ),
                 [],
             ),
-            "default_warehouse": (find_entity_id(warehouses, include_keywords=("printful", "eu")), []),
+            "default_warehouse": (default_warehouse_id, []),
         }
 
     return {
@@ -521,7 +598,7 @@ def standard_online_sales_mapping(
             find_entity_id(vat_types, include_keywords=("0%", "teenuste", "eksport"), is_sales=True, vat_percent=0),
             [],
         ),
-        "default_warehouse": (find_entity_id(warehouses, include_keywords=("printful", "eu")), []),
+        "default_warehouse": (default_warehouse_id, []),
     }
 
 
@@ -610,6 +687,39 @@ def source_refs_for_records(
             }
         )
     return refs
+
+
+def bind_woo_tax_reference_artifacts(
+    normalized_payload: dict[str, Any], *, cwd: Path
+) -> list[dict[str, str]]:
+    """Verify and bind every allocation/source file carried by normalized Woo VAT evidence."""
+    raw_bindings: list[tuple[str, dict[str, Any]]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for sale in (normalized_payload.get("records") or {}).get("sales") or []:
+        allocation = ((sale.get("attributes") or {}).get("vat_allocation") or {})
+        if not isinstance(allocation, dict) or not allocation:
+            continue
+        allocation_ref = allocation.get("allocation_ref")
+        tax_source_refs = allocation.get("tax_source_refs")
+        if not isinstance(allocation_ref, dict) or not isinstance(tax_source_refs, list) or not tax_source_refs:
+            raise SimplbooksError("Normalized Woo VAT evidence lacks allocation/source file bindings.")
+        candidates = [("woo_tax_allocation", allocation_ref)] + [
+            ("woo_tax_source", item) for item in tax_source_refs if isinstance(item, dict)
+        ]
+        for kind, binding in candidates:
+            key = (kind, str(binding.get("path") or ""), str(binding.get("sha256") or ""))
+            if key not in seen:
+                seen.add(key)
+                raw_bindings.append((kind, binding))
+
+    bound: list[dict[str, str]] = []
+    for kind, binding in sorted(raw_bindings, key=lambda item: (item[0], str(item[1].get("path") or ""))):
+        try:
+            path = verify_file_binding(binding, cwd=cwd)
+        except ReferenceArtifactError as exc:
+            raise SimplbooksError(str(exc)) from exc
+        bound.append(bind_file(path, kind=kind, cwd=cwd))
+    return bound
 
 
 def unique_values(records: list[dict[str, Any]], key: str) -> list[str]:
@@ -926,6 +1036,21 @@ def payment_action_key(
     return candidate_key
 
 
+def idempotency_suffix(
+    *,
+    group_label: str,
+    currency: str,
+    repeated_labels: set[str],
+    extra_suffix: str | None = None,
+) -> str:
+    parts = [slugify(group_label)]
+    if group_label in repeated_labels:
+        parts.append(slugify(currency))
+    if extra_suffix:
+        parts.append(slugify(extra_suffix))
+    return "-".join(part for part in parts if part)
+
+
 def processor_group_for_record(record: dict[str, Any]) -> str | None:
     return infer_processor(record)
 
@@ -935,7 +1060,12 @@ def planned_sales_groups(
     *,
     base_currency: str,
     amount_tolerance: Decimal | None = None,
-) -> tuple[dict[tuple[str, str], list[dict[str, Any]]], dict[tuple[str, str], list[str]], dict[tuple[str, str], list[str]]]:
+) -> tuple[
+    dict[tuple[str, str], list[dict[str, Any]]],
+    dict[tuple[str, str], list[str]],
+    dict[tuple[str, str], list[str]],
+    dict[tuple[str, str], tuple[str, str]],
+]:
     tolerance = TOLERANCE if amount_tolerance is None else amount_tolerance
     grouped_sales: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for record in records:
@@ -944,6 +1074,7 @@ def planned_sales_groups(
 
     review_notes_by_key: dict[tuple[str, str], list[str]] = defaultdict(list)
     matched_processors_by_key: dict[tuple[str, str], list[str]] = defaultdict(list)
+    posting_basis_by_suppressed_key: dict[tuple[str, str], tuple[str, str]] = {}
     keep_keys = set(grouped_sales)
 
     grouped_by_currency: dict[str, dict[str, dict[tuple[str, str], list[dict[str, Any]]]]] = defaultdict(
@@ -973,15 +1104,17 @@ def planned_sales_groups(
         )
         for key in processor_groups:
             keep_keys.discard(key)
+            posting_basis_by_suppressed_key[key] = merchant_key
 
     planned = {key: grouped_sales[key] for key in sorted(keep_keys)}
-    return planned, review_notes_by_key, matched_processors_by_key
+    return planned, review_notes_by_key, matched_processors_by_key, posting_basis_by_suppressed_key
 
 
 def resolve_sales_contact_id(
     entity_map: dict[str, Any] | None,
     *,
     group_label: str,
+    records: list[dict[str, Any]],
     matched_processor_labels: list[str],
 ) -> tuple[str | None, list[str]]:
     ordered_fallbacks: list[str] = []
@@ -994,6 +1127,7 @@ def resolve_sales_contact_id(
     return preferred_contact_id_with_fallbacks(
         entity_map,
         group_label=group_label,
+        candidate_labels=contact_candidate_labels(group_label=group_label, records=records),
         fallback_labels=tuple(ordered_fallbacks),
     )
 
@@ -1032,6 +1166,95 @@ def build_sales_lines(
         + shipping_zero_vat_notes
         + default_warehouse_notes
     )
+
+    allocated_records = [
+        record
+        for record in records
+        if isinstance((record.get("attributes") or {}).get("vat_allocation"), dict)
+    ]
+    unallocated_records = [
+        record
+        for record in records
+        if not isinstance((record.get("attributes") or {}).get("vat_allocation"), dict)
+    ]
+    if allocated_records:
+        def allocated_component_evidence(component: str) -> list[dict[str, Any]]:
+            gross_field = "fixed_product_gross" if component == "goods" else "fixed_shipping_gross"
+            vat_field = "product_vat" if component == "goods" else "shipping_vat"
+            evidence: list[dict[str, Any]] = []
+            for record in allocated_records:
+                allocation = ((record.get("attributes") or {}).get("vat_allocation") or {})
+                entries = allocation.get("component_vat_evidence")
+                if entries is None:
+                    order_ids = allocation.get("allocated_order_ids") or []
+                    if not isinstance(order_ids, list) or len(order_ids) != 1:
+                        raise SimplbooksError(
+                            "Woo VAT allocation requires per-order component rounding evidence for multiple orders."
+                        )
+                    entries = [{
+                        "order_id": order_ids[0],
+                        gross_field: allocation.get(gross_field),
+                        vat_field: allocation.get(vat_field),
+                    }]
+                if not isinstance(entries, list):
+                    raise SimplbooksError("Woo VAT allocation component rounding evidence must be a list.")
+                for entry in entries:
+                    if not isinstance(entry, dict) or not str(entry.get("order_id") or "").strip():
+                        raise SimplbooksError("Woo VAT allocation component rounding evidence requires order IDs.")
+                    evidence.append(
+                        {
+                            "order_id": str(entry["order_id"]),
+                            "event_date": str(entry.get("event_date") or ""),
+                            "gross_amount": decimal_number(abs(decimal_value(entry.get(gross_field)))),
+                            "vat_amount": decimal_number(abs(decimal_value(entry.get(vat_field)))),
+                            "source_row_id": entry.get("source_row_id"),
+                            "processor_ref": entry.get("processor_ref"),
+                            "country_code": entry.get("country_code"),
+                            "configured_rate": entry.get("configured_rate"),
+                            "corrected_rate": entry.get("corrected_rate"),
+                            "source_refs": copy.deepcopy(entry.get("source_refs") or []),
+                            "vat_profile": copy.deepcopy(entry.get("vat_profile")),
+                            "vat_evidence_binding": {
+                                "allocation_ref": copy.deepcopy(allocation.get("allocation_ref")),
+                                "tax_source_refs": copy.deepcopy(allocation.get("tax_source_refs") or []),
+                            },
+                        }
+                    )
+            return evidence
+
+        component_lines = (
+            ("goods", f"{direction}_revenue", f"{group_label} allocated {direction} revenue summary", "fixed_product_gross", "product_vat", revenue_account_id, standard_vat_id),
+            ("shipping", f"{direction}_shipping", f"{group_label} allocated {direction} shipping summary", "fixed_shipping_gross", "shipping_vat", shipping_account_id, shipping_standard_vat_id),
+        )
+        for component, line_role, description, gross_field, vat_field, account_id, vat_type_id in component_lines:
+            for evidence in allocated_component_evidence(component):
+                gross_amount = decimal_value(evidence["gross_amount"])
+                vat_amount = decimal_value(evidence["vat_amount"])
+                if gross_amount == 0:
+                    if vat_amount != 0:
+                        raise SimplbooksError("Woo VAT allocation cannot carry VAT on a zero-gross component.")
+                    continue
+                binding = evidence.pop("vat_evidence_binding")
+                lines.append({
+                    "line_role": line_role,
+                    "description": f"{description} - order {evidence['order_id']}",
+                    "gross_amount": decimal_number(gross_amount),
+                    "vat_amount_hint": decimal_number(vat_amount),
+                    "shipping_component_gross_amount": decimal_number(gross_amount) if component == "shipping" else 0.0,
+                    "suggested_income_account_id": account_id,
+                    "suggested_vat_type_id": vat_type_id,
+                    "warehouse_id_hint": maybe_single_warehouse(allocated_records) or default_warehouse_id,
+                    "record_count": 1,
+                    "vat_allocation_component": component,
+                    "vat_allocation_component_evidence": [evidence],
+                    "vat_evidence_binding": binding,
+                })
+        review_notes.append(
+            "Woo VAT allocation evidence keeps every order component on a separate draft line."
+        )
+        records = unallocated_records
+        if not records:
+            return lines, review_notes
 
     grouped_by_profile: dict[str, list[dict[str, Any]]] = {"taxable": [], "non_taxable": []}
     for record in records:
@@ -1153,7 +1376,15 @@ def build_sales_actions(
     actions: list[dict[str, Any]] = []
     action_ids: dict[tuple[str, str], str] = {}
     action_ids_by_currency: dict[str, list[str]] = defaultdict(list)
-    grouped_sales, planned_notes, matched_processors = planned_sales_groups(records.get("sales", []), base_currency=base_currency)
+    grouped_sales, planned_notes, matched_processors, posting_basis_by_suppressed_key = planned_sales_groups(
+        records.get("sales", []),
+        base_currency=base_currency,
+    )
+    repeated_sales_labels = {
+        label
+        for label, count in Counter(group_label for group_label, _currency in grouped_sales).items()
+        if count > 1
+    }
 
     for (group_label, currency), group_records in sorted(grouped_sales.items()):
         grouped_by_profile = {
@@ -1171,8 +1402,13 @@ def build_sales_actions(
 
             profile_mapping_hints = mapping_hints
             online_sales_override_applied = False
-            if slugify(group_label) == "woo":
-                online_sales_override = standard_online_sales_mapping(entity_map, profile_name=profile_name)
+            if slugify(group_label) in ONLINE_SALES_CHANNELS:
+                default_warehouse_keywords = ("printful", "eu") if slugify(group_label) == "woo" else ()
+                online_sales_override = standard_online_sales_mapping(
+                    entity_map,
+                    profile_name=profile_name,
+                    default_warehouse_keywords=default_warehouse_keywords,
+                )
                 online_sales_override_applied = any(
                     value[0]
                     for key, value in online_sales_override.items()
@@ -1181,18 +1417,24 @@ def build_sales_actions(
                 profile_mapping_hints = merge_mapping_hints(mapping_hints, online_sales_override)
 
             shipping_total = sum_abs_amount(profile_records, "shipping_amount")
+            has_explicit_zero_rated_residual = any(
+                isinstance((record.get("attributes") or {}).get("zero_rated_residual"), dict)
+                for record in profile_records
+            )
             lines, review_notes = build_sales_lines(
                 records=profile_records,
                 group_label=group_label,
                 direction="sales",
                 shipping_split=policy_prefers_shipping_split(policy_text, shipping_total)
-                or (online_sales_override_applied and shipping_total != 0),
+                or (online_sales_override_applied and shipping_total != 0)
+                or (has_explicit_zero_rated_residual and shipping_total != 0),
                 mapping_hints=profile_mapping_hints,
             )
             review_notes.extend(planned_notes.get((group_label, currency), []))
             contact_id, contact_notes = resolve_sales_contact_id(
                 entity_map,
                 group_label=group_label,
+                records=profile_records,
                 matched_processor_labels=matched_processor_labels,
             )
             review_notes.extend(contact_notes)
@@ -1204,9 +1446,12 @@ def build_sales_actions(
                 review_notes.append(forced_note)
             review_notes.append(record_count_note(profile_records))
 
-            action_key_suffix = slugify(group_label)
-            if split_profiles:
-                action_key_suffix = f"{action_key_suffix}-{profile_name.replace('_', '-')}"
+            action_key_suffix = idempotency_suffix(
+                group_label=group_label,
+                currency=currency,
+                repeated_labels=repeated_sales_labels,
+                extra_suffix=profile_name.replace("_", "-") if split_profiles else None,
+            )
             idempotency_key = f"{company_slug}-{period}-sales-{action_key_suffix}"
             payload = {
                 "draft_schema": "invoice_summary_v1",
@@ -1255,20 +1500,56 @@ def build_sales_actions(
             action_ids[(group_label, currency)] = action_ids_by_currency[currency][-1]
 
     grouped_refunds: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    refund_evidence_labels: dict[tuple[str, str], set[str]] = defaultdict(set)
     for record in records.get("refunds", []):
-        key = (record_group_label(record, default="refunds"), record_currency(record, base_currency))
-        grouped_refunds[key].append(record)
+        evidence_key = (record_group_label(record, default="refunds"), record_currency(record, base_currency))
+        posting_key = posting_basis_by_suppressed_key.get(evidence_key, evidence_key)
+        grouped_refunds[posting_key].append(record)
+        if posting_key != evidence_key:
+            refund_evidence_labels[posting_key].add(evidence_key[0])
+
+    repeated_refund_labels = {
+        label
+        for label, count in Counter(group_label for group_label, _currency in grouped_refunds).items()
+        if count > 1
+    }
 
     for (group_label, currency), group_records in sorted(grouped_refunds.items()):
         shipping_total = sum_abs_amount(group_records, "shipping_amount")
+        refund_mapping_hints = mapping_hints
+        online_sales_override_applied = False
+        if slugify(group_label) in ONLINE_SALES_CHANNELS:
+            default_warehouse_keywords = ("printful", "eu") if slugify(group_label) == "woo" else ()
+            online_sales_override = standard_online_sales_mapping(
+                entity_map,
+                profile_name="taxable" if any(taxable_profile(record) == "taxable" for record in group_records) else "non_taxable",
+                default_warehouse_keywords=default_warehouse_keywords,
+            )
+            online_sales_override_applied = any(
+                value[0]
+                for key, value in online_sales_override.items()
+                if key in {"revenue_account", "shipping_account"}
+            )
+            refund_mapping_hints = merge_mapping_hints(mapping_hints, online_sales_override)
         lines, review_notes = build_sales_lines(
             records=group_records,
             group_label=group_label,
             direction="refund",
-            shipping_split=policy_prefers_shipping_split(policy_text, shipping_total),
-            mapping_hints=mapping_hints,
+            shipping_split=policy_prefers_shipping_split(policy_text, shipping_total)
+            or (online_sales_override_applied and shipping_total != 0),
+            mapping_hints=refund_mapping_hints,
         )
-        contact_id, contact_notes = preferred_contact_id(entity_map, group_label=group_label)
+        evidence_labels = sorted(refund_evidence_labels.get((group_label, currency), set()))
+        if evidence_labels:
+            review_notes.append(
+                f"Processor-side refund evidence from {', '.join(evidence_labels)} was posted using {group_label} sales mapping."
+            )
+        contact_id, contact_notes = resolve_sales_contact_id(
+            entity_map,
+            group_label=group_label,
+            records=group_records,
+            matched_processor_labels=evidence_labels,
+        )
         review_notes.extend(contact_notes)
         if forced_note:
             review_notes.append(forced_note)
@@ -1281,7 +1562,12 @@ def build_sales_actions(
         else:
             depends_on.extend(action_ids_by_currency.get(currency, []))
 
-        idempotency_key = f"{company_slug}-{period}-refund-{slugify(group_label)}"
+        action_key_suffix = idempotency_suffix(
+            group_label=group_label,
+            currency=currency,
+            repeated_labels=repeated_refund_labels,
+        )
+        idempotency_key = f"{company_slug}-{period}-refund-{action_key_suffix}"
         payload = {
             "draft_schema": "invoice_summary_v1",
             "document_type": "credit_note",
@@ -1304,7 +1590,7 @@ def build_sales_actions(
         }
         confidence = review_confidence(
             notes=review_notes,
-            required_ids=[mapping_hints["revenue_account"][0]],
+            required_ids=[refund_mapping_hints["revenue_account"][0]],
         )
         actions.append(
             make_action(
@@ -1356,6 +1642,11 @@ def build_fee_actions(
             grouped_embedded[key].append(record)
 
     all_keys = sorted(set(grouped_explicit) | set(grouped_embedded))
+    repeated_fee_labels = {
+        label
+        for label, count in Counter(group_label for group_label, _currency in all_keys).items()
+        if count > 1
+    }
     fee_account_id, fee_account_notes = mapping_hints["fee_account"]
     standard_vat_type_id, standard_vat_notes = mapping_hints["standard_vat_type"]
 
@@ -1366,6 +1657,10 @@ def build_fee_actions(
         contact_id, contact_notes = preferred_contact_id_with_fallbacks(
             entity_map,
             group_label=group_label,
+            candidate_labels=contact_candidate_labels(
+                group_label=group_label,
+                records=[*explicit_records, *embedded_records],
+            ),
             fallback_labels=fallback_labels,
         )
         if explicit_records:
@@ -1387,7 +1682,12 @@ def build_fee_actions(
             review_notes.append(forced_note)
         review_notes.append(record_count_note(source_records))
 
-        idempotency_key = f"{company_slug}-{period}-fees-{slugify(group_label)}"
+        action_key_suffix = idempotency_suffix(
+            group_label=group_label,
+            currency=currency,
+            repeated_labels=repeated_fee_labels,
+        )
+        idempotency_key = f"{company_slug}-{period}-fees-{action_key_suffix}"
         payload = {
             "draft_schema": "purchase_summary_v1",
             "document_type": "purchase",
@@ -1452,6 +1752,11 @@ def build_purchase_actions(
     for record in records.get("purchase_expenses", []):
         key = (record_group_label(record, default="expenses"), record_currency(record, base_currency))
         grouped[key].append(record)
+    repeated_purchase_labels = {
+        label
+        for label, count in Counter(group_label for group_label, _currency in grouped).items()
+        if count > 1
+    }
 
     expense_account_id, expense_account_notes = mapping_hints["fulfillment_account"]
     standard_vat_type_id, standard_vat_notes = mapping_hints["standard_vat_type"]
@@ -1461,28 +1766,49 @@ def build_purchase_actions(
     printful_storage_account_id, printful_storage_vat_type_id = printful_storage_mapping(entity_map)
 
     for (group_label, currency), group_records in sorted(grouped.items()):
-        contact_id, contact_notes = preferred_contact_id(entity_map, group_label=group_label)
+        contact_id, contact_notes = preferred_contact_id(
+            entity_map,
+            group_label=group_label,
+            candidate_labels=contact_candidate_labels(group_label=group_label, records=group_records),
+        )
         review_notes = list(expense_account_notes + standard_vat_notes + zero_vat_notes + contact_notes)
         if forced_note:
             review_notes.append(forced_note)
         review_notes.append(record_count_note(group_records))
 
-        bucketed_records: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+        bucketed_records: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
         for record in group_records:
             haystack = record_haystack(record)
             if group_label == "printful":
                 if any(keyword in haystack for keyword in ("order_charge", "shipping", "fullfil")):
+                    warehouse_profile = str(record.get("warehouse_id") or "").upper()
+                    description = "Orders shipping and fullfilment"
+                    if warehouse_profile:
+                        description += f" {warehouse_profile}"
                     bucket = (
                         printful_expense_account_id or expense_account_id or "",
                         printful_vat_type_id or zero_vat_type_id or "",
-                        "Orders shipping and fullfilment",
+                        description,
+                        warehouse_profile,
                     )
                 else:
                     bucket = (
                         printful_storage_account_id or expense_account_id or "",
                         printful_storage_vat_type_id or zero_vat_type_id or "",
                         "Storage fee for warehoused products",
+                        "",
                     )
+            elif group_label in FULFILLMENT_KEYWORDS:
+                bucket = (
+                    expense_account_id or generic_expense_account_id or "",
+                    (
+                        domestic_purchase_vat_type_id or standard_vat_type_id or ""
+                        if taxable_profile(record) == "taxable"
+                        else no_vat_purchase_vat_type_id or zero_vat_type_id or ""
+                    ),
+                    f"{group_label} fulfillment cost summary",
+                    "",
+                )
             else:
                 bucket = (
                     generic_expense_account_id or expense_account_id or "",
@@ -1492,11 +1818,12 @@ def build_purchase_actions(
                         else no_vat_purchase_vat_type_id or zero_vat_type_id or ""
                     ),
                     f"{group_label} {'taxable' if taxable_profile(record) == 'taxable' else 'non taxable'} cost summary",
+                    "",
                 )
             bucketed_records[bucket].append(record)
 
         lines: list[dict[str, Any]] = []
-        for (bucket_expense_account_id, bucket_vat_type_id, description), bucket_records in sorted(bucketed_records.items()):
+        for (bucket_expense_account_id, bucket_vat_type_id, description, warehouse_profile), bucket_records in sorted(bucketed_records.items()):
             gross_total = sum_amount(bucket_records, "gross_amount")
             vat_total = sum_amount(bucket_records, "vat_amount")
             if gross_total == 0 and vat_total == 0:
@@ -1509,7 +1836,7 @@ def build_purchase_actions(
                     "vat_amount_hint": decimal_number(vat_total),
                     "suggested_expense_account_id": bucket_expense_account_id or None,
                     "suggested_vat_type_id": bucket_vat_type_id or None,
-                    "warehouse_id_hint": maybe_single_warehouse(bucket_records),
+                    "warehouse_id_hint": warehouse_profile or None,
                     "record_count": len(bucket_records),
                 }
             )
@@ -1520,7 +1847,12 @@ def build_purchase_actions(
         if len(summarize_warehouses(group_records)) > 1:
             review_notes.append("Multiple warehouse IDs appear in this expense action.")
 
-        idempotency_key = f"{company_slug}-{period}-purchase-{slugify(group_label)}"
+        action_key_suffix = idempotency_suffix(
+            group_label=group_label,
+            currency=currency,
+            repeated_labels=repeated_purchase_labels,
+        )
+        idempotency_key = f"{company_slug}-{period}-purchase-{action_key_suffix}"
         payload = {
             "draft_schema": "purchase_summary_v1",
             "document_type": "purchase",
@@ -1588,6 +1920,11 @@ def build_incoming_actions(
             continue
         key = (record_group_label(record, default="receipts"), record_currency(record, base_currency))
         grouped_bank[key].append(record)
+    repeated_incoming_labels = {
+        label
+        for label, count in Counter(group_label for group_label, _currency in grouped_payouts).items()
+        if count > 1
+    }
 
     for (group_label, currency), payout_records in sorted(grouped_payouts.items()):
         payout_total = sum_amount(payout_records, "gross_amount")
@@ -1599,6 +1936,10 @@ def build_incoming_actions(
         contact_id, contact_notes = preferred_contact_id_with_fallbacks(
             entity_map,
             group_label=group_label,
+            candidate_labels=contact_candidate_labels(
+                group_label=group_label,
+                records=[*payout_records, *bank_records],
+            ),
             fallback_labels=fallback_labels,
         )
         review_notes = list(bank_account_notes + contact_notes)
@@ -1619,7 +1960,12 @@ def build_incoming_actions(
             depends_on.append(fee_action_ids[(group_label, currency)])
         depends_on = list(dict.fromkeys(depends_on))
 
-        idempotency_key = f"{company_slug}-{period}-incoming-{slugify(group_label)}"
+        action_key_suffix = idempotency_suffix(
+            group_label=group_label,
+            currency=currency,
+            repeated_labels=repeated_incoming_labels,
+        )
+        idempotency_key = f"{company_slug}-{period}-incoming-{action_key_suffix}"
         payload = {
             "draft_schema": "cash_settlement_v1",
             "document_type": "incoming",
@@ -1753,7 +2099,11 @@ def build_payment_actions(
             )
 
         for candidate, allocated_amount in zip(matched_candidates, allocated_amounts, strict=True):
-            contact_id, contact_notes = preferred_contact_id(entity_map, group_label=group_label)
+            contact_id, contact_notes = preferred_contact_id(
+                entity_map,
+                group_label=group_label,
+                candidate_labels=contact_candidate_labels(group_label=group_label, records=bank_records),
+            )
             if contact_id in (None, "") and candidate.get("contact_id") not in (None, ""):
                 contact_id = str(candidate["contact_id"])
                 contact_notes = list(contact_notes) + [
@@ -1823,6 +2173,314 @@ def summarize_actions(actions: list[dict[str, Any]], *, period: str) -> str:
     return f"Draft batch for {period}: " + ", ".join(parts) + "."
 
 
+def suppress_existing_purchase_records(
+    records: dict[str, list[dict[str, Any]]],
+    discovery_overview: dict[str, Any] | None,
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    copied = {category: list(category_records) for category, category_records in records.items()}
+    existing = [
+        document_identity(item, document_type=str(item.get("document_type") or "purchase"))
+        for item in (discovery_overview or {}).get("document_index") or []
+        if str(item.get("document_type") or "") == "purchase"
+    ]
+    if not existing:
+        return copied, []
+
+    kept: list[dict[str, Any]] = []
+    already_present: list[dict[str, Any]] = []
+    for record in copied.get("purchase_expenses", []):
+        candidate = document_identity(record, document_type="purchase")
+        result = match_existing(candidate, existing)
+        if result.status == "ambiguous":
+            raise SimplbooksError(
+                f"Ambiguous existing Simplbooks purchase match for {record.get('external_ref') or record.get('record_id')}."
+            )
+        if result.status == "exact":
+            matched = result.matches[0]
+            already_present.append(
+                {
+                    "record_ref": record.get("record_id"),
+                    "external_ref": record.get("external_ref"),
+                    "document_type": "purchase",
+                    "simplbooks_id": matched.simplbooks_id,
+                    "reason": "Exact document identity already exists in refreshed Simplbooks discovery.",
+                }
+            )
+            continue
+        kept.append(record)
+    copied["purchase_expenses"] = kept
+    return copied, already_present
+
+
+def build_purchase_credit_actions(
+    *,
+    company_slug: str,
+    period: str,
+    period_end: date,
+    normalized_path_display: str,
+    records: dict[str, list[dict[str, Any]]],
+    base_currency: str,
+    entity_map: dict[str, Any] | None,
+    mapping_hints: dict[str, tuple[str | None, list[str]]],
+    forced_note: str | None,
+) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for record in records.get("purchase_credits", []):
+        key = (
+            record_group_label(record, default="supplier"),
+            record_currency(record, base_currency),
+            taxable_profile(record),
+        )
+        grouped[key].append(record)
+
+    actions: list[dict[str, Any]] = []
+    expense_account_id, _notes = mapping_hints["fulfillment_account"]
+    zero_vat_type_id, _vat_notes = mapping_hints["zero_vat_type"]
+    printful_expense_account_id, printful_vat_type_id = printful_purchase_mapping(entity_map)
+    repeated_labels = {
+        label
+        for label, count in Counter(group_label for group_label, _currency, _tax_profile in grouped).items()
+        if count > 1
+    }
+    for (group_label, currency, tax_profile), group_records in sorted(grouped.items()):
+        contact_id, contact_notes = preferred_contact_id(
+            entity_map,
+            group_label=group_label,
+            candidate_labels=contact_candidate_labels(group_label=group_label, records=group_records),
+        )
+        total = sum_abs_amount(group_records, "gross_amount")
+        vat_total = sum_abs_amount(group_records, "vat_amount")
+        if total == 0:
+            continue
+        account_id = printful_expense_account_id if group_label == "printful" else expense_account_id
+        vat_type_id = printful_vat_type_id if group_label == "printful" else zero_vat_type_id
+        review_notes = list(contact_notes)
+        if forced_note:
+            review_notes.append(forced_note)
+        review_notes.append(record_count_note(group_records))
+        payload = {
+            "draft_schema": "purchase_credit_summary_v1",
+            "document_type": "purchase_credit",
+            "document_date": period_end.isoformat(),
+            "currency": currency,
+            "counterparty": {
+                "contact_id": contact_id,
+                "display_name_hint": f"{group_label} supplier credit summary",
+            },
+            "vendor_hint": group_label,
+            "totals": {"gross_amount": decimal_number(total), "vat_amount": decimal_number(vat_total)},
+            "line_items": [
+                {
+                    "line_role": "purchase_credit",
+                    "description": f"{group_label} supplier credit {tax_profile} summary",
+                    "gross_amount": decimal_number(total),
+                    "vat_amount_hint": decimal_number(vat_total),
+                    "suggested_expense_account_id": account_id,
+                    "suggested_vat_type_id": vat_type_id,
+                    "warehouse_id_hint": None,
+                    "record_count": len(group_records),
+                }
+            ],
+        }
+        actions.append(
+            make_action(
+                period=period,
+                idempotency_key=(
+                    f"{company_slug}-{period}-purchase-credit-{slugify(group_label)}"
+                    + (f"-{slugify(tax_profile)}" if group_label in repeated_labels else "")
+                ),
+                action_type="create_purchase_credit_summary",
+                endpoint="purchases/create",
+                payload=payload,
+                source_refs=source_refs_for_records(normalized_path_display, group_records),
+                reason=f"Preserve {group_label} refund evidence as a separate supplier credit.",
+                confidence=review_confidence(notes=review_notes, required_ids=[contact_id, account_id, vat_type_id]),
+                depends_on=[],
+                expected_effect=f"Create a supplier credit for {group_label} in Simplbooks.",
+                review_notes=review_notes,
+            )
+        )
+    return actions
+
+
+def apply_exchange_rate_provenance(
+    actions: list[dict[str, Any]],
+    *,
+    base_currency: str,
+    exchange_rate_cache: dict[str, Any] | None,
+) -> None:
+    for action in actions:
+        payload = action.get("payload") or {}
+        currency = str(payload.get("currency") or base_currency).upper()
+        if currency == base_currency.upper() or exchange_rate_cache is None:
+            continue
+        try:
+            resolution = lookup_rate(
+                exchange_rate_cache,
+                requested_date=date.fromisoformat(str(payload["document_date"])),
+                base=currency,
+                quote=base_currency,
+            )
+        except (ExchangeRateError, ValueError, KeyError) as exc:
+            raise SimplbooksError(f"Could not resolve audited ECB rate for {currency}: {exc}") from exc
+        payload.update(
+            {
+                "currency_rate": decimal_number(resolution.rate),
+                "currency_rate_requested_date": resolution.requested_date.isoformat(),
+                "currency_rate_effective_date": resolution.effective_date.isoformat(),
+                "currency_rate_provider": resolution.provider,
+                "currency_rate_source_url": resolution.source_url,
+            }
+        )
+
+
+def apply_posting_policy(
+    actions: list[dict[str, Any]],
+    *,
+    posting_policy: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if posting_policy is None:
+        return []
+    unresolved: list[dict[str, Any]] = []
+    for action in actions:
+        payload = action.get("payload") or {}
+        action_type = str(action.get("action_type") or "")
+        if action_type in {"create_invoice_summary", "create_credit_invoice_summary"}:
+            role = "sales"
+            label = str((payload.get("summary_scope") or {}).get("channel_or_source") or "")
+        elif action_type in {"create_incoming_summary"} or action_type == "create_purchase_summary" and str(payload.get("vendor_hint")) in PROCESSOR_KEYWORDS:
+            role = "processors"
+            label = str(payload.get("counterparty_hint") or payload.get("vendor_hint") or "")
+        elif action_type in {"create_purchase_summary", "create_purchase_credit_summary", "create_payment_summary"}:
+            role = "suppliers"
+            label = str(payload.get("vendor_hint") or payload.get("counterparty_hint") or "")
+        else:
+            continue
+        try:
+            contact_id = resolve_contact(posting_policy, role=role, label=label)
+        except PostingPolicyError as exc:
+            (payload.get("counterparty") or {})["contact_id"] = None
+            dependency = {
+                "action_id": action.get("idempotency_key"),
+                "kind": "contact_mapping",
+                "role": role,
+                "label": label,
+                "blocking": True,
+                "reason": str(exc),
+            }
+            if slugify(label) == "paypal":
+                dependency["master_data_draft_ref"] = "artifacts/actions/master-data-paypal.yaml"
+            unresolved.append(dependency)
+            action.setdefault("review_notes", []).append(str(exc))
+        else:
+            (payload.get("counterparty") or {})["contact_id"] = contact_id
+
+        family = ""
+        if role == "sales":
+            tax_profile = str((payload.get("summary_scope") or {}).get("tax_profile") or "")
+            if not tax_profile:
+                tax_profile = "taxable" if decimal_value((payload.get("totals") or {}).get("vat_amount")) else "non-taxable"
+            family = f"{slugify(label)}-{slugify(tax_profile)}"
+        elif action_type == "create_purchase_summary" and role == "processors":
+            family = f"fees-{slugify(label)}"
+        elif action_type in {"create_purchase_summary", "create_purchase_credit_summary"}:
+            family = f"purchase-{slugify(label)}"
+
+        if not family:
+            continue
+        family_values = (posting_policy.get("mappings") or {}).get(family)
+        if not isinstance(family_values, dict):
+            for line in payload.get("line_items") or []:
+                for field_name in (
+                    "suggested_income_account_id",
+                    "suggested_expense_account_id",
+                    "suggested_vat_type_id",
+                    "warehouse_id_hint",
+                ):
+                    if field_name in line:
+                        line[field_name] = None
+            unresolved.append(
+                {
+                    "action_id": action.get("idempotency_key"),
+                    "kind": "posting_mapping",
+                    "family": family,
+                    "blocking": True,
+                    "reason": f"Posting family {family!r} is absent from the explicit posting policy.",
+                }
+            )
+            continue
+        payload["posting_policy_family"] = family
+        for line in payload.get("line_items") or []:
+            line_role = str(line.get("line_role") or "")
+            if role == "sales":
+                is_shipping = line_role.endswith("_shipping")
+                income_field = "shipping_income_account_id" if is_shipping else "income_account_id"
+                vat_field = "shipping_vat_type_id" if is_shipping else "vat_type_id"
+                line["suggested_income_account_id"] = resolve_mapping(
+                    posting_policy, family=family, field_name=income_field
+                )
+                line["suggested_vat_type_id"] = resolve_mapping(
+                    posting_policy, family=family, field_name=vat_field
+                )
+                if family_values.get("warehouse_id") not in (None, ""):
+                    line["warehouse_id_hint"] = resolve_mapping(
+                        posting_policy, family=family, field_name="warehouse_id"
+                    )
+                else:
+                    line["warehouse_id_hint"] = None
+                allocation_component = str(line.get("vat_allocation_component") or "")
+                if allocation_component in {"goods", "shipping"}:
+                    try:
+                        profile = resolve_sales_vat_profile(
+                            posting_policy,
+                            event_date=date.fromisoformat(str(payload.get("document_date") or "")),
+                        )
+                    except (PostingPolicyError, ValueError) as exc:
+                        raise SimplbooksError(f"Could not resolve sales VAT profile: {exc}") from exc
+                    line["suggested_vat_type_id"] = profile[
+                        "shipping_vat_type_id" if allocation_component == "shipping" else "goods_vat_type_id"
+                    ]
+                    line["vat_profile_rate"] = profile["rate"]
+                    line["vat_profile_period"] = f"{profile['start']}/{profile['end'] or 'open'}"
+            else:
+                line_key = slugify(str(line.get("description") or line_role))
+                line_values = (family_values.get("lines") or {}).get(line_key)
+                if line_values is None:
+                    line_values = family_values
+                if not isinstance(line_values, dict):
+                    raise SimplbooksError(f"Posting family {family!r} line {line_key!r} must be an object.")
+                line["posting_policy_line_key"] = line_key
+                try:
+                    line["suggested_expense_account_id"] = str(
+                        int(str(line_values.get("expense_account_id") or ""))
+                    )
+                    line["suggested_vat_type_id"] = str(int(str(line_values.get("vat_type_id") or "")))
+                except ValueError as exc:
+                    raise SimplbooksError(
+                        f"Posting family {family!r} line {line_key!r} requires integer-like expense_account_id and vat_type_id."
+                    ) from exc
+                warehouse_id = line_values.get("warehouse_id")
+                line["warehouse_id_hint"] = str(warehouse_id) if warehouse_id not in (None, "") else None
+        review_notes = [
+            note
+            for note in action.get("review_notes") or []
+            if not str(note).startswith("Ambiguous entity mapping candidates:")
+        ]
+        action["review_notes"] = review_notes
+        required_ids: list[str | None] = [str((payload.get("counterparty") or {}).get("contact_id") or "")]
+        for line in payload.get("line_items") or []:
+            if role == "sales":
+                required_ids.extend(
+                    [line.get("suggested_income_account_id"), line.get("suggested_vat_type_id")]
+                )
+            else:
+                required_ids.extend(
+                    [line.get("suggested_expense_account_id"), line.get("suggested_vat_type_id")]
+                )
+        action["confidence"] = review_confidence(notes=review_notes, required_ids=required_ids)
+    return unresolved
+
+
 def build_action_batch(
     *,
     normalized_payload: dict[str, Any],
@@ -1834,6 +2492,9 @@ def build_action_batch(
     policy_path: Path | None = None,
     entity_map: dict[str, Any] | None = None,
     company_profile: dict[str, Any] | None = None,
+    posting_policy: dict[str, Any] | None = None,
+    exchange_rate_cache: dict[str, Any] | None = None,
+    discovery_overview: dict[str, Any] | None = None,
     force: bool = False,
 ) -> dict[str, Any]:
     if normalized_payload.get("period") != recon_payload.get("period"):
@@ -1860,8 +2521,38 @@ def build_action_batch(
         forced_note = "Draft was forced even though recon did not approve this month."
 
     mapping_hints = preferred_mapping_hints(entity_map)
+    records, already_present = suppress_existing_purchase_records(
+        normalized_payload.get("records") or {},
+        discovery_overview,
+    )
     bank_account_id, bank_account_notes = preferred_bank_account_id(company_profile, entity_map)
-    records = normalized_payload.get("records") or {}
+    if posting_policy is not None and records.get("bank_transactions"):
+        source_bank_records = [
+            record
+            for record in records["bank_transactions"]
+            if slugify(str(record.get("source_system") or "")) == "bank"
+        ]
+        missing_source_accounts = [
+            str(record.get("record_id") or "<unknown>")
+            for record in source_bank_records
+            if not str((record.get("attributes") or {}).get("customer_account") or "").strip()
+        ]
+        if missing_source_accounts:
+            raise SimplbooksError(
+                f"Posting policy found bank row(s) missing source bank account: {', '.join(missing_source_accounts[:3])}."
+            )
+        source_accounts = {
+            re.sub(r"\s+", "", str((record.get("attributes") or {}).get("customer_account") or "")).upper()
+            for record in source_bank_records
+        }
+        source_accounts.discard("")
+        if len(source_accounts) != 1:
+            raise SimplbooksError("Posting policy requires exactly one source bank account in normalized bank rows.")
+        try:
+            bank_account_id = resolve_bank_account(posting_policy, customer_account=next(iter(source_accounts)))
+        except PostingPolicyError as exc:
+            raise SimplbooksError(str(exc)) from exc
+        bank_account_notes = ["Applied exact source-bank-account mapping from posting policy."]
     artifacts_dir = inferred_artifacts_dir(normalized_path)
     prior_purchase_candidates = historical_purchase_candidates(
         actions_dir=(artifacts_dir / "actions") if artifacts_dir is not None else None,
@@ -1902,6 +2593,17 @@ def build_action_batch(
         mapping_hints=mapping_hints,
         forced_note=forced_note,
     )
+    purchase_credit_actions = build_purchase_credit_actions(
+        company_slug=company_slug,
+        period=period,
+        period_end=period_end,
+        normalized_path_display=normalized_path_display,
+        records=records,
+        base_currency=base_currency,
+        entity_map=entity_map,
+        mapping_hints=mapping_hints,
+        forced_note=forced_note,
+    )
     incoming_actions = build_incoming_actions(
         company_slug=company_slug,
         period=period,
@@ -1932,7 +2634,13 @@ def build_action_batch(
         forced_note=forced_note,
     )
 
-    actions = sales_actions + fee_actions + purchase_actions + incoming_actions + payment_actions
+    actions = sales_actions + fee_actions + purchase_actions + purchase_credit_actions + incoming_actions + payment_actions
+    unresolved_dependencies = apply_posting_policy(actions, posting_policy=posting_policy)
+    apply_exchange_rate_provenance(
+        actions,
+        base_currency=base_currency,
+        exchange_rate_cache=exchange_rate_cache,
+    )
     summary_parts = [summarize_actions(actions, period=period)]
     if policy_path and policy_text is not None:
         summary_parts.append(f"Policy memo: {display_path(policy_path, repo_root)}.")
@@ -1952,6 +2660,8 @@ def build_action_batch(
         "approval_status": "draft",
         "source_summary": source_summary,
         "recon_ref": recon_path_display,
+        "already_present": already_present,
+        "unresolved_dependencies": unresolved_dependencies,
         "actions": actions,
     }
 
@@ -2014,6 +2724,21 @@ def resolve_company_profile_path(*, company_dir: Path | None, normalized_path: P
     return artifacts_dir / "company_profile.json"
 
 
+def resolve_reference_path(
+    *,
+    company_dir: Path | None,
+    normalized_path: Path,
+    override: str | None,
+    filename: str,
+) -> Path | None:
+    if override:
+        return Path(override)
+    if company_dir is not None:
+        return company_dir / "artifacts" / filename
+    artifacts_dir = inferred_artifacts_dir(normalized_path)
+    return (artifacts_dir / filename) if artifacts_dir is not None else None
+
+
 def resolve_output_path(*, company_dir: Path | None, normalized_path: Path, period: str, override: str | None) -> Path:
     if override:
         return Path(override)
@@ -2034,6 +2759,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--policy-memo", help="Optional path to policy memo markdown")
     parser.add_argument("--entity-map", help="Optional path to entity map JSON")
     parser.add_argument("--company-profile", help="Optional path to company profile JSON")
+    parser.add_argument("--posting-policy", help="Posting policy JSON; defaults to company artifacts/posting_policy.json")
+    parser.add_argument("--exchange-rates", help="Annual ECB cache; defaults to company artifacts/reference/ecb-rates-<year>.json")
+    parser.add_argument("--discovery-overview", help="Refreshed Simplbooks overview; defaults to company artifacts/discovery/<year>-overview.json")
     parser.add_argument("--output", help="Optional output path for actions YAML")
     parser.add_argument("--force", action="store_true", help="Allow draft generation even when recon does not approve the month")
     return parser
@@ -2051,6 +2779,25 @@ def main() -> int:
         normalized_path=normalized_path,
         override=args.company_profile,
     )
+    year = int(args.period[:4])
+    posting_policy_path = resolve_reference_path(
+        company_dir=company_dir,
+        normalized_path=normalized_path,
+        override=args.posting_policy,
+        filename="posting_policy.json",
+    )
+    exchange_rates_path = resolve_reference_path(
+        company_dir=company_dir,
+        normalized_path=normalized_path,
+        override=args.exchange_rates,
+        filename=f"reference/ecb-rates-{year}.json",
+    )
+    discovery_overview_path = resolve_reference_path(
+        company_dir=company_dir,
+        normalized_path=normalized_path,
+        override=args.discovery_overview,
+        filename=f"discovery/{year}-overview.json",
+    )
     output_path = resolve_output_path(company_dir=company_dir, normalized_path=normalized_path, period=args.period, override=args.output)
 
     normalized_payload = load_json(normalized_path)
@@ -2058,7 +2805,43 @@ def main() -> int:
     policy_text = load_optional_text(policy_path)
     entity_map = load_optional_json(entity_map_path)
     company_profile = load_optional_json(company_profile_path)
+    reference_artifacts_required = company_dir is not None or any(
+        (args.posting_policy, args.exchange_rates, args.discovery_overview)
+    )
+    if reference_artifacts_required and (posting_policy_path is None or not posting_policy_path.exists()):
+        raise SimplbooksError(f"Required posting policy not found: {posting_policy_path}")
+    if reference_artifacts_required and (discovery_overview_path is None or not discovery_overview_path.exists()):
+        raise SimplbooksError(f"Required discovery overview not found: {discovery_overview_path}")
+    foreign_currencies = {
+        str(record.get("currency") or normalized_payload.get("base_currency") or "EUR").upper()
+        for category_records in (normalized_payload.get("records") or {}).values()
+        for record in category_records
+        if isinstance(record, dict)
+        and str(record.get("currency") or normalized_payload.get("base_currency") or "EUR").upper()
+        != str(normalized_payload.get("base_currency") or "EUR").upper()
+    }
+    if foreign_currencies and (exchange_rates_path is None or not exchange_rates_path.exists()):
+        raise SimplbooksError(f"Required annual ECB exchange-rate cache not found: {exchange_rates_path}")
+
+    posting_policy = load_posting_policy(posting_policy_path) if posting_policy_path and posting_policy_path.exists() else None
+    exchange_rate_cache = load_optional_json(exchange_rates_path)
+    discovery_overview = load_optional_json(discovery_overview_path)
+    if posting_policy and posting_policy.get("company_slug") != normalized_payload.get("company_slug"):
+        raise SimplbooksError("Posting policy company_slug does not match normalized company_slug.")
+    if discovery_overview and company_dir is not None:
+        try:
+            validate_discovery(
+                discovery_overview,
+                year=year,
+                company_id=resolve_company_id(None, company_dir=str(company_dir)),
+            )
+        except ReferenceArtifactError as exc:
+            raise SimplbooksError(str(exc)) from exc
     repo_root = Path.cwd()
+    woo_tax_reference_bindings = bind_woo_tax_reference_artifacts(
+        normalized_payload,
+        cwd=repo_root,
+    )
 
     batch = build_action_batch(
         normalized_payload=normalized_payload,
@@ -2070,8 +2853,22 @@ def main() -> int:
         policy_path=policy_path if policy_text is not None else None,
         entity_map=entity_map,
         company_profile=company_profile,
+        posting_policy=posting_policy,
+        exchange_rate_cache=exchange_rate_cache,
+        discovery_overview=discovery_overview,
         force=args.force,
     )
+    bound_paths = [
+        ("posting_policy", posting_policy_path),
+        ("discovery_overview", discovery_overview_path),
+    ]
+    if foreign_currencies:
+        bound_paths.append(("exchange_rates", exchange_rates_path))
+    batch["reference_artifacts"] = [
+        bind_file(path, kind=kind, cwd=repo_root)
+        for kind, path in bound_paths
+        if path is not None
+    ] + woo_tax_reference_bindings
     write_yaml(output_path, batch)
 
     company_slug = str(normalized_payload.get("company_slug") or (company_dir.name if company_dir else normalized_path.stem))

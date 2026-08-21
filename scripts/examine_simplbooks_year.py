@@ -4,8 +4,11 @@ from __future__ import annotations
 import argparse
 import json
 from collections import Counter, defaultdict
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from document_identity import document_identity
 
 from simplbooks_api import (
     SimplbooksClient,
@@ -73,6 +76,16 @@ def count_row_patterns(rows: list[dict[str, Any]], field_name: str) -> dict[str,
     return dict(counter.most_common())
 
 
+def build_document_index(
+    *,
+    invoices: list[dict[str, Any]],
+    purchases: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    index = [document_identity(record, document_type="invoice").to_dict() for record in invoices]
+    index.extend(document_identity(record, document_type="purchase").to_dict() for record in purchases)
+    return index
+
+
 def build_year_overview(client: SimplbooksClient, *, year: int) -> dict[str, Any]:
     start = f"{year}-01-01"
     end = f"{year}-12-31"
@@ -135,6 +148,7 @@ def build_year_overview(client: SimplbooksClient, *, year: int) -> dict[str, Any
     return {
         "year": year,
         "company_id": client.company_id,
+        "retrieved_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "technical_findings": [
             "Invoices and purchases support year-bounded list queries by created date.",
             "Receipts and payments do not show year range filters in the published spec, so this overview scans paginated lists and filters by year client-side.",
@@ -168,6 +182,7 @@ def build_year_overview(client: SimplbooksClient, *, year: int) -> dict[str, Any
             "purchase_vat_type_ids": count_row_patterns(purchase_rows, "vat_type_id"),
             "purchase_article_ids": count_row_patterns(purchase_rows, "article_id"),
         },
+        "document_index": build_document_index(invoices=invoices, purchases=purchases),
         "samples": {
             "financial_accounts": financial_accounts[:10],
             "income_accounts": income_accounts[:10],

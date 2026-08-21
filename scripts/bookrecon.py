@@ -22,6 +22,7 @@ PROCESSOR_KEYWORDS: dict[str, tuple[str, ...]] = {
 
 FULFILLMENT_KEYWORDS: dict[str, tuple[str, ...]] = {
     "printful": ("printful",),
+    "quartermaster": ("quartermaster",),
     "shipmonk": ("shipmonk",),
     "omnipack": ("omnipack",),
 }
@@ -33,6 +34,7 @@ RECORD_CATEGORIES = (
     "payouts",
     "bank_transactions",
     "purchase_expenses",
+    "purchase_credits",
     "inventory_movements",
     "manual_adjustments",
     "other",
@@ -218,6 +220,15 @@ def classify_record(record: dict[str, Any], keyword_map: dict[str, tuple[str, ..
 
 
 def infer_processor(record: dict[str, Any]) -> str | None:
+    source_system = str(record.get("source_system") or "").lower()
+    channel = str(record.get("channel") or "").lower()
+    event_type = str(record.get("event_type") or "").lower()
+    if source_system in PROCESSOR_KEYWORDS:
+        return source_system
+    if channel in PROCESSOR_KEYWORDS:
+        return channel
+    if source_system == "woo" or channel == "woo" or event_type.startswith("woo_"):
+        return None
     return classify_record(record, PROCESSOR_KEYWORDS)
 
 
@@ -418,7 +429,7 @@ def build_woo_sales_vs_processor_check(
     notes = []
     if processors:
         notes.append(f"Processor-side sales included: {', '.join(processors)}.")
-    effective_groups, _, matched_processors_by_key = planned_sales_groups(
+    effective_groups, _, matched_processors_by_key, _ = planned_sales_groups(
         records.get("sales", []),
         base_currency=base_currency,
         amount_tolerance=amount_threshold,
@@ -701,6 +712,39 @@ def build_fulfillment_checks(
     return checks
 
 
+def build_purchase_credit_checks(
+    *,
+    normalized_path_display: str,
+    records: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    credits = records.get("purchase_credits", [])
+    currencies = sorted({record_currency(record) for record in credits})
+    checks: list[dict[str, Any]] = []
+
+    for currency in currencies:
+        currency_credits = [record for record in credits if record_currency(record) == currency]
+        total = sum_amount(currency_credits, "gross_amount")
+        checks.append(
+            make_check(
+                check_id=f"supplier-credits:{currency.lower()}",
+                name=f"Supplier credits ({currency})",
+                status="pass",
+                lhs_label=f"Supplier credits ({currency})",
+                lhs_amount=total,
+                notes=["Supplier credits are preserved separately from purchase expenses for posting."],
+                evidence_refs=[
+                    make_artifact_ref(
+                        normalized_path_display,
+                        record_refs_list=record_refs(currency_credits),
+                        notes="Normalized supplier-credit rows.",
+                    )
+                ],
+            )
+        )
+
+    return checks
+
+
 def build_inventory_check(
     *,
     normalized_path_display: str,
@@ -885,6 +929,10 @@ def build_recon_document(
             normalized_path_display=normalized_path_display,
             records=records,
             amount_threshold=amount_threshold,
+        ),
+        *build_purchase_credit_checks(
+            normalized_path_display=normalized_path_display,
+            records=records,
         ),
         *build_fulfillment_checks(
             normalized_path_display=normalized_path_display,

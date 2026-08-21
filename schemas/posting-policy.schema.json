@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Company Posting Policy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "company_slug", "bank_accounts", "contacts", "mappings", "supplier_aliases"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "company_slug": {"type": "string", "pattern": "^[a-z0-9-]+$"},
+    "bank_accounts": {
+      "type": "object",
+      "additionalProperties": {"type": "string", "pattern": "^[0-9]+$"}
+    },
+    "contacts": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": {"type": "string", "pattern": "^[0-9]+$"}
+      }
+    },
+    "mappings": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/posting_family"
+      }
+    },
+    "supplier_aliases": {
+      "type": "object",
+      "additionalProperties": {"type": "string", "minLength": 1}
+    },
+    "sales_vat_profiles": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/sales_vat_profile"}
+    },
+    "year_expectations": {
+      "type": "object",
+      "propertyNames": {"pattern": "^[0-9]{4}$"},
+      "additionalProperties": {"$ref": "#/$defs/year_expectation"}
+    }
+  },
+  "$defs": {
+    "id": {"type": ["string", "null"], "pattern": "^[0-9]+$"},
+    "sales_vat_profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start", "rate", "goods_vat_type_id", "shipping_vat_type_id"],
+      "properties": {
+        "start": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+        "end": {"type": ["string", "null"], "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+        "rate": {"type": "number", "minimum": 0},
+        "goods_vat_type_id": {"type": "string", "pattern": "^[0-9]+$"},
+        "shipping_vat_type_id": {"type": "string", "pattern": "^[0-9]+$"}
+      }
+    },
+    "line_mapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expense_account_id", "vat_type_id"],
+      "properties": {
+        "expense_account_id": {"$ref": "#/$defs/id"},
+        "vat_type_id": {"$ref": "#/$defs/id"},
+        "warehouse_id": {"$ref": "#/$defs/id"}
+      }
+    },
+    "posting_family": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "income_account_id": {"$ref": "#/$defs/id"},
+        "shipping_income_account_id": {"$ref": "#/$defs/id"},
+        "expense_account_id": {"$ref": "#/$defs/id"},
+        "vat_type_id": {"$ref": "#/$defs/id"},
+        "shipping_vat_type_id": {"$ref": "#/$defs/id"},
+        "warehouse_id": {"$ref": "#/$defs/id"},
+        "lines": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/$defs/line_mapping"}
+        }
+      }
+    },
+    "year_expectation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "supplier_credit_totals": {
+          "type": "object",
+          "propertyNames": {"pattern": "^[0-9]{4}-[0-9]{2}$"},
+          "additionalProperties": {
+            "type": "object",
+            "propertyNames": {"pattern": "^[A-Z]{3}$"},
+            "additionalProperties": {"type": "number"}
+          }
+        },
+        "suppressed_external_refs": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        },
+        "allowed_blocking_dependencies": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "label", "family"],
+            "properties": {
+              "kind": {"type": "string"},
+              "label": {"type": "string"},
+              "family": {"type": "string"}
+            }
+          }
+        }
+      }
+    }
+  }
+}

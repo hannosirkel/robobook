@@ -92,6 +92,30 @@ def record(
     }
 
 
+def policy_with_24_percent_profile() -> dict:
+    return {
+        "schema_version": "1.0", "company_slug": "example", "bank_accounts": {},
+        "contacts": {"sales": {"woo": "42"}, "processors": {}, "suppliers": {}},
+        "mappings": {"woo-taxable": {"income_account_id": "107", "shipping_income_account_id": "253",
+                                      "vat_type_id": "34", "shipping_vat_type_id": "33",
+                                      "warehouse_id": "9"}},
+        "sales_vat_profiles": [{"start": "2025-07-01", "end": None, "rate": 24,
+                                "goods_vat_type_id": "34", "shipping_vat_type_id": "33"}],
+        "supplier_aliases": {},
+    }
+
+
+def allocated_action_fixture(*, line_rate: int, vat_type_id: str) -> dict:
+    return {"actions": [{
+        "idempotency_key": "example-2025-11-woo", "action_type": "create_invoice_summary",
+        "payload": {"document_date": "2025-11-30", "posting_policy_family": "woo-taxable",
+                    "line_items": [{"line_role": "sales_revenue", "gross_amount": 62.00,
+                                    "vat_amount_hint": 12.00, "suggested_vat_type_id": vat_type_id,
+                                    "vat_profile_rate": line_rate,
+                                    "vat_profile_period": "2025-07-01/open"}]}
+    }]}
+
+
 def payment_action(
     *,
     key: str,
@@ -215,6 +239,286 @@ def build_clean_artifacts(tmp: Path, *, recon_approve: bool = True, force: bool 
 
 
 class BookcheckerTests(unittest.TestCase):
+    def test_checker_blocks_vat_type_rate_mismatch(self) -> None:
+        batch = allocated_action_fixture(line_rate=24, vat_type_id="25")
+
+        report = bookchecker.evaluate_vat_profiles(batch["actions"], policy_with_24_percent_profile())
+
+        self.assertTrue(any(item["severity"] == "error" and "VAT profile" in item["summary"] for item in report))
+
+    def test_checker_requires_one_api_line_per_order_rounding_component(self) -> None:
+        batch = allocated_action_fixture(line_rate=24, vat_type_id="34")
+        line = batch["actions"][0]["payload"]["line_items"][0]
+        line.update(
+            {
+                "vat_allocation_component": "goods",
+                "gross_amount": 0.12,
+                "vat_amount_hint": 0.04,
+                "vat_allocation_component_evidence": [
+                    {"order_id": f"EXAMPLE-{index}", "gross_amount": 0.03, "vat_amount": 0.01}
+                    for index in range(1, 5)
+                ],
+            }
+        )
+
+        report = bookchecker.evaluate_vat_profiles(batch["actions"], policy_with_24_percent_profile())
+        self.assertTrue(any("one order component" in item["summary"] for item in report))
+
+        batch["actions"][0]["payload"]["line_items"] = [
+            {
+                **line,
+                "gross_amount": 0.03,
+                "vat_amount_hint": 0.01,
+                "vat_allocation_component_evidence": [
+                    {
+                        "order_id": f"EXAMPLE-{index}", "gross_amount": 0.03, "vat_amount": 0.01,
+                        "event_date": "2025-11-27",
+                        "vat_profile": {
+                            "start": "2025-01-01", "end": "2025-12-31", "rate": 24,
+                            "goods_vat_type_id": "34", "shipping_vat_type_id": "33",
+                        },
+                    }
+                ],
+                "vat_evidence_binding": {
+                    "allocation_ref": {"path": "allocation.json", "sha256": "c" * 64},
+                    "tax_source_refs": [{
+                        "source_id": "woo-tax", "path": "woocommerce-taxes.csv",
+                        "sha256": "a" * 64, "row_refs": ["csv:2"],
+                    }],
+                },
+            }
+            for index in range(1, 5)
+        ]
+        self.assertFalse(bookchecker.evaluate_vat_profiles(batch["actions"], policy_with_24_percent_profile()))
+
+        batch["actions"][0]["payload"]["line_items"][0]["vat_allocation_component_evidence"][0]["event_date"] = "2026-01-01"
+        report = bookchecker.evaluate_vat_profiles(batch["actions"], policy_with_24_percent_profile())
+        self.assertTrue(any("event date" in item["summary"] for item in report))
+        batch["actions"][0]["payload"]["line_items"][0]["vat_allocation_component_evidence"][0]["event_date"] = "2025-11-27"
+
+        batch["actions"][0]["payload"]["line_items"][0].pop("vat_evidence_binding")
+        report = bookchecker.evaluate_vat_profiles(batch["actions"], policy_with_24_percent_profile())
+        self.assertTrue(any("evidence binding" in item["summary"] for item in report))
+
+    def test_checker_fails_unproven_foreign_rate(self) -> None:
+        action = payment_action(
+            key="example-2024-01-payment-vendor",
+            period="2024-01",
+            amount=10.0,
+            linked_purchase_action="example-2024-01-purchase-vendor",
+            source_path="companies/example/artifacts/normalized/2024-01.json",
+            record_ref="bank:1",
+        )
+        action["payload"]["currency"] = "USD"
+        action["payload"]["currency_rate"] = 1
+
+        findings = bookchecker.evaluate_exchange_rates({"actions": [action]})
+
+        self.assertTrue(any(item["severity"] == "error" for item in findings))
+
+    def test_checker_rejects_rate_that_does_not_match_cache(self) -> None:
+        action = payment_action(
+            key="example-2024-03-payment-vendor",
+            period="2024-03",
+            amount=10.0,
+            linked_purchase_action="example-2024-03-purchase-vendor",
+            source_path="companies/example/artifacts/normalized/2024-03.json",
+            record_ref="bank:1",
+        )
+        action["payload"].update(
+            {
+                "currency": "USD",
+                "currency_rate": 999,
+                "currency_rate_provider": "ECB",
+                "currency_rate_requested_date": "2024-03-31",
+                "currency_rate_effective_date": "2024-03-28",
+                "currency_rate_source_url": "https://api.frankfurter.dev/v2/rates?providers=ECB",
+            }
+        )
+        cache = {
+            "provider": "ECB",
+            "year": 2024,
+            "base": "USD",
+            "quote": "EUR",
+            "source_url": "https://api.frankfurter.dev/v2/rates?providers=ECB",
+            "rates": [{"date": "2024-03-28", "base": "USD", "quote": "EUR", "rate": "0.92498"}],
+        }
+
+        findings = bookchecker.evaluate_exchange_rates({"actions": [action]}, exchange_rate_cache=cache)
+
+        self.assertTrue(any("cache" in item["summary"].lower() for item in findings))
+
+    def test_checker_rejects_rate_requested_for_different_document_date(self) -> None:
+        action = payment_action(
+            key="example-2024-03-payment-vendor",
+            period="2024-03",
+            amount=10.0,
+            linked_purchase_action="example-2024-03-purchase-vendor",
+            source_path="companies/example/artifacts/normalized/2024-03.json",
+            record_ref="bank:1",
+        )
+        action["payload"].update(
+            {
+                "currency": "USD",
+                "currency_rate": 0.92498,
+                "currency_rate_provider": "ECB",
+                "currency_rate_requested_date": "2024-01-31",
+                "currency_rate_effective_date": "2024-01-31",
+                "currency_rate_source_url": "https://api.frankfurter.dev/v2/rates?providers=ECB",
+            }
+        )
+        cache = {
+            "provider": "ECB",
+            "year": 2024,
+            "base": "USD",
+            "quote": "EUR",
+            "source_url": "https://api.frankfurter.dev/v2/rates?providers=ECB",
+            "rates": [{"date": "2024-01-31", "base": "USD", "quote": "EUR", "rate": "0.92498"}],
+        }
+
+        findings = bookchecker.evaluate_exchange_rates({"actions": [action]}, exchange_rate_cache=cache)
+
+        self.assertTrue(any("document date" in item["summary"].lower() for item in findings))
+
+    def test_checker_fails_blocking_unresolved_dependency(self) -> None:
+        findings = bookchecker.evaluate_unresolved_dependencies(
+            {
+                "unresolved_dependencies": [
+                    {
+                        "action_id": "example-2024-01-incoming-paypal",
+                        "kind": "contact_mapping",
+                        "blocking": True,
+                        "reason": "PayPal contact requires creation.",
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(findings[0]["severity"], "error")
+
+    def test_checker_requires_file_bindings_for_allocated_woo_tax_actions(self) -> None:
+        action = allocated_action_fixture(line_rate=24, vat_type_id="34")["actions"][0]
+        action["payload"]["line_items"][0]["vat_allocation_component"] = "goods"
+        action_batch = {
+            "period": "2025-11",
+            "actions": [action],
+            "reference_artifacts": [],
+        }
+
+        findings = bookchecker.evaluate_reference_artifacts(
+            action_batch,
+            cwd=ROOT,
+            company_dir=ROOT / "companies" / "example",
+            expected_company_id="EXAMPLE-ID",
+        )
+
+        summaries = " ".join(item["summary"] for item in findings)
+        self.assertIn("woo_tax_allocation", summaries)
+        self.assertIn("woo_tax_source", summaries)
+
+    def test_checker_fails_company_batch_with_temp_source_reference(self) -> None:
+        action = payment_action(
+            key="example-2024-01-payment-vendor",
+            period="2024-01",
+            amount=10.0,
+            linked_purchase_action="example-2024-01-purchase-vendor",
+            source_path="temp/2024/bank.csv",
+            record_ref="bank:1",
+        )
+
+        findings = bookchecker.evaluate_source_locations(
+            {"actions": [action]},
+            company_dir=Path("companies/example"),
+        )
+
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["severity"], "error")
+        self.assertIn("canonical", findings[0]["summary"].lower())
+
+    def test_checker_fails_cross_company_source_reference(self) -> None:
+        action = payment_action(
+            key="example-2024-01-payment-vendor",
+            period="2024-01",
+            amount=10.0,
+            linked_purchase_action="example-2024-01-purchase-vendor",
+            source_path="companies/another-company/artifacts/normalized/2024-01.json",
+            record_ref="bank:1",
+        )
+
+        findings = bookchecker.evaluate_source_locations(
+            {"actions": [action]}, company_dir=Path("companies/example")
+        )
+
+        self.assertTrue(any(item["severity"] == "error" for item in findings))
+
+    def test_checker_rejects_absolute_and_traversal_source_references(self) -> None:
+        for source_path in ("/tmp/outside.json", "../other-company/source/file.csv"):
+            with self.subTest(source_path=source_path):
+                action = payment_action(
+                    key="example-2024-01-payment-vendor",
+                    period="2024-01",
+                    amount=10.0,
+                    linked_purchase_action="example-2024-01-purchase-vendor",
+                    source_path=source_path,
+                    record_ref="bank:1",
+                )
+                findings = bookchecker.evaluate_source_locations(
+                    {"actions": [action]},
+                    company_dir=Path("companies/example"),
+                    cwd=ROOT,
+                    action_path=ROOT / "companies/example/artifacts/actions/2024-01.yaml",
+                )
+                self.assertTrue(any(item["severity"] == "error" for item in findings))
+
+    def test_checker_accepts_company_source_fragment_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            company_dir = root / "companies" / "example"
+            source_path = company_dir / "source" / "README.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text("evidence", encoding="utf-8")
+            action = payment_action(
+                key="example-2024-01-payment-vendor",
+                period="2024-01",
+                amount=10.0,
+                linked_purchase_action="example-2024-01-purchase-vendor",
+                source_path=f"{source_path}#invoice.jpg",
+                record_ref="bank:1",
+            )
+
+            findings = bookchecker.evaluate_source_locations(
+                {"actions": [action]},
+                company_dir=company_dir,
+                cwd=root,
+                action_path=company_dir / "artifacts/actions/2024-01.yaml",
+            )
+
+        self.assertEqual(findings, [])
+
+    def test_checker_requires_supplier_credit_contact(self) -> None:
+        action = {
+            "idempotency_key": "example-2024-05-purchase-credit-printful",
+            "confidence": "high",
+            "review_notes": [],
+            "payload": {
+                "draft_schema": "purchase_credit_summary_v1",
+                "counterparty": {"contact_id": None},
+                "line_items": [
+                    {
+                        "line_role": "purchase_credit",
+                        "gross_amount": 11.4,
+                        "vat_amount_hint": 0,
+                        "suggested_expense_account_id": "257",
+                        "suggested_vat_type_id": "11",
+                    }
+                ],
+            },
+        }
+
+        findings = bookchecker.evaluate_account_vat(action=action)
+
+        self.assertTrue(any("contact" in item["summary"].lower() for item in findings))
+
     def test_checker_passes_clean_batch(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)

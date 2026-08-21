@@ -6,6 +6,8 @@ batch_id: "example-2024-01-draft"
 approval_status: "draft"
 source_summary: "Synthetic January 2024 worked example combining Woo sales, Stripe and PayPal settlements, processor fees, and one Printful purchase."
 recon_ref: "companies/example/artifacts/recon/2024-01.json"
+already_present: []
+unresolved_dependencies: []
 actions:
   - idempotency_key: "example-2024-01-sales-woo"
     period: "2024-01"

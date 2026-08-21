@@ -61,6 +61,47 @@ class BankAllocationTests(unittest.TestCase):
         record["source_system"] = "printful"
         with self.assertRaises(bank_allocations.BankAllocationError):
             bank_allocations.bank_ledger_key(record)
+
+    def test_loader_accepts_only_four_digit_years(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for year in (1000, 9999):
+                with self.subTest(year=year):
+                    record = bank_record()
+                    record["event_date"] = f"{year}-01-02"
+                    normalized_path = root / f"{year}-01.json"
+                    normalized_path.write_text(
+                        json.dumps(normalized_payload(record, period=f"{year}-01")), encoding="utf-8"
+                    )
+                    payload = {
+                        "schema_version": "1.0",
+                        "company_slug": "example",
+                        "year": year,
+                        "normalized_bindings": [{"path": str(normalized_path), "sha256": hashlib.sha256(normalized_path.read_bytes()).hexdigest()}],
+                        "allocations": [
+                            allocation(
+                                statement_id="archive:2024010212345678",
+                                record_id="bank-source:bank:2",
+                                period=f"{year}-01",
+                            )
+                        ],
+                    }
+                    allocation_path = root / f"{year}-allocations.json"
+                    allocation_path.write_text(json.dumps(payload), encoding="utf-8")
+                    bank_allocations.load_bank_allocations(allocation_path, normalized_year_paths=[normalized_path])
+            for year in (999, 10000):
+                with self.subTest(year=year):
+                    payload = {
+                        "schema_version": "1.0",
+                        "company_slug": "example",
+                        "year": year,
+                        "normalized_bindings": [{"path": str(root / "unused.json"), "sha256": "a" * 64}],
+                        "allocations": [],
+                    }
+                    allocation_path = root / f"{year}-allocations.json"
+                    allocation_path.write_text(json.dumps(payload), encoding="utf-8")
+                    with self.assertRaises(bank_allocations.BankAllocationError):
+                        bank_allocations.load_bank_allocations(allocation_path, normalized_year_paths=[])
         record = bank_record()
         record["attributes"] = {}
         with self.assertRaises(bank_allocations.BankAllocationError):

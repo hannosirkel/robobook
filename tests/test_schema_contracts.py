@@ -56,6 +56,8 @@ def validate(instance: Any, schema: dict[str, Any], *, root_schema: dict[str, An
             assert len(instance) <= schema["maxLength"], f"{path}: string is too long"
     if isinstance(instance, (int, float)) and not isinstance(instance, bool) and "minimum" in schema:
         assert instance >= schema["minimum"], f"{path}: below minimum"
+    if isinstance(instance, (int, float)) and not isinstance(instance, bool) and "maximum" in schema:
+        assert instance <= schema["maximum"], f"{path}: above maximum"
 
     if isinstance(instance, list):
         if "minItems" in schema:
@@ -151,6 +153,19 @@ class SchemaContractTests(unittest.TestCase):
         empty_target = bank_allocation_payload(allocations=[bank_allocation(target={})])
         with self.assertRaises(AssertionError):
             self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=empty_target)
+
+    def test_bank_allocation_schema_requires_a_four_digit_year(self) -> None:
+        for year in (1000, 9999):
+            with self.subTest(year=year):
+                artifact = bank_allocation_payload(allocations=[])
+                artifact["year"] = year
+                self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=artifact)
+        for year in (999, 10000):
+            with self.subTest(year=year):
+                artifact = bank_allocation_payload(allocations=[])
+                artifact["year"] = year
+                with self.assertRaises(AssertionError):
+                    self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=artifact)
 
     def test_bank_allocation_template_matches_strict_schema(self) -> None:
         artifact = json.loads((ROOT / "templates/bank-allocation.template.json").read_text(encoding="utf-8"))

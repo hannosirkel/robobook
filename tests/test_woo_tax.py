@@ -150,6 +150,17 @@ class WooTaxTests(unittest.TestCase):
         self.assertEqual(sale["attributes"]["vat_allocation"]["fixed_product_gross"], 124.0)
         self.assertEqual(sale["attributes"]["vat_allocation"]["fixed_shipping_gross"], 124.0)
 
+    def test_apply_period_allocation_leaves_unallocated_month_summary_zero_rated(self) -> None:
+        records = monthly_woo_summary_fixture(gross=Decimal("50.00"), vat=Decimal("0"), period="2025-11")
+
+        woo_tax.apply_period_allocation(records, allocation_fixture(), "2025-11")
+
+        sale = records["sales"][0]
+        self.assertEqual(sale["gross_amount"], 50.0)
+        self.assertEqual(sale["net_amount"], 50.0)
+        self.assertEqual(sale["vat_amount"], 0.0)
+        self.assertNotIn("vat_allocation", sale["attributes"])
+
     def test_apply_period_allocation_blocks_unmatched_allocated_order(self) -> None:
         records = normalized_sales_fixture(gross=Decimal("50.00"), vat=Decimal("0"), order_id="EXAMPLE-US-1")
 

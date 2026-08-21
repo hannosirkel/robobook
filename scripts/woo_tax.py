@@ -429,6 +429,8 @@ def apply_period_allocation(
         item for item in allocation.get("allocations") or []
         if isinstance(item, dict) and item.get("period") == period
     ]
+    if not period_allocations:
+        return
     allocations_by_order: dict[str, list[dict[str, Any]]] = {}
     for item in period_allocations:
         order_id = str(item.get("order_id") or "")

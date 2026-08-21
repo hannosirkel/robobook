@@ -65,7 +65,8 @@ In practice:
 - `.claude/skills/`: Claude Code project-level entry points (symlinks into `skills/`)
 - `schemas/`: JSON schemas for shared artifacts
 - `templates/`: starter artifact files
-- `plans/`: design and implementation plans
+- `docs/current/`: how the repository behaves today
+- `docs/working/`: active design and implementation plans
 - `companies/example/`: publishable synthetic example workspace
 - `companies/<company>/`: ignored local workspaces for real companies
 - `temp/`: disposable local scratch intake area
@@ -104,68 +105,52 @@ python3 -m venv .venv
 Run shared Python scripts with `.venv/bin/python` when they depend on the
 repo-managed environment.
 
+## Testing
+
+```bash
+.venv/bin/python -m unittest discover --start-directory tests
+```
+
 ## Typical Usage
 
-Read-only Simplbooks discovery:
+The command catalogue lives in
+[`docs/current/repository-layout.md`](docs/current/repository-layout.md): the
+per-script invocations, what `bookbuilder` looks for under `--company-dir`, and
+the script and testing policy. It has one home so that a command and its
+documentation cannot drift apart.
 
-```bash
-python3 scripts/examine_simplbooks_year.py \
-  --company-dir companies/example \
-  --year 2024 \
-  --output companies/example/artifacts/discovery/2024-overview.json
-```
+## Ownership and governance
 
-Month normalization:
+This repository is governed by
+[`architecture`](https://github.com/hannosirkel/architecture), which owns the
+catalogue, the shared standards, and the generated section of
+[`AGENTS.md`](AGENTS.md). Read `AGENTS.md` before changing a skill or a script.
 
-```bash
-.venv/bin/python scripts/bookprep.py \
-  --company-dir companies/example \
-  --period 2024-01 \
-  --output companies/example/artifacts/normalized/2024-01.json
-```
+**It owns** the bookkeeping skills, their Python implementations, the JSON
+schemas, the templates, the reference artifacts, and its own tests.
 
-Draft build:
+**It does not own** the accounting system of record, which is Simplbooks, any
+real company's accounting data, its deployable state, or any universe standard.
 
-```bash
-python3 scripts/bookbuilder.py \
-  --company-dir companies/example \
-  --period 2024-01 \
-  --output companies/example/artifacts/actions/2024-01.yaml
-```
+## Visibility and the ignore rules
 
-With `--company-dir`, the builder automatically looks for:
+The repository is public and must stay safe to publish. It carries no real
+company detail, no real name, no customer data, and no credential.
 
-- `artifacts/posting_policy.json` for exact bank, contact, and posting mappings
-- `artifacts/reference/ecb-rates-<year>.json` for reviewed foreign-currency rates
-- `artifacts/discovery/<year>-overview.json` for live duplicate suppression
+**The `.gitignore` rules are load-bearing.** `/companies/*` ignores every
+company workspace, and `!/companies/example/` re-admits the synthetic example
+alone. Those two lines are the only thing keeping real bookkeeping material out
+of a public repository. Never weaken them.
 
-Missing explicit contacts remain blocking dependencies. Master-data creation is kept in a separately approved draft and is never performed implicitly.
+The Simplbooks API token lives only in `.apikey`, which is ignored.
 
-Dry-run submit:
+## Where things live
 
-```bash
-python3 scripts/booksend.py \
-  --company-dir companies/example \
-  --period 2024-01 \
-  --mode dry-run \
-  --output companies/example/artifacts/submissions/2024-01.json
-```
-
-Full-year dry run:
-
-```bash
-.venv/bin/python scripts/full_year_dry_run.py \
-  --company-dir companies/example \
-  --year 2024 \
-  --source-dir companies/example/source
-```
-
-Annual ECB exchange-rate cache through Frankfurter:
-
-```bash
-.venv/bin/python scripts/exchange_rates.py fetch \
-  --company-dir companies/example \
-  --year 2024 \
-  --base USD \
-  --quote EUR
-```
+| Question | Answer |
+| --- | --- |
+| How do I work here? | [`AGENTS.md`](AGENTS.md) |
+| How does a run work? | [`docs/current/bookkeeping-run.md`](docs/current/bookkeeping-run.md) |
+| What is where, and how do I run it? | [`docs/current/repository-layout.md`](docs/current/repository-layout.md) |
+| What does the Simplbooks API do? | [`docs/current/simplbooks-api.md`](docs/current/simplbooks-api.md) |
+| What is being built? | `docs/working/` |
+| What rules apply everywhere? | [`architecture`](https://github.com/hannosirkel/architecture) |

@@ -12,13 +12,13 @@ The system should optimize for:
 - traceability from every draft action back to source data
 - "reliable enough with review", not blind full autonomy
 
-This file lives in `plans/` because it is a build/design plan, not an operator-facing artifact.
+This file lives in `docs/working/` because it is a build/design plan, not an operator-facing artifact.
 
 ## Repository Layout
 
 The plan assumes this repository structure:
 
-- `plans/`
+- `docs/working/`
   - planning and design documents, including this file
 - `scripts/`
   - reusable Python logic for deterministic tasks such as API access, parsing, normalization, reconciliation, and validation

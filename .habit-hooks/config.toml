@@ -1,0 +1,39 @@
+# Generated from hannosirkel/architecture. Do not edit by hand.
+# Regenerate with: tooling/universe sync-baseline robobook
+
+plugins = ["python", "generic"]
+files = [
+  "**/*.py",
+  "!**/.venv/**",
+  "!**/venv/**",
+  "!**/site-packages/**",
+  "**/*.md",
+  "**/*.yaml",
+  "**/*.yml",
+  "!**/node_modules/**",
+]
+
+[sensors.deptry]
+files = [
+  "**/*.py",
+  "!**/.venv/**",
+  "!**/venv/**",
+  "!**/site-packages/**",
+]
+
+[sensors.ruff]
+files = [
+  "**/*.py",
+  "!**/.venv/**",
+  "!**/venv/**",
+  "!**/site-packages/**",
+]
+
+# The plugin default is 200; the universe standard is this.
+[sensors.line-count]
+args = ["--max", "400"]
+
+# No npm project here, so jscpd cannot resolve from
+# node_modules/.bin. line-count is built in and still runs.
+[sensors.jscpd]
+disabled = true

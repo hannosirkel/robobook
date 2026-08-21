@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3 standard library (`csv`, `dataclasses`, `decimal`, `json`, `pathlib`), JSON Schema draft 2020-12, existing `unittest` suite, existing Simplbooks API wrapper.
 
-**Spec:** `plans/2026-08-21-WOO-TAX-EVIDENCE-DESIGN.md`
+**Spec:** `docs/working/2026-08-21-WOO-TAX-EVIDENCE-DESIGN.md`
 
 ## Global Constraints
 

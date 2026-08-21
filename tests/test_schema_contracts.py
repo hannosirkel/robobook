@@ -109,6 +109,15 @@ class SchemaContractTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self.assert_artifact_valid(schema_name="woo-tax-allocation.schema.json", artifact=artifact)
 
+    def test_woo_tax_allocation_schema_rejects_empty_evidence_and_allocations(self) -> None:
+        artifact = json.loads((ROOT / "templates/woo-tax-allocation.template.json").read_text(encoding="utf-8"))
+        for field in ("source_rows", "allocations"):
+            with self.subTest(field=field):
+                mutated = json.loads(json.dumps(artifact))
+                mutated[field] = []
+                with self.assertRaises(AssertionError):
+                    self.assert_artifact_valid(schema_name="woo-tax-allocation.schema.json", artifact=mutated)
+
     def test_manual_inventory_action_template_matches_strict_schema(self) -> None:
         artifact = json.loads((ROOT / "templates/manual-inventory-action.template.json").read_text(encoding="utf-8"))
         self.assert_artifact_valid(schema_name="manual-inventory-action.schema.json", artifact=artifact)

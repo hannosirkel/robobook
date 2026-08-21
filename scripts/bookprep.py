@@ -1218,6 +1218,107 @@ def parse_woo_tax_summary_csv(
     return result, exceptions
 
 
+def discover_canonical_woo_tax_evidence(
+    *, source_dir: Path, root_dir: Path, year: int
+) -> list[dict[str, Any]]:
+    if not source_dir.exists():
+        return []
+    tax_sources: list[SourceDescriptor] = []
+    for path in sorted(source_dir.rglob("*")):
+        if not path.is_file() or path.suffix.lower() != ".csv":
+            continue
+        source = inspect_source_file(
+            path=path,
+            root_dir=root_dir,
+            period_start=date(year, 1, 1),
+            period_end=date(year, 12, 31),
+        )
+        if source is not None and source.parser_name == "parse_woo_tax_summary_csv":
+            tax_sources.append(source)
+    return canonical_woo_tax_evidence(choose_canonical_sources(tax_sources), year=year)
+
+
+def canonical_woo_tax_evidence(
+    sources: list[SourceDescriptor], *, year: int
+) -> list[dict[str, Any]]:
+    """Parse canonical annual Woo tax CSVs into evidence independent of allocation JSON."""
+    period_start = date(year, 12, 1)
+    period_end = date(year, 12, 31)
+    evidence: list[dict[str, Any]] = []
+    tax_sources = [
+        source
+        for source in sources
+        if source.canonical and source.parser_name == "parse_woo_tax_summary_csv"
+    ]
+    for source in tax_sources:
+        if source.covered_from != date(year, 1, 1) or source.covered_until != period_end:
+            raise SimplbooksError(
+                f"Canonical Woo tax source {source.rel_path} does not cover the requested year {year}."
+            )
+        records, exceptions = parse_woo_tax_summary_csv(
+            source,
+            period_start=period_start,
+            period_end=period_end,
+            base_currency="EUR",
+        )
+        blocking = [item for item in exceptions if item.get("blocking")]
+        if blocking:
+            raise SimplbooksError(
+                f"Canonical Woo tax source {source.rel_path} is invalid: {blocking[0].get('reason')}"
+            )
+        rows: list[dict[str, Any]] = []
+        for record in records["other"]:
+            attributes = record.get("attributes") or {}
+            source_ref = (record.get("source_refs") or [{}])[0]
+            rows.append(
+                {
+                    "source_row_id": str(record.get("record_id") or ""),
+                    "row_ref": str(source_ref.get("row_ref") or ""),
+                    "country_code": str(record.get("country_code") or ""),
+                    "tax_code": str(attributes.get("tax_code") or ""),
+                    "configured_rate": attributes.get("configured_rate"),
+                    "order_tax": attributes.get("order_tax"),
+                    "shipping_tax": attributes.get("shipping_tax"),
+                    "total_tax": attributes.get("total_tax"),
+                    "orders": attributes.get("orders"),
+                }
+            )
+        if not rows:
+            raise SimplbooksError(f"Canonical Woo tax source {source.rel_path} contains no tax rows.")
+        manifest = source.manifest_entry()
+        evidence.append(
+            {
+                "source_id": source.source_id,
+                "path": source.rel_path,
+                "sha256": manifest["sha256"],
+                "year": year,
+                "rows": rows,
+            }
+        )
+    return evidence
+
+
+def load_bound_woo_tax_allocation(
+    *,
+    allocation_path: Path,
+    sources: list[SourceDescriptor],
+    company_slug: str,
+    year: int,
+    repo_root: Path,
+) -> dict[str, Any]:
+    tax_evidence = canonical_woo_tax_evidence(sources, year=year)
+    if not tax_evidence:
+        raise SimplbooksError("Woo tax allocation requires nonempty canonical Woo tax evidence.")
+    allocation = woo_tax.load_allocation(
+        allocation_path,
+        company_slug=company_slug,
+        year=year,
+        tax_evidence=tax_evidence,
+    )
+    allocation["_allocation_path"] = display_path(allocation_path, repo_root)
+    return allocation
+
+
 def paypal_category(row: dict[str, str], gross_amount: Decimal) -> str:
     type_value = row.get("Type", "").strip().lower()
     if "withdrawal" in type_value or "payout" in type_value:
@@ -3608,10 +3709,13 @@ def main() -> int:
             if args.woo_tax_allocation
             else company_dir / "artifacts" / "vat" / f"{period_start.year}-woo-tax-allocation.json"
         )
-        allocation = woo_tax.load_allocation(
-            allocation_path, company_slug=company_slug, year=period_start.year
+        allocation = load_bound_woo_tax_allocation(
+            allocation_path=allocation_path,
+            sources=sources,
+            company_slug=company_slug,
+            year=period_start.year,
+            repo_root=repo_root,
         )
-        allocation["_allocation_path"] = display_path(allocation_path, repo_root)
         woo_tax.apply_period_allocation(records, allocation, args.period)
     document = build_normalized_document(
         company_slug=company_slug,

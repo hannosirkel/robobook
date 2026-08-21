@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sys
 import tempfile
 import unittest
@@ -13,6 +14,46 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import bookprep  # noqa: E402
+
+
+def bound_allocation_for_tax_source(path: Path, *, root_dir: Path, sha256: str | None = None) -> dict:
+    source_id = bookprep.source_id_for_path(path, root_dir=root_dir)
+    source_path = bookprep.display_path(path, root_dir)
+    return {
+        "schema_version": "1.0",
+        "company_slug": "example",
+        "year": 2025,
+        "source_files": [{
+            "source_id": source_id,
+            "sha256": sha256 or hashlib.sha256(path.read_bytes()).hexdigest(),
+        }],
+        "policy": {"oss_registered": False, "dispatch_origin": "EE", "merchant_absorbs_vat": True},
+        "vat_periods": [{
+            "start": "2025-01-01", "end": None, "rate": 22,
+            "goods_vat_type_id": "25", "shipping_vat_type_id": "24",
+        }],
+        "source_rows": [{
+            "source_row_id": f"{source_id}:woo-tax:2", "tax_code": "DE-DE-VAT-1",
+            "configured_rate": 20, "order_tax": 10.0, "shipping_tax": 10.0,
+            "total_tax": 20.0, "orders": 1,
+        }],
+        "allocations": [{
+            "source_row_id": f"{source_id}:woo-tax:2", "order_id": "EXAMPLE-EU-1",
+            "period": "2025-05", "event_date": "2025-05-18", "country_code": "DE",
+            "processor_ref": "pi_example", "configured_rate": 20, "corrected_rate": 22,
+            "original_order_tax": 10.0, "original_shipping_tax": 10.0,
+            "fixed_product_gross": 60.0, "fixed_shipping_gross": 60.0,
+            "corrected_product_vat": 10.82, "corrected_shipping_vat": 10.82,
+            "source_refs": [{
+                "source_id": source_id, "path": source_path, "row_ref": "csv:2",
+                "page_ref": None, "notes": None,
+            }],
+        }],
+        "monthly_totals": {
+            "2025-05": {"gross": 120.0, "original_vat": 20.0, "corrected_vat": 21.64}
+        },
+        "validation": {"status": "pass", "errors": []},
+    }
 
 
 def pdf_source(root: Path, name: str, *, source_system: str) -> bookprep.SourceDescriptor:
@@ -87,6 +128,73 @@ class BookprepTests(unittest.TestCase):
             self.assertEqual(records["other"][0]["event_type"], "woo_tax_summary")
             self.assertEqual(records["other"][0]["country_code"], "DE")
             self.assertEqual(records["other"][0]["attributes"]["orders"], 1)
+
+    def test_direct_bookprep_binds_allocation_to_actual_canonical_tax_csv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_dir = root / "companies" / "example" / "source" / "2025-pack"
+            source_dir.mkdir(parents=True)
+            tax_path = source_dir / "woocommerce-taxes.csv"
+            tax_path.write_text(
+                "Tax code,Rate,Total tax,Order tax,Shipping tax,Orders\n"
+                "DE-DE-VAT-1,20,20.00,10.00,10.00,1\n",
+                encoding="utf-8",
+            )
+            allocation_path = root / "allocation.json"
+            allocation_path.write_text(
+                json.dumps(bound_allocation_for_tax_source(tax_path, root_dir=root)),
+                encoding="utf-8",
+            )
+            start, end = bookprep.parse_period("2025-05")
+            sources = bookprep.inspect_sources(
+                source_dir=source_dir, root_dir=root, period_start=start, period_end=end
+            )
+
+            allocation = bookprep.load_bound_woo_tax_allocation(
+                allocation_path=allocation_path,
+                sources=sources,
+                company_slug="example",
+                year=2025,
+                repo_root=root,
+            )
+
+            self.assertEqual(allocation["_tax_evidence"][0]["sha256"], hashlib.sha256(tax_path.read_bytes()).hexdigest())
+            self.assertEqual(allocation["_tax_evidence"][0]["rows"][0]["orders"], 1)
+
+            tax_path.write_text(
+                "Tax code,Rate,Total tax,Order tax,Shipping tax,Orders\n"
+                "DE-DE-VAT-1,20,20.01,10.01,10.00,1\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(bookprep.SimplbooksError, "hash does not match"):
+                bookprep.load_bound_woo_tax_allocation(
+                    allocation_path=allocation_path,
+                    sources=sources,
+                    company_slug="example",
+                    year=2025,
+                    repo_root=root,
+                )
+
+    def test_tax_evidence_discovery_accepts_uppercase_csv_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_dir = root / "2025-pack"
+            source_dir.mkdir()
+            tax_path = source_dir / "woocommerce-taxes.CSV"
+            tax_path.write_text(
+                "Tax code,Rate,Total tax,Order tax,Shipping tax,Orders\n"
+                "DE-DE-VAT-1,20,20.00,10.00,10.00,1\n",
+                encoding="utf-8",
+            )
+
+            evidence = bookprep.discover_canonical_woo_tax_evidence(
+                source_dir=source_dir,
+                root_dir=root,
+                year=2025,
+            )
+
+            self.assertEqual(len(evidence), 1)
+            self.assertEqual(evidence[0]["path"], "2025-pack/woocommerce-taxes.CSV")
 
     def test_woo_tax_summary_blocks_component_mismatch(self) -> None:
         records, exceptions = self.parse_tax_fixture("DE-DE-VAT-1,19,19.01,15.00,4.00,1")

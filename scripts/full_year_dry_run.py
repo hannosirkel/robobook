@@ -14,6 +14,7 @@ from typing import Any
 
 from simplbooks_api import SimplbooksError, resolve_company_name, resolve_company_slug
 from inventory_verification import evaluate_inventory_action, load_manual_inventory_actions
+import bookprep
 import woo_tax
 
 
@@ -66,13 +67,26 @@ def source_has_woo_tax_summary(source_dir: Path) -> bool:
 
 def validate_woo_tax_preflight(company_dir: Path, year: int, source_dir: Path | None) -> Path | None:
     annual_source_dir = source_dir if source_dir is not None else company_dir / "source"
-    if not source_has_woo_tax_summary(annual_source_dir):
+    if not annual_source_dir.exists():
+        return None
+
+    tax_evidence = bookprep.discover_canonical_woo_tax_evidence(
+        source_dir=annual_source_dir,
+        root_dir=Path.cwd(),
+        year=year,
+    )
+    if not tax_evidence:
         return None
 
     allocation_path = company_dir / "artifacts" / "vat" / f"{year}-woo-tax-allocation.json"
     company_slug = resolve_company_slug(company_dir=str(company_dir)) or company_dir.name
     try:
-        woo_tax.load_allocation(allocation_path, company_slug=company_slug, year=year)
+        woo_tax.load_allocation(
+            allocation_path,
+            company_slug=company_slug,
+            year=year,
+            tax_evidence=tax_evidence,
+        )
     except woo_tax.WooTaxError as error:
         raise SimplbooksError(f"Woo tax allocation preflight failed: {error}") from error
     return allocation_path

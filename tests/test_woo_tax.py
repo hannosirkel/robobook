@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import woo_tax  # noqa: E402
+import bookprep  # noqa: E402
 
 
 def allocation_fixture() -> dict[str, Any]:
@@ -45,6 +46,26 @@ def allocation_fixture() -> dict[str, Any]:
         "monthly_totals": {"2025-05": {"gross": 120.00, "original_vat": 20.00, "corrected_vat": 21.64}},
         "validation": {"status": "pass", "errors": []},
     }
+
+
+def tax_evidence_fixture() -> list[dict[str, Any]]:
+    return [{
+        "source_id": "woo-tax",
+        "path": "source/woocommerce-taxes.csv",
+        "sha256": "a" * 64,
+        "year": 2025,
+        "rows": [{
+            "source_row_id": "woo-tax:2",
+            "row_ref": "csv:2",
+            "country_code": "DE",
+            "tax_code": "DE-DE-VAT-1",
+            "configured_rate": 20,
+            "order_tax": 10.00,
+            "shipping_tax": 10.00,
+            "total_tax": 20.00,
+            "orders": 1,
+        }],
+    }]
 
 
 def normalized_sales_fixture(*, gross: Decimal, vat: Decimal, order_id: str) -> dict[str, list[dict[str, Any]]]:
@@ -92,6 +113,11 @@ def monthly_woo_summary_fixture(*, gross: Decimal, vat: Decimal, period: str) ->
 
 def mixed_summary_allocation_fixture() -> dict[str, Any]:
     payload = period_allocation_fixture(period="2024-04", order_id="774")
+    payload["year"] = 2024
+    payload["vat_periods"] = [{
+        "start": "2024-01-01", "end": "2024-12-31", "rate": 22,
+        "goods_vat_type_id": "25", "shipping_vat_type_id": "24",
+    }]
     first = payload["allocations"][0]
     first.update({
         "event_date": "2024-04-20",
@@ -116,6 +142,7 @@ class WooTaxTests(unittest.TestCase):
         records = normalized_sales_fixture(
             gross=Decimal("124.00"), vat=Decimal("22.36"), order_id="EXAMPLE-1"
         )
+        records["sales"][0]["external_ref"] = "pi_example"
 
         woo_tax.apply_period_allocation(records, period_allocation_fixture(), "2025-11")
 
@@ -140,21 +167,63 @@ class WooTaxTests(unittest.TestCase):
             Decimal(str(allocation_details["shipping_net"])) + Decimal(str(allocation_details["shipping_vat"])),
         )
         self.assertEqual(
-            allocation_details["component_vat_evidence"],
-            [{
-                "order_id": "EXAMPLE-1",
-                "fixed_product_gross": 62.0,
-                "fixed_shipping_gross": 62.0,
-                "product_vat": 12.0,
-                "shipping_vat": 12.0,
-            }],
+            {
+                key: allocation_details["component_vat_evidence"][0][key]
+                for key in (
+                    "order_id", "fixed_product_gross", "fixed_shipping_gross",
+                    "product_vat", "shipping_vat",
+                )
+            },
+            {
+                "order_id": "EXAMPLE-1", "fixed_product_gross": 62.0,
+                "fixed_shipping_gross": 62.0, "product_vat": 12.0, "shipping_vat": 12.0,
+            },
         )
 
-    def test_apply_period_allocation_does_not_tax_unlisted_export_order(self) -> None:
+    def test_apply_period_allocation_propagates_bound_source_and_vat_profile_evidence(self) -> None:
+        records = normalized_sales_fixture(
+            gross=Decimal("124.00"), vat=Decimal("22.36"), order_id="LOCAL-1"
+        )
+        records["sales"][0]["external_ref"] = "pi_example"
+        allocation = period_allocation_fixture()
+        allocation["_allocation_path"] = "companies/example/artifacts/vat/2025-woo-tax-allocation.json"
+        allocation["_allocation_sha256"] = "c" * 64
+        allocation["_tax_evidence"] = tax_evidence_fixture()
+
+        woo_tax.apply_period_allocation(records, allocation, "2025-11")
+
+        evidence = records["sales"][0]["attributes"]["vat_allocation"]
+        self.assertEqual(evidence["allocation_ref"], {
+            "path": "companies/example/artifacts/vat/2025-woo-tax-allocation.json",
+            "sha256": "c" * 64,
+        })
+        self.assertEqual(evidence["tax_source_refs"], [{
+            "source_id": "woo-tax",
+            "path": "source/woocommerce-taxes.csv",
+            "sha256": "a" * 64,
+            "row_refs": ["csv:2"],
+        }])
+        component = evidence["component_vat_evidence"][0]
+        self.assertEqual(
+            {key: component[key] for key in (
+                "source_row_id", "processor_ref", "country_code", "configured_rate", "corrected_rate"
+            )},
+            {
+                "source_row_id": "woo-tax:2", "processor_ref": "pi_example", "country_code": "DE",
+                "configured_rate": 22, "corrected_rate": 24,
+            },
+        )
+        self.assertEqual(component["vat_profile"], {
+            "start": "2025-07-01", "end": None, "rate": 24.0,
+            "goods_vat_type_id": "34", "shipping_vat_type_id": "33",
+        })
+
+    def test_apply_period_allocation_leaves_unlinked_processor_order_untouched(self) -> None:
         records = normalized_sales_fixture(gross=Decimal("50.00"), vat=Decimal("5.00"), order_id="EXAMPLE-US-1")
         records["sales"].append(
             normalized_sales_fixture(gross=Decimal("124.00"), vat=Decimal("22.36"), order_id="EXAMPLE-EU-1")["sales"][0]
         )
+        records["sales"][1]["external_ref"] = "pi_example"
 
         woo_tax.apply_period_allocation(
             records,
@@ -162,8 +231,8 @@ class WooTaxTests(unittest.TestCase):
             "2024-02",
         )
 
-        self.assertEqual(records["sales"][0]["vat_amount"], 0.0)
-        self.assertEqual(records["sales"][0]["net_amount"], 50.0)
+        self.assertEqual(records["sales"][0]["vat_amount"], 5.0)
+        self.assertEqual(records["sales"][0]["net_amount"], 45.0)
         self.assertEqual(records["sales"][1]["vat_amount"], 24.0)
         self.assertEqual(records["sales"][1]["net_amount"], 100.0)
 
@@ -171,10 +240,11 @@ class WooTaxTests(unittest.TestCase):
         records = normalized_sales_fixture(
             gross=Decimal("50.00"), vat=Decimal("5.00"), order_id="EXAMPLE-US-1"
         )
+        sale = records["sales"][0]
+        sale.update({"source_system": "woo", "channel": "woo"})
 
         woo_tax.apply_period_allocation(records, allocation_fixture(), "2025-11")
 
-        sale = records["sales"][0]
         self.assertEqual(sale["gross_amount"], 50.0)
         self.assertEqual(sale["vat_amount"], 0.0)
         self.assertEqual(sale["net_amount"], 50.0)
@@ -192,6 +262,7 @@ class WooTaxTests(unittest.TestCase):
         linked_processor = normalized_sales_fixture(
             gross=Decimal("124.00"), vat=Decimal("22.36"), order_id="EXAMPLE-1"
         )["sales"][0]
+        linked_processor["external_ref"] = "pi_example"
         records["sales"].extend([unrelated, linked_processor])
 
         woo_tax.apply_period_allocation(records, period_allocation_fixture(), "2025-11")
@@ -203,22 +274,59 @@ class WooTaxTests(unittest.TestCase):
         self.assertEqual(linked_processor["vat_amount"], 0.0)
         self.assertEqual(linked_processor["net_amount"], 124.0)
 
-    def test_apply_period_summary_allocation_blocks_ambiguous_processor_vat(self) -> None:
+    def test_apply_period_summary_allocation_leaves_unrelated_processor_sale_untouched(self) -> None:
         records = monthly_woo_summary_fixture(
             gross=Decimal("124.00"), vat=Decimal("22.36"), period="2025-11"
         )
-        ambiguous = normalized_sales_fixture(
+        unrelated = normalized_sales_fixture(
             gross=Decimal("75.00"), vat=Decimal("15.00"), order_id="UNPROVEN-1"
         )["sales"][0]
-        ambiguous["attributes"] = {}
-        ambiguous["external_ref"] = "ch_unproven"
-        records["sales"].append(ambiguous)
+        unrelated["attributes"] = {"order_id": "EXAMPLE-1"}
+        unrelated["external_ref"] = "ch_unproven"
+        records["sales"].append(unrelated)
 
-        with self.assertRaisesRegex(woo_tax.WooTaxError, "ambiguous processor sale"):
+        woo_tax.apply_period_allocation(records, period_allocation_fixture(), "2025-11")
+
+        self.assertEqual(unrelated["vat_amount"], 15.0)
+        self.assertEqual(unrelated["net_amount"], 60.0)
+
+    def test_apply_period_allocation_matches_reviewed_processor_ref_without_order_metadata(self) -> None:
+        records = normalized_sales_fixture(
+            gross=Decimal("124.00"), vat=Decimal("22.36"), order_id="ARBITRARY-LOCAL-ID"
+        )
+        sale = records["sales"][0]
+        sale["attributes"] = {}
+        sale["external_ref"] = "pi_example"
+
+        woo_tax.apply_period_allocation(records, period_allocation_fixture(), "2025-11")
+
+        self.assertEqual(sale["vat_amount"], 24.0)
+        self.assertEqual(sale["attributes"]["vat_allocation"]["allocated_order_ids"], ["EXAMPLE-1"])
+
+    def test_apply_period_allocation_does_not_trust_processor_order_id_without_reviewed_ref(self) -> None:
+        records = normalized_sales_fixture(
+            gross=Decimal("124.00"), vat=Decimal("22.36"), order_id="EXAMPLE-1"
+        )
+        sale = records["sales"][0]
+        sale["external_ref"] = "pi_unreviewed"
+        original = copy.deepcopy(sale)
+
+        with self.assertRaisesRegex(woo_tax.WooTaxError, "no matching sale"):
             woo_tax.apply_period_allocation(records, period_allocation_fixture(), "2025-11")
 
-        self.assertEqual(ambiguous["vat_amount"], 15.0)
-        self.assertEqual(ambiguous["net_amount"], 60.0)
+        self.assertEqual(sale, original)
+
+    def test_apply_period_allocation_blocks_processor_reference_collision(self) -> None:
+        records = normalized_sales_fixture(
+            gross=Decimal("124.00"), vat=Decimal("22.36"), order_id="LOCAL-1"
+        )
+        records["sales"][0]["external_ref"] = "pi_example"
+        duplicate = copy.deepcopy(records["sales"][0])
+        duplicate["record_id"] = "stripe:LOCAL-2"
+        records["sales"].append(duplicate)
+
+        with self.assertRaisesRegex(woo_tax.WooTaxError, "matched more than one sale"):
+            woo_tax.apply_period_allocation(records, period_allocation_fixture(), "2025-11")
 
     def test_apply_period_allocation_aggregates_monthly_woo_summary(self) -> None:
         records = monthly_woo_summary_fixture(gross=Decimal("248.00"), vat=Decimal("44.72"), period="2025-11")
@@ -332,6 +440,7 @@ class WooTaxTests(unittest.TestCase):
 
     def test_apply_period_allocation_rejects_gross_mismatch(self) -> None:
         records = normalized_sales_fixture(gross=Decimal("123.99"), vat=Decimal("22.36"), order_id="EXAMPLE-1")
+        records["sales"][0]["external_ref"] = "pi_example"
 
         with self.assertRaisesRegex(woo_tax.WooTaxError, "does not match processor gross"):
             woo_tax.apply_period_allocation(records, period_allocation_fixture(), "2025-11")
@@ -370,6 +479,65 @@ class WooTaxTests(unittest.TestCase):
     def test_validate_allocation_keeps_non_taxable_orders_outside_allocation(self) -> None:
         # Completeness is tied to tax-summary Orders counts, not every Woo/processor order in the year.
         self.assertEqual(woo_tax.validate_allocation(allocation_fixture()), [])
+
+    def test_validate_allocation_rejects_empty_self_certified_rows(self) -> None:
+        payload = allocation_fixture()
+        payload["source_rows"] = []
+        payload["allocations"] = []
+        payload["monthly_totals"] = {}
+
+        errors = woo_tax.validate_allocation(payload)
+
+        self.assertIn("source_rows must contain canonical Woo tax evidence", errors)
+        self.assertIn("allocations must contain every tax-evidenced order", errors)
+
+    def test_validate_allocation_binds_every_canonical_tax_field_and_hash(self) -> None:
+        self.assertEqual(
+            woo_tax.validate_allocation_against_evidence(allocation_fixture(), tax_evidence_fixture()),
+            [],
+        )
+
+        mutations = (
+            ("hash", lambda payload: payload["source_files"][0].update({"sha256": "b" * 64})),
+            ("row", lambda payload: payload["source_rows"][0].update({"order_tax": 9.99})),
+            ("source", lambda payload: payload["source_files"][0].update({"source_id": "wrong-source"})),
+            ("extra source", lambda payload: payload["source_files"].append({"source_id": "stale", "sha256": "c" * 64})),
+        )
+        for label, mutate in mutations:
+            with self.subTest(label=label):
+                payload = allocation_fixture()
+                mutate(payload)
+                errors = woo_tax.validate_allocation_against_evidence(payload, tax_evidence_fixture())
+                self.assertTrue(errors, label)
+
+    def test_validate_allocation_enforces_country_rate_year_refs_ids_and_vat_provenance(self) -> None:
+        mutations = (
+            ("country_code", "country does not match", "FR"),
+            ("configured_rate", "configured_rate does not match", 21),
+            ("event_date", "outside allocation year", "2024-12-31"),
+            ("processor_ref", "processor_ref", ""),
+        )
+        for field, expected, value in mutations:
+            with self.subTest(field=field):
+                payload = allocation_fixture()
+                payload["allocations"][0][field] = value
+                self.assertIn(expected, " ".join(woo_tax.validate_allocation(payload)))
+
+        payload = allocation_fixture()
+        payload["allocations"][0]["source_refs"] = []
+        self.assertIn("source_refs", " ".join(woo_tax.validate_allocation(payload)))
+
+        payload = allocation_fixture()
+        payload["vat_periods"][0]["goods_vat_type_id"] = ""
+        self.assertIn("VAT type", " ".join(woo_tax.validate_allocation(payload)))
+
+    def test_validate_allocation_rejects_duplicate_processor_references(self) -> None:
+        payload = allocation_fixture()
+        duplicate = copy.deepcopy(payload["allocations"][0])
+        duplicate.update({"order_id": "EXAMPLE-EU-2", "original_order_tax": 0, "original_shipping_tax": 0})
+        payload["allocations"].append(duplicate)
+
+        self.assertIn("processor_ref is allocated more than once", " ".join(woo_tax.validate_allocation(payload)))
 
     def test_validate_allocation_rejects_corrected_vat_that_changes_fixed_gross_split(self) -> None:
         payload = allocation_fixture()
@@ -425,10 +593,28 @@ class WooTaxTests(unittest.TestCase):
     def test_validate_cli_reports_recalculated_annual_totals(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             company_dir = Path(tmp) / "example"
+            source_dir = company_dir / "source" / "2025-pack"
             allocation_path = company_dir / "artifacts" / "vat" / "2025-woo-tax-allocation.json"
+            source_dir.mkdir(parents=True)
             allocation_path.parent.mkdir(parents=True)
             (company_dir / "METADATA.md").write_text("Company slug: example\n", encoding="utf-8")
-            allocation_path.write_text(json.dumps(allocation_fixture()), encoding="utf-8")
+            (source_dir / "woocommerce-taxes.csv").write_text(
+                "Tax code,Rate,Total tax,Order tax,Shipping tax,Orders\n"
+                "DE-DE-VAT-1,20,20.00,10.00,10.00,1\n",
+                encoding="utf-8",
+            )
+            actual = bookprep.discover_canonical_woo_tax_evidence(
+                source_dir=source_dir, root_dir=Path.cwd(), year=2025
+            )[0]
+            payload = allocation_fixture()
+            payload["source_files"] = [{"source_id": actual["source_id"], "sha256": actual["sha256"]}]
+            payload["source_rows"][0]["source_row_id"] = actual["rows"][0]["source_row_id"]
+            payload["allocations"][0]["source_row_id"] = actual["rows"][0]["source_row_id"]
+            payload["allocations"][0]["source_refs"] = [{
+                "source_id": actual["source_id"], "path": actual["path"], "row_ref": "csv:2",
+                "page_ref": None, "notes": None,
+            }]
+            allocation_path.write_text(json.dumps(payload), encoding="utf-8")
             stdout = io.StringIO()
             with contextlib.redirect_stdout(stdout):
                 status = woo_tax.main(["validate", "--company-dir", str(company_dir), "--year", "2025"])
@@ -437,6 +623,27 @@ class WooTaxTests(unittest.TestCase):
         self.assertEqual(json.loads(stdout.getvalue()), {
             "corrected_vat": 21.64, "errors": [], "gross": 120.0, "original_vat": 20.0
         })
+
+    def test_validate_cli_rejects_allocation_not_bound_to_actual_tax_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            company_dir = Path(tmp) / "example"
+            source_dir = company_dir / "source" / "2025-pack"
+            allocation_path = company_dir / "artifacts" / "vat" / "2025-woo-tax-allocation.json"
+            source_dir.mkdir(parents=True)
+            allocation_path.parent.mkdir(parents=True)
+            (company_dir / "METADATA.md").write_text("Company slug: example\n", encoding="utf-8")
+            (source_dir / "woocommerce-taxes.csv").write_text(
+                "Tax code,Rate,Total tax,Order tax,Shipping tax,Orders\n"
+                "DE-DE-VAT-1,20,20.00,10.00,10.00,1\n",
+                encoding="utf-8",
+            )
+            allocation_path.write_text(json.dumps(allocation_fixture()), encoding="utf-8")
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                status = woo_tax.main(["validate", "--company-dir", str(company_dir), "--year", "2025"])
+
+        self.assertEqual(status, 2)
+        self.assertIn("canonical", stderr.getvalue())
 
 
 if __name__ == "__main__":

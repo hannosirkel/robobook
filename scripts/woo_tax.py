@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
+import re
 import sys
 from dataclasses import dataclass
 from datetime import date
@@ -81,15 +83,21 @@ def vat_periods_from_payload(payload: dict[str, Any]) -> list[VatPeriod]:
         rate = decimal_value(item.get("rate"))
         if rate < 0:
             raise WooTaxError("VAT profile rate must be non-negative.")
+        goods_vat_type_id = str(item.get("goods_vat_type_id") or "").strip()
+        shipping_vat_type_id = str(item.get("shipping_vat_type_id") or "").strip()
+        if not goods_vat_type_id.isdigit() or not shipping_vat_type_id.isdigit():
+            raise WooTaxError("VAT profiles require usable integer-like goods and shipping VAT type IDs.")
         periods.append(
             VatPeriod(
                 start=start,
                 end=end,
                 rate=rate,
-                goods_vat_type_id=str(item.get("goods_vat_type_id") or ""),
-                shipping_vat_type_id=str(item.get("shipping_vat_type_id") or ""),
+                goods_vat_type_id=goods_vat_type_id,
+                shipping_vat_type_id=shipping_vat_type_id,
             )
         )
+    if not periods:
+        raise WooTaxError("At least one effective VAT profile is required.")
     return periods
 
 
@@ -139,12 +147,35 @@ def validate_allocation(payload: dict[str, Any]) -> list[str]:
         errors.append("policy must be an object")
     elif policy.get("merchant_absorbs_vat") is not True:
         errors.append("merchant_absorbs_vat must be true")
+    source_files = payload.get("source_files") or []
     source_rows = payload.get("source_rows") or []
     allocations = payload.get("allocations") or []
+    if not isinstance(source_files, list):
+        return ["source_files must be a list"]
     if not isinstance(source_rows, list):
         return ["source_rows must be a list"]
     if not isinstance(allocations, list):
         return ["allocations must be a list"]
+    if not source_rows:
+        errors.append("source_rows must contain canonical Woo tax evidence")
+    if not allocations:
+        errors.append("allocations must contain every tax-evidenced order")
+
+    source_file_ids: set[str] = set()
+    for index, item in enumerate(source_files):
+        if not isinstance(item, dict):
+            errors.append(f"source file {index} must be an object")
+            continue
+        source_id = str(item.get("source_id") or "").strip()
+        sha256 = str(item.get("sha256") or "").strip()
+        if not source_id:
+            errors.append(f"source file {index} has no source_id")
+        elif source_id in source_file_ids:
+            errors.append(f"source file {source_id} appears more than once")
+        else:
+            source_file_ids.add(source_id)
+        if not re.fullmatch(r"[a-f0-9]{64}", sha256):
+            errors.append(f"source file {source_id or index} has invalid sha256")
 
     try:
         periods = vat_periods_from_payload(payload)
@@ -153,6 +184,7 @@ def validate_allocation(payload: dict[str, Any]) -> list[str]:
         periods = []
 
     source_by_id: dict[str, dict[str, Any]] = {}
+    source_countries: dict[str, str] = {}
     for index, row in enumerate(source_rows):
         if not isinstance(row, dict) or not str(row.get("source_row_id") or ""):
             errors.append(f"source row {index} has no source_row_id")
@@ -161,9 +193,23 @@ def validate_allocation(payload: dict[str, Any]) -> list[str]:
         if row_id in source_by_id:
             errors.append(f"source row {row_id} appears more than once")
         source_by_id[row_id] = row
+        tax_code = str(row.get("tax_code") or "").strip()
+        country_match = re.fullmatch(r"([A-Z]{2})-[A-Z]{2}-VAT-[A-Za-z0-9-]+", tax_code)
+        if not country_match:
+            errors.append(f"source row {row_id} has invalid tax_code")
+        else:
+            source_countries[row_id] = country_match.group(1)
+        try:
+            configured_rate = decimal_value(row.get("configured_rate"))
+            if configured_rate < 0:
+                raise WooTaxError("negative rate")
+        except WooTaxError:
+            errors.append(f"source row {row_id} has invalid configured_rate")
 
     grouped: dict[str, list[dict[str, Any]]] = {row_id: [] for row_id in source_by_id}
     seen_orders: set[str] = set()
+    seen_processor_refs: set[str] = set()
+    artifact_year = payload.get("year")
     for index, allocation in enumerate(allocations):
         if not isinstance(allocation, dict):
             errors.append(f"allocation {index} must be an object")
@@ -177,11 +223,41 @@ def validate_allocation(payload: dict[str, Any]) -> list[str]:
         else:
             seen_orders.add(order_id)
 
+        processor_ref = str(allocation.get("processor_ref") or "").strip()
+        if not processor_ref:
+            errors.append(f"allocation {label} has no processor_ref")
+        elif processor_ref in seen_processor_refs:
+            errors.append(f"processor_ref is allocated more than once: {processor_ref}")
+        else:
+            seen_processor_refs.add(processor_ref)
+
         row_id = str(allocation.get("source_row_id") or "")
         if row_id not in source_by_id:
             errors.append(f"allocation {label} references unknown source row {row_id or '<empty>'}")
         else:
             grouped[row_id].append(allocation)
+            expected_country = source_countries.get(row_id)
+            if expected_country and str(allocation.get("country_code") or "") != expected_country:
+                errors.append(f"allocation {label} country does not match source tax row")
+            try:
+                if decimal_value(allocation.get("configured_rate")) != decimal_value(
+                    source_by_id[row_id].get("configured_rate")
+                ):
+                    errors.append(f"allocation {label} configured_rate does not match source tax row")
+            except WooTaxError:
+                errors.append(f"allocation {label} has invalid configured_rate")
+
+        source_refs = allocation.get("source_refs")
+        if not isinstance(source_refs, list) or not source_refs:
+            errors.append(f"allocation {label} requires source_refs")
+        else:
+            for source_ref in source_refs:
+                if not isinstance(source_ref, dict):
+                    errors.append(f"allocation {label} source_refs must contain objects")
+                    continue
+                source_id = str(source_ref.get("source_id") or "").strip()
+                if not source_id or source_id not in source_file_ids:
+                    errors.append(f"allocation {label} source_ref is not listed in source_files")
 
         product_gross = _decimal_field(allocation, "fixed_product_gross", errors, label)
         shipping_gross = _decimal_field(allocation, "fixed_shipping_gross", errors, label)
@@ -192,6 +268,8 @@ def validate_allocation(payload: dict[str, Any]) -> list[str]:
 
         try:
             event_date = date_value(allocation.get("event_date"))
+            if not isinstance(artifact_year, int) or event_date.year != artifact_year:
+                errors.append(f"allocation {label} event_date is outside allocation year")
             expected_period = event_date.strftime("%Y-%m")
             if allocation.get("period") != expected_period:
                 errors.append(f"allocation {label} period does not match event_date")
@@ -287,6 +365,136 @@ def validate_allocation(payload: dict[str, Any]) -> list[str]:
     return sorted(set(errors))
 
 
+def validate_allocation_against_evidence(
+    payload: dict[str, Any], tax_evidence: list[dict[str, Any]]
+) -> list[str]:
+    """Compare an allocation with independently parsed canonical Woo tax CSV evidence."""
+    errors: list[str] = []
+    if not tax_evidence:
+        return ["canonical Woo tax evidence is empty"]
+
+    allocation_files = {
+        str(item.get("source_id") or ""): item
+        for item in payload.get("source_files") or []
+        if isinstance(item, dict) and str(item.get("source_id") or "")
+    }
+    allocation_rows = {
+        str(item.get("source_row_id") or ""): item
+        for item in payload.get("source_rows") or []
+        if isinstance(item, dict) and str(item.get("source_row_id") or "")
+    }
+    actual_rows: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+    actual_source_ids: set[str] = set()
+    artifact_year = payload.get("year")
+
+    for evidence in tax_evidence:
+        if not isinstance(evidence, dict):
+            errors.append("canonical Woo tax evidence entries must be objects")
+            continue
+        source_id = str(evidence.get("source_id") or "").strip()
+        source_path = str(evidence.get("path") or "").strip()
+        source_hash = str(evidence.get("sha256") or "").strip()
+        if not source_id or source_id in actual_source_ids:
+            errors.append(f"canonical Woo tax source ID is missing or duplicated: {source_id or '<empty>'}")
+            continue
+        actual_source_ids.add(source_id)
+        if evidence.get("year") != artifact_year:
+            errors.append(f"canonical Woo tax source {source_id} year does not match allocation year")
+        allocation_file = allocation_files.get(source_id)
+        if allocation_file is None:
+            errors.append(f"allocation is bound to the wrong source; missing canonical source {source_id}")
+        elif str(allocation_file.get("sha256") or "") != source_hash:
+            errors.append(f"canonical Woo tax source {source_id} hash does not match allocation")
+        elif allocation_file.get("path") not in (None, "", source_path):
+            errors.append(f"canonical Woo tax source {source_id} path does not match allocation")
+
+        rows = evidence.get("rows")
+        if not isinstance(rows, list) or not rows:
+            errors.append(f"canonical Woo tax source {source_id} has no rows")
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                errors.append(f"canonical Woo tax source {source_id} has a non-object row")
+                continue
+            row_id = str(row.get("source_row_id") or "").strip()
+            if not row_id or row_id in actual_rows:
+                errors.append(f"canonical Woo tax row ID is missing or duplicated: {row_id or '<empty>'}")
+                continue
+            actual_rows[row_id] = (evidence, row)
+
+    stale_source_ids = sorted(set(allocation_files) - actual_source_ids)
+    if stale_source_ids:
+        errors.append(
+            "allocation contains stale Woo tax source(s): " + ", ".join(stale_source_ids)
+        )
+
+    if set(allocation_rows) != set(actual_rows):
+        missing = sorted(set(actual_rows) - set(allocation_rows))
+        stale = sorted(set(allocation_rows) - set(actual_rows))
+        if missing:
+            errors.append("allocation is missing canonical Woo tax row(s): " + ", ".join(missing))
+        if stale:
+            errors.append("allocation contains stale Woo tax row(s): " + ", ".join(stale))
+
+    decimal_fields = ("configured_rate", "order_tax", "shipping_tax", "total_tax")
+    for row_id in sorted(set(allocation_rows) & set(actual_rows)):
+        supplied = allocation_rows[row_id]
+        _, actual = actual_rows[row_id]
+        for field in decimal_fields:
+            try:
+                matches = decimal_value(supplied.get(field)) == decimal_value(actual.get(field))
+            except WooTaxError:
+                matches = False
+            if not matches:
+                errors.append(f"canonical Woo tax row {row_id} {field} does not match allocation")
+        if str(supplied.get("tax_code") or "") != str(actual.get("tax_code") or ""):
+            errors.append(f"canonical Woo tax row {row_id} tax_code does not match allocation")
+        try:
+            matches_orders = int(supplied.get("orders")) == int(actual.get("orders"))
+        except (TypeError, ValueError):
+            matches_orders = False
+        if not matches_orders:
+            errors.append(f"canonical Woo tax row {row_id} orders does not match allocation")
+
+    for allocation in payload.get("allocations") or []:
+        if not isinstance(allocation, dict):
+            continue
+        label = str(allocation.get("order_id") or "<unknown>")
+        row_id = str(allocation.get("source_row_id") or "")
+        actual_pair = actual_rows.get(row_id)
+        if actual_pair is None:
+            continue
+        evidence, actual_row = actual_pair
+        if str(allocation.get("country_code") or "") != str(actual_row.get("country_code") or ""):
+            errors.append(f"allocation {label} country does not match canonical Woo tax evidence")
+        try:
+            configured_matches = decimal_value(allocation.get("configured_rate")) == decimal_value(
+                actual_row.get("configured_rate")
+            )
+        except WooTaxError:
+            configured_matches = False
+        if not configured_matches:
+            errors.append(f"allocation {label} configured_rate does not match canonical Woo tax evidence")
+        expected_ref = (
+            str(evidence.get("source_id") or ""),
+            str(evidence.get("path") or ""),
+            str(actual_row.get("row_ref") or ""),
+        )
+        actual_refs = {
+            (
+                str(item.get("source_id") or ""),
+                str(item.get("path") or ""),
+                str(item.get("row_ref") or ""),
+            )
+            for item in allocation.get("source_refs") or []
+            if isinstance(item, dict)
+        }
+        if expected_ref not in actual_refs:
+            errors.append(f"allocation {label} lacks an exact canonical Woo tax source reference")
+
+    return sorted(set(errors))
+
+
 def decimal_number(value: Decimal) -> float:
     return float(money(value))
 
@@ -331,7 +539,13 @@ def load_json(path: Path) -> dict[str, Any]:
     return payload
 
 
-def load_allocation(path: Path, *, company_slug: str, year: int) -> dict[str, Any]:
+def load_allocation(
+    path: Path,
+    *,
+    company_slug: str,
+    year: int,
+    tax_evidence: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Load a reviewed annual allocation only when it is safe for the company and year."""
     payload = load_json(path)
     validation = payload.get("validation")
@@ -343,38 +557,40 @@ def load_allocation(path: Path, *, company_slug: str, year: int) -> dict[str, An
         errors.append(f"allocation company_slug does not match {company_slug}")
     if payload.get("year") != year:
         errors.append(f"allocation year does not match {year}")
+    if tax_evidence is not None:
+        errors.extend(validate_allocation_against_evidence(payload, tax_evidence))
     if errors:
         raise WooTaxError(f"Woo tax allocation validation failed: {'; '.join(sorted(set(errors)))}")
+    payload["_allocation_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    if tax_evidence is not None:
+        payload["_tax_evidence"] = copy.deepcopy(tax_evidence)
     return payload
 
 
-def allocation_order_id(record: dict[str, Any]) -> str:
-    attributes = record.get("attributes")
-    if isinstance(attributes, dict) and attributes.get("order_id") not in (None, ""):
-        return str(attributes["order_id"])
-    if record.get("external_ref") not in (None, ""):
-        return str(record["external_ref"])
-    return ""
-
-
 def record_link_values(record: dict[str, Any]) -> tuple[set[str], set[str]]:
-    """Return order and processor identifiers carried by a normalized sale."""
+    """Return source-scoped Woo order IDs and processor identifiers for a sale."""
     attributes = record.get("attributes")
     order_refs: set[str] = set()
     processor_refs: set[str] = set()
-    if isinstance(attributes, dict):
-        order_id = str(attributes.get("order_id") or "").strip()
-        if order_id:
-            order_refs.add(order_id)
-        for key in ("stripe_source_id", "stripe_balance_transaction_id"):
+    source_system = str(record.get("source_system") or "").lower()
+    channel = str(record.get("channel") or "").lower()
+    is_woo = source_system == "woo" or channel == "woo"
+    is_processor = is_processor_sale(record)
+    if isinstance(attributes, dict) and is_woo:
+        for key in ("order_id", "order_key"):
+            value = str(attributes.get(key) or "").strip()
+            if value:
+                order_refs.add(value)
+    if isinstance(attributes, dict) and is_processor:
+        for key in ("stripe_source_id", "stripe_balance_transaction_id", "transaction_id"):
             value = str(attributes.get(key) or "").strip()
             if value:
                 processor_refs.add(value)
     external_ref = str(record.get("external_ref") or "").strip()
-    if external_ref:
+    if external_ref and is_woo:
+        order_refs.add(external_ref)
+    if external_ref and is_processor:
         processor_refs.add(external_ref)
-        if not order_refs:
-            order_refs.add(external_ref)
     return order_refs, processor_refs
 
 
@@ -401,36 +617,40 @@ def is_processor_sale(sale: dict[str, Any]) -> bool:
     return event_type.startswith(("stripe_", "paypal_"))
 
 
-def is_demonstrably_woo_linked_sale(
-    sale: dict[str, Any], allocations: list[dict[str, Any]]
-) -> bool:
-    if sale.get("source_system") == "woo" or sale.get("channel") == "woo":
-        return True
-    if not is_processor_sale(sale):
-        return False
-    attributes = sale.get("attributes")
-    if isinstance(attributes, dict) and any(
-        attributes.get(key) not in (None, "") for key in ("order_id", "order_key")
-    ):
-        return True
-    return bool(linked_allocation_order_ids(sale, allocations))
-
-
-def block_ambiguous_processor_vat(
+def match_allocations_to_sales(
     sales: list[dict[str, Any]], allocations: list[dict[str, Any]]
-) -> None:
-    ambiguous = [
-        str(sale.get("record_id") or sale.get("external_ref") or "unknown")
-        for sale in sales
-        if is_processor_sale(sale)
-        and not is_demonstrably_woo_linked_sale(sale, allocations)
-        and decimal_value(sale.get("vat_amount")) != 0
-    ]
-    if ambiguous:
-        raise WooTaxError(
-            "Woo tax allocation found ambiguous processor sale(s) with source VAT: "
-            + ", ".join(sorted(ambiguous))
-        )
+) -> dict[str, dict[str, Any]]:
+    """Match reviewed allocations once, without trusting processor order metadata."""
+    matched: dict[str, dict[str, Any]] = {}
+    matched_sale_ids: dict[int, str] = {}
+    for allocation in allocations:
+        order_id = str(allocation.get("order_id") or "").strip()
+        processor_ref = str(allocation.get("processor_ref") or "").strip()
+        candidates: list[dict[str, Any]] = []
+        for sale in sales:
+            order_refs, processor_refs = record_link_values(sale)
+            if order_id in order_refs or processor_ref in processor_refs:
+                candidates.append(sale)
+        if len(candidates) > 1:
+            raise WooTaxError(f"Woo tax allocation for order {order_id} matched more than one sale.")
+        if not candidates:
+            continue
+        sale = candidates[0]
+        sale_identity = id(sale)
+        if sale_identity in matched_sale_ids:
+            raise WooTaxError(
+                "Woo tax allocations for orders "
+                f"{matched_sale_ids[sale_identity]} and {order_id} matched the same sale."
+            )
+        matched[order_id] = sale
+        matched_sale_ids[sale_identity] = order_id
+    return matched
+
+
+def is_woo_source_sale(sale: dict[str, Any]) -> bool:
+    return str(sale.get("source_system") or "").lower() == "woo" or str(
+        sale.get("channel") or ""
+    ).lower() == "woo"
 
 
 def allocation_components(items: list[dict[str, Any]]) -> dict[str, Decimal]:
@@ -490,6 +710,33 @@ def set_allocated_sale_components(
     components: dict[str, Decimal],
 ) -> None:
     allocated_gross = components["product_gross"] + components["shipping_gross"]
+    periods = vat_periods_from_payload(allocation)
+    allocated_source_row_ids = {str(item.get("source_row_id") or "") for item in items}
+    tax_source_refs: list[dict[str, Any]] = []
+    for source in allocation.get("_tax_evidence") or []:
+        if not isinstance(source, dict):
+            continue
+        row_refs = sorted(
+            str(row.get("row_ref") or "")
+            for row in source.get("rows") or []
+            if isinstance(row, dict)
+            and str(row.get("source_row_id") or "") in allocated_source_row_ids
+            and str(row.get("row_ref") or "")
+        )
+        if row_refs:
+            tax_source_refs.append(
+                {
+                    "source_id": str(source.get("source_id") or ""),
+                    "path": str(source.get("path") or ""),
+                    "sha256": str(source.get("sha256") or ""),
+                    "row_refs": row_refs,
+                }
+            )
+
+    allocation_ref = {
+        "path": allocation.get("_allocation_path"),
+        "sha256": allocation.get("_allocation_sha256"),
+    }
 
     attributes = sale.setdefault("attributes", {})
     if not isinstance(attributes, dict):
@@ -506,16 +753,32 @@ def set_allocated_sale_components(
         "product_vat": decimal_number(components["product_vat"]),
         "shipping_vat": decimal_number(components["shipping_vat"]),
         "allocation_path": allocation.get("_allocation_path"),
+        "allocation_ref": allocation_ref,
+        "tax_source_refs": tax_source_refs,
         "allocated_order_ids": sorted(str(item["order_id"]) for item in items),
         "component_vat_evidence": [
             {
                 "order_id": str(item["order_id"]),
+                "source_row_id": str(item.get("source_row_id") or ""),
+                "processor_ref": str(item.get("processor_ref") or ""),
+                "country_code": str(item.get("country_code") or ""),
+                "configured_rate": decimal_number(decimal_value(item.get("configured_rate"))),
+                "corrected_rate": decimal_number(decimal_value(item.get("corrected_rate"))),
                 "fixed_product_gross": decimal_number(decimal_value(item.get("fixed_product_gross"))),
                 "fixed_shipping_gross": decimal_number(decimal_value(item.get("fixed_shipping_gross"))),
                 "product_vat": decimal_number(decimal_value(item.get("corrected_product_vat"))),
                 "shipping_vat": decimal_number(decimal_value(item.get("corrected_shipping_vat"))),
+                "source_refs": copy.deepcopy(item.get("source_refs") or []),
+                "vat_profile": {
+                    "start": profile.start.isoformat(),
+                    "end": profile.end.isoformat() if profile.end is not None else None,
+                    "rate": decimal_number(profile.rate),
+                    "goods_vat_type_id": profile.goods_vat_type_id,
+                    "shipping_vat_type_id": profile.shipping_vat_type_id,
+                },
             }
             for item in sorted(items, key=lambda item: str(item["order_id"]))
+            for profile in [select_vat_period(date_value(item.get("event_date")), periods)]
         ],
     }
 
@@ -632,16 +895,10 @@ def apply_period_allocation(
         item for item in annual_allocations if item.get("period") == period
     ]
     if not period_allocations:
-        block_ambiguous_processor_vat(sales, annual_allocations)
         for sale in sales:
-            if is_demonstrably_woo_linked_sale(sale, annual_allocations):
+            if is_woo_source_sale(sale):
                 zero_unsupported_sale(sale)
         return
-    allocations_by_order: dict[str, list[dict[str, Any]]] = {}
-    for item in period_allocations:
-        order_id = str(item.get("order_id") or "")
-        if order_id:
-            allocations_by_order.setdefault(order_id, []).append(item)
 
     summary_sales = [
         sale
@@ -651,38 +908,31 @@ def apply_period_allocation(
     if len(summary_sales) > 1:
         raise WooTaxError(f"Woo tax allocation found multiple monthly summary sales for {period}.")
     if summary_sales:
-        block_ambiguous_processor_vat(sales, annual_allocations)
         residual = apply_allocation_to_monthly_summary(
             summary_sales[0], period_allocations, allocation, f"monthly summary {period}"
         )
         if residual is not None:
             records.setdefault("sales", []).append(residual)
-        for sale in sales:
-            if (
-                sale is not summary_sales[0]
-                and is_demonstrably_woo_linked_sale(sale, annual_allocations)
-            ):
-                zero_unsupported_sale(sale)
+        duplicates = match_allocations_to_sales(
+            [sale for sale in sales if sale is not summary_sales[0]], period_allocations
+        )
+        for sale in duplicates.values():
+            zero_unsupported_sale(sale)
         return
 
-    consumed_orders: set[str] = set()
-    block_ambiguous_processor_vat(sales, annual_allocations)
+    allocations_by_order = {
+        str(item.get("order_id") or ""): [item]
+        for item in period_allocations
+        if str(item.get("order_id") or "")
+    }
+    matched_sales = match_allocations_to_sales(sales, period_allocations)
     for sale in sales:
-        order_id = allocation_order_id(sale)
-        matching = allocations_by_order.get(order_id)
-        woo_linked = is_demonstrably_woo_linked_sale(sale, annual_allocations)
-        if not matching:
-            if woo_linked:
-                zero_unsupported_sale(sale)
-            continue
-        if not woo_linked:
-            continue
-        if order_id in consumed_orders:
-            raise WooTaxError(f"Woo tax allocation for order {order_id} matched more than one processor sale.")
-        apply_allocation_to_sale(sale, matching, allocation, f"order {order_id}")
-        consumed_orders.add(order_id)
+        if is_woo_source_sale(sale) and sale not in matched_sales.values():
+            zero_unsupported_sale(sale)
+    for order_id, sale in matched_sales.items():
+        apply_allocation_to_sale(sale, allocations_by_order[order_id], allocation, f"order {order_id}")
 
-    missing_orders = sorted(set(allocations_by_order) - consumed_orders)
+    missing_orders = sorted(set(allocations_by_order) - set(matched_sales))
     if missing_orders:
         raise WooTaxError("Woo tax allocation has no matching sale for order(s): " + ", ".join(missing_orders))
 
@@ -719,8 +969,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         company_slug = resolve_company_slug(company_dir=str(args.company_dir))
         if not company_slug:
             raise WooTaxError(f"Company slug is missing from {args.company_dir / 'METADATA.md'}.")
+        import bookprep
+
+        tax_evidence = bookprep.discover_canonical_woo_tax_evidence(
+            source_dir=args.company_dir / "source",
+            root_dir=Path.cwd(),
+            year=args.year,
+        )
+        if not tax_evidence:
+            raise WooTaxError("No canonical Woo tax-summary evidence was found for allocation validation.")
         path = args.company_dir / "artifacts" / "vat" / f"{args.year}-woo-tax-allocation.json"
-        artifact = load_allocation(path, company_slug=company_slug, year=args.year)
+        artifact = load_allocation(
+            path,
+            company_slug=company_slug,
+            year=args.year,
+            tax_evidence=tax_evidence,
+        )
         errors: list[str] = []
         totals = annual_totals(artifact)
         print(json.dumps({"gross": decimal_number(totals["gross"]), "original_vat": decimal_number(totals["original_vat"]), "corrected_vat": decimal_number(totals["corrected_vat"]), "errors": sorted(set(errors))}, sort_keys=True))

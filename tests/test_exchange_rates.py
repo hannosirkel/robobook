@@ -39,6 +39,11 @@ class ExchangeRateTests(unittest.TestCase):
         self.assertIn("quotes=EUR", url)
         self.assertIn("providers=ECB", url)
 
+    def test_request_identifies_the_client_to_frankfurter(self) -> None:
+        req = exchange_rates.build_frankfurter_request(2024, "USD", "EUR")
+
+        self.assertEqual(req.get_header("User-agent"), "robobook-exchange-rates/1.0")
+
     def test_lookup_uses_latest_prior_ecb_date(self) -> None:
         payload = cache_with_rates({"2024-03-28": "0.9241", "2024-04-02": "0.9280"})
 
@@ -73,6 +78,19 @@ class ExchangeRateTests(unittest.TestCase):
                 base="USD",
                 quote="EUR",
             )
+
+    def test_cache_accepts_frankfurter_prior_business_day_carry_in(self) -> None:
+        payload = cache_with_rates({"2023-12-29": "0.90498", "2024-01-02": "0.91274"})
+
+        result = exchange_rates.lookup_rate(
+            payload,
+            requested_date=date(2024, 1, 1),
+            base="USD",
+            quote="EUR",
+        )
+
+        self.assertEqual(result.effective_date, date(2023, 12, 29))
+        self.assertEqual(result.rate, Decimal("0.90498"))
 
 
 if __name__ == "__main__":

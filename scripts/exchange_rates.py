@@ -56,6 +56,14 @@ def build_frankfurter_url(year: int, base: str, quote: str) -> str:
     return f"{FRANKFURTER_RATES_URL}?{query}"
 
 
+def build_frankfurter_request(year: int, base: str, quote: str) -> request.Request:
+    return request.Request(
+        build_frankfurter_url(year, base, quote),
+        headers={"Accept": "application/json", "User-Agent": "robobook-exchange-rates/1.0"},
+        method="GET",
+    )
+
+
 def decimal_rate(value: Any) -> Decimal:
     try:
         rate = Decimal(str(value))
@@ -92,8 +100,12 @@ def validate_cache(payload: dict[str, Any], *, year: int, base: str, quote: str)
             row_date = date.fromisoformat(str(row.get("date") or ""))
         except ValueError as exc:
             raise ExchangeRateError(f"Invalid exchange-rate date {row.get('date')!r}.") from exc
-        if row_date.year != year:
-            raise ExchangeRateError(f"Exchange-rate row {row_date} falls outside {year}.")
+        carry_in_start = date(year - 1, 12, 1)
+        year_end = date(year, 12, 31)
+        if row_date < carry_in_start or row_date > year_end:
+            raise ExchangeRateError(
+                f"Exchange-rate row {row_date} falls outside the allowed carry-in/{year} window."
+            )
         if row_date in seen_dates:
             raise ExchangeRateError(f"Duplicate exchange-rate date {row_date}.")
         seen_dates.add(row_date)
@@ -168,8 +180,8 @@ def normalize_api_rows(
 
 
 def fetch_annual_rates(*, year: int, base: str, quote: str, timeout: float = 30.0) -> dict[str, Any]:
-    source_url = build_frankfurter_url(year, base, quote)
-    req = request.Request(source_url, headers={"Accept": "application/json"}, method="GET")
+    req = build_frankfurter_request(year, base, quote)
+    source_url = req.full_url
     try:
         with request.urlopen(req, timeout=timeout) as response:
             raw = response.read().decode("utf-8")

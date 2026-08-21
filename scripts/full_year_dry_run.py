@@ -6,11 +6,15 @@ import copy
 import json
 import subprocess
 import sys
+from collections import defaultdict
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 from simplbooks_api import SimplbooksError, resolve_company_name
 
+
+ORIGINAL_SUBPROCESS_RUN = subprocess.run
 
 STEP_SPECS = (
     ("bookprep", "bookprep.py"),
@@ -60,6 +64,70 @@ def extract_api_calls(*, period: str, step_summary: dict[str, Any]) -> list[dict
     return collected
 
 
+def summarize_action_artifacts(*, company_dir: Path, year: int) -> dict[str, Any]:
+    def load_action_yaml(path: Path) -> dict[str, Any]:
+        text = path.read_text(encoding="utf-8")
+        try:
+            loaded = json.loads(text)
+        except json.JSONDecodeError:
+            run = ORIGINAL_SUBPROCESS_RUN(
+                ["ruby", "-ryaml", "-rjson", "-e", "puts JSON.generate(YAML.load_file(ARGV[0]))", str(path)],
+                capture_output=True,
+                check=True,
+                text=True,
+            )
+            loaded = json.loads(run.stdout)
+        if not isinstance(loaded, dict):
+            raise SimplbooksError(f"Action artifact {path} must contain an object.")
+        return loaded
+
+    foreign_action_count = 0
+    ecb_provenance_count = 0
+    suppressed_document_count = 0
+    blocking_dependency_count = 0
+    source_reference_count = 0
+    canonical_source_reference_count = 0
+    supplier_credit_totals: dict[str, dict[str, Decimal]] = defaultdict(lambda: defaultdict(Decimal))
+
+    actions_dir = company_dir / "artifacts" / "actions"
+    for path in sorted(actions_dir.glob(f"{year}-??.yaml")) if actions_dir.exists() else []:
+        batch = load_action_yaml(path)
+        period = str(batch.get("period") or path.stem)
+        suppressed_document_count += len(batch.get("already_present") or [])
+        blocking_dependency_count += sum(
+            1 for item in batch.get("unresolved_dependencies") or [] if item.get("blocking")
+        )
+        for action in batch.get("actions") or []:
+            payload = action.get("payload") or {}
+            currency = str(payload.get("currency") or "EUR").upper()
+            if currency != "EUR":
+                foreign_action_count += 1
+                if payload.get("currency_rate_provider") == "ECB" and payload.get("currency_rate") not in (None, ""):
+                    ecb_provenance_count += 1
+            if action.get("action_type") == "create_purchase_credit_summary":
+                amount = Decimal(str((payload.get("totals") or {}).get("gross_amount") or 0))
+                supplier_credit_totals[period][currency] += amount
+            for source_ref in action.get("source_refs") or []:
+                source_reference_count += 1
+                ref_path = str(source_ref.get("path") or "")
+                relative_prefix = f"companies/{company_dir.name}/artifacts/normalized/"
+                if ref_path.startswith(str(company_dir / "artifacts" / "normalized")) or ref_path.startswith(relative_prefix):
+                    canonical_source_reference_count += 1
+
+    return {
+        "foreign_action_count": foreign_action_count,
+        "ecb_provenance_count": ecb_provenance_count,
+        "supplier_credit_totals": {
+            period: {currency: float(amount) for currency, amount in sorted(totals.items())}
+            for period, totals in sorted(supplier_credit_totals.items())
+        },
+        "suppressed_document_count": suppressed_document_count,
+        "blocking_dependency_count": blocking_dependency_count,
+        "source_reference_count": source_reference_count,
+        "canonical_source_reference_count": canonical_source_reference_count,
+    }
+
+
 def build_step_command(
     *,
     python_executable: str,
@@ -73,8 +141,20 @@ def build_step_command(
     cmd = [python_executable, f"scripts/{script_name}", "--company-dir", str(company_dir), "--period", period]
     if step_name == "bookprep" and source_dir is not None:
         cmd.extend(["--source-dir", str(source_dir)])
-    if step_name == "bookbuilder" and force_build:
-        cmd.append("--force")
+    if step_name == "bookbuilder":
+        year = period[:4]
+        cmd.extend(
+            [
+                "--posting-policy",
+                str(company_dir / "artifacts" / "posting_policy.json"),
+                "--exchange-rates",
+                str(company_dir / "artifacts" / "reference" / f"ecb-rates-{year}.json"),
+                "--discovery-overview",
+                str(company_dir / "artifacts" / "discovery" / f"{year}-overview.json"),
+            ]
+        )
+        if force_build:
+            cmd.append("--force")
     if step_name == "booksend":
         cmd.extend(["--mode", "dry-run"])
     return cmd
@@ -120,7 +200,12 @@ def run_full_year_dry_run(
             step_results.append(step_summary)
             if step_name == "booksend":
                 api_calls.extend(extract_api_calls(period=period, step_summary=step_summary))
-            if run.returncode != 0:
+            checker_failed = (
+                step_name == "bookchecker"
+                and isinstance(step_summary["stdout"], dict)
+                and step_summary["stdout"].get("result") != "pass"
+            )
+            if run.returncode != 0 or checker_failed:
                 month_success = False
                 overall_success = False
                 break
@@ -139,6 +224,7 @@ def run_full_year_dry_run(
         "force_build": force_build,
         "continue_on_error": continue_on_error,
         "overall_success": overall_success,
+        "reference_summary": summarize_action_artifacts(company_dir=company_dir, year=year),
         "api_calls": api_calls,
         "months": months,
     }

@@ -91,7 +91,7 @@ The file follows `schemas/recon-period.schema.json` and includes:
 - groups `clearing_transactions` by structured `clearing_provider`, `clearing_account`, and currency
 - requires each movement to be referenced by a reviewed allocation or a normalized bridge reference
 - when opening and closing clearing balances are present, verifies opening plus movements equals closing; otherwise the check records the precise missing evidence
-- unresolved clearing emits `clearing-continuity:<provider>:<currency>: warn` and makes report-only bank write readiness false
+- unresolved clearing emits a collision-safe `clearing-continuity:<provider>:<account>:<currency>: warn` and makes report-only bank write readiness false
 
 ## Current Blocking Rules
 

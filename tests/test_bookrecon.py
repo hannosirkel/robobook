@@ -135,6 +135,22 @@ class BookreconTests(unittest.TestCase):
         self.assertFalse(document["bank_coverage"]["coverage_ready"])
         self.assertTrue(document["approve_for_build"])
 
+    def test_whitespace_padded_bank_source_system_is_malformed_not_physical_bank(self) -> None:
+        malformed = bank_row(record_id="padded", amount=20.0)
+        malformed["source_system"] = " bank "
+
+        check, coverage = bookrecon.build_physical_bank_coverage_check(
+            normalized_path_display="normalized/2024-01.json",
+            bank_records=[malformed],
+            allocations={},
+        )
+
+        self.assertEqual(check["status"], "warn")
+        self.assertFalse(coverage["coverage_ready"])
+        self.assertEqual(coverage["physical_bank_row_count"], 0)
+        self.assertTrue(any("' bank '" in note for note in check["notes"]))
+        self.assertEqual(check["evidence_refs"][0]["record_refs"], ["padded"])
+
     def test_duplicate_reviewed_allocation_is_report_only_warning(self) -> None:
         normalized = base_normalized()
         normalized["records"]["bank_transactions"] = [bank_row(record_id="a", amount=20.0)]
@@ -237,6 +253,50 @@ class BookreconTests(unittest.TestCase):
             ],
         )
 
+    def test_balance_only_camt_ledger_is_reported_with_zero_movement(self) -> None:
+        balances = [
+            record(record_id="open", source_system="bank", event_type="bank_balance", gross_amount=100.0, currency="EUR", attributes={"iban": "EE999", "balance_type": "OPBD"}),
+            record(record_id="close", source_system="bank", event_type="bank_balance", gross_amount=100.0, currency="EUR", attributes={"iban": "EE999", "balance_type": "CLBD"}),
+        ]
+
+        check, coverage = bookrecon.build_physical_bank_coverage_check(
+            normalized_path_display="normalized/2024-01.json",
+            bank_records=[],
+            allocations={},
+            bank_balance_records=balances,
+        )
+
+        self.assertEqual(check["status"], "pass")
+        self.assertTrue(coverage["coverage_ready"])
+        self.assertEqual(
+            coverage["ledgers"],
+            [{"iban": "EE999", "currency": "EUR", "physical_bank_row_count": 0, "allocated_row_count": 0, "unallocated_row_count": 0, "credit_total": 0.0, "debit_total": 0.0, "net_movement": 0.0, "camt_opening_balance": 100.0, "computed_closing_balance": 100.0, "camt_closing_balance": 100.0}],
+        )
+
+    def test_clearing_accounts_with_same_provider_currency_have_separate_checks(self) -> None:
+        records = base_normalized()["records"]
+        records["clearing_transactions"] = [
+            record(record_id="wallet-one", source_system="printful", event_type="wallet", gross_amount=5.0, attributes={"clearing_provider": "printful", "clearing_account": "wallet:one", "opening_balance": 10.0, "closing_balance": 15.0}),
+            record(record_id="wallet-two", source_system="printful", event_type="wallet", gross_amount=-3.0, attributes={"clearing_provider": "printful", "clearing_account": "wallet-two", "opening_balance": 20.0, "closing_balance": 17.0}),
+        ]
+        records["other"] = [
+            record(record_id="bridge", source_system="printful", event_type="bridge", gross_amount=0.0, attributes={"clearing_record_ids": ["wallet-one", "wallet-two"]}),
+        ]
+
+        checks, ready = bookrecon.build_clearing_continuity_checks(
+            normalized_path_display="normalized/2024-01.json",
+            records=records,
+            allocations={},
+        )
+
+        self.assertTrue(ready)
+        self.assertEqual([check["check_id"] for check in checks], [
+            "clearing-continuity:printful:wallet-two:eur",
+            "clearing-continuity:printful:wallet%3Aone:eur",
+        ])
+        self.assertEqual([check["lhs_amount"] for check in checks], [-3.0, 5.0])
+        self.assertTrue(all(check["status"] == "pass" for check in checks))
+
     def test_unresolved_clearing_warns_without_changing_legacy_build_approval(self) -> None:
         normalized = base_normalized()
         normalized["records"]["clearing_transactions"] = [
@@ -259,7 +319,7 @@ class BookreconTests(unittest.TestCase):
                 quantity_threshold=bookrecon.Decimal("1"),
             )
 
-        check = find_check(document, "clearing-continuity:printful:eur")
+        check = find_check(document, "clearing-continuity:printful:printful_wallet:eur")
         self.assertEqual(check["status"], "warn")
         self.assertFalse(document["bank_coverage"]["coverage_ready"])
         self.assertTrue(document["approve_for_build"])

@@ -10,6 +10,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from bank_allocations import BankAllocationError, bank_ledger_key, load_bank_allocations, period_allocations, statement_identity
 from bookbuilder import planned_sales_groups
@@ -440,7 +441,11 @@ def build_physical_bank_coverage_check(
     indexed: dict[str, tuple[dict[str, Any], tuple[str, str]]] = {}
     ledger_rows: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for record in bank_records:
-        if str(record.get("source_system") or "").strip() != "bank":
+        if record.get("source_system") != "bank":
+            errors.append(
+                f"Malformed bank transaction {record.get('record_id') or '<unknown>'}: "
+                f"source_system must be exactly 'bank', got {record.get('source_system')!r}."
+            )
             continue
         try:
             statement_id = statement_identity(record)
@@ -485,9 +490,9 @@ def build_physical_bank_coverage_check(
     openings, closings, balance_errors = _bank_balance_values(bank_balance_records or [])
     errors.extend(balance_errors)
     ledgers: list[dict[str, Any]] = []
-    for ledger in sorted(ledger_rows):
+    for ledger in sorted(set(ledger_rows) | set(openings) | set(closings)):
         iban, currency = ledger
-        rows = ledger_rows[ledger]
+        rows = ledger_rows.get(ledger, [])
         movement = sum_amount(rows)
         opening_values = openings.get(ledger, [])
         closing_values = closings.get(ledger, [])
@@ -538,6 +543,9 @@ def build_physical_bank_coverage_check(
         status = "warn"
     elif indexed:
         notes = ["Every physical bank row has one exact reviewed allocation; CAMT balances agree where both endpoints were available."]
+        status = "pass"
+    elif ledgers:
+        notes = ["No physical bank rows were normalized; CAMT balance-only ledgers agree with zero movement."]
         status = "pass"
     else:
         notes = ["No physical bank rows were normalized for this period."]
@@ -602,7 +610,7 @@ def build_clearing_continuity_checks(
             bridge_references.update(_reference_values((record.get("attributes") or {}).get("clearing_record_ids")))
             bridge_references.update(_reference_values((record.get("attributes") or {}).get("clearing_reference")))
 
-    results: dict[tuple[str, str], list[tuple[str, list[dict[str, Any]], list[str]]]] = {}
+    results: dict[tuple[str, str, str], tuple[list[dict[str, Any]], list[str]]] = {}
     for (provider, account, currency), group_records in grouped.items():
         missing = [
             str(record.get("record_id") or "<unknown>")
@@ -625,19 +633,19 @@ def build_clearing_continuity_checks(
                 )
         else:
             notes.append(f"{account}: no paired opening and closing clearing balances were normalized.")
-        results.setdefault((provider, currency), []).append((account, group_records, notes))
+        results[(provider, account, currency)] = group_records, notes
 
     checks: list[dict[str, Any]] = []
     ready = True
-    for (provider, currency), account_results in sorted(results.items()):
-        notes = [note for _, _, account_notes in account_results for note in account_notes]
+    for (provider, account, currency), (group_records, notes) in sorted(results.items()):
         status = "pass" if not notes else "warn"
         ready = ready and status == "pass"
-        group_records = [record for _, records_for_account, _ in account_results for record in records_for_account]
         checks.append(
             make_check(
-                check_id=f"clearing-continuity:{provider}:{currency.lower()}",
-                name=f"{provider} clearing continuity ({currency})",
+                check_id=(
+                    f"clearing-continuity:{quote(provider, safe='')}:{quote(account, safe='')}:{quote(currency.lower(), safe='')}"
+                ),
+                name=f"{provider} {account} clearing continuity ({currency})",
                 status=status,
                 lhs_label="Clearing net movement",
                 lhs_amount=sum_amount(group_records),

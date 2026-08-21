@@ -134,6 +134,11 @@ def _decimal_field(allocation: dict[str, Any], field: str, errors: list[str], la
 def validate_allocation(payload: dict[str, Any]) -> list[str]:
     """Return deterministic errors for an annual allocation; do not alter *payload*."""
     errors: list[str] = []
+    policy = payload.get("policy")
+    if not isinstance(policy, dict):
+        errors.append("policy must be an object")
+    elif policy.get("merchant_absorbs_vat") is not True:
+        errors.append("merchant_absorbs_vat must be true")
     source_rows = payload.get("source_rows") or []
     allocations = payload.get("allocations") or []
     if not isinstance(source_rows, list):
@@ -269,7 +274,12 @@ def validate_allocation(payload: dict[str, Any]) -> list[str]:
                     errors.append(f"monthly totals {period} must be an object")
                     continue
                 for field, amount in actual.items():
-                    if not same_money(decimal_value(supplied.get(field)), amount):
+                    supplied_amount = decimal_value(supplied.get(field))
+                    if supplied_amount < 0:
+                        errors.append(f"monthly totals {period} has negative {field}")
+                    elif supplied_amount != money(supplied_amount):
+                        errors.append(f"monthly totals {period} has fractional-cent {field}")
+                    elif supplied_amount != amount:
                         errors.append(f"monthly totals {period} {field} do not match allocations")
     except WooTaxError as error:
         errors.append(str(error))

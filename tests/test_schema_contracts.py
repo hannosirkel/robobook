@@ -103,6 +103,12 @@ class SchemaContractTests(unittest.TestCase):
         artifact = json.loads((ROOT / "templates/woo-tax-allocation.template.json").read_text(encoding="utf-8"))
         self.assert_artifact_valid(schema_name="woo-tax-allocation.schema.json", artifact=artifact)
 
+    def test_woo_tax_allocation_schema_requires_merchant_to_absorb_vat(self) -> None:
+        artifact = json.loads((ROOT / "templates/woo-tax-allocation.template.json").read_text(encoding="utf-8"))
+        artifact["policy"]["merchant_absorbs_vat"] = False
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="woo-tax-allocation.schema.json", artifact=artifact)
+
     def test_generated_action_batch_matches_strict_schema(self) -> None:
         categories = (
             "sales", "refunds", "fees", "payouts", "bank_transactions", "purchase_expenses",

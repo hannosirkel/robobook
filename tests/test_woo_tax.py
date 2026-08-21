@@ -90,6 +90,22 @@ class WooTaxTests(unittest.TestCase):
         payload["monthly_totals"] = []
         self.assertIn("monthly_totals must be an object", woo_tax.validate_allocation(payload))
 
+    def test_validate_allocation_rejects_policy_without_fixed_gross_absorption(self) -> None:
+        payload = allocation_fixture()
+        payload["policy"]["merchant_absorbs_vat"] = False
+        self.assertIn("merchant_absorbs_vat must be true", woo_tax.validate_allocation(payload))
+
+    def test_build_allocation_marks_non_absorbed_policy_as_failed(self) -> None:
+        review = allocation_fixture()
+        review["policy"]["merchant_absorbs_vat"] = False
+        self.assertEqual(woo_tax.build_allocation(review)["validation"]["status"], "fail")
+
+    def test_validate_allocation_rejects_fractional_cent_monthly_total(self) -> None:
+        payload = allocation_fixture()
+        payload["monthly_totals"]["2025-05"]["corrected_vat"] = 21.641
+        errors = woo_tax.validate_allocation(payload)
+        self.assertIn("monthly totals 2025-05 has fractional-cent corrected_vat", errors)
+
     def test_build_allocation_derives_rate_components_and_month_totals(self) -> None:
         review = allocation_fixture()
         allocation = review["allocations"][0]

@@ -52,7 +52,7 @@
       "properties": {
         "oss_registered": {"type": "boolean"},
         "dispatch_origin": {"type": "string", "pattern": "^[A-Z]{2}$"},
-        "merchant_absorbs_vat": {"type": "boolean"}
+        "merchant_absorbs_vat": {"const": true}
       }
     },
     "vat_period": {

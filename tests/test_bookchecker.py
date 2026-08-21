@@ -215,6 +215,25 @@ def build_clean_artifacts(tmp: Path, *, recon_approve: bool = True, force: bool 
 
 
 class BookcheckerTests(unittest.TestCase):
+    def test_checker_fails_company_batch_with_temp_source_reference(self) -> None:
+        action = payment_action(
+            key="example-2024-01-payment-vendor",
+            period="2024-01",
+            amount=10.0,
+            linked_purchase_action="example-2024-01-purchase-vendor",
+            source_path="temp/2024/bank.csv",
+            record_ref="bank:1",
+        )
+
+        findings = bookchecker.evaluate_source_locations(
+            {"actions": [action]},
+            company_dir=Path("companies/example"),
+        )
+
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["severity"], "error")
+        self.assertIn("canonical", findings[0]["summary"].lower())
+
     def test_checker_passes_clean_batch(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)

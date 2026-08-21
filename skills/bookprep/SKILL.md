@@ -32,6 +32,7 @@ submission.
 5. Ignore `.gsheet` accountant work files entirely during intake.
    They are not source data and should not appear in the normalized manifest.
 6. Treat the `sources` array inside the normalized JSON as the source manifest for the period.
+7. For company workflows, keep canonical source references under `companies/<company>/source/`; `temp/` is review-only scratch.
 
 ## Command
 

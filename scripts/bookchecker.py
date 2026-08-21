@@ -151,6 +151,63 @@ def action_label(action: dict[str, Any]) -> str:
     return str(action.get("idempotency_key") or "<unknown-action>")
 
 
+def is_temp_source_path(value: Any) -> bool:
+    text = str(value or "").strip().replace("\\", "/")
+    parts = [part for part in text.split("/") if part not in {"", "."}]
+    return "temp" in parts
+
+
+def evaluate_source_locations(
+    action_batch: dict[str, Any],
+    *,
+    company_dir: Path | None,
+) -> list[dict[str, Any]]:
+    if company_dir is None:
+        return []
+    findings: list[dict[str, Any]] = []
+    for action in action_batch.get("actions") or []:
+        for ref in action.get("source_refs") or []:
+            path_text = str(ref.get("path") or "")
+            if is_temp_source_path(path_text):
+                findings.append(
+                    make_finding(
+                        section="source_reference_coverage",
+                        severity="error",
+                        summary=f"Company action references disposable source path {path_text!r}; canonical source evidence is required.",
+                        action_id=action_label(action),
+                    )
+                )
+    return findings
+
+
+def evaluate_resolved_record_source_locations(
+    *,
+    action: dict[str, Any],
+    resolved_sources: list[dict[str, Any]],
+    company_dir: Path | None,
+) -> list[dict[str, Any]]:
+    if company_dir is None:
+        return []
+    findings: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for resolved in resolved_sources:
+        record = resolved.get("record") or {}
+        for ref in record.get("source_refs") or []:
+            path_text = str(ref.get("path") or "")
+            if not is_temp_source_path(path_text) or path_text in seen:
+                continue
+            seen.add(path_text)
+            findings.append(
+                make_finding(
+                    section="source_reference_coverage",
+                    severity="error",
+                    summary=f"Normalized evidence points to disposable source path {path_text!r}; regenerate from canonical company source.",
+                    action_id=action_label(action),
+                )
+            )
+    return findings
+
+
 def resolve_path(path_text: str, *, cwd: Path, action_path: Path) -> Path:
     candidate = Path(path_text)
     if candidate.is_absolute():
@@ -839,6 +896,7 @@ def evaluate_action_batch(
     recon_path: Path,
     policy_text: str | None,
     cwd: Path,
+    company_dir: Path | None = None,
 ) -> dict[str, Any]:
     findings: list[dict[str, Any]] = []
     payload_cache: dict[Path, dict[str, Any]] = {}
@@ -846,6 +904,7 @@ def evaluate_action_batch(
     resolved_sources_by_action: dict[str, list[dict[str, Any]]] = {}
 
     findings.extend(evaluate_duplicates(action_batch))
+    findings.extend(evaluate_source_locations(action_batch, company_dir=company_dir))
     findings.extend(
         evaluate_recon_alignment(
             action_batch=action_batch,
@@ -872,6 +931,13 @@ def evaluate_action_batch(
 
     for action in action_batch.get("actions") or []:
         resolved_sources = resolved_sources_by_action.get(action_label(action), [])
+        findings.extend(
+            evaluate_resolved_record_source_locations(
+                action=action,
+                resolved_sources=resolved_sources,
+                company_dir=company_dir,
+            )
+        )
         findings.extend(
             evaluate_arithmetic(
                 action=action,
@@ -1057,6 +1123,7 @@ def main() -> int:
         recon_path=recon_path,
         policy_text=policy_text,
         cwd=cwd,
+        company_dir=company_dir,
     )
 
     company_slug = str(action_batch.get("company_slug") or (company_dir.name if company_dir else action_path.stem))

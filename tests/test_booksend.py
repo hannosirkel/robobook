@@ -133,6 +133,28 @@ def purchase_action(*, key: str = "example-2024-01-purchase-printful") -> dict:
     }
 
 
+def purchase_credit_action() -> dict:
+    action = purchase_action(key="example-2024-07-purchase-credit-printful")
+    action["period"] = "2024-07"
+    action["action_type"] = "create_purchase_credit_summary"
+    action["payload"]["draft_schema"] = "purchase_credit_summary_v1"
+    action["payload"]["document_type"] = "purchase_credit"
+    action["payload"]["document_date"] = "2024-07-31"
+    action["payload"]["currency"] = "USD"
+    action["payload"]["currency_rate"] = 0.9241
+    action["payload"]["currency_rate_provider"] = "ECB"
+    action["payload"]["currency_rate_effective_date"] = "2024-07-31"
+    action["payload"]["totals"]["gross_amount"] = 113.12
+    action["payload"]["line_items"][0].update(
+        {
+            "line_role": "purchase_credit",
+            "gross_amount": 113.12,
+            "warehouse_id_hint": None,
+        }
+    )
+    return action
+
+
 def incoming_action(
     *,
     key: str = "example-2024-01-incoming-paypal",
@@ -253,6 +275,26 @@ class FakeClient:
 
 
 class BooksendTests(unittest.TestCase):
+    def test_sender_copies_reviewed_rate_and_translates_supplier_credit(self) -> None:
+        translated = booksend.translate_action_for_api(purchase_credit_action(), lookup={})
+
+        self.assertEqual(translated["payload"]["Purchase"]["currency_rate"], 0.9241)
+        self.assertEqual(translated["payload"]["PurchaseRows"][0]["PurchaseRow"]["sum"], -113.12)
+
+    def test_sender_rejects_foreign_action_without_reviewed_rate(self) -> None:
+        action = purchase_action()
+        action["payload"]["currency"] = "USD"
+
+        with self.assertRaisesRegex(SimplbooksError, "reviewed currency_rate"):
+            booksend.translate_action_for_api(action, lookup={})
+
+    def test_sender_rejects_inventory_linked_supplier_credit(self) -> None:
+        action = purchase_credit_action()
+        action["payload"]["line_items"][0]["warehouse_id_hint"] = "6"
+
+        with self.assertRaisesRegex(SimplbooksError, "inventory-linked"):
+            booksend.translate_action_for_api(action, lookup={})
+
     def test_dry_run_updates_actions_and_uses_translated_payloads(self) -> None:
         batch = make_batch(approval_status="draft")
 

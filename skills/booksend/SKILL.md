@@ -28,6 +28,8 @@ Do not use this skill for source parsing, reconciliation, draft generation, or p
 3. Require `approval_status: approved` or `submitted`, a passing check report that matches the batch ID and current action-file SHA, and `--confirm-write` before `--mode write`.
 4. Use `scripts/booksend.py` as the main entrypoint.
 5. Let the runner translate draft schemas into live Simplbooks `create` payloads instead of posting the draft payloads directly.
+   Foreign-currency drafts must carry the checker-reviewed ECB rate and provenance; the runner copies that rate and never invents one.
+   Non-inventory supplier-credit drafts are translated into purchase invoices with negative line sums.
 6. Keep execution order dependency-stable and stop on the first hard failure unless `--continue-on-error` is explicit.
 7. Preserve the updated action file and submission log together so reruns remain auditable.
 
@@ -67,6 +69,8 @@ Implemented write targets:
 - Already successful actions are skipped on rerun instead of being resent.
 - Automatic rollback is not implemented; the submission log carries a manual reversal plan only.
 - Master-data creation endpoints stay blocked unless separately approved.
+- Reject foreign-currency actions without a positive reviewed rate.
+- Reject supplier credits with non-positive draft magnitudes or inventory/article links; those need original stock-batch handling.
 
 ## References
 

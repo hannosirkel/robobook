@@ -24,6 +24,7 @@ SECTIONS = (
     "source_reference_coverage",
     "arithmetic_consistency",
     "account_and_vat_review",
+    "exchange_rate_review",
     "recon_alignment",
     "historical_outliers",
 )
@@ -33,6 +34,7 @@ SECTION_TITLES = {
     "source_reference_coverage": "Source Reference Coverage",
     "arithmetic_consistency": "Arithmetic Consistency",
     "account_and_vat_review": "Account And VAT Review",
+    "exchange_rate_review": "Exchange Rate Review",
     "recon_alignment": "Recon Alignment",
     "historical_outliers": "Historical Outliers",
 }
@@ -705,7 +707,7 @@ def evaluate_account_vat(
                     action_id=action_label(action),
                 )
             )
-        if draft_schema == "purchase_summary_v1" and gross_amount > 0 and expense_account_id in (None, ""):
+        if draft_schema in {"purchase_summary_v1", "purchase_credit_summary_v1"} and gross_amount > 0 and expense_account_id in (None, ""):
             findings.append(
                 make_finding(
                     section="account_and_vat_review",
@@ -714,6 +716,25 @@ def evaluate_account_vat(
                     action_id=action_label(action),
                 )
             )
+        if draft_schema == "purchase_credit_summary_v1":
+            if decimal_value(line.get("gross_amount")) <= 0:
+                findings.append(
+                    make_finding(
+                        section="account_and_vat_review",
+                        severity="error",
+                        summary="Supplier-credit lines must use positive reviewed magnitudes; sender applies the posting sign.",
+                        action_id=action_label(action),
+                    )
+                )
+            if line.get("article_id_hint") not in (None, "") or line.get("warehouse_id_hint") not in (None, ""):
+                findings.append(
+                    make_finding(
+                        section="account_and_vat_review",
+                        severity="error",
+                        summary="Inventory-linked supplier credit requires original stock-batch handling.",
+                        action_id=action_label(action),
+                    )
+                )
         if gross_amount > 0 and vat_type_id in (None, ""):
             findings.append(
                 make_finding(
@@ -750,6 +771,65 @@ def evaluate_account_vat(
                 severity="error",
                 summary="Cash-settlement draft does not resolve a bank account ID.",
                 action_id=action_label(action),
+            )
+        )
+    return findings
+
+
+def evaluate_exchange_rates(
+    action_batch: dict[str, Any],
+    *,
+    base_currency: str = "EUR",
+) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    for action in action_batch.get("actions") or []:
+        payload = action.get("payload") or {}
+        currency = str(payload.get("currency") or base_currency).strip().upper()
+        if currency == base_currency.upper():
+            continue
+        action_id = action_label(action)
+        rate = decimal_value(payload.get("currency_rate"))
+        provider = str(payload.get("currency_rate_provider") or "")
+        source_url = str(payload.get("currency_rate_source_url") or "")
+        requested_date = str(payload.get("currency_rate_requested_date") or payload.get("document_date") or "")
+        effective_date = str(payload.get("currency_rate_effective_date") or "")
+        errors: list[str] = []
+        if rate <= 0:
+            errors.append("a positive currency_rate")
+        if provider != "ECB":
+            errors.append("currency_rate_provider=ECB")
+        if not source_url.startswith("https://api.frankfurter.dev/v2/rates"):
+            errors.append("Frankfurter source provenance")
+        try:
+            requested = datetime.fromisoformat(requested_date).date()
+            effective = datetime.fromisoformat(effective_date).date()
+            if effective > requested:
+                errors.append("an effective rate date on or before the requested date")
+        except ValueError:
+            errors.append("valid requested/effective rate dates")
+        if errors:
+            findings.append(
+                make_finding(
+                    section="exchange_rate_review",
+                    severity="error",
+                    summary=f"Foreign-currency action lacks {', '.join(errors)}.",
+                    action_id=action_id,
+                )
+            )
+    return findings
+
+
+def evaluate_unresolved_dependencies(action_batch: dict[str, Any]) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    for dependency in action_batch.get("unresolved_dependencies") or []:
+        if not dependency.get("blocking"):
+            continue
+        findings.append(
+            make_finding(
+                section="account_and_vat_review",
+                severity="error",
+                summary=str(dependency.get("reason") or "Action batch has a blocking unresolved dependency."),
+                action_id=str(dependency.get("action_id") or "") or None,
             )
         )
     return findings
@@ -904,6 +984,8 @@ def evaluate_action_batch(
     resolved_sources_by_action: dict[str, list[dict[str, Any]]] = {}
 
     findings.extend(evaluate_duplicates(action_batch))
+    findings.extend(evaluate_exchange_rates(action_batch))
+    findings.extend(evaluate_unresolved_dependencies(action_batch))
     findings.extend(evaluate_source_locations(action_batch, company_dir=company_dir))
     findings.extend(
         evaluate_recon_alignment(

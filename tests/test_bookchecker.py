@@ -215,6 +215,38 @@ def build_clean_artifacts(tmp: Path, *, recon_approve: bool = True, force: bool 
 
 
 class BookcheckerTests(unittest.TestCase):
+    def test_checker_fails_unproven_foreign_rate(self) -> None:
+        action = payment_action(
+            key="example-2024-01-payment-vendor",
+            period="2024-01",
+            amount=10.0,
+            linked_purchase_action="example-2024-01-purchase-vendor",
+            source_path="companies/example/artifacts/normalized/2024-01.json",
+            record_ref="bank:1",
+        )
+        action["payload"]["currency"] = "USD"
+        action["payload"]["currency_rate"] = 1
+
+        findings = bookchecker.evaluate_exchange_rates({"actions": [action]})
+
+        self.assertTrue(any(item["severity"] == "error" for item in findings))
+
+    def test_checker_fails_blocking_unresolved_dependency(self) -> None:
+        findings = bookchecker.evaluate_unresolved_dependencies(
+            {
+                "unresolved_dependencies": [
+                    {
+                        "action_id": "example-2024-01-incoming-paypal",
+                        "kind": "contact_mapping",
+                        "blocking": True,
+                        "reason": "PayPal contact requires creation.",
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual(findings[0]["severity"], "error")
+
     def test_checker_fails_company_batch_with_temp_source_reference(self) -> None:
         action = payment_action(
             key="example-2024-01-payment-vendor",

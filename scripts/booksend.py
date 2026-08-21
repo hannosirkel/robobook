@@ -324,7 +324,7 @@ def translate_invoice_payload(
             "created": document_date,
             "transaction_date": document_date,
             "currency_name": currency,
-            "currency_rate": 1,
+            "currency_rate": reviewed_currency_rate(payload),
             "row_sum_with_vat": True,
             "additional_info": str(counterparty.get("display_name_hint") or action_id(action)),
         }
@@ -357,7 +357,20 @@ def translate_invoice_payload(
     }
 
 
-def translate_purchase_payload(action: dict[str, Any]) -> dict[str, Any]:
+def reviewed_currency_rate(payload: dict[str, Any], *, base_currency: str = "EUR") -> float:
+    currency = str(payload.get("currency") or base_currency).strip().upper()
+    if currency == base_currency.upper():
+        return 1.0
+    raw_rate = payload.get("currency_rate")
+    if raw_rate in (None, ""):
+        raise SimplbooksError(f"Foreign-currency action is missing a reviewed currency_rate for {currency}.")
+    rate = decimal_value(raw_rate)
+    if rate <= 0:
+        raise SimplbooksError(f"Foreign-currency action has invalid reviewed currency_rate {raw_rate!r} for {currency}.")
+    return decimal_number(rate)
+
+
+def translate_purchase_payload(action: dict[str, Any], *, credit: bool = False) -> dict[str, Any]:
     payload = action.get("payload") or {}
     counterparty = payload.get("counterparty") or {}
     document_date = str(payload.get("document_date") or "")
@@ -366,8 +379,16 @@ def translate_purchase_payload(action: dict[str, Any]) -> dict[str, Any]:
     rows = []
     for index, line in enumerate(payload.get("line_items") or [], start=1):
         gross_amount = decimal_value(line.get("gross_amount"))
+        if credit:
+            if gross_amount <= 0:
+                raise SimplbooksError(f"{action_id(action)} credit line {index} must contain a positive reviewed magnitude.")
+            if line.get("article_id_hint") not in (None, "") or line.get("warehouse_id_hint") not in (None, ""):
+                raise SimplbooksError(
+                    f"{action_id(action)} credit line {index} is inventory-linked and requires original stock-batch handling."
+                )
         vat_amount_hint = line.get("vat_amount_hint")
         vat_amount = None if vat_amount_hint in (None, "") else abs(decimal_value(vat_amount_hint))
+        posted_amount = -gross_amount if credit else gross_amount
         row = compact_dict(
             {
                 "expense_account_id": api_id(
@@ -387,7 +408,7 @@ def translate_purchase_payload(action: dict[str, Any]) -> dict[str, Any]:
                 "name": str(line.get("description") or f"Line {index}"),
                 "unit": "summary",
                 "amount": 1,
-                "sum": decimal_number(gross_amount),
+                "sum": decimal_number(posted_amount),
                 "vat": rounded_rate(gross_amount, vat_amount),
                 "discount": 0,
             }
@@ -402,9 +423,13 @@ def translate_purchase_payload(action: dict[str, Any]) -> dict[str, Any]:
             "created": document_date,
             "transaction_date": document_date,
             "currency_name": currency,
-            "currency_rate": 1,
+            "currency_rate": reviewed_currency_rate(payload),
             "row_sum_with_vat": True,
-            "vat": payload.get("totals", {}).get("vat_amount"),
+            "vat": (
+                -abs(decimal_number(decimal_value(payload.get("totals", {}).get("vat_amount"))) or 0)
+                if credit
+                else payload.get("totals", {}).get("vat_amount")
+            ),
             "comments": str(counterparty.get("display_name_hint") or action_id(action)),
         }
     )
@@ -433,7 +458,7 @@ def translate_cash_settlement_payload(
     common = {
         "income_account_id": api_id(payload.get("bank_account_id"), field_name=f"{action_id(action)} bank_account_id"),
         "currency_name": currency,
-        "currency_rate": 1,
+        "currency_rate": reviewed_currency_rate(payload),
         "client_id": api_id(counterparty.get("contact_id"), field_name=f"{action_id(action)} client_id"),
     }
 
@@ -514,6 +539,8 @@ def translate_action_for_api(
         )
     if draft_schema == "purchase_summary_v1":
         return translate_purchase_payload(action)
+    if draft_schema == "purchase_credit_summary_v1":
+        return translate_purchase_payload(action, credit=True)
     if draft_schema == "cash_settlement_v1":
         return translate_cash_settlement_payload(
             action,

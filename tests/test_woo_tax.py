@@ -133,6 +133,61 @@ class WooTaxTests(unittest.TestCase):
 
         self.assertEqual(records["sales"][0]["vat_amount"], 0.0)
         self.assertEqual(records["sales"][0]["net_amount"], 50.0)
+        self.assertEqual(records["sales"][1]["vat_amount"], 24.0)
+        self.assertEqual(records["sales"][1]["net_amount"], 100.0)
+
+    def test_apply_period_allocation_zero_rates_woo_linked_order_when_period_has_no_allocations(self) -> None:
+        records = normalized_sales_fixture(
+            gross=Decimal("50.00"), vat=Decimal("5.00"), order_id="EXAMPLE-US-1"
+        )
+
+        woo_tax.apply_period_allocation(records, allocation_fixture(), "2025-11")
+
+        sale = records["sales"][0]
+        self.assertEqual(sale["gross_amount"], 50.0)
+        self.assertEqual(sale["vat_amount"], 0.0)
+        self.assertEqual(sale["net_amount"], 50.0)
+
+    def test_apply_period_summary_allocation_preserves_unrelated_non_woo_sale(self) -> None:
+        records = monthly_woo_summary_fixture(
+            gross=Decimal("124.00"), vat=Decimal("22.36"), period="2025-11"
+        )
+        unrelated = normalized_sales_fixture(
+            gross=Decimal("75.00"), vat=Decimal("15.00"), order_id="MARKETPLACE-1"
+        )["sales"][0]
+        unrelated.update({"source_system": "marketplace", "channel": "marketplace"})
+        unrelated["attributes"] = {}
+        unrelated["external_ref"] = "pi_example"
+        linked_processor = normalized_sales_fixture(
+            gross=Decimal("124.00"), vat=Decimal("22.36"), order_id="EXAMPLE-1"
+        )["sales"][0]
+        records["sales"].extend([unrelated, linked_processor])
+
+        woo_tax.apply_period_allocation(records, period_allocation_fixture(), "2025-11")
+
+        self.assertEqual(unrelated["gross_amount"], 75.0)
+        self.assertEqual(unrelated["vat_amount"], 15.0)
+        self.assertEqual(unrelated["net_amount"], 60.0)
+        self.assertEqual(linked_processor["gross_amount"], 124.0)
+        self.assertEqual(linked_processor["vat_amount"], 0.0)
+        self.assertEqual(linked_processor["net_amount"], 124.0)
+
+    def test_apply_period_summary_allocation_blocks_ambiguous_processor_vat(self) -> None:
+        records = monthly_woo_summary_fixture(
+            gross=Decimal("124.00"), vat=Decimal("22.36"), period="2025-11"
+        )
+        ambiguous = normalized_sales_fixture(
+            gross=Decimal("75.00"), vat=Decimal("15.00"), order_id="UNPROVEN-1"
+        )["sales"][0]
+        ambiguous["attributes"] = {}
+        ambiguous["external_ref"] = "ch_unproven"
+        records["sales"].append(ambiguous)
+
+        with self.assertRaisesRegex(woo_tax.WooTaxError, "ambiguous processor sale"):
+            woo_tax.apply_period_allocation(records, period_allocation_fixture(), "2025-11")
+
+        self.assertEqual(ambiguous["vat_amount"], 15.0)
+        self.assertEqual(ambiguous["net_amount"], 60.0)
 
     def test_apply_period_allocation_aggregates_monthly_woo_summary(self) -> None:
         records = monthly_woo_summary_fixture(gross=Decimal("248.00"), vat=Decimal("44.72"), period="2025-11")

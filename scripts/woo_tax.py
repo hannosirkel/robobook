@@ -357,6 +357,82 @@ def allocation_order_id(record: dict[str, Any]) -> str:
     return ""
 
 
+def record_link_values(record: dict[str, Any]) -> tuple[set[str], set[str]]:
+    """Return order and processor identifiers carried by a normalized sale."""
+    attributes = record.get("attributes")
+    order_refs: set[str] = set()
+    processor_refs: set[str] = set()
+    if isinstance(attributes, dict):
+        order_id = str(attributes.get("order_id") or "").strip()
+        if order_id:
+            order_refs.add(order_id)
+        for key in ("stripe_source_id", "stripe_balance_transaction_id"):
+            value = str(attributes.get(key) or "").strip()
+            if value:
+                processor_refs.add(value)
+    external_ref = str(record.get("external_ref") or "").strip()
+    if external_ref:
+        processor_refs.add(external_ref)
+        if not order_refs:
+            order_refs.add(external_ref)
+    return order_refs, processor_refs
+
+
+def linked_allocation_order_ids(
+    sale: dict[str, Any], allocations: list[dict[str, Any]]
+) -> set[str]:
+    order_refs, processor_refs = record_link_values(sale)
+    return {
+        str(item.get("order_id") or "")
+        for item in allocations
+        if str(item.get("order_id") or "") in order_refs
+        or str(item.get("processor_ref") or "") in processor_refs
+    } - {""}
+
+
+def is_processor_sale(sale: dict[str, Any]) -> bool:
+    source_system = str(sale.get("source_system") or "").lower()
+    channel = str(sale.get("channel") or "").lower()
+    event_type = str(sale.get("event_type") or "").lower()
+    if source_system:
+        return source_system in {"stripe", "paypal"}
+    if channel:
+        return channel in {"stripe", "paypal"}
+    return event_type.startswith(("stripe_", "paypal_"))
+
+
+def is_demonstrably_woo_linked_sale(
+    sale: dict[str, Any], allocations: list[dict[str, Any]]
+) -> bool:
+    if sale.get("source_system") == "woo" or sale.get("channel") == "woo":
+        return True
+    if not is_processor_sale(sale):
+        return False
+    attributes = sale.get("attributes")
+    if isinstance(attributes, dict) and any(
+        attributes.get(key) not in (None, "") for key in ("order_id", "order_key")
+    ):
+        return True
+    return bool(linked_allocation_order_ids(sale, allocations))
+
+
+def block_ambiguous_processor_vat(
+    sales: list[dict[str, Any]], allocations: list[dict[str, Any]]
+) -> None:
+    ambiguous = [
+        str(sale.get("record_id") or sale.get("external_ref") or "unknown")
+        for sale in sales
+        if is_processor_sale(sale)
+        and not is_demonstrably_woo_linked_sale(sale, allocations)
+        and decimal_value(sale.get("vat_amount")) != 0
+    ]
+    if ambiguous:
+        raise WooTaxError(
+            "Woo tax allocation found ambiguous processor sale(s) with source VAT: "
+            + ", ".join(sorted(ambiguous))
+        )
+
+
 def allocation_components(items: list[dict[str, Any]]) -> dict[str, Decimal]:
     product_gross = sum(
         (decimal_value(item.get("fixed_product_gross")) for item in items), Decimal("0")
@@ -435,13 +511,17 @@ def apply_period_allocation(
     records: dict[str, list[dict[str, Any]]], allocation: dict[str, Any], period: str
 ) -> None:
     """Apply reviewed fixed-gross VAT allocations to matching processor sales in one period."""
+    sales = [sale for sale in records.get("sales") or [] if isinstance(sale, dict)]
+    annual_allocations = [
+        item for item in allocation.get("allocations") or [] if isinstance(item, dict)
+    ]
     period_allocations = [
-        item for item in allocation.get("allocations") or []
-        if isinstance(item, dict) and item.get("period") == period
+        item for item in annual_allocations if item.get("period") == period
     ]
     if not period_allocations:
-        for sale in records.get("sales") or []:
-            if isinstance(sale, dict) and is_monthly_woo_summary(sale, period):
+        block_ambiguous_processor_vat(sales, annual_allocations)
+        for sale in sales:
+            if is_demonstrably_woo_linked_sale(sale, annual_allocations):
                 zero_unsupported_sale(sale)
         return
     allocations_by_order: dict[str, list[dict[str, Any]]] = {}
@@ -452,26 +532,30 @@ def apply_period_allocation(
 
     summary_sales = [
         sale
-        for sale in records.get("sales") or []
-        if isinstance(sale, dict) and is_monthly_woo_summary(sale, period)
+        for sale in sales
+        if is_monthly_woo_summary(sale, period)
     ]
     if len(summary_sales) > 1:
         raise WooTaxError(f"Woo tax allocation found multiple monthly summary sales for {period}.")
     if summary_sales:
+        block_ambiguous_processor_vat(sales, annual_allocations)
         apply_allocation_to_sale(summary_sales[0], period_allocations, allocation, f"monthly summary {period}")
-        for sale in records.get("sales") or []:
-            if isinstance(sale, dict) and sale is not summary_sales[0]:
+        for sale in sales:
+            if (
+                sale is not summary_sales[0]
+                and is_demonstrably_woo_linked_sale(sale, annual_allocations)
+            ):
                 zero_unsupported_sale(sale)
         return
 
     consumed_orders: set[str] = set()
-    for sale in records.get("sales") or []:
-        if not isinstance(sale, dict):
-            continue
+    block_ambiguous_processor_vat(sales, annual_allocations)
+    for sale in sales:
         order_id = allocation_order_id(sale)
         matching = allocations_by_order.get(order_id)
         if not matching:
-            zero_unsupported_sale(sale)
+            if is_demonstrably_woo_linked_sale(sale, annual_allocations):
+                zero_unsupported_sale(sale)
             continue
         if order_id in consumed_orders:
             raise WooTaxError(f"Woo tax allocation for order {order_id} matched more than one processor sale.")

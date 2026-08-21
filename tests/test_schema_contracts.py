@@ -41,6 +41,7 @@ def validate(instance: Any, schema: dict[str, Any], *, root_schema: dict[str, An
         "string": lambda value: isinstance(value, str),
         "integer": lambda value: isinstance(value, int) and not isinstance(value, bool),
         "number": lambda value: isinstance(value, (int, float)) and not isinstance(value, bool),
+        "boolean": lambda value: isinstance(value, bool),
         "null": lambda value: value is None,
     }
     if allowed:
@@ -97,6 +98,10 @@ class SchemaContractTests(unittest.TestCase):
     def test_year_overview_template_matches_strict_schema(self) -> None:
         artifact = json.loads((ROOT / "templates/year-overview.template.json").read_text(encoding="utf-8"))
         self.assert_artifact_valid(schema_name="year-overview.schema.json", artifact=artifact)
+
+    def test_woo_tax_allocation_template_matches_strict_schema(self) -> None:
+        artifact = json.loads((ROOT / "templates/woo-tax-allocation.template.json").read_text(encoding="utf-8"))
+        self.assert_artifact_valid(schema_name="woo-tax-allocation.schema.json", artifact=artifact)
 
     def test_generated_action_batch_matches_strict_schema(self) -> None:
         categories = (

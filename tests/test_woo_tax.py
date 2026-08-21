@@ -1,0 +1,129 @@
+from __future__ import annotations
+
+import copy
+import contextlib
+import io
+import json
+import sys
+import tempfile
+import unittest
+from datetime import date
+from decimal import Decimal
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+
+import woo_tax  # noqa: E402
+
+
+def allocation_fixture() -> dict[str, Any]:
+    return {
+        "schema_version": "1.0",
+        "company_slug": "example",
+        "year": 2025,
+        "source_files": [{"source_id": "woo-tax", "sha256": "a" * 64}],
+        "policy": {"oss_registered": False, "dispatch_origin": "EE", "merchant_absorbs_vat": True},
+        "vat_periods": [
+            {"start": "2025-01-01", "end": "2025-06-30", "rate": 22,
+             "goods_vat_type_id": "25", "shipping_vat_type_id": "24"},
+            {"start": "2025-07-01", "end": None, "rate": 24,
+             "goods_vat_type_id": "34", "shipping_vat_type_id": "33"},
+        ],
+        "source_rows": [{"source_row_id": "woo-tax:2", "tax_code": "DE-DE-VAT-1",
+                         "configured_rate": 20, "order_tax": 10.00, "shipping_tax": 10.00,
+                         "total_tax": 20.00, "orders": 1}],
+        "allocations": [{"source_row_id": "woo-tax:2", "order_id": "EXAMPLE-EU-1",
+                         "period": "2025-05", "event_date": "2025-05-18", "country_code": "DE",
+                         "processor_ref": "pi_example", "configured_rate": 20, "corrected_rate": 22,
+                         "original_order_tax": 10.00, "original_shipping_tax": 10.00,
+                         "fixed_product_gross": 60.00, "fixed_shipping_gross": 60.00,
+                         "corrected_product_vat": 10.82, "corrected_shipping_vat": 10.82,
+                         "source_refs": [{"source_id": "woo-tax", "path": "source/woocommerce-taxes.csv",
+                                          "row_ref": "csv:2", "page_ref": None, "notes": None}]}],
+        "monthly_totals": {"2025-05": {"gross": 120.00, "original_vat": 20.00, "corrected_vat": 21.64}},
+        "validation": {"status": "pass", "errors": []},
+    }
+
+
+class WooTaxTests(unittest.TestCase):
+    def test_corrected_component_preserves_fixed_gross(self) -> None:
+        net, vat = woo_tax.corrected_component(Decimal("124.00"), Decimal("24"))
+        self.assertEqual(vat, Decimal("24.00"))
+        self.assertEqual(net, Decimal("100.00"))
+        self.assertEqual(net + vat, Decimal("124.00"))
+
+    def test_select_vat_period_uses_effective_date(self) -> None:
+        periods = [
+            woo_tax.VatPeriod(date(2024, 1, 1), date(2025, 6, 30), Decimal("22"), "25", "24"),
+            woo_tax.VatPeriod(date(2025, 7, 1), None, Decimal("24"), "34", "33"),
+        ]
+        self.assertEqual(woo_tax.select_vat_period(date(2025, 6, 30), periods).rate, Decimal("22"))
+        self.assertEqual(woo_tax.select_vat_period(date(2025, 7, 1), periods).rate, Decimal("24"))
+
+    def test_validate_allocation_rejects_duplicate_and_unallocated_counts(self) -> None:
+        payload = allocation_fixture()
+        payload["allocations"].append(copy.deepcopy(payload["allocations"][0]))
+        errors = woo_tax.validate_allocation(payload)
+        self.assertIn("taxable order is allocated more than once", " ".join(errors))
+        self.assertIn("allocated order count", " ".join(errors))
+
+    def test_validate_allocation_keeps_non_taxable_orders_outside_allocation(self) -> None:
+        # Completeness is tied to tax-summary Orders counts, not every Woo/processor order in the year.
+        self.assertEqual(woo_tax.validate_allocation(allocation_fixture()), [])
+
+    def test_validate_allocation_rejects_corrected_vat_that_changes_fixed_gross_split(self) -> None:
+        payload = allocation_fixture()
+        payload["allocations"][0]["corrected_product_vat"] = 10.81
+        errors = woo_tax.validate_allocation(payload)
+        self.assertIn("corrected product VAT does not match fixed-gross calculation", " ".join(errors))
+
+    def test_validate_allocation_rejects_fractional_cent_source_evidence(self) -> None:
+        payload = allocation_fixture()
+        payload["source_rows"][0]["total_tax"] = 20.001
+        errors = woo_tax.validate_allocation(payload)
+        self.assertIn("source row woo-tax:2 has fractional-cent total_tax", " ".join(errors))
+
+    def test_validate_allocation_returns_error_for_non_object_monthly_totals(self) -> None:
+        payload = allocation_fixture()
+        payload["monthly_totals"] = []
+        self.assertIn("monthly_totals must be an object", woo_tax.validate_allocation(payload))
+
+    def test_build_allocation_derives_rate_components_and_month_totals(self) -> None:
+        review = allocation_fixture()
+        allocation = review["allocations"][0]
+        del allocation["period"]
+        del allocation["corrected_rate"]
+        del allocation["corrected_product_vat"]
+        del allocation["corrected_shipping_vat"]
+
+        built = woo_tax.build_allocation(review)
+
+        self.assertEqual(built["allocations"][0]["period"], "2025-05")
+        self.assertEqual(built["allocations"][0]["corrected_rate"], 22.0)
+        self.assertEqual(built["allocations"][0]["corrected_product_vat"], 10.82)
+        self.assertEqual(built["monthly_totals"], {
+            "2025-05": {"gross": 120.0, "original_vat": 20.0, "corrected_vat": 21.64}
+        })
+        self.assertEqual(built["validation"], {"status": "pass", "errors": []})
+
+    def test_validate_cli_reports_recalculated_annual_totals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            company_dir = Path(tmp) / "example"
+            allocation_path = company_dir / "artifacts" / "vat" / "2025-woo-tax-allocation.json"
+            allocation_path.parent.mkdir(parents=True)
+            (company_dir / "METADATA.md").write_text("Company slug: example\n", encoding="utf-8")
+            allocation_path.write_text(json.dumps(allocation_fixture()), encoding="utf-8")
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                status = woo_tax.main(["validate", "--company-dir", str(company_dir), "--year", "2025"])
+
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), {
+            "corrected_vat": 21.64, "errors": [], "gross": 120.0, "original_vat": 20.0
+        })
+
+
+if __name__ == "__main__":
+    unittest.main()

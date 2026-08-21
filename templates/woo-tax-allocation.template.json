@@ -1,0 +1,64 @@
+{
+  "schema_version": "1.0",
+  "company_slug": "example",
+  "year": 2025,
+  "source_files": [
+    {"source_id": "woo-tax", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+  ],
+  "policy": {
+    "oss_registered": false,
+    "dispatch_origin": "EE",
+    "merchant_absorbs_vat": true
+  },
+  "vat_periods": [
+    {
+      "start": "2025-01-01",
+      "end": null,
+      "rate": 22,
+      "goods_vat_type_id": "25",
+      "shipping_vat_type_id": "24"
+    }
+  ],
+  "source_rows": [
+    {
+      "source_row_id": "woo-tax:2",
+      "tax_code": "DE-DE-VAT-1",
+      "configured_rate": 20,
+      "order_tax": 10.00,
+      "shipping_tax": 10.00,
+      "total_tax": 20.00,
+      "orders": 1
+    }
+  ],
+  "allocations": [
+    {
+      "source_row_id": "woo-tax:2",
+      "order_id": "EXAMPLE-EU-1",
+      "period": "2025-05",
+      "event_date": "2025-05-18",
+      "country_code": "DE",
+      "processor_ref": "pi_example",
+      "configured_rate": 20,
+      "corrected_rate": 22,
+      "original_order_tax": 10.00,
+      "original_shipping_tax": 10.00,
+      "fixed_product_gross": 60.00,
+      "fixed_shipping_gross": 60.00,
+      "corrected_product_vat": 10.82,
+      "corrected_shipping_vat": 10.82,
+      "source_refs": [
+        {
+          "source_id": "woo-tax",
+          "path": "source/woocommerce-taxes.csv",
+          "row_ref": "csv:2",
+          "page_ref": null,
+          "notes": null
+        }
+      ]
+    }
+  ],
+  "monthly_totals": {
+    "2025-05": {"gross": 120.00, "original_vat": 20.00, "corrected_vat": 21.64}
+  },
+  "validation": {"status": "pass", "errors": []}
+}

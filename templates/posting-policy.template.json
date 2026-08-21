@@ -22,9 +22,29 @@
       "vat_type_id": "21",
       "shipping_vat_type_id": "22",
       "warehouse_id": "6"
+    },
+    "purchase-printful": {
+      "lines": {
+        "orders-shipping-and-fullfilment-lv": {
+          "expense_account_id": "257",
+          "vat_type_id": "11",
+          "warehouse_id": "6"
+        }
+      }
     }
   },
   "supplier_aliases": {
     "omniva": "as-eesti-post"
+  },
+  "year_expectations": {
+    "2024": {
+      "supplier_credit_totals": {
+        "2024-05": {"EUR": 11.4}
+      },
+      "suppressed_external_refs": ["EXAMPLE-EXISTING-DOCUMENT"],
+      "allowed_blocking_dependencies": [
+        {"kind": "contact_mapping", "label": "paypal", "family": ""}
+      ]
+    }
   }
 }

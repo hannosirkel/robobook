@@ -13,6 +13,7 @@
     "approval_status",
     "already_present",
     "unresolved_dependencies",
+    "reference_artifacts",
     "actions"
   ],
   "properties": {
@@ -64,6 +65,11 @@
       "type": "array",
       "items": {"type": "object"}
     },
+    "reference_artifacts": {
+      "type": "array",
+      "minItems": 2,
+      "items": {"$ref": "#/$defs/reference_artifact"}
+    },
     "actions": {
       "type": "array",
       "items": {
@@ -72,6 +78,19 @@
     }
   },
   "$defs": {
+    "reference_artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path", "sha256"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["posting_policy", "discovery_overview", "exchange_rates"]
+        },
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+      }
+    },
     "source_ref": {
       "type": "object",
       "additionalProperties": false,

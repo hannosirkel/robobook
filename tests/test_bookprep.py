@@ -320,6 +320,65 @@ class BookprepTests(unittest.TestCase):
 
             self.assertEqual(sources[0].parser_name, "unrecognized_source")
 
+    def test_printful_marker_keeps_logical_year_coverage_through_company_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "worktree"
+            canonical_company = Path(tmp) / "canonical-company"
+            marker = canonical_company / "source" / "2025-pack" / "Printful" / "no-activity-during-period"
+            marker.parent.mkdir(parents=True)
+            marker.touch()
+            logical_company = root / "companies" / "example"
+            logical_company.parent.mkdir(parents=True)
+            logical_company.symlink_to(canonical_company, target_is_directory=True)
+            source_dir = logical_company / "source" / "2025-pack"
+            period_start, period_end = bookprep.parse_period("2025-01")
+
+            sources = bookprep.inspect_sources(
+                source_dir=source_dir,
+                root_dir=root,
+                period_start=period_start,
+                period_end=period_end,
+            )
+
+            marker_source = next(source for source in sources if source.path.name == "no-activity-during-period")
+            self.assertEqual(marker_source.parser_name, "parse_no_activity_marker")
+            self.assertEqual(marker_source.covered_from, date(2025, 1, 1))
+            self.assertEqual(marker_source.covered_until, date(2025, 12, 31))
+
+    def test_parse_woo_order_summary_csv_as_nonfinancial_supporting_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "2025-pack"
+            root.mkdir()
+            csv_path = root / "woocommerce-sales-report.csv"
+            csv_path.write_text(
+                'Date,"Order #",Status,Customer,"Customer type",Product(s),"Items sold",Coupon(s),"Net sales",Attribution\n'
+                '"2025-11-27 05:25:49",819,processing,"Example Customer",new,"1x Example game",1,,25,"Referral"\n',
+                encoding="utf-8",
+            )
+            period_start, period_end = bookprep.parse_period("2025-11")
+            source = bookprep.inspect_source_file(
+                path=csv_path, root_dir=root, period_start=period_start, period_end=period_end
+            )
+            assert source is not None
+
+            self.assertEqual(source.source_system, "woo")
+            self.assertEqual(source.parser_name, "parse_woo_order_summary_csv")
+            records, exceptions = bookprep.PARSERS[source.parser_name](
+                source,
+                period_start=period_start,
+                period_end=period_end,
+                base_currency="EUR",
+            )
+            self.assertFalse(exceptions)
+            self.assertEqual(records["sales"], [])
+            self.assertEqual(len(records["other"]), 1)
+            evidence = records["other"][0]
+            self.assertEqual(evidence["event_type"], "woo_order_summary")
+            self.assertEqual(evidence["external_ref"], "819")
+            self.assertEqual(evidence["gross_amount"], 0.0)
+            self.assertEqual(evidence["attributes"]["observed_net_sales"], 25.0)
+            self.assertEqual(evidence["attributes"]["items_sold"], 1.0)
+
     def test_parse_woo_sales_csv_adds_sales_record_and_returns_warning(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

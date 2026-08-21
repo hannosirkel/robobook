@@ -90,6 +90,27 @@ def monthly_woo_summary_fixture(*, gross: Decimal, vat: Decimal, period: str) ->
     return records
 
 
+def mixed_summary_allocation_fixture() -> dict[str, Any]:
+    payload = period_allocation_fixture(period="2024-04", order_id="774")
+    first = payload["allocations"][0]
+    first.update({
+        "event_date": "2024-04-20",
+        "country_code": "FR",
+        "configured_rate": 22,
+        "corrected_rate": 22,
+        "original_order_tax": 5.50,
+        "original_shipping_tax": 1.07,
+        "fixed_product_gross": 30.50,
+        "fixed_shipping_gross": 5.92,
+        "corrected_product_vat": 5.50,
+        "corrected_shipping_vat": 1.07,
+    })
+    second = copy.deepcopy(first)
+    second.update({"order_id": "777", "event_date": "2024-04-23", "processor_ref": "ch_777"})
+    payload["allocations"] = [first, second]
+    return payload
+
+
 class WooTaxTests(unittest.TestCase):
     def test_apply_period_allocation_changes_vat_not_customer_gross(self) -> None:
         records = normalized_sales_fixture(
@@ -215,6 +236,67 @@ class WooTaxTests(unittest.TestCase):
         self.assertEqual(sale["attributes"]["vat_allocation"]["allocated_order_ids"], ["EXAMPLE-1", "EXAMPLE-2"])
         self.assertEqual(sale["attributes"]["vat_allocation"]["fixed_product_gross"], 124.0)
         self.assertEqual(sale["attributes"]["vat_allocation"]["fixed_shipping_gross"], 124.0)
+
+    def test_apply_period_allocation_splits_mixed_monthly_summary_into_taxable_and_zero_rated_gross(self) -> None:
+        records = monthly_woo_summary_fixture(
+            gross=Decimal("135.54"), vat=Decimal("13.14"), period="2024-04"
+        )
+        summary = records["sales"][0]
+        summary["net_amount"] = 100.0
+        summary["shipping_amount"] = 22.40
+        summary["attributes"]["orders"] = 4
+        unrelated = normalized_sales_fixture(
+            gross=Decimal("75.00"), vat=Decimal("15.00"), order_id="MARKETPLACE-1"
+        )["sales"][0]
+        unrelated.update({"source_system": "marketplace", "channel": "marketplace"})
+        original_unrelated = copy.deepcopy(unrelated)
+        records["sales"].append(unrelated)
+
+        woo_tax.apply_period_allocation(records, mixed_summary_allocation_fixture(), "2024-04")
+
+        woo_sales = [sale for sale in records["sales"] if sale["source_system"] == "woo"]
+        self.assertEqual(len(woo_sales), 2)
+        taxable = next(sale for sale in woo_sales if sale["vat_amount"] != 0)
+        residual = next(sale for sale in woo_sales if sale["vat_amount"] == 0)
+        self.assertEqual(
+            (taxable["gross_amount"], taxable["net_amount"], taxable["vat_amount"], taxable["shipping_amount"]),
+            (72.84, 59.70, 13.14, 11.84),
+        )
+        self.assertEqual(
+            (residual["gross_amount"], residual["net_amount"], residual["vat_amount"], residual["shipping_amount"]),
+            (62.70, 62.70, 0.0, 12.70),
+        )
+        self.assertEqual(residual["attributes"]["zero_rated_residual"], {
+            "fixed_product_gross": 50.0,
+            "fixed_shipping_gross": 12.7,
+            "allocated_order_ids": ["774", "777"],
+        })
+        self.assertEqual(
+            sum(Decimal(str(sale["gross_amount"])) for sale in woo_sales), Decimal("135.54")
+        )
+        self.assertEqual(unrelated, original_unrelated)
+
+    def test_apply_period_allocation_blocks_monthly_taxable_gross_above_summary_gross(self) -> None:
+        records = monthly_woo_summary_fixture(
+            gross=Decimal("70.00"), vat=Decimal("13.14"), period="2024-04"
+        )
+        summary = records["sales"][0]
+        summary["net_amount"] = 50.0
+        summary["shipping_amount"] = 6.86
+
+        with self.assertRaisesRegex(woo_tax.WooTaxError, "exceeds monthly summary gross"):
+            woo_tax.apply_period_allocation(records, mixed_summary_allocation_fixture(), "2024-04")
+
+    def test_apply_period_allocation_blocks_monthly_summary_component_mismatch(self) -> None:
+        records = monthly_woo_summary_fixture(
+            gross=Decimal("135.54"), vat=Decimal("13.14"), period="2024-04"
+        )
+        summary = records["sales"][0]
+        summary["net_amount"] = 100.0
+        summary["shipping_amount"] = 20.0
+
+        with self.assertRaisesRegex(woo_tax.WooTaxError, "component evidence does not reconcile"):
+            woo_tax.apply_period_allocation(records, mixed_summary_allocation_fixture(), "2024-04")
 
     def test_apply_period_allocation_leaves_unallocated_month_summary_zero_rated(self) -> None:
         records = monthly_woo_summary_fixture(gross=Decimal("50.00"), vat=Decimal("10.00"), period="2025-11")

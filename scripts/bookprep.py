@@ -53,6 +53,18 @@ ROW_EVENT_HEADERS = {
         "refund amount",
     },
     "woo_tax_summary_csv": {"tax code", "rate", "total tax", "order tax", "shipping tax", "orders"},
+    "woo_order_summary_csv": {
+        "date",
+        "order",
+        "status",
+        "customer",
+        "customer type",
+        "product s",
+        "items sold",
+        "coupon s",
+        "net sales",
+        "attribution",
+    },
     "paypal_csv": {"date", "time", "timezone", "name", "type", "status", "currency", "gross", "fee", "net", "transaction id"},
     "stripe_balance_csv": {"id", "type", "source", "amount", "fee", "net", "currency", "created (utc)", "available on (utc)"},
     "stripe_payouts_csv": {
@@ -202,7 +214,10 @@ def canonical_group_for_path(path: Path) -> str:
 def infer_source_system(path: Path, source_type: str, header_names: set[str] | None = None) -> str:
     normalized = normalize_ascii(str(path)).lower()
     headers = header_names or set()
-    if headers >= ROW_EVENT_HEADERS["woo_tax_summary_csv"]:
+    if (
+        headers >= ROW_EVENT_HEADERS["woo_tax_summary_csv"]
+        or headers >= ROW_EVENT_HEADERS["woo_order_summary_csv"]
+    ):
         return "woo"
     if "paypal" in normalized or headers >= ROW_EVENT_HEADERS["paypal_csv"]:
         return "paypal"
@@ -431,6 +446,8 @@ def detect_parser(path: Path, source_type: str, source_system: str, header_names
     if source_type == "csv" and source_system == "woo":
         if headers >= ROW_EVENT_HEADERS["woo_tax_summary_csv"]:
             return "parse_woo_tax_summary_csv"
+        if headers >= ROW_EVENT_HEADERS["woo_order_summary_csv"]:
+            return "parse_woo_order_summary_csv"
         return "parse_woo_sales_csv"
     if source_type == "csv" and source_system == "paypal":
         return "parse_paypal_csv"
@@ -488,7 +505,10 @@ def infer_no_activity_marker_coverage(path: Path, *, root_dir: Path) -> tuple[da
     if slugify(path.name) != "no-activity-during-period":
         return None
     try:
-        relative_parts = path.resolve().relative_to(root_dir.resolve()).parts[:-1]
+        # Coverage belongs to the logical source-pack path. Resolving a company
+        # symlink here would replace that path with its private canonical target
+        # and discard a logical parent such as ``2025-pack``.
+        relative_parts = path.absolute().relative_to(root_dir.absolute()).parts[:-1]
     except ValueError:
         return None
     directory_names = [*relative_parts, root_dir.name]
@@ -1009,6 +1029,88 @@ def parse_woo_sales_csv(
                     suggested_follow_up="Use a refund-detail export if separate refund rows are required for this month.",
                 )
             )
+
+    update_coverage_from_dates(source, seen_dates)
+    return result, exceptions
+
+
+def parse_woo_order_summary_csv(
+    source: SourceDescriptor,
+    *,
+    period_start: date,
+    period_end: date,
+    base_currency: str,
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    """Retain Woo order-summary rows as nonfinancial supporting evidence.
+
+    The Woo Analytics order export exposes net sales but omits customer-paid
+    gross, shipping, and tax. Treating it as a sale would duplicate a complete
+    merchant or processor export and invent a gross amount, so its amounts stay
+    in attributes for order matching only.
+    """
+    rows, _ = read_csv_rows(source.path)
+    result = parser_result()
+    exceptions: list[dict[str, Any]] = []
+    seen_dates: list[date] = []
+
+    for line_no, row in enumerate(rows, start=2):
+        row_ref = f"csv:{line_no}"
+        try:
+            event_date = parse_date_value(row.get("Date", ""))
+            order_id = str(row.get("Order #") or "").strip()
+            net_sales = parse_decimal(row.get("Net sales"))
+            items_sold = parse_decimal(row.get("Items sold"))
+            if (
+                not order_id
+                or not net_sales.is_finite()
+                or not items_sold.is_finite()
+                or items_sold < 0
+                or items_sold != items_sold.to_integral_value()
+            ):
+                raise SimplbooksError("invalid Woo order summary row")
+        except (InvalidOperation, SimplbooksError, ValueError):
+            exceptions.append(
+                make_exception(
+                    source=source,
+                    exception_id=f"{source.source_id}:invalid-order-summary:{line_no}",
+                    severity="warn",
+                    reason="Woo order-summary row has an invalid date, order number, net-sales value, or item count.",
+                    blocking=False,
+                    row_ref=row_ref,
+                    suggested_follow_up="Re-export the Woo order report if this row is needed for order matching.",
+                )
+            )
+            continue
+
+        seen_dates.append(event_date)
+        if not periods_overlap(event_date, event_date, period_start, period_end):
+            continue
+
+        _, record = make_record(
+            source=source,
+            category="other",
+            record_id=f"{source.source_id}:woo-order:{line_no}",
+            event_type="woo_order_summary",
+            event_date=event_date,
+            description=f"Woo order-summary evidence {order_id}",
+            currency=base_currency,
+            gross_amount=Decimal("0"),
+            net_amount=Decimal("0"),
+            external_ref=order_id,
+            channel="woo",
+            attributes={
+                "order_id": order_id,
+                "status": str(row.get("Status") or "").strip(),
+                "product_summary": str(row.get("Product(s)") or "").strip(),
+                "items_sold": float(items_sold),
+                "observed_net_sales": float(net_sales),
+                "customer_type": str(row.get("Customer type") or "").strip(),
+                "attribution": str(row.get("Attribution") or "").strip(),
+                "nonfinancial_supporting_evidence": True,
+            },
+            row_ref=row_ref,
+        )
+        result["other"].append(record)
 
     update_coverage_from_dates(source, seen_dates)
     return result, exceptions
@@ -3131,6 +3233,7 @@ def parse_purchase_note_markdown(
 PARSERS: dict[str, Callable[..., tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]]] = {
     "parse_no_activity_marker": parse_no_activity_marker,
     "parse_woo_sales_csv": parse_woo_sales_csv,
+    "parse_woo_order_summary_csv": parse_woo_order_summary_csv,
     "parse_woo_tax_summary_csv": parse_woo_tax_summary_csv,
     "parse_paypal_csv": parse_paypal_csv,
     "parse_stripe_payouts_csv": parse_stripe_payouts_csv,

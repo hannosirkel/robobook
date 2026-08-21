@@ -1362,12 +1362,17 @@ def build_sales_actions(
                 profile_mapping_hints = merge_mapping_hints(mapping_hints, online_sales_override)
 
             shipping_total = sum_abs_amount(profile_records, "shipping_amount")
+            has_explicit_zero_rated_residual = any(
+                isinstance((record.get("attributes") or {}).get("zero_rated_residual"), dict)
+                for record in profile_records
+            )
             lines, review_notes = build_sales_lines(
                 records=profile_records,
                 group_label=group_label,
                 direction="sales",
                 shipping_split=policy_prefers_shipping_split(policy_text, shipping_total)
-                or (online_sales_override_applied and shipping_total != 0),
+                or (online_sales_override_applied and shipping_total != 0)
+                or (has_explicit_zero_rated_residual and shipping_total != 0),
                 mapping_hints=profile_mapping_hints,
             )
             review_notes.extend(planned_notes.get((group_label, currency), []))

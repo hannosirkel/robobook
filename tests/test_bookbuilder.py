@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import sys
 import unittest
+from decimal import Decimal
 from pathlib import Path
 
 
@@ -10,6 +11,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import bookbuilder  # noqa: E402
+import bookchecker  # noqa: E402
+import woo_tax  # noqa: E402
 
 
 RECORD_CATEGORIES = (
@@ -118,6 +121,30 @@ def policy_with_24_percent_profile() -> dict:
     }
 
 
+def policy_with_mixed_22_percent_profile() -> dict:
+    return {
+        "schema_version": "1.0",
+        "company_slug": "example",
+        "bank_accounts": {},
+        "contacts": {"sales": {"woo": "42"}, "processors": {}, "suppliers": {}},
+        "mappings": {
+            "woo-taxable": {
+                "income_account_id": "107", "shipping_income_account_id": "253",
+                "vat_type_id": "25", "shipping_vat_type_id": "24", "warehouse_id": "6",
+            },
+            "woo-non-taxable": {
+                "income_account_id": "109", "shipping_income_account_id": "255",
+                "vat_type_id": "12", "shipping_vat_type_id": "13", "warehouse_id": "6",
+            },
+        },
+        "sales_vat_profiles": [{
+            "start": "2024-01-01", "end": "2024-12-31", "rate": 22,
+            "goods_vat_type_id": "25", "shipping_vat_type_id": "24",
+        }],
+        "supplier_aliases": {},
+    }
+
+
 def allocated_sale_fixture(*, product_gross: float, shipping_gross: float,
                            product_vat: float, shipping_vat: float) -> dict:
     sale = record(record_id="woo:2025-11", source_system="woo", event_type="woo_monthly_sales",
@@ -213,6 +240,77 @@ class BookbuilderTests(unittest.TestCase):
         self.assertEqual([line["suggested_vat_type_id"] for line in lines], ["34", "33"])
         self.assertEqual([line["vat_profile_rate"] for line in lines], [24, 24])
         self.assertEqual([line["vat_profile_period"] for line in lines], ["2025-07-01/open", "2025-07-01/open"])
+
+    def test_builder_and_checker_preserve_mixed_taxable_and_zero_rated_month_total(self) -> None:
+        normalized = base_normalized("2024-04")
+        summary = record(
+            record_id="woo:2024-04", source_system="woo", event_type="woo_monthly_sales",
+            gross_amount=135.54, net_amount=100.0, vat_amount=13.14,
+            shipping_amount=22.40, channel="woo",
+        )
+        summary["event_date"] = "2024-04-30"
+        summary["attributes"] = {"is_monthly_summary": True, "orders": 4}
+        normalized["records"]["sales"] = [summary]
+        allocation_item = {
+            "source_row_id": "woo-tax:2", "order_id": "774", "period": "2024-04",
+            "event_date": "2024-04-20", "country_code": "FR", "processor_ref": "pi_774",
+            "configured_rate": 22, "corrected_rate": 22,
+            "original_order_tax": 5.50, "original_shipping_tax": 1.07,
+            "fixed_product_gross": 30.50, "fixed_shipping_gross": 5.92,
+            "corrected_product_vat": 5.50, "corrected_shipping_vat": 1.07,
+            "source_refs": [],
+        }
+        second = dict(allocation_item)
+        second.update({"order_id": "777", "event_date": "2024-04-23", "processor_ref": "pi_777"})
+
+        woo_tax.apply_period_allocation(
+            normalized["records"], {"allocations": [allocation_item, second]}, "2024-04"
+        )
+        policy = policy_with_mixed_22_percent_profile()
+        batch = build_batch_with_policy(normalized, policy)
+        sales_actions = [
+            action for action in batch["actions"] if action["action_type"] == "create_invoice_summary"
+        ]
+        self.assertEqual(len(sales_actions), 2)
+        taxable = next(
+            action for action in sales_actions
+            if action["payload"]["posting_policy_family"] == "woo-taxable"
+        )
+        zero_rated = next(
+            action for action in sales_actions
+            if action["payload"]["posting_policy_family"] == "woo-non-taxable"
+        )
+        self.assertEqual(taxable["payload"]["totals"], {
+            "gross_amount": 72.84, "vat_amount": 13.14,
+            "shipping_amount": 11.84, "fee_amount_observed": 0.0,
+        })
+        self.assertEqual(
+            [(line["gross_amount"], line["suggested_vat_type_id"]) for line in taxable["payload"]["line_items"]],
+            [(61.0, "25"), (11.84, "24")],
+        )
+        self.assertEqual(zero_rated["payload"]["totals"], {
+            "gross_amount": 62.70, "vat_amount": 0.0,
+            "shipping_amount": 12.70, "fee_amount_observed": 0.0,
+        })
+        self.assertEqual(
+            [(line["gross_amount"], line["suggested_vat_type_id"]) for line in zero_rated["payload"]["line_items"]],
+            [(50.0, "12"), (12.70, "13")],
+        )
+        self.assertEqual(
+            sum(Decimal(str(action["payload"]["totals"]["gross_amount"])) for action in sales_actions),
+            Decimal("135.54"),
+        )
+
+        records_by_id = {item["record_id"]: item for item in normalized["records"]["sales"]}
+        findings = bookchecker.evaluate_posting_policy(batch, policy)
+        findings.extend(bookchecker.evaluate_vat_profiles(batch["actions"], policy))
+        for action in sales_actions:
+            resolved = [
+                {"category": "sales", "record": records_by_id[str(ref["record_ref"])]}
+                for ref in action["source_refs"]
+            ]
+            findings.extend(bookchecker.evaluate_arithmetic(action=action, resolved_sources=resolved))
+        self.assertFalse([item for item in findings if item["severity"] == "error"], findings)
 
     def test_builder_applies_single_month_end_ecb_rate(self) -> None:
         normalized = base_normalized(period="2024-03")

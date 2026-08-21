@@ -480,11 +480,24 @@ def apply_allocation_to_sale(
             f"({money(expected_gross)} != {money(sale_gross)})."
         )
 
+    set_allocated_sale_components(sale, items, allocation, components)
+
+
+def set_allocated_sale_components(
+    sale: dict[str, Any],
+    items: list[dict[str, Any]],
+    allocation: dict[str, Any],
+    components: dict[str, Decimal],
+) -> None:
+    allocated_gross = components["product_gross"] + components["shipping_gross"]
+
     attributes = sale.setdefault("attributes", {})
     if not isinstance(attributes, dict):
-        raise WooTaxError(f"Processor sale for {label} has invalid attributes.")
+        raise WooTaxError("Woo sale has invalid attributes.")
+    sale["gross_amount"] = decimal_number(allocated_gross)
     sale["vat_amount"] = decimal_number(components["product_vat"] + components["shipping_vat"])
     sale["net_amount"] = decimal_number(components["product_net"] + components["shipping_net"])
+    sale["shipping_amount"] = decimal_number(components["shipping_gross"])
     attributes["vat_allocation"] = {
         "fixed_product_gross": decimal_number(components["product_gross"]),
         "fixed_shipping_gross": decimal_number(components["shipping_gross"]),
@@ -505,6 +518,96 @@ def apply_allocation_to_sale(
             for item in sorted(items, key=lambda item: str(item["order_id"]))
         ],
     }
+
+
+def apply_allocation_to_monthly_summary(
+    sale: dict[str, Any],
+    items: list[dict[str, Any]],
+    allocation: dict[str, Any],
+    label: str,
+) -> dict[str, Any] | None:
+    """Apply taxable components and return an explicit zero-rated residual, if any."""
+    components = allocation_components(items)
+    allocated_gross = components["product_gross"] + components["shipping_gross"]
+    summary_gross = decimal_value(sale.get("gross_amount"))
+    if money(allocated_gross) > money(summary_gross):
+        raise WooTaxError(
+            f"Woo tax allocation gross for {label} exceeds monthly summary gross "
+            f"({money(allocated_gross)} > {money(summary_gross)})."
+        )
+    if same_money(allocated_gross, summary_gross):
+        set_allocated_sale_components(sale, items, allocation, components)
+        return None
+
+    source_product_net = decimal_value(sale.get("net_amount"))
+    source_shipping_net = decimal_value(sale.get("shipping_amount"))
+    source_vat = decimal_value(sale.get("vat_amount"))
+    original_product_vat = sum(
+        (decimal_value(item.get("original_order_tax")) for item in items), Decimal("0")
+    )
+    original_shipping_vat = sum(
+        (decimal_value(item.get("original_shipping_tax")) for item in items), Decimal("0")
+    )
+    original_vat = original_product_vat + original_shipping_vat
+    if not same_money(source_vat, original_vat) or not same_money(
+        source_product_net + source_shipping_net + source_vat, summary_gross
+    ):
+        raise WooTaxError(
+            f"Woo monthly summary component evidence does not reconcile for {label}."
+        )
+
+    source_product_gross = source_product_net + original_product_vat
+    source_shipping_gross = source_shipping_net + original_shipping_vat
+    residual_product_gross = source_product_gross - components["product_gross"]
+    residual_shipping_gross = source_shipping_gross - components["shipping_gross"]
+    if residual_product_gross < 0 or residual_shipping_gross < 0:
+        raise WooTaxError(
+            f"Woo monthly summary component evidence does not reconcile for {label}."
+        )
+    residual_gross = residual_product_gross + residual_shipping_gross
+    if not same_money(allocated_gross + residual_gross, summary_gross):
+        raise WooTaxError(
+            f"Woo monthly summary component evidence does not reconcile for {label}."
+        )
+
+    residual = copy.deepcopy(sale)
+    original_attributes = sale.get("attributes")
+    total_orders = (
+        int(original_attributes.get("orders"))
+        if isinstance(original_attributes, dict)
+        and isinstance(original_attributes.get("orders"), int)
+        else None
+    )
+    if total_orders is not None and total_orders < len(items):
+        raise WooTaxError(
+            f"Woo monthly summary component evidence does not reconcile for {label}."
+        )
+
+    set_allocated_sale_components(sale, items, allocation, components)
+    sale_attributes = sale.get("attributes")
+    if isinstance(sale_attributes, dict):
+        sale_attributes["orders"] = len(items)
+
+    residual["record_id"] = f"{residual.get('record_id')}:zero-rated-residual"
+    residual["description"] = f"{residual.get('description') or 'Woo monthly summary'} zero-rated residual"
+    residual["external_ref"] = f"{residual.get('external_ref') or label}:zero-rated-residual"
+    residual["gross_amount"] = decimal_number(residual_gross)
+    residual["net_amount"] = decimal_number(residual_gross)
+    residual["vat_amount"] = 0.0
+    residual["shipping_amount"] = decimal_number(residual_shipping_gross)
+    residual["quantity"] = None
+    residual_attributes = residual.setdefault("attributes", {})
+    if not isinstance(residual_attributes, dict):
+        raise WooTaxError("Woo monthly summary residual has invalid attributes.")
+    residual_attributes.pop("vat_allocation", None)
+    if total_orders is not None:
+        residual_attributes["orders"] = total_orders - len(items)
+    residual_attributes["zero_rated_residual"] = {
+        "fixed_product_gross": decimal_number(residual_product_gross),
+        "fixed_shipping_gross": decimal_number(residual_shipping_gross),
+        "allocated_order_ids": sorted(str(item["order_id"]) for item in items),
+    }
+    return residual
 
 
 def zero_unsupported_sale(sale: dict[str, Any]) -> None:
@@ -549,7 +652,11 @@ def apply_period_allocation(
         raise WooTaxError(f"Woo tax allocation found multiple monthly summary sales for {period}.")
     if summary_sales:
         block_ambiguous_processor_vat(sales, annual_allocations)
-        apply_allocation_to_sale(summary_sales[0], period_allocations, allocation, f"monthly summary {period}")
+        residual = apply_allocation_to_monthly_summary(
+            summary_sales[0], period_allocations, allocation, f"monthly summary {period}"
+        )
+        if residual is not None:
+            records.setdefault("sales", []).append(residual)
         for sale in sales:
             if (
                 sale is not summary_sales[0]

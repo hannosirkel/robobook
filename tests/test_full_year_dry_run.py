@@ -15,6 +15,185 @@ import full_year_dry_run  # noqa: E402
 
 
 class FullYearDryRunTests(unittest.TestCase):
+    def test_reference_summary_blocks_required_manual_inventory_action(self) -> None:
+        action = {
+            "action_type": "manual_inventory_writeoff",
+            "effective_date": "2024-06-30",
+            "article_id": "10",
+            "warehouse_id": "20",
+            "quantity": 5,
+            "expense_account_id": "30",
+            "expected_remnant_after": 0,
+            "reason": "Obsolete inventory",
+            "approval": "reviewed",
+            "status": "required",
+            "source_refs": [{"source_id": "inventory-decision", "path": "artifacts/inventory-decision.json", "row_ref": None, "page_ref": None, "notes": None}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            company_dir = Path(tmp) / "companies" / "example"
+            actions_dir = company_dir / "artifacts" / "actions"
+            actions_dir.mkdir(parents=True)
+            (actions_dir / "2024-inventory-manual.json").write_text(json.dumps(action), encoding="utf-8")
+
+            summary = full_year_dry_run.summarize_action_artifacts(company_dir=company_dir, year=2024)
+            issues = full_year_dry_run.reference_acceptance_issues(summary)
+
+        self.assertEqual(summary["manual_inventory_status"], "required")
+        self.assertTrue(any("manual inventory" in issue.lower() for issue in issues))
+
+    def test_reference_summary_accepts_completed_manual_action_with_matching_remnant_evidence(self) -> None:
+        action = {
+            "action_type": "manual_inventory_writeoff",
+            "effective_date": "2024-06-30",
+            "article_id": "10",
+            "warehouse_id": "20",
+            "quantity": 5,
+            "expense_account_id": "30",
+            "expected_remnant_after": 0,
+            "reason": "Obsolete inventory",
+            "approval": "reviewed",
+            "status": "completed",
+            "source_refs": [{"source_id": "inventory-decision", "path": "artifacts/inventory-decision.json", "row_ref": None, "page_ref": None, "notes": None}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            company_dir = Path(tmp) / "companies" / "example"
+            actions_dir = company_dir / "artifacts" / "actions"
+            discovery_dir = company_dir / "artifacts" / "discovery"
+            actions_dir.mkdir(parents=True)
+            discovery_dir.mkdir(parents=True)
+            (actions_dir / "2024-inventory-manual.json").write_text(json.dumps(action), encoding="utf-8")
+            (discovery_dir / "2024-inventory-remnant-verification.json").write_text(
+                json.dumps({
+                    "action_type": "manual_inventory_writeoff",
+                    "effective_date": "2024-06-30",
+                    "article_id": "10",
+                    "warehouse_id": "20",
+                    "expected_remnant_after": 0,
+                    "verified_at": "2026-08-21T00:00:00Z",
+                    "remnant_response": {"data": {"10": {"20": 0}}},
+                }),
+                encoding="utf-8",
+            )
+
+            summary = full_year_dry_run.summarize_action_artifacts(company_dir=company_dir, year=2024)
+            issues = full_year_dry_run.reference_acceptance_issues(summary)
+
+        self.assertEqual(summary["manual_inventory_status"], "completed")
+        self.assertTrue(summary["manual_inventory_remnant_verified"])
+        self.assertFalse(any("manual inventory" in issue.lower() for issue in issues))
+
+    def test_reference_summary_rejects_unbound_remnant_evidence(self) -> None:
+        action = {
+            "action_type": "manual_inventory_writeoff",
+            "effective_date": "2024-06-30",
+            "article_id": "10",
+            "warehouse_id": "20",
+            "quantity": 5,
+            "expense_account_id": "30",
+            "expected_remnant_after": 0,
+            "reason": "Obsolete inventory",
+            "approval": "reviewed",
+            "status": "completed",
+            "source_refs": [{"source_id": "inventory-decision", "path": "artifacts/inventory-decision.json", "row_ref": None, "page_ref": None, "notes": None}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            company_dir = Path(tmp) / "companies" / "example"
+            actions_dir = company_dir / "artifacts" / "actions"
+            discovery_dir = company_dir / "artifacts" / "discovery"
+            actions_dir.mkdir(parents=True)
+            discovery_dir.mkdir(parents=True)
+            (actions_dir / "2024-inventory-manual.json").write_text(json.dumps(action), encoding="utf-8")
+            (discovery_dir / "2024-inventory-remnant-verification.json").write_text(
+                json.dumps({"verified_at": "2026-08-21T00:00:00Z", "remnant_response": {"data": {"10": {"20": 0}}}}),
+                encoding="utf-8",
+            )
+
+            summary = full_year_dry_run.summarize_action_artifacts(company_dir=company_dir, year=2024)
+
+        self.assertFalse(summary["manual_inventory_remnant_verified"])
+
+    def test_reference_summary_keeps_malformed_remnant_evidence_unverified(self) -> None:
+        action = {
+            "action_type": "manual_inventory_writeoff",
+            "effective_date": "2024-06-30",
+            "article_id": "10",
+            "warehouse_id": "20",
+            "quantity": 5,
+            "expense_account_id": "30",
+            "expected_remnant_after": 0,
+            "reason": "Obsolete inventory",
+            "approval": "reviewed",
+            "status": "completed",
+            "source_refs": [{"source_id": "inventory-decision", "path": "artifacts/inventory-decision.json", "row_ref": None, "page_ref": None, "notes": None}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            company_dir = Path(tmp) / "companies" / "example"
+            actions_dir = company_dir / "artifacts" / "actions"
+            discovery_dir = company_dir / "artifacts" / "discovery"
+            actions_dir.mkdir(parents=True)
+            discovery_dir.mkdir(parents=True)
+            (actions_dir / "2024-inventory-manual.json").write_text(json.dumps(action), encoding="utf-8")
+            (discovery_dir / "2024-inventory-remnant-verification.json").write_text("[]", encoding="utf-8")
+
+            summary = full_year_dry_run.summarize_action_artifacts(company_dir=company_dir, year=2024)
+
+        self.assertEqual(summary["manual_inventory_status"], "completed")
+        self.assertTrue(summary["manual_inventory_error"])
+
+    def test_full_year_runner_processes_months_before_required_manual_inventory_blocks_acceptance(self) -> None:
+        action = {
+            "action_type": "manual_inventory_writeoff",
+            "effective_date": "2024-06-30",
+            "article_id": "10",
+            "warehouse_id": "20",
+            "quantity": 5,
+            "expense_account_id": "30",
+            "expected_remnant_after": 0,
+            "reason": "Obsolete inventory",
+            "approval": "reviewed",
+            "status": "required",
+            "source_refs": [{"source_id": "inventory-decision", "path": "artifacts/inventory-decision.json", "row_ref": None, "page_ref": None, "notes": None}],
+        }
+        called_scripts: list[str] = []
+
+        def fake_run(cmd: list[str], cwd: Path, capture_output: bool, text: bool) -> SimpleNamespace:
+            del cwd, capture_output, text
+            script = Path(cmd[1]).name
+            called_scripts.append(script)
+            payload = {"result": "pass"} if script == "bookchecker.py" else {"ok": True}
+            return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            company_dir = Path(tmp) / "companies" / "example"
+            actions_dir = company_dir / "artifacts" / "actions"
+            actions_dir.mkdir(parents=True)
+            (actions_dir / "2024-inventory-manual.json").write_text(json.dumps(action), encoding="utf-8")
+            original_run = full_year_dry_run.subprocess.run
+            original_periods = full_year_dry_run.periods_for_year
+            original_resolve = full_year_dry_run.resolve_company_name
+            try:
+                full_year_dry_run.subprocess.run = fake_run
+                full_year_dry_run.periods_for_year = lambda _year: ["2024-01", "2024-02"]
+                full_year_dry_run.resolve_company_name = lambda company_dir: "Example Company OÜ"
+                summary = full_year_dry_run.run_full_year_dry_run(
+                    company_dir=company_dir,
+                    year=2024,
+                    source_dir=None,
+                    python_executable="python3",
+                    continue_on_error=False,
+                    force_build=False,
+                    cwd=Path.cwd(),
+                )
+            finally:
+                full_year_dry_run.subprocess.run = original_run
+                full_year_dry_run.periods_for_year = original_periods
+                full_year_dry_run.resolve_company_name = original_resolve
+
+        self.assertEqual([month["period"] for month in summary["months"]], ["2024-01", "2024-02"])
+        self.assertEqual(called_scripts.count("booksend.py"), 2)
+        self.assertFalse(summary["overall_success"])
+        self.assertTrue(any("manual inventory" in issue.lower() for issue in summary["acceptance_issues"]))
+
     def test_full_year_runner_blocks_before_months_when_tax_evidence_has_no_valid_allocation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             company_dir = Path(tmp) / "companies" / "example"

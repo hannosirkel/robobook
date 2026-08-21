@@ -275,6 +275,18 @@ class FakeClient:
 
 
 class BooksendTests(unittest.TestCase):
+    def test_sender_rejects_manual_inventory_writeoff_before_translation(self) -> None:
+        action = invoice_action()
+        action["action_type"] = "manual_inventory_writeoff"
+
+        with self.assertRaisesRegex(SimplbooksError, "manual inventory"):
+            booksend.translate_action(action, lookup={})
+
+        client = FakeClient(responses=[])
+        with self.assertRaisesRegex(SimplbooksError, "manual inventory"):
+            booksend.execute_batch(action_batch=make_batch(actions=[action]), mode="write", client=client)
+        self.assertEqual(client.calls, [])
+
     def test_sender_copies_reviewed_rate_and_translates_supplier_credit(self) -> None:
         translated = booksend.translate_action_for_api(purchase_credit_action(), lookup={})
 

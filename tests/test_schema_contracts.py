@@ -109,6 +109,16 @@ class SchemaContractTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self.assert_artifact_valid(schema_name="woo-tax-allocation.schema.json", artifact=artifact)
 
+    def test_manual_inventory_action_template_matches_strict_schema(self) -> None:
+        artifact = json.loads((ROOT / "templates/manual-inventory-action.template.json").read_text(encoding="utf-8"))
+        self.assert_artifact_valid(schema_name="manual-inventory-action.schema.json", artifact=artifact)
+
+    def test_manual_inventory_action_schema_rejects_nonpositive_quantity(self) -> None:
+        artifact = json.loads((ROOT / "templates/manual-inventory-action.template.json").read_text(encoding="utf-8"))
+        artifact["quantity"] = 0
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="manual-inventory-action.schema.json", artifact=artifact)
+
     def test_generated_action_batch_matches_strict_schema(self) -> None:
         categories = (
             "sales", "refunds", "fees", "payouts", "bank_transactions", "purchase_expenses",

@@ -199,6 +199,10 @@ def action_successfully_submitted(action: dict[str, Any]) -> bool:
 
 
 def validate_action_shape(action: dict[str, Any]) -> None:
+    if str(action.get("action_type") or "") == "manual_inventory_writeoff":
+        raise SimplbooksError(
+            "manual inventory write-off actions are UI-only and must not be submitted through Simplbooks API."
+        )
     endpoint = normalized_endpoint(str(action.get("endpoint") or ""))
     if endpoint not in ALLOWED_ENDPOINTS:
         raise SimplbooksError(
@@ -532,6 +536,10 @@ def translate_action_for_api(
     allow_unresolved_dependencies: bool = False,
     exchange_rate_cache: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if str(action.get("action_type") or "") == "manual_inventory_writeoff":
+        raise SimplbooksError(
+            "manual inventory write-off actions are UI-only and must not be translated for Simplbooks API submission."
+        )
     payload = action.get("payload") or {}
     draft_schema = str(payload.get("draft_schema") or "")
     currency = str(payload.get("currency") or "EUR").upper()
@@ -577,6 +585,11 @@ def translate_action_for_api(
     raise SimplbooksError(
         f"Action {action_id(action)} uses unsupported draft_schema {draft_schema!r} for live Simplbooks submission."
     )
+
+
+def translate_action(action: dict[str, Any], *, lookup: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Compatibility entry point for local action translation checks."""
+    return translate_action_for_api(action, lookup=lookup)
 
 
 def validate_run_preconditions(

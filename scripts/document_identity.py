@@ -53,15 +53,21 @@ class MatchResult:
 def document_identity(record: dict[str, Any], *, document_type: str) -> DocumentIdentity:
     attributes = record.get("attributes") or {}
     supplier_name = record.get("client_name") or attributes.get("vendor_name") or record.get("supplier_name")
-    external_number = record.get("number")
+    external_number = record.get("number") or record.get("external_number")
     if external_number in (None, ""):
         external_number = record.get("external_ref") or attributes.get("invoice_number")
-    document_date = record.get("transaction_date") or record.get("event_date") or record.get("created") or ""
+    document_date = (
+        record.get("transaction_date")
+        or record.get("event_date")
+        or record.get("document_date")
+        or record.get("created")
+        or ""
+    )
     currency = record.get("currency_name") or record.get("currency") or "EUR"
     gross_amount = record.get("total_sum")
     if gross_amount is None:
         gross_amount = record.get("gross_amount", record.get("sum", 0))
-    simplbooks_id = record.get("id")
+    simplbooks_id = record.get("id") or record.get("simplbooks_id")
 
     return DocumentIdentity(
         document_type=normalize_text(document_type),

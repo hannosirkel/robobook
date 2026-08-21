@@ -12,6 +12,9 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+from document_identity import document_identity, match_existing
+from exchange_rates import ExchangeRateError, lookup_rate
+from posting_policy import PostingPolicyError, load_posting_policy, resolve_bank_account, resolve_contact, resolve_mapping
 from simplbooks_api import SimplbooksError, resolve_company_name
 
 
@@ -2024,6 +2027,237 @@ def summarize_actions(actions: list[dict[str, Any]], *, period: str) -> str:
     return f"Draft batch for {period}: " + ", ".join(parts) + "."
 
 
+def suppress_existing_purchase_records(
+    records: dict[str, list[dict[str, Any]]],
+    discovery_overview: dict[str, Any] | None,
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    copied = {category: list(category_records) for category, category_records in records.items()}
+    existing = [
+        document_identity(item, document_type=str(item.get("document_type") or "purchase"))
+        for item in (discovery_overview or {}).get("document_index") or []
+        if str(item.get("document_type") or "") == "purchase"
+    ]
+    if not existing:
+        return copied, []
+
+    kept: list[dict[str, Any]] = []
+    already_present: list[dict[str, Any]] = []
+    for record in copied.get("purchase_expenses", []):
+        candidate = document_identity(record, document_type="purchase")
+        result = match_existing(candidate, existing)
+        if result.status == "ambiguous":
+            raise SimplbooksError(
+                f"Ambiguous existing Simplbooks purchase match for {record.get('external_ref') or record.get('record_id')}."
+            )
+        if result.status == "exact":
+            matched = result.matches[0]
+            already_present.append(
+                {
+                    "record_ref": record.get("record_id"),
+                    "external_ref": record.get("external_ref"),
+                    "document_type": "purchase",
+                    "simplbooks_id": matched.simplbooks_id,
+                    "reason": "Exact document identity already exists in refreshed Simplbooks discovery.",
+                }
+            )
+            continue
+        kept.append(record)
+    copied["purchase_expenses"] = kept
+    return copied, already_present
+
+
+def build_purchase_credit_actions(
+    *,
+    company_slug: str,
+    period: str,
+    period_end: date,
+    normalized_path_display: str,
+    records: dict[str, list[dict[str, Any]]],
+    base_currency: str,
+    entity_map: dict[str, Any] | None,
+    mapping_hints: dict[str, tuple[str | None, list[str]]],
+    forced_note: str | None,
+) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for record in records.get("purchase_credits", []):
+        key = (record_group_label(record, default="supplier"), record_currency(record, base_currency))
+        grouped[key].append(record)
+
+    actions: list[dict[str, Any]] = []
+    expense_account_id, _notes = mapping_hints["fulfillment_account"]
+    zero_vat_type_id, _vat_notes = mapping_hints["zero_vat_type"]
+    printful_expense_account_id, printful_vat_type_id = printful_purchase_mapping(entity_map)
+    for (group_label, currency), group_records in sorted(grouped.items()):
+        contact_id, contact_notes = preferred_contact_id(
+            entity_map,
+            group_label=group_label,
+            candidate_labels=contact_candidate_labels(group_label=group_label, records=group_records),
+        )
+        total = sum_abs_amount(group_records, "gross_amount")
+        if total == 0:
+            continue
+        account_id = printful_expense_account_id if group_label == "printful" else expense_account_id
+        vat_type_id = printful_vat_type_id if group_label == "printful" else zero_vat_type_id
+        review_notes = list(contact_notes)
+        if forced_note:
+            review_notes.append(forced_note)
+        review_notes.append(record_count_note(group_records))
+        payload = {
+            "draft_schema": "purchase_credit_summary_v1",
+            "document_type": "purchase_credit",
+            "document_date": period_end.isoformat(),
+            "currency": currency,
+            "counterparty": {
+                "contact_id": contact_id,
+                "display_name_hint": f"{group_label} supplier credit summary",
+            },
+            "vendor_hint": group_label,
+            "totals": {"gross_amount": decimal_number(total), "vat_amount": 0.0},
+            "line_items": [
+                {
+                    "line_role": "purchase_credit",
+                    "description": f"{group_label} supplier credit summary",
+                    "gross_amount": decimal_number(total),
+                    "vat_amount_hint": 0.0,
+                    "suggested_expense_account_id": account_id,
+                    "suggested_vat_type_id": vat_type_id,
+                    "warehouse_id_hint": None,
+                    "record_count": len(group_records),
+                }
+            ],
+        }
+        actions.append(
+            make_action(
+                period=period,
+                idempotency_key=f"{company_slug}-{period}-purchase-credit-{slugify(group_label)}",
+                action_type="create_purchase_credit_summary",
+                endpoint="purchases/create",
+                payload=payload,
+                source_refs=source_refs_for_records(normalized_path_display, group_records),
+                reason=f"Preserve {group_label} refund evidence as a separate supplier credit.",
+                confidence=review_confidence(notes=review_notes, required_ids=[contact_id, account_id, vat_type_id]),
+                depends_on=[],
+                expected_effect=f"Create a supplier credit for {group_label} in Simplbooks.",
+                review_notes=review_notes,
+            )
+        )
+    return actions
+
+
+def apply_exchange_rate_provenance(
+    actions: list[dict[str, Any]],
+    *,
+    base_currency: str,
+    exchange_rate_cache: dict[str, Any] | None,
+) -> None:
+    for action in actions:
+        payload = action.get("payload") or {}
+        currency = str(payload.get("currency") or base_currency).upper()
+        if currency == base_currency.upper() or exchange_rate_cache is None:
+            continue
+        try:
+            resolution = lookup_rate(
+                exchange_rate_cache,
+                requested_date=date.fromisoformat(str(payload["document_date"])),
+                base=currency,
+                quote=base_currency,
+            )
+        except (ExchangeRateError, ValueError, KeyError) as exc:
+            raise SimplbooksError(f"Could not resolve audited ECB rate for {currency}: {exc}") from exc
+        payload.update(
+            {
+                "currency_rate": decimal_number(resolution.rate),
+                "currency_rate_requested_date": resolution.requested_date.isoformat(),
+                "currency_rate_effective_date": resolution.effective_date.isoformat(),
+                "currency_rate_provider": resolution.provider,
+                "currency_rate_source_url": resolution.source_url,
+            }
+        )
+
+
+def apply_posting_policy(
+    actions: list[dict[str, Any]],
+    *,
+    posting_policy: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if posting_policy is None:
+        return []
+    unresolved: list[dict[str, Any]] = []
+    for action in actions:
+        payload = action.get("payload") or {}
+        action_type = str(action.get("action_type") or "")
+        if action_type in {"create_invoice_summary", "create_credit_invoice_summary"}:
+            role = "sales"
+            label = str((payload.get("summary_scope") or {}).get("channel_or_source") or "")
+        elif action_type in {"create_incoming_summary"} or action_type == "create_purchase_summary" and str(payload.get("vendor_hint")) in PROCESSOR_KEYWORDS:
+            role = "processors"
+            label = str(payload.get("counterparty_hint") or payload.get("vendor_hint") or "")
+        elif action_type in {"create_purchase_summary", "create_purchase_credit_summary", "create_payment_summary"}:
+            role = "suppliers"
+            label = str(payload.get("vendor_hint") or payload.get("counterparty_hint") or "")
+        else:
+            continue
+        try:
+            contact_id = resolve_contact(posting_policy, role=role, label=label)
+        except PostingPolicyError as exc:
+            (payload.get("counterparty") or {})["contact_id"] = None
+            dependency = {
+                "action_id": action.get("idempotency_key"),
+                "kind": "contact_mapping",
+                "role": role,
+                "label": label,
+                "blocking": True,
+                "reason": str(exc),
+            }
+            if slugify(label) == "paypal":
+                dependency["master_data_draft_ref"] = "artifacts/actions/master-data-paypal.yaml"
+            unresolved.append(dependency)
+            action.setdefault("review_notes", []).append(str(exc))
+        else:
+            (payload.get("counterparty") or {})["contact_id"] = contact_id
+
+        family = ""
+        if role == "sales":
+            tax_profile = str((payload.get("summary_scope") or {}).get("tax_profile") or "")
+            if not tax_profile:
+                tax_profile = "taxable" if decimal_value((payload.get("totals") or {}).get("vat_amount")) else "non-taxable"
+            family = f"{slugify(label)}-{slugify(tax_profile)}"
+        elif action_type == "create_purchase_summary" and role == "processors":
+            family = f"fees-{slugify(label)}"
+        elif action_type in {"create_purchase_summary", "create_purchase_credit_summary"}:
+            family = f"purchase-{slugify(label)}"
+
+        family_values = (posting_policy.get("mappings") or {}).get(family)
+        if not isinstance(family_values, dict):
+            continue
+        for line in payload.get("line_items") or []:
+            line_role = str(line.get("line_role") or "")
+            if role == "sales":
+                is_shipping = line_role.endswith("_shipping")
+                income_field = "shipping_income_account_id" if is_shipping else "income_account_id"
+                vat_field = "shipping_vat_type_id" if is_shipping else "vat_type_id"
+                line["suggested_income_account_id"] = resolve_mapping(
+                    posting_policy, family=family, field_name=income_field
+                )
+                line["suggested_vat_type_id"] = resolve_mapping(
+                    posting_policy, family=family, field_name=vat_field
+                )
+                if family_values.get("warehouse_id") not in (None, ""):
+                    line["warehouse_id_hint"] = resolve_mapping(
+                        posting_policy, family=family, field_name="warehouse_id"
+                    )
+            else:
+                if family_values.get("expense_account_id") not in (None, ""):
+                    line["suggested_expense_account_id"] = resolve_mapping(
+                        posting_policy, family=family, field_name="expense_account_id"
+                    )
+                if family_values.get("vat_type_id") not in (None, ""):
+                    line["suggested_vat_type_id"] = resolve_mapping(
+                        posting_policy, family=family, field_name="vat_type_id"
+                    )
+    return unresolved
+
+
 def build_action_batch(
     *,
     normalized_payload: dict[str, Any],
@@ -2035,6 +2269,9 @@ def build_action_batch(
     policy_path: Path | None = None,
     entity_map: dict[str, Any] | None = None,
     company_profile: dict[str, Any] | None = None,
+    posting_policy: dict[str, Any] | None = None,
+    exchange_rate_cache: dict[str, Any] | None = None,
+    discovery_overview: dict[str, Any] | None = None,
     force: bool = False,
 ) -> dict[str, Any]:
     if normalized_payload.get("period") != recon_payload.get("period"):
@@ -2061,8 +2298,24 @@ def build_action_batch(
         forced_note = "Draft was forced even though recon did not approve this month."
 
     mapping_hints = preferred_mapping_hints(entity_map)
+    records, already_present = suppress_existing_purchase_records(
+        normalized_payload.get("records") or {},
+        discovery_overview,
+    )
     bank_account_id, bank_account_notes = preferred_bank_account_id(company_profile, entity_map)
-    records = normalized_payload.get("records") or {}
+    if posting_policy is not None and records.get("bank_transactions"):
+        source_accounts = {
+            re.sub(r"\s+", "", str((record.get("attributes") or {}).get("customer_account") or "")).upper()
+            for record in records["bank_transactions"]
+        }
+        source_accounts.discard("")
+        if len(source_accounts) != 1:
+            raise SimplbooksError("Posting policy requires exactly one source bank account in normalized bank rows.")
+        try:
+            bank_account_id = resolve_bank_account(posting_policy, customer_account=next(iter(source_accounts)))
+        except PostingPolicyError as exc:
+            raise SimplbooksError(str(exc)) from exc
+        bank_account_notes = ["Applied exact source-bank-account mapping from posting policy."]
     artifacts_dir = inferred_artifacts_dir(normalized_path)
     prior_purchase_candidates = historical_purchase_candidates(
         actions_dir=(artifacts_dir / "actions") if artifacts_dir is not None else None,
@@ -2103,6 +2356,17 @@ def build_action_batch(
         mapping_hints=mapping_hints,
         forced_note=forced_note,
     )
+    purchase_credit_actions = build_purchase_credit_actions(
+        company_slug=company_slug,
+        period=period,
+        period_end=period_end,
+        normalized_path_display=normalized_path_display,
+        records=records,
+        base_currency=base_currency,
+        entity_map=entity_map,
+        mapping_hints=mapping_hints,
+        forced_note=forced_note,
+    )
     incoming_actions = build_incoming_actions(
         company_slug=company_slug,
         period=period,
@@ -2133,7 +2397,13 @@ def build_action_batch(
         forced_note=forced_note,
     )
 
-    actions = sales_actions + fee_actions + purchase_actions + incoming_actions + payment_actions
+    actions = sales_actions + fee_actions + purchase_actions + purchase_credit_actions + incoming_actions + payment_actions
+    unresolved_dependencies = apply_posting_policy(actions, posting_policy=posting_policy)
+    apply_exchange_rate_provenance(
+        actions,
+        base_currency=base_currency,
+        exchange_rate_cache=exchange_rate_cache,
+    )
     summary_parts = [summarize_actions(actions, period=period)]
     if policy_path and policy_text is not None:
         summary_parts.append(f"Policy memo: {display_path(policy_path, repo_root)}.")
@@ -2153,6 +2423,8 @@ def build_action_batch(
         "approval_status": "draft",
         "source_summary": source_summary,
         "recon_ref": recon_path_display,
+        "already_present": already_present,
+        "unresolved_dependencies": unresolved_dependencies,
         "actions": actions,
     }
 
@@ -2215,6 +2487,21 @@ def resolve_company_profile_path(*, company_dir: Path | None, normalized_path: P
     return artifacts_dir / "company_profile.json"
 
 
+def resolve_reference_path(
+    *,
+    company_dir: Path | None,
+    normalized_path: Path,
+    override: str | None,
+    filename: str,
+) -> Path | None:
+    if override:
+        return Path(override)
+    if company_dir is not None:
+        return company_dir / "artifacts" / filename
+    artifacts_dir = inferred_artifacts_dir(normalized_path)
+    return (artifacts_dir / filename) if artifacts_dir is not None else None
+
+
 def resolve_output_path(*, company_dir: Path | None, normalized_path: Path, period: str, override: str | None) -> Path:
     if override:
         return Path(override)
@@ -2235,6 +2522,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--policy-memo", help="Optional path to policy memo markdown")
     parser.add_argument("--entity-map", help="Optional path to entity map JSON")
     parser.add_argument("--company-profile", help="Optional path to company profile JSON")
+    parser.add_argument("--posting-policy", help="Posting policy JSON; defaults to company artifacts/posting_policy.json")
+    parser.add_argument("--exchange-rates", help="Annual ECB cache; defaults to company artifacts/reference/ecb-rates-<year>.json")
+    parser.add_argument("--discovery-overview", help="Refreshed Simplbooks overview; defaults to company artifacts/discovery/<year>-overview.json")
     parser.add_argument("--output", help="Optional output path for actions YAML")
     parser.add_argument("--force", action="store_true", help="Allow draft generation even when recon does not approve the month")
     return parser
@@ -2252,6 +2542,25 @@ def main() -> int:
         normalized_path=normalized_path,
         override=args.company_profile,
     )
+    year = int(args.period[:4])
+    posting_policy_path = resolve_reference_path(
+        company_dir=company_dir,
+        normalized_path=normalized_path,
+        override=args.posting_policy,
+        filename="posting_policy.json",
+    )
+    exchange_rates_path = resolve_reference_path(
+        company_dir=company_dir,
+        normalized_path=normalized_path,
+        override=args.exchange_rates,
+        filename=f"reference/ecb-rates-{year}.json",
+    )
+    discovery_overview_path = resolve_reference_path(
+        company_dir=company_dir,
+        normalized_path=normalized_path,
+        override=args.discovery_overview,
+        filename=f"discovery/{year}-overview.json",
+    )
     output_path = resolve_output_path(company_dir=company_dir, normalized_path=normalized_path, period=args.period, override=args.output)
 
     normalized_payload = load_json(normalized_path)
@@ -2259,6 +2568,9 @@ def main() -> int:
     policy_text = load_optional_text(policy_path)
     entity_map = load_optional_json(entity_map_path)
     company_profile = load_optional_json(company_profile_path)
+    posting_policy = load_posting_policy(posting_policy_path) if posting_policy_path and posting_policy_path.exists() else None
+    exchange_rate_cache = load_optional_json(exchange_rates_path)
+    discovery_overview = load_optional_json(discovery_overview_path)
     repo_root = Path.cwd()
 
     batch = build_action_batch(
@@ -2271,6 +2583,9 @@ def main() -> int:
         policy_path=policy_path if policy_text is not None else None,
         entity_map=entity_map,
         company_profile=company_profile,
+        posting_policy=posting_policy,
+        exchange_rate_cache=exchange_rate_cache,
+        discovery_overview=discovery_overview,
         force=args.force,
     )
     write_yaml(output_path, batch)

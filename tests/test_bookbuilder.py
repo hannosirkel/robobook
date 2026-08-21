@@ -19,6 +19,7 @@ RECORD_CATEGORIES = (
     "payouts",
     "bank_transactions",
     "purchase_expenses",
+    "purchase_credits",
     "inventory_movements",
     "manual_adjustments",
     "other",
@@ -149,6 +150,166 @@ def purchase_summary_action(
 
 
 class BookbuilderTests(unittest.TestCase):
+    def test_builder_applies_single_month_end_ecb_rate(self) -> None:
+        normalized = base_normalized(period="2024-03")
+        usd_purchase = record(
+            record_id="quartermaster:usd:1",
+            source_system="quartermaster",
+            event_type="quartermaster_service_invoice",
+            gross_amount=31.0,
+            description="Quartermaster March invoice",
+            channel="quartermaster",
+        )
+        usd_purchase["currency"] = "USD"
+        normalized["records"]["purchase_expenses"].append(usd_purchase)
+        rate_cache = {
+            "schema_version": "1.0",
+            "provider": "ECB",
+            "year": 2024,
+            "base": "USD",
+            "quote": "EUR",
+            "source_url": "https://api.frankfurter.dev/v2/rates?provider=ECB",
+            "retrieved_at": "2026-08-21T00:00:00Z",
+            "rates": [
+                {"date": "2024-03-28", "base": "USD", "quote": "EUR", "rate": "0.9241"}
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            batch = bookbuilder.build_action_batch(
+                normalized_payload=normalized,
+                recon_payload=base_recon(period="2024-03"),
+                normalized_path=Path(tmp) / "normalized.json",
+                recon_path=Path(tmp) / "recon.json",
+                repo_root=Path(tmp),
+                exchange_rate_cache=rate_cache,
+            )
+
+        action = find_action(batch, "create_purchase_summary")
+        self.assertEqual(action["payload"]["currency_rate"], 0.9241)
+        self.assertEqual(action["payload"]["currency_rate_effective_date"], "2024-03-28")
+        self.assertEqual(action["payload"]["currency_rate_provider"], "ECB")
+
+    def test_builder_creates_credit_and_suppresses_exact_existing_purchase(self) -> None:
+        normalized = base_normalized(period="2024-07")
+        normalized["records"]["purchase_credits"].append(
+            record(
+                record_id="printful:credit:1",
+                source_system="printful",
+                event_type="printful_supplier_credit",
+                gross_amount=113.12,
+                description="Printful supplier credit",
+                channel="printful",
+                external_ref="105211877",
+                attributes={"vendor_name": "Printful Inc."},
+            )
+        )
+        existing_record = record(
+            record_id="simplbooks:invoice:1",
+            source_system="document",
+            source_type="pdf",
+            event_type="purchase_invoice_pdf",
+            gross_amount=206.18,
+            description="SimplBooks invoice",
+            channel="simplbooks-ou",
+            external_ref="EE24111268",
+            attributes={"vendor_name": "SimplBooks OÜ"},
+        )
+        existing_record["event_date"] = "2024-11-18"
+        normalized["records"]["purchase_expenses"].append(existing_record)
+        discovery = {
+            "document_index": [
+                {
+                    "document_type": "purchase",
+                    "supplier_name": "simplbooks oü",
+                    "external_number": "EE24111268",
+                    "document_date": "2024-11-18",
+                    "currency": "EUR",
+                    "gross_amount": 206.18,
+                    "simplbooks_id": "157",
+                }
+            ]
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            batch = bookbuilder.build_action_batch(
+                normalized_payload=normalized,
+                recon_payload=base_recon(period="2024-07"),
+                normalized_path=Path(tmp) / "normalized.json",
+                recon_path=Path(tmp) / "recon.json",
+                repo_root=Path(tmp),
+                discovery_overview=discovery,
+            )
+
+        credit = find_action(batch, "create_purchase_credit_summary")
+        self.assertEqual(credit["payload"]["totals"]["gross_amount"], 113.12)
+        self.assertTrue(any(item["external_ref"] == "EE24111268" for item in batch["already_present"]))
+        self.assertFalse(any(action["payload"].get("vendor_hint") == "simplbooks-ou" for action in batch["actions"]))
+
+    def test_builder_applies_explicit_bank_and_sales_contact_policy(self) -> None:
+        normalized = base_normalized()
+        normalized["records"]["sales"].append(
+            record(
+                record_id="woo:sale:1",
+                source_system="woocommerce",
+                event_type="merchant_sales_summary",
+                gross_amount=10.0,
+                channel="woo",
+            )
+        )
+        payout = record(
+            record_id="stripe:payout:1",
+            source_system="stripe",
+            event_type="stripe_payout",
+            gross_amount=10.0,
+            channel="stripe",
+        )
+        normalized["records"]["payouts"].append(payout)
+        bank = record(
+            record_id="bank:1",
+            source_system="bank",
+            event_type="bank_credit",
+            gross_amount=10.0,
+            channel="stripe",
+            attributes={"customer_account": "EE001234567890"},
+        )
+        normalized["records"]["bank_transactions"].append(bank)
+        policy = {
+            "schema_version": "1.0",
+            "company_slug": "example",
+            "bank_accounts": {"EE001234567890": "3"},
+            "contacts": {"sales": {"woo": "42"}, "processors": {"stripe": "29"}, "suppliers": {}},
+            "mappings": {
+                "woo-non-taxable": {
+                    "income_account_id": "109",
+                    "shipping_income_account_id": "255",
+                    "vat_type_id": "12",
+                    "shipping_vat_type_id": "13",
+                    "warehouse_id": "6",
+                }
+            },
+            "supplier_aliases": {},
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            batch = bookbuilder.build_action_batch(
+                normalized_payload=normalized,
+                recon_payload=base_recon(),
+                normalized_path=Path(tmp) / "normalized.json",
+                recon_path=Path(tmp) / "recon.json",
+                repo_root=Path(tmp),
+                posting_policy=policy,
+            )
+
+        sales = find_action(batch, "create_invoice_summary")
+        self.assertEqual(sales["payload"]["counterparty"]["contact_id"], "42")
+        self.assertEqual(sales["payload"]["line_items"][0]["suggested_income_account_id"], "109")
+        self.assertEqual(sales["payload"]["line_items"][0]["suggested_vat_type_id"], "12")
+        self.assertEqual(sales["payload"]["line_items"][0]["warehouse_id_hint"], "6")
+        incoming = find_action(batch, "create_incoming_summary")
+        self.assertEqual(incoming["payload"]["bank_account_id"], "3")
+        self.assertEqual(incoming["payload"]["counterparty"]["contact_id"], "29")
+
     def test_builder_blocks_when_recon_not_approved(self) -> None:
         normalized = base_normalized()
         recon = base_recon(approve=False)

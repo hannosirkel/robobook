@@ -11,6 +11,8 @@
     "generated_at",
     "batch_id",
     "approval_status",
+    "already_present",
+    "unresolved_dependencies",
     "actions"
   ],
   "properties": {
@@ -53,6 +55,14 @@
         "string",
         "null"
       ]
+    },
+    "already_present": {
+      "type": "array",
+      "items": {"type": "object"}
+    },
+    "unresolved_dependencies": {
+      "type": "array",
+      "items": {"type": "object"}
     },
     "actions": {
       "type": "array",

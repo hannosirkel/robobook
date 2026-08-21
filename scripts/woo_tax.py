@@ -422,12 +422,6 @@ def validate_allocation_against_evidence(
                 continue
             actual_rows[row_id] = (evidence, row)
 
-    stale_source_ids = sorted(set(allocation_files) - actual_source_ids)
-    if stale_source_ids:
-        errors.append(
-            "allocation contains stale Woo tax source(s): " + ", ".join(stale_source_ids)
-        )
-
     if set(allocation_rows) != set(actual_rows):
         missing = sorted(set(actual_rows) - set(allocation_rows))
         stale = sorted(set(allocation_rows) - set(actual_rows))

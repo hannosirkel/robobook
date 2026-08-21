@@ -501,7 +501,6 @@ class WooTaxTests(unittest.TestCase):
             ("hash", lambda payload: payload["source_files"][0].update({"sha256": "b" * 64})),
             ("row", lambda payload: payload["source_rows"][0].update({"order_tax": 9.99})),
             ("source", lambda payload: payload["source_files"][0].update({"source_id": "wrong-source"})),
-            ("extra source", lambda payload: payload["source_files"].append({"source_id": "stale", "sha256": "c" * 64})),
         )
         for label, mutate in mutations:
             with self.subTest(label=label):

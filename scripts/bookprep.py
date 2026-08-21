@@ -1964,6 +1964,10 @@ def parse_bank_csv(
 
         currency = row.get("Valuuta", "").strip().upper() or base_currency
         description = row.get("Selgitus") or row.get("Saaja/maksja nimi") or "Bank transaction"
+        archive_identifier = str(row.get("Arhiveerimistunnus") or "").strip() or None
+        account_servicer_reference = str(row.get("Konto teenusepakkuja viide") or "").strip() or None
+        entry_reference = str(row.get("Kande viide") or "").strip() or None
+        document_number = str(row.get("Dokumendi number") or "").strip() or None
         category, record = make_record(
             source=source,
             category="bank_transactions",
@@ -1974,14 +1978,16 @@ def parse_bank_csv(
             currency=currency,
             gross_amount=amount,
             net_amount=amount,
-            external_ref=row.get("Arhiveerimistunnus") or row.get("Dokumendi number") or None,
+            external_ref=archive_identifier or account_servicer_reference or entry_reference or document_number,
             attributes={
                 "customer_account": row.get("Kliendi konto"),
                 "counterparty_account": row.get("Saaja/maksja konto"),
                 "counterparty_name": row.get("Saaja/maksja nimi"),
                 "reference_number": row.get("Viitenumber"),
                 "bank_bic": row.get("Saaja/maksja panga BIC"),
-                "archive_identifier": row.get("Arhiveerimistunnus") or None,
+                "archive_identifier": archive_identifier,
+                "account_servicer_reference": account_servicer_reference,
+                "entry_reference": entry_reference,
             },
             row_ref=f"csv:{line_no}",
         )
@@ -2393,6 +2399,18 @@ def parse_camt_xml(
         if account is not None:
             iban = (account.findtext("ns:Id/ns:IBAN" if ns else "Id/IBAN", default="", namespaces=ns) or "").strip().upper()
             account_currency = (account.findtext("ns:Ccy" if ns else "Ccy", default=base_currency, namespaces=ns) or base_currency).strip().upper()
+        statement_from_text = statement.findtext(
+            "ns:FrToDt/ns:FrDtTm" if ns else "FrToDt/FrDtTm",
+            default="",
+            namespaces=ns,
+        )
+        statement_to_text = statement.findtext(
+            "ns:FrToDt/ns:ToDtTm" if ns else "FrToDt/ToDtTm",
+            default="",
+            namespaces=ns,
+        )
+        statement_from = parse_date_value(statement_from_text[:10]).isoformat() if statement_from_text else None
+        statement_to = parse_date_value(statement_to_text[:10]).isoformat() if statement_to_text else None
 
         for balance in statement.findall("ns:Bal" if ns else "Bal", ns):
             balance_index += 1
@@ -2434,6 +2452,8 @@ def parse_camt_xml(
                     "balance_type": balance_type,
                     "balance_date": balance_date.isoformat(),
                     "credit_debit_indicator": credit_debit or None,
+                    "statement_from": statement_from,
+                    "statement_to": statement_to,
                 },
                 row_ref=f"xml:balance:{balance_index}",
             )
@@ -2471,6 +2491,11 @@ def parse_camt_xml(
                 default="",
                 namespaces=ns,
             )
+            entry_reference = entry.findtext(
+                "ns:NtryRef" if ns else "NtryRef",
+                default="",
+                namespaces=ns,
+            )
             category, record = make_record(
                 source=source,
                 category="bank_transactions",
@@ -2485,6 +2510,7 @@ def parse_camt_xml(
                 attributes={
                     "iban": iban or None,
                     "account_servicer_reference": reference or None,
+                    "entry_reference": entry_reference or None,
                     "credit_debit_indicator": credit_debit,
                 },
                 row_ref=f"xml:{entry_index}",
@@ -3486,6 +3512,7 @@ def physical_bank_references(record: dict[str, Any]) -> set[str]:
             record.get("external_ref"),
             attributes.get("archive_identifier"),
             attributes.get("account_servicer_reference"),
+            attributes.get("entry_reference"),
         )
         if str(value or "").strip()
     }

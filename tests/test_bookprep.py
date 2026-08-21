@@ -692,6 +692,56 @@ class BookprepTests(unittest.TestCase):
             self.assertEqual(len(records["bank_transactions"]), 1)
             self.assertEqual(len(records["bank_balances"]), 1)
 
+    def test_camt_is_supporting_when_csv_uses_account_servicer_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kontovv_primary_2024-01.csv").write_text(
+                "Kliendi konto,Dokumendi number,Kuupäev,Saaja/maksja konto,Saaja/maksja nimi,Deebet/Kreedit (D/C),Summa,Viitenumber,Arhiveerimistunnus,Konto teenusepakkuja viide,Kande viide,Selgitus,Valuuta\n"
+                "EE00,DOC1,2024-01-02,ACC1,Customer,C,12.00,,,SVC-0001,ENTRY-0001,Receipt,EUR\n",
+                encoding="utf-8",
+            )
+            (root / "statement_2024-01.xml").write_text(
+                "<Document><BkToCstmrStmt><Stmt><Acct><Id><IBAN>EE00</IBAN></Id><Ccy>EUR</Ccy></Acct>"
+                "<Ntry><Amt Ccy=\"EUR\">12.00</Amt><CdtDbtInd>CRDT</CdtDbtInd><BookgDt><Dt>2024-01-02</Dt></BookgDt><AcctSvcrRef>SVC-0001</AcctSvcrRef></Ntry>"
+                "</Stmt></BkToCstmrStmt></Document>",
+                encoding="utf-8",
+            )
+            start, end = bookprep.parse_period("2024-01")
+            sources = bookprep.inspect_sources(source_dir=root, root_dir=root, period_start=start, period_end=end)
+
+            records, exceptions = bookprep.aggregate_results(
+                sources=sources, period_start=start, period_end=end, base_currency="EUR"
+            )
+
+            self.assertEqual(len(records["bank_transactions"]), 1)
+            csv_record = records["bank_transactions"][0]
+            self.assertEqual(csv_record["external_ref"], "SVC-0001")
+            self.assertEqual(csv_record["attributes"]["account_servicer_reference"], "SVC-0001")
+            self.assertEqual(csv_record["attributes"]["entry_reference"], "ENTRY-0001")
+            self.assertFalse(any("duplicate-risk" in item["exception_id"] for item in exceptions))
+
+    def test_camt_xml_attaches_annual_statement_scope_to_balances(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            xml_path = root / "statement_2024.xml"
+            xml_path.write_text(
+                "<Document><BkToCstmrStmt><Stmt>"
+                "<FrToDt><FrDtTm>2024-01-01T00:00:00+02:00</FrDtTm><ToDtTm>2024-12-31T23:59:59+02:00</ToDtTm></FrToDt>"
+                "<Acct><Id><IBAN>EE11</IBAN></Id><Ccy>EUR</Ccy></Acct>"
+                "<Bal><Tp><CdOrPrtry><Cd>CLBD</Cd></CdOrPrtry></Tp><Amt Ccy=\"EUR\">20.00</Amt><Dt><Dt>2024-12-31</Dt></Dt></Bal>"
+                "</Stmt></BkToCstmrStmt></Document>",
+                encoding="utf-8",
+            )
+            start, end = bookprep.parse_period("2024-12")
+            source = bookprep.inspect_source_file(path=xml_path, root_dir=root, period_start=start, period_end=end)
+            assert source is not None
+
+            records, _ = bookprep.parse_camt_xml(source, period_start=start, period_end=end, base_currency="EUR")
+
+            balance = records["bank_balances"][0]
+            self.assertEqual(balance["attributes"]["statement_from"], "2024-01-01")
+            self.assertEqual(balance["attributes"]["statement_to"], "2024-12-31")
+
     def test_camt_same_ledger_mismatched_reference_is_blocking_duplicate_risk(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

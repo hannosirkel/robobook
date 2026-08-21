@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Company Posting Policy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "company_slug", "bank_accounts", "contacts", "mappings", "supplier_aliases"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "company_slug": {"type": "string", "pattern": "^[a-z0-9-]+$"},
+    "bank_accounts": {
+      "type": "object",
+      "additionalProperties": {"type": "string", "pattern": "^[0-9]+$"}
+    },
+    "contacts": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": {"type": "string", "pattern": "^[0-9]+$"}
+      }
+    },
+    "mappings": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": {"type": ["string", "null"]}
+      }
+    },
+    "supplier_aliases": {
+      "type": "object",
+      "additionalProperties": {"type": "string", "minLength": 1}
+    }
+  }
+}

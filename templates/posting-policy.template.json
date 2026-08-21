@@ -1,0 +1,30 @@
+{
+  "schema_version": "1.0",
+  "company_slug": "example",
+  "bank_accounts": {
+    "EE001234567890": "3"
+  },
+  "contacts": {
+    "sales": {
+      "woo": "42"
+    },
+    "processors": {
+      "stripe": "29"
+    },
+    "suppliers": {
+      "printful": "41"
+    }
+  },
+  "mappings": {
+    "woo-taxable": {
+      "income_account_id": "107",
+      "shipping_income_account_id": "253",
+      "vat_type_id": "21",
+      "shipping_vat_type_id": "22",
+      "warehouse_id": "6"
+    }
+  },
+  "supplier_aliases": {
+    "omniva": "as-eesti-post"
+  }
+}

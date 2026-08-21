@@ -7,13 +7,14 @@ import hashlib
 import json
 import re
 from collections import defaultdict
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
 from bookbuilder import write_yaml
 from bookchecker import load_yaml
+from exchange_rates import ExchangeRateError, lookup_rate
 from simplbooks_api import (
     SimplbooksClient,
     SimplbooksError,
@@ -527,9 +528,30 @@ def translate_action_for_api(
     *,
     lookup: dict[str, dict[str, Any]],
     allow_unresolved_dependencies: bool = False,
+    exchange_rate_cache: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload = action.get("payload") or {}
     draft_schema = str(payload.get("draft_schema") or "")
+    currency = str(payload.get("currency") or "EUR").upper()
+    if currency != "EUR" and exchange_rate_cache is not None:
+        try:
+            resolution = lookup_rate(
+                exchange_rate_cache,
+                requested_date=date.fromisoformat(
+                    str(payload.get("currency_rate_requested_date") or payload.get("document_date"))
+                ),
+                base=currency,
+                quote="EUR",
+            )
+        except (ExchangeRateError, ValueError) as exc:
+            raise SimplbooksError(f"{action_id(action)} ECB cache validation failed: {exc}") from exc
+        if (
+            decimal_value(payload.get("currency_rate")) != resolution.rate
+            or str(payload.get("currency_rate_effective_date") or "") != resolution.effective_date.isoformat()
+            or str(payload.get("currency_rate_provider") or "") != resolution.provider
+            or str(payload.get("currency_rate_source_url") or "") != resolution.source_url
+        ):
+            raise SimplbooksError(f"{action_id(action)} reviewed rate does not match the annual ECB cache.")
 
     if draft_schema == "invoice_summary_v1":
         return translate_invoice_payload(
@@ -872,6 +894,7 @@ def execute_batch(
     client: Any | None = None,
     existing_request_log: list[dict[str, Any]] | None = None,
     reference_lookup: dict[str, dict[str, Any]] | None = None,
+    exchange_rate_cache: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     ordered_actions = stable_execution_order(list(action_batch.get("actions") or []))
     lookup = dict(reference_lookup or {})
@@ -881,6 +904,13 @@ def execute_batch(
     successful_actions = 0
     failed_actions = 0
     stopped_on_failure = False
+
+    has_foreign_actions = any(
+        str((action.get("payload") or {}).get("currency") or "EUR").upper() != "EUR"
+        for action in ordered_actions
+    )
+    if mode == "write" and has_foreign_actions and exchange_rate_cache is None:
+        raise SimplbooksError("Write mode requires the annual ECB cache for foreign-currency actions.")
 
     for action in ordered_actions:
         validate_action_shape(action)
@@ -892,6 +922,7 @@ def execute_batch(
             action,
             lookup=lookup,
             allow_unresolved_dependencies=(mode == "dry-run"),
+            exchange_rate_cache=exchange_rate_cache,
         )
         translated_endpoint = normalized_endpoint(str(translated.get("endpoint") or ""))
         translated_payload = copy.deepcopy(translated.get("payload") or {})
@@ -1026,6 +1057,16 @@ def run_submission(
         action_path=action_path,
         period=period,
     )
+    exchange_rate_cache_path = (
+        company_dir / "artifacts" / "reference" / f"ecb-rates-{period[:4]}.json"
+        if company_dir is not None
+        else None
+    )
+    exchange_rate_cache = (
+        load_json(exchange_rate_cache_path)
+        if exchange_rate_cache_path is not None and exchange_rate_cache_path.exists()
+        else None
+    )
 
     if mode == "write" and client is None:
         resolved_company_id = resolve_company_id(company_id, company_dir=str(company_dir) if company_dir else None)
@@ -1043,6 +1084,7 @@ def run_submission(
         client=client,
         existing_request_log=(existing_submission or {}).get("request_log") or [],
         reference_lookup=reference_lookup,
+        exchange_rate_cache=exchange_rate_cache,
     )
     prior_request_count = len((existing_submission or {}).get("request_log") or [])
     current_request_log = submission["request_log"][prior_request_count:]

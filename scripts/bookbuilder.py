@@ -2094,6 +2094,7 @@ def build_purchase_credit_actions(
             candidate_labels=contact_candidate_labels(group_label=group_label, records=group_records),
         )
         total = sum_abs_amount(group_records, "gross_amount")
+        vat_total = sum_abs_amount(group_records, "vat_amount")
         if total == 0:
             continue
         account_id = printful_expense_account_id if group_label == "printful" else expense_account_id
@@ -2112,13 +2113,13 @@ def build_purchase_credit_actions(
                 "display_name_hint": f"{group_label} supplier credit summary",
             },
             "vendor_hint": group_label,
-            "totals": {"gross_amount": decimal_number(total), "vat_amount": 0.0},
+            "totals": {"gross_amount": decimal_number(total), "vat_amount": decimal_number(vat_total)},
             "line_items": [
                 {
                     "line_role": "purchase_credit",
                     "description": f"{group_label} supplier credit summary",
                     "gross_amount": decimal_number(total),
-                    "vat_amount_hint": 0.0,
+                    "vat_amount_hint": decimal_number(vat_total),
                     "suggested_expense_account_id": account_id,
                     "suggested_vat_type_id": vat_type_id,
                     "warehouse_id_hint": None,
@@ -2304,9 +2305,23 @@ def build_action_batch(
     )
     bank_account_id, bank_account_notes = preferred_bank_account_id(company_profile, entity_map)
     if posting_policy is not None and records.get("bank_transactions"):
+        source_bank_records = [
+            record
+            for record in records["bank_transactions"]
+            if slugify(str(record.get("source_system") or "")) == "bank"
+        ]
+        missing_source_accounts = [
+            str(record.get("record_id") or "<unknown>")
+            for record in source_bank_records
+            if not str((record.get("attributes") or {}).get("customer_account") or "").strip()
+        ]
+        if missing_source_accounts:
+            raise SimplbooksError(
+                f"Posting policy found bank row(s) missing source bank account: {', '.join(missing_source_accounts[:3])}."
+            )
         source_accounts = {
             re.sub(r"\s+", "", str((record.get("attributes") or {}).get("customer_account") or "")).upper()
-            for record in records["bank_transactions"]
+            for record in source_bank_records
         }
         source_accounts.discard("")
         if len(source_accounts) != 1:
@@ -2568,9 +2583,31 @@ def main() -> int:
     policy_text = load_optional_text(policy_path)
     entity_map = load_optional_json(entity_map_path)
     company_profile = load_optional_json(company_profile_path)
+    reference_artifacts_required = company_dir is not None or any(
+        (args.posting_policy, args.exchange_rates, args.discovery_overview)
+    )
+    if reference_artifacts_required and (posting_policy_path is None or not posting_policy_path.exists()):
+        raise SimplbooksError(f"Required posting policy not found: {posting_policy_path}")
+    if reference_artifacts_required and (discovery_overview_path is None or not discovery_overview_path.exists()):
+        raise SimplbooksError(f"Required discovery overview not found: {discovery_overview_path}")
+    foreign_currencies = {
+        str(record.get("currency") or normalized_payload.get("base_currency") or "EUR").upper()
+        for category_records in (normalized_payload.get("records") or {}).values()
+        for record in category_records
+        if isinstance(record, dict)
+        and str(record.get("currency") or normalized_payload.get("base_currency") or "EUR").upper()
+        != str(normalized_payload.get("base_currency") or "EUR").upper()
+    }
+    if foreign_currencies and (exchange_rates_path is None or not exchange_rates_path.exists()):
+        raise SimplbooksError(f"Required annual ECB exchange-rate cache not found: {exchange_rates_path}")
+
     posting_policy = load_posting_policy(posting_policy_path) if posting_policy_path and posting_policy_path.exists() else None
     exchange_rate_cache = load_optional_json(exchange_rates_path)
     discovery_overview = load_optional_json(discovery_overview_path)
+    if posting_policy and posting_policy.get("company_slug") != normalized_payload.get("company_slug"):
+        raise SimplbooksError("Posting policy company_slug does not match normalized company_slug.")
+    if discovery_overview and int(discovery_overview.get("year") or 0) != year:
+        raise SimplbooksError("Discovery overview year does not match action period year.")
     repo_root = Path.cwd()
 
     batch = build_action_batch(

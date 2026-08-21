@@ -14,6 +14,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+from exchange_rates import ExchangeRateError, lookup_rate
 from simplbooks_api import SimplbooksError, resolve_company_name
 
 
@@ -170,12 +171,18 @@ def evaluate_source_locations(
     for action in action_batch.get("actions") or []:
         for ref in action.get("source_refs") or []:
             path_text = str(ref.get("path") or "")
-            if is_temp_source_path(path_text):
+            path_parts = Path(path_text).parts
+            wrong_company = (
+                len(path_parts) >= 3
+                and path_parts[0] == "companies"
+                and (path_parts[1] != company_dir.name or path_parts[2] not in {"source", "artifacts"})
+            )
+            if is_temp_source_path(path_text) or wrong_company:
                 findings.append(
                     make_finding(
                         section="source_reference_coverage",
                         severity="error",
-                        summary=f"Company action references disposable source path {path_text!r}; canonical source evidence is required.",
+                        summary=f"Company action references non-canonical source path {path_text!r}; company-local evidence is required.",
                         action_id=action_label(action),
                     )
                 )
@@ -755,7 +762,7 @@ def evaluate_account_vat(
             )
 
     counterparty = payload.get("counterparty") or {}
-    if draft_schema in {"invoice_summary_v1", "purchase_summary_v1", "cash_settlement_v1"} and counterparty.get("contact_id") in (None, ""):
+    if draft_schema in {"invoice_summary_v1", "purchase_summary_v1", "purchase_credit_summary_v1", "cash_settlement_v1"} and counterparty.get("contact_id") in (None, ""):
         findings.append(
             make_finding(
                 section="account_and_vat_review",
@@ -780,6 +787,7 @@ def evaluate_exchange_rates(
     action_batch: dict[str, Any],
     *,
     base_currency: str = "EUR",
+    exchange_rate_cache: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     for action in action_batch.get("actions") or []:
@@ -813,6 +821,48 @@ def evaluate_exchange_rates(
                     section="exchange_rate_review",
                     severity="error",
                     summary=f"Foreign-currency action lacks {', '.join(errors)}.",
+                    action_id=action_id,
+                )
+            )
+            continue
+        if exchange_rate_cache is None:
+            findings.append(
+                make_finding(
+                    section="exchange_rate_review",
+                    severity="error",
+                    summary="Foreign-currency action cannot be verified because the annual ECB cache is unavailable.",
+                    action_id=action_id,
+                )
+            )
+            continue
+        try:
+            resolution = lookup_rate(
+                exchange_rate_cache,
+                requested_date=datetime.fromisoformat(requested_date).date(),
+                base=currency,
+                quote=base_currency,
+            )
+        except (ExchangeRateError, ValueError) as exc:
+            findings.append(
+                make_finding(
+                    section="exchange_rate_review",
+                    severity="error",
+                    summary=f"ECB cache lookup failed: {exc}",
+                    action_id=action_id,
+                )
+            )
+            continue
+        if (
+            rate != resolution.rate
+            or effective_date != resolution.effective_date.isoformat()
+            or provider != resolution.provider
+            or source_url != resolution.source_url
+        ):
+            findings.append(
+                make_finding(
+                    section="exchange_rate_review",
+                    severity="error",
+                    summary="Foreign-currency rate provenance does not exactly match the annual ECB cache.",
                     action_id=action_id,
                 )
             )
@@ -977,6 +1027,7 @@ def evaluate_action_batch(
     policy_text: str | None,
     cwd: Path,
     company_dir: Path | None = None,
+    exchange_rate_cache: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     findings: list[dict[str, Any]] = []
     payload_cache: dict[Path, dict[str, Any]] = {}
@@ -984,7 +1035,7 @@ def evaluate_action_batch(
     resolved_sources_by_action: dict[str, list[dict[str, Any]]] = {}
 
     findings.extend(evaluate_duplicates(action_batch))
-    findings.extend(evaluate_exchange_rates(action_batch))
+    findings.extend(evaluate_exchange_rates(action_batch, exchange_rate_cache=exchange_rate_cache))
     findings.extend(evaluate_unresolved_dependencies(action_batch))
     findings.extend(evaluate_source_locations(action_batch, company_dir=company_dir))
     findings.extend(
@@ -1165,6 +1216,14 @@ def resolve_output_path(*, company_dir: Path | None, action_path: Path, period: 
     return action_path.with_suffix(".check.md")
 
 
+def resolve_exchange_rates_path(*, company_dir: Path | None, period: str, override: str | None) -> Path | None:
+    if override:
+        return Path(override)
+    if company_dir is None:
+        return None
+    return company_dir / "artifacts" / "reference" / f"ecb-rates-{period[:4]}.json"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run a pre-submit review over a draft Simplbooks action batch")
     parser.add_argument("--company-dir", help="Company folder, e.g. companies/example")
@@ -1172,6 +1231,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--actions", help="Path to actions YAML. Defaults to companies/<company>/artifacts/actions/<period>.yaml")
     parser.add_argument("--recon", help="Path to recon JSON. Defaults to companies/<company>/artifacts/recon/<period>.json")
     parser.add_argument("--policy-memo", help="Optional path to policy memo markdown")
+    parser.add_argument("--exchange-rates", help="Annual ECB cache used to independently verify foreign rates")
     parser.add_argument("--output", help="Optional output path for the Markdown check report")
     return parser
 
@@ -1183,10 +1243,16 @@ def main() -> int:
     recon_path = resolve_recon_path(company_dir=company_dir, action_path=action_path, period=args.period, override=args.recon)
     policy_path = resolve_policy_path(company_dir=company_dir, action_path=action_path, override=args.policy_memo)
     output_path = resolve_output_path(company_dir=company_dir, action_path=action_path, period=args.period, override=args.output)
+    exchange_rates_path = resolve_exchange_rates_path(
+        company_dir=company_dir,
+        period=args.period,
+        override=args.exchange_rates,
+    )
 
     action_batch = load_yaml(action_path)
     recon_payload = load_json(recon_path)
     policy_text = load_optional_text(policy_path)
+    exchange_rate_cache = load_json(exchange_rates_path) if exchange_rates_path and exchange_rates_path.exists() else None
 
     if action_batch.get("period") != args.period:
         raise SimplbooksError(
@@ -1206,6 +1272,7 @@ def main() -> int:
         policy_text=policy_text,
         cwd=cwd,
         company_dir=company_dir,
+        exchange_rate_cache=exchange_rate_cache,
     )
 
     company_slug = str(action_batch.get("company_slug") or (company_dir.name if company_dir else action_path.stem))

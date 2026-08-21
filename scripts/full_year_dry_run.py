@@ -87,7 +87,17 @@ def summarize_action_artifacts(*, company_dir: Path, year: int) -> dict[str, Any
     blocking_dependency_count = 0
     source_reference_count = 0
     canonical_source_reference_count = 0
+    unsafe_paypal_stripe_count = 0
+    policy_mapping_mismatch_count = 0
+    raw_source_reference_count = 0
+    canonical_raw_source_reference_count = 0
     supplier_credit_totals: dict[str, dict[str, Decimal]] = defaultdict(lambda: defaultdict(Decimal))
+
+    policy_path = company_dir / "artifacts" / "posting_policy.json"
+    posting_policy = json.loads(policy_path.read_text(encoding="utf-8")) if policy_path.exists() else {}
+    expected_woo_contact = ((posting_policy.get("contacts") or {}).get("sales") or {}).get("woo")
+    stripe_contact = ((posting_policy.get("contacts") or {}).get("processors") or {}).get("stripe")
+    allowed_bank_accounts = {str(value) for value in (posting_policy.get("bank_accounts") or {}).values()}
 
     actions_dir = company_dir / "artifacts" / "actions"
     for path in sorted(actions_dir.glob(f"{year}-??.yaml")) if actions_dir.exists() else []:
@@ -99,6 +109,21 @@ def summarize_action_artifacts(*, company_dir: Path, year: int) -> dict[str, Any
         )
         for action in batch.get("actions") or []:
             payload = action.get("payload") or {}
+            action_type = str(action.get("action_type") or "")
+            label = str(
+                (payload.get("summary_scope") or {}).get("channel_or_source")
+                or payload.get("vendor_hint")
+                or payload.get("counterparty_hint")
+                or ""
+            )
+            contact_id = str((payload.get("counterparty") or {}).get("contact_id") or "")
+            if label == "paypal" and stripe_contact is not None and contact_id == str(stripe_contact):
+                unsafe_paypal_stripe_count += 1
+            if label == "woo" and expected_woo_contact is not None and contact_id != str(expected_woo_contact):
+                policy_mapping_mismatch_count += 1
+            if action_type in {"create_incoming_summary", "create_payment_summary"} and allowed_bank_accounts:
+                if str(payload.get("bank_account_id") or "") not in allowed_bank_accounts:
+                    policy_mapping_mismatch_count += 1
             currency = str(payload.get("currency") or "EUR").upper()
             if currency != "EUR":
                 foreign_action_count += 1
@@ -114,6 +139,17 @@ def summarize_action_artifacts(*, company_dir: Path, year: int) -> dict[str, Any
                 if ref_path.startswith(str(company_dir / "artifacts" / "normalized")) or ref_path.startswith(relative_prefix):
                     canonical_source_reference_count += 1
 
+    normalized_dir = company_dir / "artifacts" / "normalized"
+    for path in sorted(normalized_dir.glob(f"{year}-??.json")) if normalized_dir.exists() else []:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        for source in payload.get("sources") or []:
+            raw_source_reference_count += 1
+            source_path = str(source.get("path") or "")
+            if source_path.startswith(str(company_dir / "source")) or source_path.startswith(
+                f"companies/{company_dir.name}/source/"
+            ):
+                canonical_raw_source_reference_count += 1
+
     return {
         "foreign_action_count": foreign_action_count,
         "ecb_provenance_count": ecb_provenance_count,
@@ -125,7 +161,26 @@ def summarize_action_artifacts(*, company_dir: Path, year: int) -> dict[str, Any
         "blocking_dependency_count": blocking_dependency_count,
         "source_reference_count": source_reference_count,
         "canonical_source_reference_count": canonical_source_reference_count,
+        "raw_source_reference_count": raw_source_reference_count,
+        "canonical_raw_source_reference_count": canonical_raw_source_reference_count,
+        "unsafe_paypal_stripe_count": unsafe_paypal_stripe_count,
+        "policy_mapping_mismatch_count": policy_mapping_mismatch_count,
     }
+
+
+def reference_acceptance_issues(reference_summary: dict[str, Any]) -> list[str]:
+    issues: list[str] = []
+    if reference_summary["foreign_action_count"] != reference_summary["ecb_provenance_count"]:
+        issues.append("Not every foreign-currency action has verified ECB provenance.")
+    if reference_summary["source_reference_count"] != reference_summary["canonical_source_reference_count"]:
+        issues.append("Not every action source reference is company-local and canonical.")
+    if reference_summary["raw_source_reference_count"] != reference_summary["canonical_raw_source_reference_count"]:
+        issues.append("Not every normalized source manifest entry is under the company source directory.")
+    if reference_summary["unsafe_paypal_stripe_count"]:
+        issues.append("One or more PayPal actions reuse the Stripe contact.")
+    if reference_summary["policy_mapping_mismatch_count"]:
+        issues.append("One or more cash/Woo actions differ from the posting policy.")
+    return issues
 
 
 def build_step_command(
@@ -175,7 +230,8 @@ def run_full_year_dry_run(
     api_calls: list[dict[str, Any]] = []
     overall_success = True
 
-    for period in periods_for_year(year):
+    target_periods = periods_for_year(year)
+    for period in target_periods:
         step_results: list[dict[str, Any]] = []
         month_success = True
         for step_name, script_name in STEP_SPECS:
@@ -213,6 +269,11 @@ def run_full_year_dry_run(
         if not month_success and not continue_on_error:
             break
 
+    reference_summary = summarize_action_artifacts(company_dir=company_dir, year=year)
+    acceptance_issues = reference_acceptance_issues(reference_summary)
+    if len(months) != len(target_periods):
+        acceptance_issues.append(f"Expected {len(target_periods)} processed months, found {len(months)}.")
+    overall_success = overall_success and not acceptance_issues
     return {
         "company_dir": str(company_dir),
         "company_name": company_name,
@@ -224,7 +285,8 @@ def run_full_year_dry_run(
         "force_build": force_build,
         "continue_on_error": continue_on_error,
         "overall_success": overall_success,
-        "reference_summary": summarize_action_artifacts(company_dir=company_dir, year=year),
+        "reference_summary": reference_summary,
+        "acceptance_issues": acceptance_issues,
         "api_calls": api_calls,
         "months": months,
     }

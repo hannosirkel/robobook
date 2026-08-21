@@ -198,6 +198,7 @@ class BookbuilderTests(unittest.TestCase):
                 source_system="printful",
                 event_type="printful_supplier_credit",
                 gross_amount=113.12,
+                vat_amount=13.12,
                 description="Printful supplier credit",
                 channel="printful",
                 external_ref="105211877",
@@ -243,6 +244,8 @@ class BookbuilderTests(unittest.TestCase):
 
         credit = find_action(batch, "create_purchase_credit_summary")
         self.assertEqual(credit["payload"]["totals"]["gross_amount"], 113.12)
+        self.assertEqual(credit["payload"]["totals"]["vat_amount"], 13.12)
+        self.assertEqual(credit["payload"]["line_items"][0]["vat_amount_hint"], 13.12)
         self.assertTrue(any(item["external_ref"] == "EE24111268" for item in batch["already_present"]))
         self.assertFalse(any(action["payload"].get("vendor_hint") == "simplbooks-ou" for action in batch["actions"]))
 
@@ -309,6 +312,46 @@ class BookbuilderTests(unittest.TestCase):
         incoming = find_action(batch, "create_incoming_summary")
         self.assertEqual(incoming["payload"]["bank_account_id"], "3")
         self.assertEqual(incoming["payload"]["counterparty"]["contact_id"], "29")
+
+    def test_builder_rejects_bank_row_without_source_account_under_policy(self) -> None:
+        normalized = base_normalized()
+        normalized["records"]["bank_transactions"].extend(
+            [
+                record(
+                    record_id="bank:identified",
+                    source_system="bank",
+                    event_type="bank_credit",
+                    gross_amount=10.0,
+                    attributes={"customer_account": "EE001234567890"},
+                ),
+                record(
+                    record_id="bank:missing",
+                    source_system="bank",
+                    event_type="bank_credit",
+                    gross_amount=5.0,
+                ),
+            ]
+        )
+        policy = {
+            "schema_version": "1.0",
+            "company_slug": "example",
+            "bank_accounts": {"EE001234567890": "3"},
+            "contacts": {},
+            "mappings": {},
+            "supplier_aliases": {},
+        }
+
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(
+            bookbuilder.SimplbooksError, "missing source bank account"
+        ):
+            bookbuilder.build_action_batch(
+                normalized_payload=normalized,
+                recon_payload=base_recon(),
+                normalized_path=Path(tmp) / "normalized.json",
+                recon_path=Path(tmp) / "recon.json",
+                repo_root=Path(tmp),
+                posting_policy=policy,
+            )
 
     def test_builder_blocks_when_recon_not_approved(self) -> None:
         normalized = base_normalized()

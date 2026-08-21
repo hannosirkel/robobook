@@ -288,6 +288,24 @@ class BooksendTests(unittest.TestCase):
         with self.assertRaisesRegex(SimplbooksError, "reviewed currency_rate"):
             booksend.translate_action_for_api(action, lookup={})
 
+    def test_sender_rejects_reviewed_rate_that_differs_from_cache(self) -> None:
+        action = purchase_credit_action()
+        action["payload"]["currency_rate"] = 999
+        action["payload"]["currency_rate_requested_date"] = "2024-07-31"
+        action["payload"]["currency_rate_effective_date"] = "2024-07-31"
+        action["payload"]["currency_rate_source_url"] = "https://api.frankfurter.dev/v2/rates?providers=ECB"
+        cache = {
+            "provider": "ECB",
+            "year": 2024,
+            "base": "USD",
+            "quote": "EUR",
+            "source_url": "https://api.frankfurter.dev/v2/rates?providers=ECB",
+            "rates": [{"date": "2024-07-31", "base": "USD", "quote": "EUR", "rate": "0.92"}],
+        }
+
+        with self.assertRaisesRegex(SimplbooksError, "does not match"):
+            booksend.translate_action_for_api(action, lookup={}, exchange_rate_cache=cache)
+
     def test_sender_rejects_inventory_linked_supplier_credit(self) -> None:
         action = purchase_credit_action()
         action["payload"]["line_items"][0]["warehouse_id_hint"] = "6"

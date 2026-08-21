@@ -231,6 +231,38 @@ class BookcheckerTests(unittest.TestCase):
 
         self.assertTrue(any(item["severity"] == "error" for item in findings))
 
+    def test_checker_rejects_rate_that_does_not_match_cache(self) -> None:
+        action = payment_action(
+            key="example-2024-03-payment-vendor",
+            period="2024-03",
+            amount=10.0,
+            linked_purchase_action="example-2024-03-purchase-vendor",
+            source_path="companies/example/artifacts/normalized/2024-03.json",
+            record_ref="bank:1",
+        )
+        action["payload"].update(
+            {
+                "currency": "USD",
+                "currency_rate": 999,
+                "currency_rate_provider": "ECB",
+                "currency_rate_requested_date": "2024-03-31",
+                "currency_rate_effective_date": "2024-03-28",
+                "currency_rate_source_url": "https://api.frankfurter.dev/v2/rates?providers=ECB",
+            }
+        )
+        cache = {
+            "provider": "ECB",
+            "year": 2024,
+            "base": "USD",
+            "quote": "EUR",
+            "source_url": "https://api.frankfurter.dev/v2/rates?providers=ECB",
+            "rates": [{"date": "2024-03-28", "base": "USD", "quote": "EUR", "rate": "0.92498"}],
+        }
+
+        findings = bookchecker.evaluate_exchange_rates({"actions": [action]}, exchange_rate_cache=cache)
+
+        self.assertTrue(any("cache" in item["summary"].lower() for item in findings))
+
     def test_checker_fails_blocking_unresolved_dependency(self) -> None:
         findings = bookchecker.evaluate_unresolved_dependencies(
             {
@@ -265,6 +297,46 @@ class BookcheckerTests(unittest.TestCase):
         self.assertEqual(len(findings), 1)
         self.assertEqual(findings[0]["severity"], "error")
         self.assertIn("canonical", findings[0]["summary"].lower())
+
+    def test_checker_fails_cross_company_source_reference(self) -> None:
+        action = payment_action(
+            key="example-2024-01-payment-vendor",
+            period="2024-01",
+            amount=10.0,
+            linked_purchase_action="example-2024-01-purchase-vendor",
+            source_path="companies/another-company/artifacts/normalized/2024-01.json",
+            record_ref="bank:1",
+        )
+
+        findings = bookchecker.evaluate_source_locations(
+            {"actions": [action]}, company_dir=Path("companies/example")
+        )
+
+        self.assertTrue(any(item["severity"] == "error" for item in findings))
+
+    def test_checker_requires_supplier_credit_contact(self) -> None:
+        action = {
+            "idempotency_key": "example-2024-05-purchase-credit-printful",
+            "confidence": "high",
+            "review_notes": [],
+            "payload": {
+                "draft_schema": "purchase_credit_summary_v1",
+                "counterparty": {"contact_id": None},
+                "line_items": [
+                    {
+                        "line_role": "purchase_credit",
+                        "gross_amount": 11.4,
+                        "vat_amount_hint": 0,
+                        "suggested_expense_account_id": "257",
+                        "suggested_vat_type_id": "11",
+                    }
+                ],
+            },
+        }
+
+        findings = bookchecker.evaluate_account_vat(action=action)
+
+        self.assertTrue(any("contact" in item["summary"].lower() for item in findings))
 
     def test_checker_passes_clean_batch(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -89,6 +89,7 @@
             "posting_policy",
             "discovery_overview",
             "exchange_rates",
+            "bank_allocations",
             "woo_tax_allocation",
             "woo_tax_source"
           ]

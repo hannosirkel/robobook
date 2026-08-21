@@ -118,6 +118,32 @@ class SchemaContractTests(unittest.TestCase):
                 with self.assertRaises(AssertionError):
                     self.assert_artifact_valid(schema_name="woo-tax-allocation.schema.json", artifact=mutated)
 
+    def test_bank_allocation_schema_accepts_exact_reviewed_disposition(self) -> None:
+        artifact = bank_allocation_payload(
+            allocations=[
+                {
+                    "statement_id": "archive:2024010212345678",
+                    "record_id": "bank-source:bank:2",
+                    "period": "2024-01",
+                    "disposition": "existing_invoice_receipt",
+                    "amount": 330.0,
+                    "currency": "EUR",
+                    "target": {"simplbooks_id": "119", "document_type": "invoice"},
+                    "review": {"status": "approved", "rationale": "Exact invoice number and amount."},
+                }
+            ]
+        )
+        self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=artifact)
+
+    def test_bank_allocation_schema_rejects_ignore(self) -> None:
+        artifact = bank_allocation_payload(allocations=[bank_allocation(disposition="ignore")])
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=artifact)
+
+    def test_bank_allocation_template_matches_strict_schema(self) -> None:
+        artifact = json.loads((ROOT / "templates/bank-allocation.template.json").read_text(encoding="utf-8"))
+        self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=artifact)
+
     def test_manual_inventory_action_template_matches_strict_schema(self) -> None:
         artifact = json.loads((ROOT / "templates/manual-inventory-action.template.json").read_text(encoding="utf-8"))
         self.assert_artifact_valid(schema_name="manual-inventory-action.schema.json", artifact=artifact)
@@ -162,6 +188,25 @@ class SchemaContractTests(unittest.TestCase):
         ]
         self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=batch)
 
+    def test_action_batch_schema_allows_bank_allocation_reference(self) -> None:
+        batch = {
+            "schema_version": "1.0",
+            "company_slug": "example",
+            "period": "2024-01",
+            "generated_at": "2024-01-01T00:00:00Z",
+            "batch_id": "example-2024-01",
+            "approval_status": "draft",
+            "already_present": [],
+            "unresolved_dependencies": [],
+            "reference_artifacts": [
+                {"kind": "posting_policy", "path": "policy.json", "sha256": "0" * 64},
+                {"kind": "discovery_overview", "path": "overview.json", "sha256": "1" * 64},
+                {"kind": "bank_allocations", "path": "allocations.json", "sha256": "2" * 64},
+            ],
+            "actions": [],
+        }
+        self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=batch)
+
     def test_generated_year_overview_matches_strict_schema(self) -> None:
         class EmptyClient:
             company_id = "CID"
@@ -178,3 +223,33 @@ class SchemaContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def bank_allocation_payload(*, allocations: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "schema_version": "1.0",
+        "company_slug": "example",
+        "year": 2024,
+        "normalized_bindings": [
+            {
+                "path": "companies/example/artifacts/normalized/2024-01.json",
+                "sha256": "a" * 64,
+            }
+        ],
+        "allocations": allocations,
+    }
+
+
+def bank_allocation(**overrides: Any) -> dict[str, Any]:
+    allocation = {
+        "statement_id": "archive:2024010212345678",
+        "record_id": "bank-source:bank:2",
+        "period": "2024-01",
+        "disposition": "existing_invoice_receipt",
+        "amount": 330.0,
+        "currency": "EUR",
+        "target": {"simplbooks_id": "119", "document_type": "invoice"},
+        "review": {"status": "approved", "rationale": "Exact invoice number and amount."},
+    }
+    allocation.update(overrides)
+    return allocation

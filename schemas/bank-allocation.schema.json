@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.books/schemas/bank-allocation.schema.json",
+  "title": "Reviewed Bank Allocation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "company_slug", "year", "normalized_bindings", "allocations"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "company_slug": {"type": "string", "pattern": "^[a-z0-9-]+$"},
+    "year": {"type": "integer", "minimum": 1},
+    "normalized_bindings": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/binding"}
+    },
+    "allocations": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/allocation"}
+    }
+  },
+  "$defs": {
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+      }
+    },
+    "allocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["statement_id", "record_id", "period", "disposition", "amount", "currency", "target", "review"],
+      "properties": {
+        "statement_id": {"type": "string", "minLength": 1},
+        "record_id": {"type": "string", "minLength": 1},
+        "period": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}$"},
+        "disposition": {
+          "type": "string",
+          "enum": [
+            "generated_invoice_receipt",
+            "existing_invoice_receipt",
+            "generated_purchase_payment",
+            "existing_purchase_payment",
+            "direct_sale_receipt",
+            "bank_fee_payment",
+            "clearing_transfer",
+            "reviewed_split"
+          ]
+        },
+        "amount": {"type": "number"},
+        "currency": {"type": "string", "pattern": "^[A-Z]{3}$"},
+        "target": {"type": "object", "additionalProperties": true},
+        "parts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": ["amount"],
+            "properties": {"amount": {"type": "number"}}
+          }
+        },
+        "review": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "rationale"],
+          "properties": {
+            "status": {"type": "string", "enum": ["approved", "needs_review"]},
+            "rationale": {"type": "string", "minLength": 1}
+          }
+        }
+      }
+    }
+  }
+}

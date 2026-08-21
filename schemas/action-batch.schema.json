@@ -85,7 +85,13 @@
       "properties": {
         "kind": {
           "type": "string",
-          "enum": ["posting_policy", "discovery_overview", "exchange_rates"]
+          "enum": [
+            "posting_policy",
+            "discovery_overview",
+            "exchange_rates",
+            "woo_tax_allocation",
+            "woo_tax_source"
+          ]
         },
         "path": {"type": "string", "minLength": 1},
         "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}

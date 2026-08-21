@@ -1,0 +1,21 @@
+{
+  "action_type": "manual_inventory_writeoff",
+  "effective_date": "2024-12-31",
+  "article_id": "100",
+  "warehouse_id": "200",
+  "quantity": 1,
+  "expense_account_id": "6000",
+  "expected_remnant_after": 0,
+  "reason": "Reviewed obsolete inventory write-off",
+  "approval": "reviewed",
+  "status": "required",
+  "source_refs": [
+    {
+      "source_id": "inventory-decision",
+      "path": "artifacts/inventory-decision.json",
+      "row_ref": null,
+      "page_ref": null,
+      "notes": "Example Company OÜ template only."
+    }
+  ]
+}

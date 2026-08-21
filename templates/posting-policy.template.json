@@ -36,6 +36,15 @@
   "supplier_aliases": {
     "omniva": "as-eesti-post"
   },
+  "sales_vat_profiles": [
+    {
+      "start": "2025-01-01",
+      "end": null,
+      "rate": 24,
+      "goods_vat_type_id": "21",
+      "shipping_vat_type_id": "22"
+    }
+  ],
   "year_expectations": {
     "2024": {
       "supplier_credit_totals": {

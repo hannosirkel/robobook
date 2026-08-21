@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
+from datetime import date
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +23,79 @@ def normalize_id(value: Any, *, field_name: str) -> str:
     if not text or not text.isdigit():
         raise PostingPolicyError(f"{field_name} must be an integer-like Simplbooks ID, got {value!r}.")
     return text
+
+
+def parse_profile_date(value: Any, *, field_name: str) -> date:
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise PostingPolicyError(f"{field_name} must use ISO YYYY-MM-DD format, got {value!r}.")
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise PostingPolicyError(f"{field_name} must be a real calendar date, got {value!r}.") from exc
+
+
+def normalize_rate(value: Any, *, field_name: str) -> Decimal:
+    if isinstance(value, bool):
+        raise PostingPolicyError(f"{field_name} must be a non-negative number, got {value!r}.")
+    try:
+        rate = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise PostingPolicyError(f"{field_name} must be a non-negative number, got {value!r}.") from exc
+    if not rate.is_finite() or rate < 0:
+        raise PostingPolicyError(f"{field_name} must be a non-negative number, got {value!r}.")
+    return rate
+
+
+def validated_sales_vat_profiles(policy: dict[str, Any]) -> list[dict[str, Any]]:
+    profiles = policy.get("sales_vat_profiles")
+    if not isinstance(profiles, list):
+        raise PostingPolicyError("Posting policy requires sales_vat_profiles to resolve taxable sales VAT.")
+    normalized: list[dict[str, Any]] = []
+    for index, profile in enumerate(profiles):
+        path = f"sales_vat_profiles[{index}]"
+        if not isinstance(profile, dict):
+            raise PostingPolicyError(f"{path} must be an object.")
+        start = parse_profile_date(profile.get("start"), field_name=f"{path}.start")
+        end_value = profile.get("end")
+        end = None if end_value is None else parse_profile_date(end_value, field_name=f"{path}.end")
+        if end is not None and end < start:
+            raise PostingPolicyError(f"{path}.end cannot be before {path}.start.")
+        rate = normalize_rate(profile.get("rate"), field_name=f"{path}.rate")
+        normalized.append(
+            {
+                "start": start,
+                "end": end,
+                "rate": rate,
+                "goods_vat_type_id": normalize_id(profile.get("goods_vat_type_id"), field_name=f"{path}.goods_vat_type_id"),
+                "shipping_vat_type_id": normalize_id(profile.get("shipping_vat_type_id"), field_name=f"{path}.shipping_vat_type_id"),
+                "source": profile,
+            }
+        )
+    for index, profile in enumerate(normalized):
+        for other in normalized[index + 1 :]:
+            profile_end = profile["end"] or date.max
+            other_end = other["end"] or date.max
+            if profile["start"] <= other_end and other["start"] <= profile_end:
+                raise PostingPolicyError("sales_vat_profiles must not overlap.")
+    return normalized
+
+
+def resolve_sales_vat_profile(policy: dict[str, Any], *, event_date: date) -> dict[str, Any]:
+    matches = [
+        profile
+        for profile in validated_sales_vat_profiles(policy)
+        if profile["start"] <= event_date and (profile["end"] is None or event_date <= profile["end"])
+    ]
+    if len(matches) != 1:
+        raise PostingPolicyError(f"Expected exactly one sales VAT profile for {event_date.isoformat()}, found {len(matches)}.")
+    profile = matches[0]
+    return {
+        "start": profile["start"].isoformat(),
+        "end": profile["end"].isoformat() if profile["end"] is not None else None,
+        "rate": int(profile["rate"]) if profile["rate"] == profile["rate"].to_integral_value() else float(profile["rate"]),
+        "goods_vat_type_id": profile["goods_vat_type_id"],
+        "shipping_vat_type_id": profile["shipping_vat_type_id"],
+    }
 
 
 def validate_posting_policy(payload: dict[str, Any]) -> None:
@@ -55,6 +130,8 @@ def validate_posting_policy(payload: dict[str, Any]) -> None:
                 normalize_id(child, field_name=child_path)
 
     validate_mapping_ids(payload["mappings"], path="mappings")
+    if "sales_vat_profiles" in payload:
+        validated_sales_vat_profiles(payload)
 
 
 def load_posting_policy(path: Path) -> dict[str, Any]:
@@ -164,6 +241,13 @@ def action_policy_errors(action: dict[str, Any], policy: dict[str, Any]) -> list
             vat_field = "shipping_vat_type_id" if shipping else "vat_type_id"
             expected_account = normalize_id(family_values.get(account_field), field_name=f"mappings[{family}][{account_field}]")
             expected_vat = normalize_id(family_values.get(vat_field), field_name=f"mappings[{family}][{vat_field}]")
+            if line.get("vat_profile_rate") not in (None, ""):
+                try:
+                    document_date = parse_profile_date(payload.get("document_date"), field_name="payload.document_date")
+                    profile = resolve_sales_vat_profile(policy, event_date=document_date)
+                    expected_vat = profile["shipping_vat_type_id"] if shipping else profile["goods_vat_type_id"]
+                except PostingPolicyError as exc:
+                    errors.append(str(exc))
             if str(line.get("suggested_income_account_id") or "") != expected_account:
                 errors.append(f"Line income account does not match policy family {family!r}.")
         else:

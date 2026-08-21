@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import tempfile
+import hashlib
 import sys
 import unittest
+from decimal import Decimal
 from pathlib import Path
 
 
@@ -10,6 +12,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import bookbuilder  # noqa: E402
+import bookchecker  # noqa: E402
+import woo_tax  # noqa: E402
 
 
 RECORD_CATEGORIES = (
@@ -105,6 +109,68 @@ def find_action(batch: dict, action_type: str, *, endpoint: str | None = None) -
     raise AssertionError(f"Missing action {action_type} {endpoint or ''}")
 
 
+def policy_with_24_percent_profile() -> dict:
+    return {
+        "schema_version": "1.0", "company_slug": "example", "bank_accounts": {},
+        "contacts": {"sales": {"woo": "42"}, "processors": {}, "suppliers": {}},
+        "mappings": {"woo-taxable": {"income_account_id": "107", "shipping_income_account_id": "253",
+                                      "vat_type_id": "34", "shipping_vat_type_id": "33",
+                                      "warehouse_id": "9"}},
+        "sales_vat_profiles": [{"start": "2025-07-01", "end": None, "rate": 24,
+                                "goods_vat_type_id": "34", "shipping_vat_type_id": "33"}],
+        "supplier_aliases": {},
+    }
+
+
+def policy_with_mixed_22_percent_profile() -> dict:
+    return {
+        "schema_version": "1.0",
+        "company_slug": "example",
+        "bank_accounts": {},
+        "contacts": {"sales": {"woo": "42"}, "processors": {}, "suppliers": {}},
+        "mappings": {
+            "woo-taxable": {
+                "income_account_id": "107", "shipping_income_account_id": "253",
+                "vat_type_id": "25", "shipping_vat_type_id": "24", "warehouse_id": "6",
+            },
+            "woo-non-taxable": {
+                "income_account_id": "109", "shipping_income_account_id": "255",
+                "vat_type_id": "12", "shipping_vat_type_id": "13", "warehouse_id": "6",
+            },
+        },
+        "sales_vat_profiles": [{
+            "start": "2024-01-01", "end": "2024-12-31", "rate": 22,
+            "goods_vat_type_id": "25", "shipping_vat_type_id": "24",
+        }],
+        "supplier_aliases": {},
+    }
+
+
+def allocated_sale_fixture(*, product_gross: float, shipping_gross: float,
+                           product_vat: float, shipping_vat: float) -> dict:
+    sale = record(record_id="woo:2025-11", source_system="woo", event_type="woo_monthly_sales",
+                  gross_amount=product_gross + shipping_gross, vat_amount=product_vat + shipping_vat,
+                  shipping_amount=shipping_gross, channel="woo")
+    sale["event_date"] = "2025-11-30"
+    sale["attributes"]["vat_allocation"] = {
+        "fixed_product_gross": product_gross, "fixed_shipping_gross": shipping_gross,
+        "product_vat": product_vat, "shipping_vat": shipping_vat,
+        "allocation_path": "companies/example/artifacts/vat/2025-woo-tax-allocation.json",
+        "allocated_order_ids": ["EXAMPLE-1"],
+    }
+    return sale
+
+
+def build_batch_with_policy(normalized: dict, policy: dict) -> dict:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        return bookbuilder.build_action_batch(
+            normalized_payload=normalized, recon_payload=base_recon(normalized["period"]),
+            normalized_path=root / "normalized.json", recon_path=root / "recon.json",
+            repo_root=root, posting_policy=policy,
+        )
+
+
 def purchase_summary_action(
     *,
     period: str,
@@ -150,6 +216,215 @@ def purchase_summary_action(
 
 
 class BookbuilderTests(unittest.TestCase):
+    def test_processor_classifier_ignores_refs_nested_in_woo_vat_evidence(self) -> None:
+        woo_sale = record(
+            record_id="woo:sale:1",
+            source_system="woo",
+            channel="woo",
+            event_type="woo_daily_sales",
+            gross_amount=110.0,
+            attributes={
+                "vat_allocation": {
+                    "component_vat_evidence": [
+                        {"order_id": "EXAMPLE-1", "processor_ref": "paypal-reference"}
+                    ]
+                }
+            },
+        )
+
+        self.assertIsNone(bookbuilder.infer_processor(woo_sale))
+        stripe_sale = dict(woo_sale, source_system="stripe", channel="stripe", event_type="stripe_charge")
+        self.assertEqual(bookbuilder.infer_processor(stripe_sale), "stripe")
+
+    def test_builder_binds_action_batch_to_allocation_and_tax_source_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            allocation_path = root / "allocation.json"
+            tax_path = root / "woocommerce-taxes.csv"
+            allocation_path.write_text("{}\n", encoding="utf-8")
+            tax_path.write_text("tax evidence\n", encoding="utf-8")
+            normalized = base_normalized("2025-11")
+            sale = allocated_sale_fixture(
+                product_gross=62.0, shipping_gross=62.0, product_vat=12.0, shipping_vat=12.0
+            )
+            sale["attributes"]["vat_allocation"].update({
+                "allocation_ref": {
+                    "path": "allocation.json", "sha256": hashlib.sha256(allocation_path.read_bytes()).hexdigest()
+                },
+                "tax_source_refs": [{
+                    "source_id": "woo-tax", "path": "woocommerce-taxes.csv",
+                    "sha256": hashlib.sha256(tax_path.read_bytes()).hexdigest(), "row_refs": ["csv:2"],
+                }],
+            })
+            normalized["records"]["sales"] = [sale]
+
+            bindings = bookbuilder.bind_woo_tax_reference_artifacts(normalized, cwd=root)
+
+            self.assertEqual([item["kind"] for item in bindings], ["woo_tax_allocation", "woo_tax_source"])
+            tax_path.write_text("changed\n", encoding="utf-8")
+            with self.assertRaisesRegex(bookbuilder.SimplbooksError, "changed"):
+                bookbuilder.bind_woo_tax_reference_artifacts(normalized, cwd=root)
+
+    def test_builder_blocks_allocated_vat_without_effective_profile(self) -> None:
+        normalized = base_normalized("2025-11")
+        normalized["records"]["sales"] = [allocated_sale_fixture(
+            product_gross=62.00, shipping_gross=62.00, product_vat=12.00, shipping_vat=12.00
+        )]
+        policy = policy_with_24_percent_profile()
+        policy["sales_vat_profiles"][0]["start"] = "2025-12-01"
+
+        with self.assertRaisesRegex(bookbuilder.SimplbooksError, "sales VAT profile"):
+            build_batch_with_policy(normalized, policy)
+
+    def test_builder_preserves_allocated_goods_and_shipping_vat(self) -> None:
+        normalized = base_normalized("2025-11")
+        normalized["records"]["sales"] = [allocated_sale_fixture(
+            product_gross=62.00, shipping_gross=62.00, product_vat=12.00, shipping_vat=12.00
+        )]
+
+        batch = build_batch_with_policy(normalized, policy_with_24_percent_profile())
+        lines = batch["actions"][0]["payload"]["line_items"]
+
+        self.assertEqual([(line["gross_amount"], line["vat_amount_hint"]) for line in lines],
+                         [(62.00, 12.00), (62.00, 12.00)])
+        self.assertEqual([line["suggested_vat_type_id"] for line in lines], ["34", "33"])
+        self.assertEqual([line["vat_profile_rate"] for line in lines], [24, 24])
+        self.assertEqual([line["vat_profile_period"] for line in lines], ["2025-07-01/open", "2025-07-01/open"])
+
+    def test_builder_emits_one_api_line_per_order_component_for_rounding(self) -> None:
+        normalized = base_normalized("2025-11")
+        sale = allocated_sale_fixture(
+            product_gross=0.06, shipping_gross=0.06, product_vat=0.02, shipping_vat=0.02
+        )
+        sale["gross_amount"] = 0.12
+        sale["net_amount"] = 0.08
+        allocation = sale["attributes"]["vat_allocation"]
+        allocation.update({
+            "allocated_order_ids": ["EXAMPLE-1", "EXAMPLE-2"],
+            "allocation_ref": {"path": "companies/example/artifacts/vat/2025-woo-tax-allocation.json", "sha256": "c" * 64},
+            "tax_source_refs": [{
+                "source_id": "woo-tax", "path": "companies/example/source/2025-pack/woocommerce-taxes.csv",
+                "sha256": "a" * 64, "row_refs": ["csv:2"],
+            }],
+            "component_vat_evidence": [
+                {
+                    "order_id": f"EXAMPLE-{index}", "source_row_id": "woo-tax:2",
+                    "processor_ref": f"pi_example_{index}", "country_code": "DE",
+                    "event_date": "2025-11-27",
+                    "configured_rate": 22, "corrected_rate": 24,
+                    "fixed_product_gross": 0.03, "fixed_shipping_gross": 0.03,
+                    "product_vat": 0.01, "shipping_vat": 0.01,
+                    "source_refs": [],
+                    "vat_profile": {
+                        "start": "2025-07-01", "end": None, "rate": 24,
+                        "goods_vat_type_id": "34", "shipping_vat_type_id": "33",
+                    },
+                }
+                for index in (1, 2)
+            ],
+        })
+        normalized["records"]["sales"] = [sale]
+
+        batch = build_batch_with_policy(normalized, policy_with_24_percent_profile())
+        action = batch["actions"][0]
+        lines = action["payload"]["line_items"]
+
+        self.assertEqual(len(lines), 4)
+        self.assertEqual(
+            [(line["vat_allocation_component"], line["gross_amount"], line["vat_amount_hint"])
+             for line in lines],
+            [("goods", 0.03, 0.01), ("goods", 0.03, 0.01),
+             ("shipping", 0.03, 0.01), ("shipping", 0.03, 0.01)],
+        )
+        self.assertTrue(all(len(line["vat_allocation_component_evidence"]) == 1 for line in lines))
+        self.assertTrue(all(line["vat_allocation_component_evidence"][0]["event_date"] == "2025-11-27" for line in lines))
+        self.assertTrue(all(line["vat_evidence_binding"]["allocation_ref"]["sha256"] == "c" * 64 for line in lines))
+        self.assertEqual(action["payload"]["totals"]["vat_amount"], 0.04)
+
+    def test_builder_and_checker_preserve_mixed_taxable_and_zero_rated_month_total(self) -> None:
+        normalized = base_normalized("2024-04")
+        summary = record(
+            record_id="woo:2024-04", source_system="woo", event_type="woo_monthly_sales",
+            gross_amount=135.54, net_amount=100.0, vat_amount=13.14,
+            shipping_amount=22.40, channel="woo",
+        )
+        summary["event_date"] = "2024-04-30"
+        summary["attributes"] = {"is_monthly_summary": True, "orders": 4}
+        normalized["records"]["sales"] = [summary]
+        allocation_item = {
+            "source_row_id": "woo-tax:2", "order_id": "774", "period": "2024-04",
+            "event_date": "2024-04-20", "country_code": "FR", "processor_ref": "pi_774",
+            "configured_rate": 22, "corrected_rate": 22,
+            "original_order_tax": 5.50, "original_shipping_tax": 1.07,
+            "fixed_product_gross": 30.50, "fixed_shipping_gross": 5.92,
+            "corrected_product_vat": 5.50, "corrected_shipping_vat": 1.07,
+            "source_refs": [],
+        }
+        second = dict(allocation_item)
+        second.update({"order_id": "777", "event_date": "2024-04-23", "processor_ref": "pi_777"})
+
+        woo_tax.apply_period_allocation(
+            normalized["records"], {
+                "allocations": [allocation_item, second],
+                "_allocation_path": "companies/example/artifacts/vat/2024-woo-tax-allocation.json",
+                "_allocation_sha256": "c" * 64,
+                "_tax_evidence": [{
+                    "source_id": "woo-tax", "path": "companies/example/source/2024-pack/woocommerce-taxes.csv",
+                    "sha256": "a" * 64,
+                    "rows": [{"source_row_id": "woo-tax:2", "row_ref": "csv:2"}],
+                }],
+                "vat_periods": [{
+                    "start": "2024-01-01", "end": "2024-12-31", "rate": 22,
+                    "goods_vat_type_id": "25", "shipping_vat_type_id": "24",
+                }],
+            }, "2024-04"
+        )
+        policy = policy_with_mixed_22_percent_profile()
+        batch = build_batch_with_policy(normalized, policy)
+        sales_actions = [
+            action for action in batch["actions"] if action["action_type"] == "create_invoice_summary"
+        ]
+        self.assertEqual(len(sales_actions), 2)
+        taxable = next(
+            action for action in sales_actions
+            if action["payload"]["posting_policy_family"] == "woo-taxable"
+        )
+        zero_rated = next(
+            action for action in sales_actions
+            if action["payload"]["posting_policy_family"] == "woo-non-taxable"
+        )
+        self.assertEqual(taxable["payload"]["totals"], {
+            "gross_amount": 72.84, "vat_amount": 13.14,
+            "shipping_amount": 11.84, "fee_amount_observed": 0.0,
+        })
+        self.assertEqual(
+            [(line["gross_amount"], line["suggested_vat_type_id"]) for line in taxable["payload"]["line_items"]],
+            [(30.5, "25"), (30.5, "25"), (5.92, "24"), (5.92, "24")],
+        )
+        self.assertEqual(zero_rated["payload"]["totals"], {
+            "gross_amount": 62.70, "vat_amount": 0.0,
+            "shipping_amount": 12.70, "fee_amount_observed": 0.0,
+        })
+        self.assertEqual(
+            [(line["gross_amount"], line["suggested_vat_type_id"]) for line in zero_rated["payload"]["line_items"]],
+            [(50.0, "12"), (12.70, "13")],
+        )
+        self.assertEqual(
+            sum(Decimal(str(action["payload"]["totals"]["gross_amount"])) for action in sales_actions),
+            Decimal("135.54"),
+        )
+
+        records_by_id = {item["record_id"]: item for item in normalized["records"]["sales"]}
+        findings = bookchecker.evaluate_posting_policy(batch, policy)
+        findings.extend(bookchecker.evaluate_vat_profiles(batch["actions"], policy))
+        for action in sales_actions:
+            resolved = [
+                {"category": "sales", "record": records_by_id[str(ref["record_ref"])]}
+                for ref in action["source_refs"]
+            ]
+            findings.extend(bookchecker.evaluate_arithmetic(action=action, resolved_sources=resolved))
+        self.assertFalse([item for item in findings if item["severity"] == "error"], findings)
+
     def test_builder_applies_single_month_end_ecb_rate(self) -> None:
         normalized = base_normalized(period="2024-03")
         usd_purchase = record(

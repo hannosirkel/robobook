@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import re
 import unicodedata
@@ -14,8 +15,8 @@ from typing import Any
 
 from document_identity import document_identity, match_existing
 from exchange_rates import ExchangeRateError, lookup_rate
-from posting_policy import PostingPolicyError, load_posting_policy, resolve_bank_account, resolve_contact, resolve_mapping
-from reference_artifacts import ReferenceArtifactError, bind_file, validate_discovery
+from posting_policy import PostingPolicyError, load_posting_policy, resolve_bank_account, resolve_contact, resolve_mapping, resolve_sales_vat_profile
+from reference_artifacts import ReferenceArtifactError, bind_file, validate_discovery, verify_file_binding
 from simplbooks_api import SimplbooksError, resolve_company_id, resolve_company_name
 
 
@@ -183,6 +184,15 @@ def classify_record(record: dict[str, Any], keyword_map: dict[str, tuple[str, ..
 
 
 def infer_processor(record: dict[str, Any]) -> str | None:
+    source_system = str(record.get("source_system") or "").lower()
+    channel = str(record.get("channel") or "").lower()
+    event_type = str(record.get("event_type") or "").lower()
+    if source_system in PROCESSOR_KEYWORDS:
+        return source_system
+    if channel in PROCESSOR_KEYWORDS:
+        return channel
+    if source_system == "woo" or channel == "woo" or event_type.startswith("woo_"):
+        return None
     return classify_record(record, PROCESSOR_KEYWORDS)
 
 
@@ -679,6 +689,39 @@ def source_refs_for_records(
     return refs
 
 
+def bind_woo_tax_reference_artifacts(
+    normalized_payload: dict[str, Any], *, cwd: Path
+) -> list[dict[str, str]]:
+    """Verify and bind every allocation/source file carried by normalized Woo VAT evidence."""
+    raw_bindings: list[tuple[str, dict[str, Any]]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for sale in (normalized_payload.get("records") or {}).get("sales") or []:
+        allocation = ((sale.get("attributes") or {}).get("vat_allocation") or {})
+        if not isinstance(allocation, dict) or not allocation:
+            continue
+        allocation_ref = allocation.get("allocation_ref")
+        tax_source_refs = allocation.get("tax_source_refs")
+        if not isinstance(allocation_ref, dict) or not isinstance(tax_source_refs, list) or not tax_source_refs:
+            raise SimplbooksError("Normalized Woo VAT evidence lacks allocation/source file bindings.")
+        candidates = [("woo_tax_allocation", allocation_ref)] + [
+            ("woo_tax_source", item) for item in tax_source_refs if isinstance(item, dict)
+        ]
+        for kind, binding in candidates:
+            key = (kind, str(binding.get("path") or ""), str(binding.get("sha256") or ""))
+            if key not in seen:
+                seen.add(key)
+                raw_bindings.append((kind, binding))
+
+    bound: list[dict[str, str]] = []
+    for kind, binding in sorted(raw_bindings, key=lambda item: (item[0], str(item[1].get("path") or ""))):
+        try:
+            path = verify_file_binding(binding, cwd=cwd)
+        except ReferenceArtifactError as exc:
+            raise SimplbooksError(str(exc)) from exc
+        bound.append(bind_file(path, kind=kind, cwd=cwd))
+    return bound
+
+
 def unique_values(records: list[dict[str, Any]], key: str) -> list[str]:
     return sorted({str(record.get(key)) for record in records if record.get(key) not in (None, "")})
 
@@ -1124,6 +1167,95 @@ def build_sales_lines(
         + default_warehouse_notes
     )
 
+    allocated_records = [
+        record
+        for record in records
+        if isinstance((record.get("attributes") or {}).get("vat_allocation"), dict)
+    ]
+    unallocated_records = [
+        record
+        for record in records
+        if not isinstance((record.get("attributes") or {}).get("vat_allocation"), dict)
+    ]
+    if allocated_records:
+        def allocated_component_evidence(component: str) -> list[dict[str, Any]]:
+            gross_field = "fixed_product_gross" if component == "goods" else "fixed_shipping_gross"
+            vat_field = "product_vat" if component == "goods" else "shipping_vat"
+            evidence: list[dict[str, Any]] = []
+            for record in allocated_records:
+                allocation = ((record.get("attributes") or {}).get("vat_allocation") or {})
+                entries = allocation.get("component_vat_evidence")
+                if entries is None:
+                    order_ids = allocation.get("allocated_order_ids") or []
+                    if not isinstance(order_ids, list) or len(order_ids) != 1:
+                        raise SimplbooksError(
+                            "Woo VAT allocation requires per-order component rounding evidence for multiple orders."
+                        )
+                    entries = [{
+                        "order_id": order_ids[0],
+                        gross_field: allocation.get(gross_field),
+                        vat_field: allocation.get(vat_field),
+                    }]
+                if not isinstance(entries, list):
+                    raise SimplbooksError("Woo VAT allocation component rounding evidence must be a list.")
+                for entry in entries:
+                    if not isinstance(entry, dict) or not str(entry.get("order_id") or "").strip():
+                        raise SimplbooksError("Woo VAT allocation component rounding evidence requires order IDs.")
+                    evidence.append(
+                        {
+                            "order_id": str(entry["order_id"]),
+                            "event_date": str(entry.get("event_date") or ""),
+                            "gross_amount": decimal_number(abs(decimal_value(entry.get(gross_field)))),
+                            "vat_amount": decimal_number(abs(decimal_value(entry.get(vat_field)))),
+                            "source_row_id": entry.get("source_row_id"),
+                            "processor_ref": entry.get("processor_ref"),
+                            "country_code": entry.get("country_code"),
+                            "configured_rate": entry.get("configured_rate"),
+                            "corrected_rate": entry.get("corrected_rate"),
+                            "source_refs": copy.deepcopy(entry.get("source_refs") or []),
+                            "vat_profile": copy.deepcopy(entry.get("vat_profile")),
+                            "vat_evidence_binding": {
+                                "allocation_ref": copy.deepcopy(allocation.get("allocation_ref")),
+                                "tax_source_refs": copy.deepcopy(allocation.get("tax_source_refs") or []),
+                            },
+                        }
+                    )
+            return evidence
+
+        component_lines = (
+            ("goods", f"{direction}_revenue", f"{group_label} allocated {direction} revenue summary", "fixed_product_gross", "product_vat", revenue_account_id, standard_vat_id),
+            ("shipping", f"{direction}_shipping", f"{group_label} allocated {direction} shipping summary", "fixed_shipping_gross", "shipping_vat", shipping_account_id, shipping_standard_vat_id),
+        )
+        for component, line_role, description, gross_field, vat_field, account_id, vat_type_id in component_lines:
+            for evidence in allocated_component_evidence(component):
+                gross_amount = decimal_value(evidence["gross_amount"])
+                vat_amount = decimal_value(evidence["vat_amount"])
+                if gross_amount == 0:
+                    if vat_amount != 0:
+                        raise SimplbooksError("Woo VAT allocation cannot carry VAT on a zero-gross component.")
+                    continue
+                binding = evidence.pop("vat_evidence_binding")
+                lines.append({
+                    "line_role": line_role,
+                    "description": f"{description} - order {evidence['order_id']}",
+                    "gross_amount": decimal_number(gross_amount),
+                    "vat_amount_hint": decimal_number(vat_amount),
+                    "shipping_component_gross_amount": decimal_number(gross_amount) if component == "shipping" else 0.0,
+                    "suggested_income_account_id": account_id,
+                    "suggested_vat_type_id": vat_type_id,
+                    "warehouse_id_hint": maybe_single_warehouse(allocated_records) or default_warehouse_id,
+                    "record_count": 1,
+                    "vat_allocation_component": component,
+                    "vat_allocation_component_evidence": [evidence],
+                    "vat_evidence_binding": binding,
+                })
+        review_notes.append(
+            "Woo VAT allocation evidence keeps every order component on a separate draft line."
+        )
+        records = unallocated_records
+        if not records:
+            return lines, review_notes
+
     grouped_by_profile: dict[str, list[dict[str, Any]]] = {"taxable": [], "non_taxable": []}
     for record in records:
         grouped_by_profile[taxable_profile(record)].append(record)
@@ -1285,12 +1417,17 @@ def build_sales_actions(
                 profile_mapping_hints = merge_mapping_hints(mapping_hints, online_sales_override)
 
             shipping_total = sum_abs_amount(profile_records, "shipping_amount")
+            has_explicit_zero_rated_residual = any(
+                isinstance((record.get("attributes") or {}).get("zero_rated_residual"), dict)
+                for record in profile_records
+            )
             lines, review_notes = build_sales_lines(
                 records=profile_records,
                 group_label=group_label,
                 direction="sales",
                 shipping_split=policy_prefers_shipping_split(policy_text, shipping_total)
-                or (online_sales_override_applied and shipping_total != 0),
+                or (online_sales_override_applied and shipping_total != 0)
+                or (has_explicit_zero_rated_residual and shipping_total != 0),
                 mapping_hints=profile_mapping_hints,
             )
             review_notes.extend(planned_notes.get((group_label, currency), []))
@@ -2291,6 +2428,20 @@ def apply_posting_policy(
                     )
                 else:
                     line["warehouse_id_hint"] = None
+                allocation_component = str(line.get("vat_allocation_component") or "")
+                if allocation_component in {"goods", "shipping"}:
+                    try:
+                        profile = resolve_sales_vat_profile(
+                            posting_policy,
+                            event_date=date.fromisoformat(str(payload.get("document_date") or "")),
+                        )
+                    except (PostingPolicyError, ValueError) as exc:
+                        raise SimplbooksError(f"Could not resolve sales VAT profile: {exc}") from exc
+                    line["suggested_vat_type_id"] = profile[
+                        "shipping_vat_type_id" if allocation_component == "shipping" else "goods_vat_type_id"
+                    ]
+                    line["vat_profile_rate"] = profile["rate"]
+                    line["vat_profile_period"] = f"{profile['start']}/{profile['end'] or 'open'}"
             else:
                 line_key = slugify(str(line.get("description") or line_role))
                 line_values = (family_values.get("lines") or {}).get(line_key)
@@ -2687,6 +2838,10 @@ def main() -> int:
         except ReferenceArtifactError as exc:
             raise SimplbooksError(str(exc)) from exc
     repo_root = Path.cwd()
+    woo_tax_reference_bindings = bind_woo_tax_reference_artifacts(
+        normalized_payload,
+        cwd=repo_root,
+    )
 
     batch = build_action_batch(
         normalized_payload=normalized_payload,
@@ -2713,7 +2868,7 @@ def main() -> int:
         bind_file(path, kind=kind, cwd=repo_root)
         for kind, path in bound_paths
         if path is not None
-    ]
+    ] + woo_tax_reference_bindings
     write_yaml(output_path, batch)
 
     company_slug = str(normalized_payload.get("company_slug") or (company_dir.name if company_dir else normalized_path.stem))

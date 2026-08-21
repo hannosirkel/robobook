@@ -41,6 +41,7 @@ def validate(instance: Any, schema: dict[str, Any], *, root_schema: dict[str, An
         "string": lambda value: isinstance(value, str),
         "integer": lambda value: isinstance(value, int) and not isinstance(value, bool),
         "number": lambda value: isinstance(value, (int, float)) and not isinstance(value, bool),
+        "boolean": lambda value: isinstance(value, bool),
         "null": lambda value: value is None,
     }
     if allowed:
@@ -97,6 +98,35 @@ class SchemaContractTests(unittest.TestCase):
     def test_year_overview_template_matches_strict_schema(self) -> None:
         artifact = json.loads((ROOT / "templates/year-overview.template.json").read_text(encoding="utf-8"))
         self.assert_artifact_valid(schema_name="year-overview.schema.json", artifact=artifact)
+
+    def test_woo_tax_allocation_template_matches_strict_schema(self) -> None:
+        artifact = json.loads((ROOT / "templates/woo-tax-allocation.template.json").read_text(encoding="utf-8"))
+        self.assert_artifact_valid(schema_name="woo-tax-allocation.schema.json", artifact=artifact)
+
+    def test_woo_tax_allocation_schema_requires_merchant_to_absorb_vat(self) -> None:
+        artifact = json.loads((ROOT / "templates/woo-tax-allocation.template.json").read_text(encoding="utf-8"))
+        artifact["policy"]["merchant_absorbs_vat"] = False
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="woo-tax-allocation.schema.json", artifact=artifact)
+
+    def test_woo_tax_allocation_schema_rejects_empty_evidence_and_allocations(self) -> None:
+        artifact = json.loads((ROOT / "templates/woo-tax-allocation.template.json").read_text(encoding="utf-8"))
+        for field in ("source_rows", "allocations"):
+            with self.subTest(field=field):
+                mutated = json.loads(json.dumps(artifact))
+                mutated[field] = []
+                with self.assertRaises(AssertionError):
+                    self.assert_artifact_valid(schema_name="woo-tax-allocation.schema.json", artifact=mutated)
+
+    def test_manual_inventory_action_template_matches_strict_schema(self) -> None:
+        artifact = json.loads((ROOT / "templates/manual-inventory-action.template.json").read_text(encoding="utf-8"))
+        self.assert_artifact_valid(schema_name="manual-inventory-action.schema.json", artifact=artifact)
+
+    def test_manual_inventory_action_schema_rejects_nonpositive_quantity(self) -> None:
+        artifact = json.loads((ROOT / "templates/manual-inventory-action.template.json").read_text(encoding="utf-8"))
+        artifact["quantity"] = 0
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="manual-inventory-action.schema.json", artifact=artifact)
 
     def test_generated_action_batch_matches_strict_schema(self) -> None:
         categories = (

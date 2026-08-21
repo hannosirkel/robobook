@@ -3,15 +3,19 @@ from __future__ import annotations
 
 import argparse
 import copy
+import csv
 import json
 import subprocess
 import sys
 from collections import defaultdict
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-from simplbooks_api import SimplbooksError, resolve_company_name
+from simplbooks_api import SimplbooksError, resolve_company_name, resolve_company_slug
+from inventory_verification import evaluate_inventory_action, load_manual_inventory_actions
+import bookprep
+import woo_tax
 
 
 ORIGINAL_SUBPROCESS_RUN = subprocess.run
@@ -44,6 +48,48 @@ def parse_json_output(text: str) -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def source_has_woo_tax_summary(source_dir: Path) -> bool:
+    required_headers = {"Tax code", "Rate", "Total tax", "Order tax", "Shipping tax", "Orders"}
+    if not source_dir.exists():
+        return False
+    for path in sorted(source_dir.rglob("*.csv")):
+        try:
+            with path.open(encoding="utf-8-sig", newline="") as handle:
+                headers = set(next(csv.reader(handle), []))
+        except (OSError, UnicodeDecodeError, csv.Error):
+            continue
+        if headers >= required_headers:
+            return True
+    return False
+
+
+def validate_woo_tax_preflight(company_dir: Path, year: int, source_dir: Path | None) -> Path | None:
+    annual_source_dir = source_dir if source_dir is not None else company_dir / "source"
+    if not annual_source_dir.exists():
+        return None
+
+    tax_evidence = bookprep.discover_canonical_woo_tax_evidence(
+        source_dir=annual_source_dir,
+        root_dir=Path.cwd(),
+        year=year,
+    )
+    if not tax_evidence:
+        return None
+
+    allocation_path = company_dir / "artifacts" / "vat" / f"{year}-woo-tax-allocation.json"
+    company_slug = resolve_company_slug(company_dir=str(company_dir)) or company_dir.name
+    try:
+        woo_tax.load_allocation(
+            allocation_path,
+            company_slug=company_slug,
+            year=year,
+            tax_evidence=tax_evidence,
+        )
+    except woo_tax.WooTaxError as error:
+        raise SimplbooksError(f"Woo tax allocation preflight failed: {error}") from error
+    return allocation_path
 
 
 def extract_api_calls(*, period: str, step_summary: dict[str, Any]) -> list[dict[str, Any]]:
@@ -94,6 +140,10 @@ def summarize_action_artifacts(*, company_dir: Path, year: int) -> dict[str, Any
     supplier_credit_totals: dict[str, dict[str, Decimal]] = defaultdict(lambda: defaultdict(Decimal))
     suppressed_external_refs: list[str] = []
     blocking_dependencies: list[dict[str, str]] = []
+    manual_inventory_status: str | None = None
+    manual_inventory_remnant_verified = False
+    manual_inventory_error: str | None = None
+    manual_inventory_action_loaded = False
 
     policy_path = company_dir / "artifacts" / "posting_policy.json"
     posting_policy = json.loads(policy_path.read_text(encoding="utf-8")) if policy_path.exists() else {}
@@ -102,6 +152,41 @@ def summarize_action_artifacts(*, company_dir: Path, year: int) -> dict[str, Any
     allowed_bank_accounts = {str(value) for value in (posting_policy.get("bank_accounts") or {}).values()}
 
     actions_dir = company_dir / "artifacts" / "actions"
+    manual_action_path = actions_dir / f"{year}-inventory-manual.json"
+    if manual_action_path.exists():
+        try:
+            manual_action = load_manual_inventory_actions(manual_action_path)
+            manual_inventory_status = str(manual_action["status"])
+            manual_inventory_action_loaded = True
+            evidence_path = company_dir / "artifacts" / "discovery" / f"{year}-inventory-remnant-verification.json"
+            if evidence_path.exists():
+                evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+                if not isinstance(evidence, dict):
+                    raise SimplbooksError("Manual inventory remnant evidence must contain an object.")
+                required_evidence_fields = {
+                    "action_type",
+                    "effective_date",
+                    "article_id",
+                    "warehouse_id",
+                    "expected_remnant_after",
+                    "verified_at",
+                    "remnant_response",
+                }
+                same_action = required_evidence_fields <= evidence.keys() and (
+                    str(evidence["action_type"]) == "manual_inventory_writeoff"
+                    and str(evidence["effective_date"]) == str(manual_action["effective_date"])
+                    and str(evidence["article_id"]) == str(manual_action["article_id"])
+                    and str(evidence["warehouse_id"]) == str(manual_action["warehouse_id"])
+                    and Decimal(str(evidence["expected_remnant_after"]))
+                    == Decimal(str(manual_action["expected_remnant_after"]))
+                )
+                manual_inventory_remnant_verified = bool(evidence.get("verified_at")) and same_action and not evaluate_inventory_action(
+                    manual_action, evidence.get("remnant_response") or {}
+                )
+        except (SimplbooksError, OSError, ValueError, InvalidOperation, json.JSONDecodeError) as exc:
+            if not manual_inventory_action_loaded:
+                manual_inventory_status = "invalid"
+            manual_inventory_error = str(exc)
     for path in sorted(actions_dir.glob(f"{year}-??.yaml")) if actions_dir.exists() else []:
         batch = load_action_yaml(path)
         period = str(batch.get("period") or path.stem)
@@ -183,6 +268,9 @@ def summarize_action_artifacts(*, company_dir: Path, year: int) -> dict[str, Any
         "policy_mapping_mismatch_count": policy_mapping_mismatch_count,
         "suppressed_external_refs": sorted(set(suppressed_external_refs)),
         "blocking_dependencies": blocking_dependencies,
+        "manual_inventory_status": manual_inventory_status,
+        "manual_inventory_remnant_verified": manual_inventory_remnant_verified,
+        "manual_inventory_error": manual_inventory_error,
     }
 
 
@@ -200,6 +288,16 @@ def reference_acceptance_issues(
         issues.append("One or more PayPal actions reuse the Stripe contact.")
     if reference_summary["policy_mapping_mismatch_count"]:
         issues.append("One or more cash/Woo actions differ from the posting policy.")
+    manual_status = reference_summary.get("manual_inventory_status")
+    manual_verified = bool(reference_summary.get("manual_inventory_remnant_verified"))
+    if manual_status == "required":
+        issues.append("Manual inventory write-off remains required before year-close readiness can pass.")
+    elif manual_status in {"completed", "verified"} and not manual_verified:
+        issues.append("Manual inventory write-off lacks matching dated remnant verification.")
+    elif manual_status == "invalid":
+        issues.append(
+            f"Manual inventory action is invalid: {reference_summary.get('manual_inventory_error') or 'unknown error'}"
+        )
     expectations = expectations or {}
     actual_credit_totals = reference_summary.get("supplier_credit_totals") or {}
     for period, expected_currencies in (expectations.get("supplier_credit_totals") or {}).items():
@@ -235,10 +333,13 @@ def build_step_command(
     script_name: str,
     source_dir: Path | None,
     force_build: bool,
+    woo_tax_allocation: Path | None = None,
 ) -> list[str]:
     cmd = [python_executable, f"scripts/{script_name}", "--company-dir", str(company_dir), "--period", period]
     if step_name == "bookprep" and source_dir is not None:
         cmd.extend(["--source-dir", str(source_dir)])
+    if step_name == "bookprep" and woo_tax_allocation is not None:
+        cmd.extend(["--woo-tax-allocation", str(woo_tax_allocation)])
     if step_name == "bookbuilder":
         year = period[:4]
         cmd.extend(
@@ -269,6 +370,7 @@ def run_full_year_dry_run(
     cwd: Path,
 ) -> dict[str, Any]:
     company_name = resolve_company_name(company_dir=str(company_dir))
+    woo_tax_allocation = validate_woo_tax_preflight(company_dir, year, source_dir)
     months: list[dict[str, Any]] = []
     api_calls: list[dict[str, Any]] = []
     overall_success = True
@@ -286,6 +388,7 @@ def run_full_year_dry_run(
                 script_name=script_name,
                 source_dir=source_dir,
                 force_build=force_build,
+                woo_tax_allocation=woo_tax_allocation,
             )
             run = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
             step_summary = {

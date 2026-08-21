@@ -9,14 +9,19 @@ import subprocess
 import sys
 import unicodedata
 from collections import Counter, defaultdict
-from datetime import UTC, datetime
-from decimal import Decimal, InvalidOperation
+from datetime import UTC, date, datetime
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
 from exchange_rates import ExchangeRateError, lookup_rate
-from posting_policy import PostingPolicyError, action_policy_errors, load_posting_policy
-from reference_artifacts import ReferenceArtifactError, validate_discovery, verify_file_binding
+from posting_policy import PostingPolicyError, action_policy_errors, load_posting_policy, resolve_sales_vat_profile
+from reference_artifacts import (
+    ReferenceArtifactError,
+    required_action_binding_kinds,
+    validate_discovery,
+    verify_file_binding,
+)
 from simplbooks_api import SimplbooksError, resolve_company_id, resolve_company_name
 
 
@@ -932,6 +937,212 @@ def evaluate_posting_policy(
     return findings
 
 
+def evaluate_vat_profiles(actions: list[dict[str, Any]], posting_policy: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if posting_policy is None:
+        return []
+    findings: list[dict[str, Any]] = []
+    for action in actions:
+        payload = action.get("payload") or {}
+        for line in payload.get("line_items") or []:
+            has_profile_provenance = any(
+                field in line for field in ("vat_profile_rate", "vat_profile_period", "vat_allocation_component")
+            )
+            if not has_profile_provenance:
+                continue
+            try:
+                event_date = date.fromisoformat(str(payload.get("document_date") or ""))
+                profile = resolve_sales_vat_profile(posting_policy, event_date=event_date)
+            except (PostingPolicyError, ValueError) as exc:
+                findings.append(
+                    make_finding(
+                        section="account_and_vat_review",
+                        severity="error",
+                        summary=f"VAT profile cannot be resolved for allocated line: {exc}",
+                        action_id=action_label(action),
+                    )
+                )
+                continue
+
+            expected_period = f"{profile['start']}/{profile['end'] or 'open'}"
+            line_role = str(line.get("line_role") or "")
+            component = str(line.get("vat_allocation_component") or "")
+            is_shipping = component == "shipping" or (not component and line_role.endswith("_shipping"))
+            expected_vat_type_id = profile["shipping_vat_type_id"] if is_shipping else profile["goods_vat_type_id"]
+            if line.get("vat_profile_rate") != profile["rate"]:
+                findings.append(
+                    make_finding(
+                        section="account_and_vat_review",
+                        severity="error",
+                        summary="VAT profile rate does not match the effective posting-policy profile.",
+                        action_id=action_label(action),
+                    )
+                )
+            if str(line.get("vat_profile_period") or "") != expected_period:
+                findings.append(
+                    make_finding(
+                        section="account_and_vat_review",
+                        severity="error",
+                        summary="VAT profile period does not match the effective posting-policy profile.",
+                        action_id=action_label(action),
+                    )
+                )
+            if str(line.get("suggested_vat_type_id") or "") != expected_vat_type_id:
+                findings.append(
+                    make_finding(
+                        section="account_and_vat_review",
+                        severity="error",
+                        summary="VAT profile VAT type does not match the effective goods or shipping mapping.",
+                        action_id=action_label(action),
+                    )
+                )
+            evidence = line.get("vat_allocation_component_evidence")
+            if not isinstance(evidence, list) or not evidence:
+                findings.append(
+                    make_finding(
+                        section="account_and_vat_review",
+                        severity="error",
+                        summary="VAT profile line lacks per-order component rounding evidence.",
+                        action_id=action_label(action),
+                    )
+                )
+                continue
+            if len(evidence) != 1:
+                findings.append(
+                    make_finding(
+                        section="account_and_vat_review",
+                        severity="error",
+                        summary="VAT profile API line must represent exactly one order component.",
+                        action_id=action_label(action),
+                    )
+                )
+                continue
+            evidence_binding = line.get("vat_evidence_binding")
+            allocation_ref = (
+                evidence_binding.get("allocation_ref")
+                if isinstance(evidence_binding, dict)
+                else None
+            )
+            tax_source_refs = (
+                evidence_binding.get("tax_source_refs")
+                if isinstance(evidence_binding, dict)
+                else None
+            )
+            valid_allocation_ref = (
+                isinstance(allocation_ref, dict)
+                and bool(str(allocation_ref.get("path") or "").strip())
+                and bool(re.fullmatch(r"[a-f0-9]{64}", str(allocation_ref.get("sha256") or "")))
+            )
+            valid_tax_refs = isinstance(tax_source_refs, list) and bool(tax_source_refs)
+            if valid_tax_refs:
+                valid_tax_refs = all(
+                    isinstance(item, dict)
+                    and bool(str(item.get("source_id") or "").strip())
+                    and bool(str(item.get("path") or "").strip())
+                    and bool(re.fullmatch(r"[a-f0-9]{64}", str(item.get("sha256") or "")))
+                    and isinstance(item.get("row_refs"), list)
+                    and bool(item.get("row_refs"))
+                    for item in tax_source_refs
+                )
+            if not valid_allocation_ref or not valid_tax_refs:
+                findings.append(
+                    make_finding(
+                        section="account_and_vat_review",
+                        severity="error",
+                        summary="VAT profile API line lacks a usable allocation and tax-source evidence binding.",
+                        action_id=action_label(action),
+                    )
+                )
+                continue
+
+            try:
+                gross_amount = abs(decimal_value(line.get("gross_amount")))
+                vat_amount = abs(decimal_value(line.get("vat_amount_hint")))
+                rate = Decimal(str(profile["rate"]))
+                evidence_gross = Decimal("0")
+                evidence_vat = Decimal("0")
+                seen_order_ids: set[str] = set()
+                rounding_error = False
+                for item in evidence:
+                    if not isinstance(item, dict):
+                        raise SimplbooksError("component evidence item must be an object")
+                    order_id = str(item.get("order_id") or "").strip()
+                    if not order_id or order_id in seen_order_ids:
+                        raise SimplbooksError("component evidence order IDs must be unique and non-empty")
+                    seen_order_ids.add(order_id)
+                    item_gross = abs(decimal_value(item.get("gross_amount")))
+                    item_vat = abs(decimal_value(item.get("vat_amount")))
+                    item_profile = item.get("vat_profile")
+                    if not isinstance(item_profile, dict):
+                        raise SimplbooksError("component evidence lacks VAT profile provenance")
+                    item_event_date = date.fromisoformat(str(item.get("event_date") or ""))
+                    item_profile_start = date.fromisoformat(str(item_profile.get("start") or ""))
+                    item_profile_end = (
+                        date.fromisoformat(str(item_profile["end"]))
+                        if item_profile.get("end") not in (None, "")
+                        else None
+                    )
+                    if item_event_date < item_profile_start or (
+                        item_profile_end is not None and item_event_date > item_profile_end
+                    ):
+                        raise SimplbooksError("component evidence event date is outside its VAT profile")
+                    if (item_event_date.year, item_event_date.month) != (event_date.year, event_date.month):
+                        raise SimplbooksError("component evidence event date is outside the action period")
+                    item_policy_profile = resolve_sales_vat_profile(
+                        posting_policy,
+                        event_date=item_event_date,
+                    )
+                    item_vat_type_id = item_profile.get(
+                        "shipping_vat_type_id" if is_shipping else "goods_vat_type_id"
+                    )
+                    item_policy_vat_type_id = item_policy_profile[
+                        "shipping_vat_type_id" if is_shipping else "goods_vat_type_id"
+                    ]
+                    if (
+                        decimal_value(item_profile.get("rate")) != rate
+                        or str(item_vat_type_id or "") != expected_vat_type_id
+                        or Decimal(str(item_policy_profile["rate"])) != rate
+                        or str(item_policy_vat_type_id or "") != expected_vat_type_id
+                    ):
+                        raise SimplbooksError("component evidence VAT profile provenance does not match policy")
+                    if item_gross != item_gross.quantize(TOLERANCE) or item_vat != item_vat.quantize(TOLERANCE):
+                        raise SimplbooksError("component evidence amounts must use whole cents")
+                    evidence_gross += item_gross
+                    evidence_vat += item_vat
+                    expected_item_vat = (item_gross * rate / (Decimal("100") + rate)).quantize(
+                        TOLERANCE, rounding=ROUND_HALF_UP
+                    )
+                    rounding_error = rounding_error or item_vat != expected_item_vat
+            except (InvalidOperation, PostingPolicyError, SimplbooksError, ValueError) as exc:
+                findings.append(
+                    make_finding(
+                        section="account_and_vat_review",
+                        severity="error",
+                        summary=f"VAT profile line has invalid component rounding evidence: {exc}",
+                        action_id=action_label(action),
+                    )
+                )
+                continue
+            if gross_amount != evidence_gross or vat_amount != evidence_vat:
+                findings.append(
+                    make_finding(
+                        section="account_and_vat_review",
+                        severity="error",
+                        summary="VAT profile line does not exactly match per-order component rounding evidence.",
+                        action_id=action_label(action),
+                    )
+                )
+            if rounding_error:
+                findings.append(
+                    make_finding(
+                        section="account_and_vat_review",
+                        severity="error",
+                        summary="VAT profile component rounding evidence does not match the effective rate.",
+                        action_id=action_label(action),
+                    )
+                )
+    return findings
+
+
 def evaluate_reference_artifacts(
     action_batch: dict[str, Any],
     *,
@@ -943,15 +1154,19 @@ def evaluate_reference_artifacts(
         return []
     findings: list[dict[str, Any]] = []
     bindings = action_batch.get("reference_artifacts") or []
-    by_kind = {str(item.get("kind") or ""): item for item in bindings}
-    required = {"posting_policy", "discovery_overview"}
-    if any(str((action.get("payload") or {}).get("currency") or "EUR").upper() != "EUR" for action in action_batch.get("actions") or []):
-        required.add("exchange_rates")
+    by_kind: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for item in bindings:
+        if isinstance(item, dict):
+            by_kind[str(item.get("kind") or "")].append(item)
+    required = required_action_binding_kinds(action_batch)
     for kind in sorted(required):
-        binding = by_kind.get(kind)
-        if binding is None:
+        if not by_kind.get(kind):
             findings.append(make_finding(section="duplicate_risk", severity="error", summary=f"Action batch is not bound to required {kind} artifact."))
+    for binding in bindings:
+        if not isinstance(binding, dict):
+            findings.append(make_finding(section="duplicate_risk", severity="error", summary="Action reference binding must be an object."))
             continue
+        kind = str(binding.get("kind") or "")
         try:
             path = verify_file_binding(binding, cwd=cwd)
             if kind == "discovery_overview":
@@ -1122,6 +1337,7 @@ def evaluate_action_batch(
     findings.extend(evaluate_exchange_rates(action_batch, exchange_rate_cache=exchange_rate_cache))
     findings.extend(evaluate_unresolved_dependencies(action_batch))
     findings.extend(evaluate_posting_policy(action_batch, posting_policy))
+    findings.extend(evaluate_vat_profiles(action_batch.get("actions") or [], posting_policy))
     findings.extend(
         evaluate_reference_artifacts(
             action_batch,

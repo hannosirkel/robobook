@@ -21,6 +21,7 @@ from simplbooks_api import (
     resolve_company_name,
     resolve_company_slug,
 )
+import woo_tax
 
 try:
     from pypdf import PdfReader  # type: ignore
@@ -50,6 +51,19 @@ ROW_EVENT_HEADERS = {
         "gross sales amount",
         "net sales amount",
         "refund amount",
+    },
+    "woo_tax_summary_csv": {"tax code", "rate", "total tax", "order tax", "shipping tax", "orders"},
+    "woo_order_summary_csv": {
+        "date",
+        "order",
+        "status",
+        "customer",
+        "customer type",
+        "product s",
+        "items sold",
+        "coupon s",
+        "net sales",
+        "attribution",
     },
     "paypal_csv": {"date", "time", "timezone", "name", "type", "status", "currency", "gross", "fee", "net", "transaction id"},
     "stripe_balance_csv": {"id", "type", "source", "amount", "fee", "net", "currency", "created (utc)", "available on (utc)"},
@@ -200,6 +214,11 @@ def canonical_group_for_path(path: Path) -> str:
 def infer_source_system(path: Path, source_type: str, header_names: set[str] | None = None) -> str:
     normalized = normalize_ascii(str(path)).lower()
     headers = header_names or set()
+    if (
+        headers >= ROW_EVENT_HEADERS["woo_tax_summary_csv"]
+        or headers >= ROW_EVENT_HEADERS["woo_order_summary_csv"]
+    ):
+        return "woo"
     if "paypal" in normalized or headers >= ROW_EVENT_HEADERS["paypal_csv"]:
         return "paypal"
     if "stripe" in normalized or headers >= ROW_EVENT_HEADERS["stripe_balance_csv"]:
@@ -222,6 +241,7 @@ def infer_source_system(path: Path, source_type: str, header_names: set[str] | N
     if (
         "muugiraport" in normalized
         or "sales report" in normalized
+        or headers >= ROW_EVENT_HEADERS["woo_tax_summary_csv"]
         or headers >= ROW_EVENT_HEADERS["woo_sales_csv"]
         or headers >= ROW_EVENT_HEADERS["woo_monthly_sales_csv"]
     ):
@@ -424,6 +444,10 @@ def detect_parser(path: Path, source_type: str, source_system: str, header_names
     if source_system == "printful" and slugify(path.name) == "no-activity-during-period":
         return "parse_no_activity_marker"
     if source_type == "csv" and source_system == "woo":
+        if headers >= ROW_EVENT_HEADERS["woo_tax_summary_csv"]:
+            return "parse_woo_tax_summary_csv"
+        if headers >= ROW_EVENT_HEADERS["woo_order_summary_csv"]:
+            return "parse_woo_order_summary_csv"
         return "parse_woo_sales_csv"
     if source_type == "csv" and source_system == "paypal":
         return "parse_paypal_csv"
@@ -481,7 +505,10 @@ def infer_no_activity_marker_coverage(path: Path, *, root_dir: Path) -> tuple[da
     if slugify(path.name) != "no-activity-during-period":
         return None
     try:
-        relative_parts = path.resolve().relative_to(root_dir.resolve()).parts[:-1]
+        # Coverage belongs to the logical source-pack path. Resolving a company
+        # symlink here would replace that path with its private canonical target
+        # and discard a logical parent such as ``2025-pack``.
+        relative_parts = path.absolute().relative_to(root_dir.absolute()).parts[:-1]
     except ValueError:
         return None
     directory_names = [*relative_parts, root_dir.name]
@@ -495,6 +522,15 @@ def infer_no_activity_marker_coverage(path: Path, *, root_dir: Path) -> tuple[da
         year_match = re.fullmatch(r"(20\d{2})(?:-pack)?", normalized)
         if year_match:
             year = int(year_match.group(1))
+            return date(year, 1, 1), date(year, 12, 31)
+    return None
+
+
+def infer_parent_year_coverage(path: Path) -> tuple[date, date] | None:
+    for parent in path.parents:
+        match = re.fullmatch(r"(20\d{2})(?:-pack)?", normalize_ascii(parent.name).lower())
+        if match:
+            year = int(match.group(1))
             return date(year, 1, 1), date(year, 12, 31)
     return None
 
@@ -548,7 +584,23 @@ def inspect_source_file(
 
     is_no_activity_marker = source_system == "printful" and slugify(path.name) == "no-activity-during-period"
     marker_coverage = infer_no_activity_marker_coverage(path, root_dir=root_dir) if is_no_activity_marker else None
-    coverage = content_coverage or marker_coverage or parse_filename_dates(path)
+    is_woo_tax_summary = bool(
+        source_type == "csv"
+        and header_names is not None
+        and header_names >= ROW_EVENT_HEADERS["woo_tax_summary_csv"]
+    )
+    parent_year_coverage = infer_parent_year_coverage(path) if is_woo_tax_summary else None
+    filename_coverage = parse_filename_dates(path)
+    coverage = content_coverage or marker_coverage or parent_year_coverage or filename_coverage
+    annual_coverage = bool(parent_year_coverage)
+    if is_woo_tax_summary and filename_coverage:
+        filename_start, filename_end = filename_coverage
+        annual_coverage = annual_coverage or (
+            filename_start.month == 1
+            and filename_start.day == 1
+            and filename_end.month == 12
+            and filename_end.day == 31
+        )
     if coverage is None:
         coverage = (period_start, period_end)
         if is_no_activity_marker:
@@ -571,6 +623,7 @@ def inspect_source_file(
             else detect_parser(path, source_type, source_system, header_names)
         ),
         parser_notes=parser_notes,
+        context={"annual_coverage": annual_coverage} if is_woo_tax_summary else {},
     )
 
     if not descriptor.overlaps(period_start, period_end):
@@ -958,6 +1011,7 @@ def parse_woo_sales_csv(
                 "gross_sales": float(gross_sales),
                 "returns": float(returns),
                 "coupons": float(coupons),
+                "is_monthly_summary": row_start != row_end,
             },
             row_ref=f"csv:{line_no}",
         )
@@ -978,6 +1032,291 @@ def parse_woo_sales_csv(
 
     update_coverage_from_dates(source, seen_dates)
     return result, exceptions
+
+
+def parse_woo_order_summary_csv(
+    source: SourceDescriptor,
+    *,
+    period_start: date,
+    period_end: date,
+    base_currency: str,
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    """Retain Woo order-summary rows as nonfinancial supporting evidence.
+
+    The Woo Analytics order export exposes net sales but omits customer-paid
+    gross, shipping, and tax. Treating it as a sale would duplicate a complete
+    merchant or processor export and invent a gross amount, so its amounts stay
+    in attributes for order matching only.
+    """
+    rows, _ = read_csv_rows(source.path)
+    result = parser_result()
+    exceptions: list[dict[str, Any]] = []
+    seen_dates: list[date] = []
+
+    for line_no, row in enumerate(rows, start=2):
+        row_ref = f"csv:{line_no}"
+        try:
+            event_date = parse_date_value(row.get("Date", ""))
+            order_id = str(row.get("Order #") or "").strip()
+            net_sales = parse_decimal(row.get("Net sales"))
+            items_sold = parse_decimal(row.get("Items sold"))
+            if (
+                not order_id
+                or not net_sales.is_finite()
+                or not items_sold.is_finite()
+                or items_sold < 0
+                or items_sold != items_sold.to_integral_value()
+            ):
+                raise SimplbooksError("invalid Woo order summary row")
+        except (InvalidOperation, SimplbooksError, ValueError):
+            exceptions.append(
+                make_exception(
+                    source=source,
+                    exception_id=f"{source.source_id}:invalid-order-summary:{line_no}",
+                    severity="warn",
+                    reason="Woo order-summary row has an invalid date, order number, net-sales value, or item count.",
+                    blocking=False,
+                    row_ref=row_ref,
+                    suggested_follow_up="Re-export the Woo order report if this row is needed for order matching.",
+                )
+            )
+            continue
+
+        seen_dates.append(event_date)
+        if not periods_overlap(event_date, event_date, period_start, period_end):
+            continue
+
+        _, record = make_record(
+            source=source,
+            category="other",
+            record_id=f"{source.source_id}:woo-order:{line_no}",
+            event_type="woo_order_summary",
+            event_date=event_date,
+            description=f"Woo order-summary evidence {order_id}",
+            currency=base_currency,
+            gross_amount=Decimal("0"),
+            net_amount=Decimal("0"),
+            external_ref=order_id,
+            channel="woo",
+            attributes={
+                "order_id": order_id,
+                "status": str(row.get("Status") or "").strip(),
+                "product_summary": str(row.get("Product(s)") or "").strip(),
+                "items_sold": float(items_sold),
+                "observed_net_sales": float(net_sales),
+                "customer_type": str(row.get("Customer type") or "").strip(),
+                "attribution": str(row.get("Attribution") or "").strip(),
+                "nonfinancial_supporting_evidence": True,
+            },
+            row_ref=row_ref,
+        )
+        result["other"].append(record)
+
+    update_coverage_from_dates(source, seen_dates)
+    return result, exceptions
+
+
+def parse_woo_tax_summary_csv(
+    source: SourceDescriptor,
+    *,
+    period_start: date,
+    period_end: date,
+    base_currency: str,
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    result = parser_result()
+    exceptions: list[dict[str, Any]] = []
+
+    if not source.context.get("annual_coverage"):
+        exceptions.append(
+            make_exception(
+                source=source,
+                exception_id=f"{source.source_id}:missing-annual-coverage",
+                severity="error",
+                reason="Woo tax summary lacks annual coverage in its filename or source-pack directory.",
+                blocking=True,
+                suggested_follow_up="Place the export in a year-bearing source pack or rename it to include the covered year.",
+            )
+        )
+        return result, exceptions
+
+    if period_end != source.covered_until:
+        return result, exceptions
+
+    rows, _ = read_csv_rows(source.path)
+    cents = Decimal("0.01")
+    for line_no, row in enumerate(rows, start=2):
+        try:
+            rate = parse_decimal(row.get("Rate"))
+            total = parse_decimal(row.get("Total tax"))
+            order_tax = parse_decimal(row.get("Order tax"))
+            shipping_tax = parse_decimal(row.get("Shipping tax"))
+            orders = parse_decimal(row.get("Orders"))
+            tax_code = row.get("Tax code", "").strip()
+            country_match = re.fullmatch(r"([A-Z]{2})-[A-Z]{2}-VAT-[A-Za-z0-9-]+", tax_code)
+            valid_numbers = all(value.is_finite() for value in (rate, total, order_tax, shipping_tax, orders))
+            valid_row = (
+                bool(country_match)
+                and valid_numbers
+                and rate >= 0
+                and total >= 0
+                and order_tax >= 0
+                and shipping_tax >= 0
+                and all(
+                    value == value.quantize(cents, rounding=ROUND_HALF_UP)
+                    for value in (total, order_tax, shipping_tax)
+                )
+                and orders > 0
+                and orders == orders.to_integral_value()
+                and total.quantize(cents, rounding=ROUND_HALF_UP)
+                == (order_tax + shipping_tax).quantize(cents, rounding=ROUND_HALF_UP)
+            )
+        except (InvalidOperation, SimplbooksError, ValueError):
+            valid_row = False
+            country_match = None
+
+        if not valid_row:
+            exceptions.append(
+                make_exception(
+                    source=source,
+                    exception_id=f"{source.source_id}:invalid-tax-row:{line_no}",
+                    severity="error",
+                    reason="Woo tax row has an invalid code, count, rate, or component total.",
+                    blocking=True,
+                    row_ref=f"csv:{line_no}",
+                    suggested_follow_up="Export a corrected Woo tax summary before rebuilding this year.",
+                )
+            )
+            continue
+
+        _, record = make_record(
+            source=source,
+            category="other",
+            record_id=f"{source.source_id}:woo-tax:{line_no}",
+            event_type="woo_tax_summary",
+            event_date=source.covered_until,
+            description=f"Woo annual tax summary {tax_code}",
+            currency=base_currency,
+            gross_amount=Decimal("0"),
+            net_amount=Decimal("0"),
+            vat_amount=total,
+            external_ref=tax_code,
+            channel="woo",
+            country_code=country_match.group(1),
+            attributes={
+                "tax_code": tax_code,
+                "configured_rate": float(rate),
+                "order_tax": float(order_tax),
+                "shipping_tax": float(shipping_tax),
+                "total_tax": float(total),
+                "orders": int(orders),
+                "annual_evidence": True,
+            },
+            row_ref=f"csv:{line_no}",
+        )
+        result["other"].append(record)
+
+    return result, exceptions
+
+
+def discover_canonical_woo_tax_evidence(
+    *, source_dir: Path, root_dir: Path, year: int
+) -> list[dict[str, Any]]:
+    if not source_dir.exists():
+        return []
+    tax_sources: list[SourceDescriptor] = []
+    for path in sorted(source_dir.rglob("*")):
+        if not path.is_file() or path.suffix.lower() != ".csv":
+            continue
+        source = inspect_source_file(
+            path=path,
+            root_dir=root_dir,
+            period_start=date(year, 1, 1),
+            period_end=date(year, 12, 31),
+        )
+        if source is not None and source.parser_name == "parse_woo_tax_summary_csv":
+            tax_sources.append(source)
+    return canonical_woo_tax_evidence(choose_canonical_sources(tax_sources), year=year)
+
+
+def canonical_woo_tax_evidence(
+    sources: list[SourceDescriptor], *, year: int
+) -> list[dict[str, Any]]:
+    """Parse canonical annual Woo tax CSVs into evidence independent of allocation JSON."""
+    period_start = date(year, 12, 1)
+    period_end = date(year, 12, 31)
+    evidence: list[dict[str, Any]] = []
+    tax_sources = [
+        source
+        for source in sources
+        if source.canonical and source.parser_name == "parse_woo_tax_summary_csv"
+    ]
+    for source in tax_sources:
+        if source.covered_from != date(year, 1, 1) or source.covered_until != period_end:
+            raise SimplbooksError(
+                f"Canonical Woo tax source {source.rel_path} does not cover the requested year {year}."
+            )
+        records, exceptions = parse_woo_tax_summary_csv(
+            source,
+            period_start=period_start,
+            period_end=period_end,
+            base_currency="EUR",
+        )
+        blocking = [item for item in exceptions if item.get("blocking")]
+        if blocking:
+            raise SimplbooksError(
+                f"Canonical Woo tax source {source.rel_path} is invalid: {blocking[0].get('reason')}"
+            )
+        rows: list[dict[str, Any]] = []
+        for record in records["other"]:
+            attributes = record.get("attributes") or {}
+            source_ref = (record.get("source_refs") or [{}])[0]
+            rows.append(
+                {
+                    "source_row_id": str(record.get("record_id") or ""),
+                    "row_ref": str(source_ref.get("row_ref") or ""),
+                    "country_code": str(record.get("country_code") or ""),
+                    "tax_code": str(attributes.get("tax_code") or ""),
+                    "configured_rate": attributes.get("configured_rate"),
+                    "order_tax": attributes.get("order_tax"),
+                    "shipping_tax": attributes.get("shipping_tax"),
+                    "total_tax": attributes.get("total_tax"),
+                    "orders": attributes.get("orders"),
+                }
+            )
+        if not rows:
+            raise SimplbooksError(f"Canonical Woo tax source {source.rel_path} contains no tax rows.")
+        manifest = source.manifest_entry()
+        evidence.append(
+            {
+                "source_id": source.source_id,
+                "path": source.rel_path,
+                "sha256": manifest["sha256"],
+                "year": year,
+                "rows": rows,
+            }
+        )
+    return evidence
+
+
+def load_bound_woo_tax_allocation(
+    *,
+    allocation_path: Path,
+    sources: list[SourceDescriptor],
+    company_slug: str,
+    year: int,
+    repo_root: Path,
+) -> dict[str, Any]:
+    tax_evidence = canonical_woo_tax_evidence(sources, year=year)
+    if not tax_evidence:
+        raise SimplbooksError("Woo tax allocation requires nonempty canonical Woo tax evidence.")
+    allocation = woo_tax.load_allocation(
+        allocation_path,
+        company_slug=company_slug,
+        year=year,
+        tax_evidence=tax_evidence,
+    )
+    allocation["_allocation_path"] = display_path(allocation_path, repo_root)
+    return allocation
 
 
 def paypal_category(row: dict[str, str], gross_amount: Decimal) -> str:
@@ -2995,6 +3334,8 @@ def parse_purchase_note_markdown(
 PARSERS: dict[str, Callable[..., tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]]] = {
     "parse_no_activity_marker": parse_no_activity_marker,
     "parse_woo_sales_csv": parse_woo_sales_csv,
+    "parse_woo_order_summary_csv": parse_woo_order_summary_csv,
+    "parse_woo_tax_summary_csv": parse_woo_tax_summary_csv,
     "parse_paypal_csv": parse_paypal_csv,
     "parse_stripe_payouts_csv": parse_stripe_payouts_csv,
     "parse_stripe_balance_csv": parse_stripe_balance_csv,
@@ -3332,6 +3673,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--period", required=True, help="Target month in YYYY-MM format")
     parser.add_argument("--source-dir", help="Optional source override. Defaults to companies/<company>/source")
     parser.add_argument("--base-currency", help="Override base currency, e.g. EUR")
+    parser.add_argument("--woo-tax-allocation", help="Reviewed annual Woo VAT allocation JSON override")
     parser.add_argument("--output", help="Optional output path for normalized JSON")
     return parser
 
@@ -3361,6 +3703,20 @@ def main() -> int:
         period_end=period_end,
         base_currency=base_currency,
     )
+    if any(source.parser_name == "parse_woo_tax_summary_csv" for source in sources):
+        allocation_path = (
+            Path(args.woo_tax_allocation)
+            if args.woo_tax_allocation
+            else company_dir / "artifacts" / "vat" / f"{period_start.year}-woo-tax-allocation.json"
+        )
+        allocation = load_bound_woo_tax_allocation(
+            allocation_path=allocation_path,
+            sources=sources,
+            company_slug=company_slug,
+            year=period_start.year,
+            repo_root=repo_root,
+        )
+        woo_tax.apply_period_allocation(records, allocation, args.period)
     document = build_normalized_document(
         company_slug=company_slug,
         period=args.period,

@@ -68,3 +68,23 @@ def verify_file_binding(binding: dict[str, Any], *, cwd: Path) -> Path:
     if file_sha256(resolved) != str(binding.get("sha256") or ""):
         raise ReferenceArtifactError(f"Bound reference artifact changed after draft creation: {path}")
     return resolved
+
+
+def required_action_binding_kinds(action_batch: dict[str, Any]) -> set[str]:
+    required = {"posting_policy", "discovery_overview"}
+    actions = action_batch.get("actions") or []
+    if any(
+        str((action.get("payload") or {}).get("currency") or "EUR").upper() != "EUR"
+        for action in actions
+        if isinstance(action, dict)
+    ):
+        required.add("exchange_rates")
+    if any(
+        line.get("vat_allocation_component") not in (None, "")
+        for action in actions
+        if isinstance(action, dict)
+        for line in (action.get("payload") or {}).get("line_items") or []
+        if isinstance(line, dict)
+    ):
+        required.update({"woo_tax_allocation", "woo_tax_source"})
+    return required

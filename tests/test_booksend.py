@@ -308,6 +308,78 @@ class BooksendTests(unittest.TestCase):
         self.assertEqual(translated["payload"]["Purchase"]["currency_rate"], 0.9241)
         self.assertEqual(translated["payload"]["PurchaseRows"][0]["PurchaseRow"]["sum"], -113.12)
 
+    def test_sender_preserves_reviewed_rate_and_per_order_rounding_lines(self) -> None:
+        action = invoice_action()
+        action["payload"]["totals"].update({"gross_amount": 0.06, "vat_amount": 0.02, "shipping_amount": 0.0})
+        action["payload"]["line_items"] = [
+            {
+                "line_role": "sales_revenue",
+                "description": f"Woo order EXAMPLE-{index} goods",
+                "gross_amount": 0.03,
+                "vat_amount_hint": 0.01,
+                "suggested_income_account_id": "3000",
+                "suggested_vat_type_id": "34",
+                "warehouse_id_hint": None,
+                "vat_allocation_component": "goods",
+                "vat_profile_rate": 24,
+                "vat_profile_period": "2025-07-01/open",
+                "vat_allocation_component_evidence": [
+                    {
+                        "order_id": f"EXAMPLE-{index}", "gross_amount": 0.03, "vat_amount": 0.01,
+                        "vat_profile": {
+                            "start": "2025-07-01", "end": None, "rate": 24,
+                            "goods_vat_type_id": "34", "shipping_vat_type_id": "33",
+                        },
+                    }
+                ],
+                "vat_evidence_binding": {
+                    "allocation_ref": {"path": "allocation.json", "sha256": "c" * 64},
+                    "tax_source_refs": [{
+                        "source_id": "woo-tax", "path": "woocommerce-taxes.csv",
+                        "sha256": "a" * 64, "row_refs": ["csv:2"],
+                    }],
+                },
+            }
+            for index in (1, 2)
+        ]
+
+        translated = booksend.translate_action_for_api(action, lookup={})
+        tasks = [item["Task"] for item in translated["payload"]["Tasks"]]
+
+        self.assertEqual([task["vat"] for task in tasks], [24.0, 24.0])
+        self.assertEqual([task["price_per_unit"] for task in tasks], [0.03, 0.03])
+
+        unbound = copy.deepcopy(action)
+        unbound["payload"]["line_items"][0].pop("vat_evidence_binding")
+        with self.assertRaisesRegex(SimplbooksError, "evidence binding"):
+            booksend.translate_action_for_api(unbound, lookup={})
+
+        action["payload"]["line_items"] = [{
+            **action["payload"]["line_items"][0],
+            "gross_amount": 0.06,
+            "vat_amount_hint": 0.02,
+            "vat_allocation_component_evidence": [
+                {"order_id": "EXAMPLE-1", "gross_amount": 0.03, "vat_amount": 0.01},
+                {"order_id": "EXAMPLE-2", "gross_amount": 0.03, "vat_amount": 0.01},
+            ],
+        }]
+        with self.assertRaisesRegex(SimplbooksError, "one order component"):
+            booksend.translate_action_for_api(action, lookup={})
+
+    def test_write_reference_verification_requires_woo_tax_bindings(self) -> None:
+        action = invoice_action()
+        action["payload"]["line_items"][0]["vat_allocation_component"] = "goods"
+        batch = make_batch(actions=[action])
+        batch["reference_artifacts"] = []
+
+        with self.assertRaisesRegex(SimplbooksError, "woo_tax_allocation"):
+            booksend.verify_submission_reference_artifacts(
+                batch,
+                cwd=ROOT,
+                period="2024-01",
+                company_id="EXAMPLE-ID",
+            )
+
     def test_sender_rejects_foreign_action_without_reviewed_rate(self) -> None:
         action = purchase_action()
         action["payload"]["currency"] = "USD"

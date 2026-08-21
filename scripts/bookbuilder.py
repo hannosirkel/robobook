@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import re
 import unicodedata
@@ -15,7 +16,7 @@ from typing import Any
 from document_identity import document_identity, match_existing
 from exchange_rates import ExchangeRateError, lookup_rate
 from posting_policy import PostingPolicyError, load_posting_policy, resolve_bank_account, resolve_contact, resolve_mapping, resolve_sales_vat_profile
-from reference_artifacts import ReferenceArtifactError, bind_file, validate_discovery
+from reference_artifacts import ReferenceArtifactError, bind_file, validate_discovery, verify_file_binding
 from simplbooks_api import SimplbooksError, resolve_company_id, resolve_company_name
 
 
@@ -679,6 +680,39 @@ def source_refs_for_records(
     return refs
 
 
+def bind_woo_tax_reference_artifacts(
+    normalized_payload: dict[str, Any], *, cwd: Path
+) -> list[dict[str, str]]:
+    """Verify and bind every allocation/source file carried by normalized Woo VAT evidence."""
+    raw_bindings: list[tuple[str, dict[str, Any]]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for sale in (normalized_payload.get("records") or {}).get("sales") or []:
+        allocation = ((sale.get("attributes") or {}).get("vat_allocation") or {})
+        if not isinstance(allocation, dict) or not allocation:
+            continue
+        allocation_ref = allocation.get("allocation_ref")
+        tax_source_refs = allocation.get("tax_source_refs")
+        if not isinstance(allocation_ref, dict) or not isinstance(tax_source_refs, list) or not tax_source_refs:
+            raise SimplbooksError("Normalized Woo VAT evidence lacks allocation/source file bindings.")
+        candidates = [("woo_tax_allocation", allocation_ref)] + [
+            ("woo_tax_source", item) for item in tax_source_refs if isinstance(item, dict)
+        ]
+        for kind, binding in candidates:
+            key = (kind, str(binding.get("path") or ""), str(binding.get("sha256") or ""))
+            if key not in seen:
+                seen.add(key)
+                raw_bindings.append((kind, binding))
+
+    bound: list[dict[str, str]] = []
+    for kind, binding in sorted(raw_bindings, key=lambda item: (item[0], str(item[1].get("path") or ""))):
+        try:
+            path = verify_file_binding(binding, cwd=cwd)
+        except ReferenceArtifactError as exc:
+            raise SimplbooksError(str(exc)) from exc
+        bound.append(bind_file(path, kind=kind, cwd=cwd))
+    return bound
+
+
 def unique_values(records: list[dict[str, Any]], key: str) -> list[str]:
     return sorted({str(record.get(key)) for record in records if record.get(key) not in (None, "")})
 
@@ -1135,12 +1169,6 @@ def build_sales_lines(
         if not isinstance((record.get("attributes") or {}).get("vat_allocation"), dict)
     ]
     if allocated_records:
-        def allocated_total(field_name: str) -> Decimal:
-            return sum(
-                abs(decimal_value(((record.get("attributes") or {}).get("vat_allocation") or {}).get(field_name)))
-                for record in allocated_records
-            )
-
         def allocated_component_evidence(component: str) -> list[dict[str, Any]]:
             gross_field = "fixed_product_gross" if component == "goods" else "fixed_shipping_gross"
             vat_field = "product_vat" if component == "goods" else "shipping_vat"
@@ -1169,6 +1197,17 @@ def build_sales_lines(
                             "order_id": str(entry["order_id"]),
                             "gross_amount": decimal_number(abs(decimal_value(entry.get(gross_field)))),
                             "vat_amount": decimal_number(abs(decimal_value(entry.get(vat_field)))),
+                            "source_row_id": entry.get("source_row_id"),
+                            "processor_ref": entry.get("processor_ref"),
+                            "country_code": entry.get("country_code"),
+                            "configured_rate": entry.get("configured_rate"),
+                            "corrected_rate": entry.get("corrected_rate"),
+                            "source_refs": copy.deepcopy(entry.get("source_refs") or []),
+                            "vat_profile": copy.deepcopy(entry.get("vat_profile")),
+                            "vat_evidence_binding": {
+                                "allocation_ref": copy.deepcopy(allocation.get("allocation_ref")),
+                                "tax_source_refs": copy.deepcopy(allocation.get("tax_source_refs") or []),
+                            },
                         }
                     )
             return evidence
@@ -1178,25 +1217,31 @@ def build_sales_lines(
             ("shipping", f"{direction}_shipping", f"{group_label} allocated {direction} shipping summary", "fixed_shipping_gross", "shipping_vat", shipping_account_id, shipping_standard_vat_id),
         )
         for component, line_role, description, gross_field, vat_field, account_id, vat_type_id in component_lines:
-            gross_amount = allocated_total(gross_field)
-            if gross_amount == 0:
-                continue
-            lines.append(
-                {
+            for evidence in allocated_component_evidence(component):
+                gross_amount = decimal_value(evidence["gross_amount"])
+                vat_amount = decimal_value(evidence["vat_amount"])
+                if gross_amount == 0:
+                    if vat_amount != 0:
+                        raise SimplbooksError("Woo VAT allocation cannot carry VAT on a zero-gross component.")
+                    continue
+                binding = evidence.pop("vat_evidence_binding")
+                lines.append({
                     "line_role": line_role,
-                    "description": description,
+                    "description": f"{description} - order {evidence['order_id']}",
                     "gross_amount": decimal_number(gross_amount),
-                    "vat_amount_hint": decimal_number(allocated_total(vat_field)),
+                    "vat_amount_hint": decimal_number(vat_amount),
                     "shipping_component_gross_amount": decimal_number(gross_amount) if component == "shipping" else 0.0,
                     "suggested_income_account_id": account_id,
                     "suggested_vat_type_id": vat_type_id,
                     "warehouse_id_hint": maybe_single_warehouse(allocated_records) or default_warehouse_id,
-                    "record_count": len(allocated_records),
+                    "record_count": 1,
                     "vat_allocation_component": component,
-                    "vat_allocation_component_evidence": allocated_component_evidence(component),
-                }
+                    "vat_allocation_component_evidence": [evidence],
+                    "vat_evidence_binding": binding,
+                })
+        review_notes.append(
+            "Woo VAT allocation evidence keeps every order component on a separate draft line."
         )
-        review_notes.append("Woo VAT allocation evidence keeps goods and shipping VAT in separate draft lines.")
         records = unallocated_records
         if not records:
             return lines, review_notes
@@ -2783,6 +2828,10 @@ def main() -> int:
         except ReferenceArtifactError as exc:
             raise SimplbooksError(str(exc)) from exc
     repo_root = Path.cwd()
+    woo_tax_reference_bindings = bind_woo_tax_reference_artifacts(
+        normalized_payload,
+        cwd=repo_root,
+    )
 
     batch = build_action_batch(
         normalized_payload=normalized_payload,
@@ -2809,7 +2858,7 @@ def main() -> int:
         bind_file(path, kind=kind, cwd=repo_root)
         for kind, path in bound_paths
         if path is not None
-    ]
+    ] + woo_tax_reference_bindings
     write_yaml(output_path, batch)
 
     company_slug = str(normalized_payload.get("company_slug") or (company_dir.name if company_dir else normalized_path.stem))

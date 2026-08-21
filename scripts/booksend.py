@@ -8,7 +8,7 @@ import json
 import re
 from collections import defaultdict
 from datetime import UTC, date, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +16,12 @@ from bookbuilder import write_yaml
 from bookchecker import load_yaml
 from exchange_rates import ExchangeRateError, lookup_rate
 from posting_policy import PostingPolicyError, action_policy_errors, load_posting_policy
-from reference_artifacts import ReferenceArtifactError, validate_discovery, verify_file_binding
+from reference_artifacts import (
+    ReferenceArtifactError,
+    required_action_binding_kinds,
+    validate_discovery,
+    verify_file_binding,
+)
 from simplbooks_api import (
     SimplbooksClient,
     SimplbooksError,
@@ -244,6 +249,69 @@ def rounded_rate(gross_amount: Decimal, vat_amount: Decimal | None) -> float | N
     return float((vat_amount / taxable_base * Decimal("100")).quantize(Decimal("0.01")))
 
 
+def reviewed_allocated_rate(
+    line: dict[str, Any], *, gross_amount: Decimal, vat_amount: Decimal | None
+) -> float:
+    evidence = line.get("vat_allocation_component_evidence")
+    if not isinstance(evidence, list) or len(evidence) != 1:
+        raise SimplbooksError(
+            "Woo VAT API line must represent exactly one order component so reviewed rounding can be preserved."
+        )
+    if vat_amount is None:
+        raise SimplbooksError("Woo VAT API line requires a reviewed vat_amount_hint.")
+    item = evidence[0]
+    if not isinstance(item, dict):
+        raise SimplbooksError("Woo VAT API line has invalid per-order component evidence.")
+    binding = line.get("vat_evidence_binding")
+    allocation_ref = binding.get("allocation_ref") if isinstance(binding, dict) else None
+    tax_source_refs = binding.get("tax_source_refs") if isinstance(binding, dict) else None
+    valid_binding = (
+        isinstance(allocation_ref, dict)
+        and bool(str(allocation_ref.get("path") or "").strip())
+        and bool(re.fullmatch(r"[a-f0-9]{64}", str(allocation_ref.get("sha256") or "")))
+        and isinstance(tax_source_refs, list)
+        and bool(tax_source_refs)
+        and all(
+            isinstance(source_ref, dict)
+            and bool(str(source_ref.get("source_id") or "").strip())
+            and bool(str(source_ref.get("path") or "").strip())
+            and bool(re.fullmatch(r"[a-f0-9]{64}", str(source_ref.get("sha256") or "")))
+            and isinstance(source_ref.get("row_refs"), list)
+            and bool(source_ref.get("row_refs"))
+            for source_ref in tax_source_refs
+        )
+    )
+    if not valid_binding:
+        raise SimplbooksError("Woo VAT API line lacks a usable allocation and tax-source evidence binding.")
+    evidence_gross = abs(decimal_value(item.get("gross_amount")))
+    evidence_vat = abs(decimal_value(item.get("vat_amount")))
+    if evidence_gross != gross_amount or evidence_vat != vat_amount:
+        raise SimplbooksError("Woo VAT API line does not match its reviewed per-order component evidence.")
+    rate = decimal_value(line.get("vat_profile_rate"))
+    if rate < 0:
+        raise SimplbooksError("Woo VAT API line has an invalid reviewed VAT profile rate.")
+    item_profile = item.get("vat_profile")
+    if not isinstance(item_profile, dict):
+        raise SimplbooksError("Woo VAT API line lacks usable VAT profile provenance.")
+    component = str(line.get("vat_allocation_component") or "")
+    vat_type_field = "shipping_vat_type_id" if component == "shipping" else "goods_vat_type_id"
+    profile_period = f"{item_profile.get('start')}/{item_profile.get('end') or 'open'}"
+    if (
+        decimal_value(item_profile.get("rate")) != rate
+        or profile_period != str(line.get("vat_profile_period") or "")
+        or str(item_profile.get(vat_type_field) or "") != str(line.get("suggested_vat_type_id") or "")
+    ):
+        raise SimplbooksError("Woo VAT API line VAT profile provenance does not match the reviewed line.")
+    expected_vat = (gross_amount * rate / (Decimal("100") + rate)).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+    if vat_amount != expected_vat:
+        raise SimplbooksError(
+            "Woo VAT API payload cannot preserve the approved per-order VAT total at the reviewed rate."
+        )
+    return float(rate)
+
+
 def compact_dict(payload: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in payload.items() if value is not None}
 
@@ -316,7 +384,15 @@ def translate_invoice_payload(
                 "unit": "summary",
                 "amount": 1,
                 "price_per_unit": decimal_number(gross_amount),
-                "vat": rounded_rate(abs(gross_amount), vat_amount),
+                "vat": (
+                    reviewed_allocated_rate(
+                        line,
+                        gross_amount=abs(gross_amount),
+                        vat_amount=vat_amount,
+                    )
+                    if line.get("vat_allocation_component") not in (None, "")
+                    else rounded_rate(abs(gross_amount), vat_amount)
+                ),
                 "discount": 0,
                 "contents": str(line.get("description") or f"Line {index}"),
             }
@@ -903,6 +979,44 @@ def load_prior_action_lookup(
     return lookup
 
 
+def verify_submission_reference_artifacts(
+    action_batch: dict[str, Any],
+    *,
+    cwd: Path,
+    period: str,
+    company_id: str,
+) -> None:
+    bindings = action_batch.get("reference_artifacts") or []
+    by_kind: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for binding in bindings:
+        if not isinstance(binding, dict):
+            raise SimplbooksError("Action reference binding must be an object.")
+        by_kind[str(binding.get("kind") or "")].append(binding)
+
+    missing = [
+        kind
+        for kind in sorted(required_action_binding_kinds(action_batch))
+        if not by_kind.get(kind)
+    ]
+    if missing:
+        raise SimplbooksError(
+            "Write mode action batch is not bound to required artifact(s): " + ", ".join(missing)
+        )
+
+    for binding in bindings:
+        kind = str(binding.get("kind") or "")
+        try:
+            bound_path = verify_file_binding(binding, cwd=cwd)
+            if kind == "discovery_overview":
+                validate_discovery(
+                    load_json(bound_path),
+                    year=int(period[:4]),
+                    company_id=company_id,
+                )
+        except ReferenceArtifactError as exc:
+            raise SimplbooksError(str(exc)) from exc
+
+
 def execute_batch(
     *,
     action_batch: dict[str, Any],
@@ -1082,26 +1196,12 @@ def run_submission(
         if company_dir is None:
             raise SimplbooksError("Write mode requires --company-dir for bound reference verification.")
         resolved_company_id = resolve_company_id(company_id, company_dir=str(company_dir))
-        bindings = {str(item.get("kind") or ""): item for item in action_batch.get("reference_artifacts") or []}
-        required_bindings = ["posting_policy", "discovery_overview"]
-        if any(
-            str((action.get("payload") or {}).get("currency") or "EUR").upper() != "EUR"
-            for action in action_batch.get("actions") or []
-        ):
-            required_bindings.append("exchange_rates")
-        for kind in required_bindings:
-            if kind not in bindings:
-                raise SimplbooksError(f"Write mode action batch is not bound to required {kind} artifact.")
-            try:
-                bound_path = verify_file_binding(bindings[kind], cwd=cwd)
-                if kind == "discovery_overview":
-                    validate_discovery(
-                        load_json(bound_path),
-                        year=int(period[:4]),
-                        company_id=resolved_company_id,
-                    )
-            except ReferenceArtifactError as exc:
-                raise SimplbooksError(str(exc)) from exc
+        verify_submission_reference_artifacts(
+            action_batch,
+            cwd=cwd,
+            period=period,
+            company_id=resolved_company_id,
+        )
 
     company_slug = str(
         action_batch.get("company_slug")

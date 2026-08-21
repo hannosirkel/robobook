@@ -246,7 +246,7 @@ class BookcheckerTests(unittest.TestCase):
 
         self.assertTrue(any(item["severity"] == "error" and "VAT profile" in item["summary"] for item in report))
 
-    def test_checker_uses_per_order_rounding_evidence_for_tiny_allocated_components(self) -> None:
+    def test_checker_requires_one_api_line_per_order_rounding_component(self) -> None:
         batch = allocated_action_fixture(line_rate=24, vat_type_id="34")
         line = batch["actions"][0]["payload"]["line_items"][0]
         line.update(
@@ -261,11 +261,38 @@ class BookcheckerTests(unittest.TestCase):
             }
         )
 
+        report = bookchecker.evaluate_vat_profiles(batch["actions"], policy_with_24_percent_profile())
+        self.assertTrue(any("one order component" in item["summary"] for item in report))
+
+        batch["actions"][0]["payload"]["line_items"] = [
+            {
+                **line,
+                "gross_amount": 0.03,
+                "vat_amount_hint": 0.01,
+                "vat_allocation_component_evidence": [
+                    {
+                        "order_id": f"EXAMPLE-{index}", "gross_amount": 0.03, "vat_amount": 0.01,
+                        "vat_profile": {
+                            "start": "2025-07-01", "end": None, "rate": 24,
+                            "goods_vat_type_id": "34", "shipping_vat_type_id": "33",
+                        },
+                    }
+                ],
+                "vat_evidence_binding": {
+                    "allocation_ref": {"path": "allocation.json", "sha256": "c" * 64},
+                    "tax_source_refs": [{
+                        "source_id": "woo-tax", "path": "woocommerce-taxes.csv",
+                        "sha256": "a" * 64, "row_refs": ["csv:2"],
+                    }],
+                },
+            }
+            for index in range(1, 5)
+        ]
         self.assertFalse(bookchecker.evaluate_vat_profiles(batch["actions"], policy_with_24_percent_profile()))
 
-        line["vat_amount_hint"] = 0.03
+        batch["actions"][0]["payload"]["line_items"][0].pop("vat_evidence_binding")
         report = bookchecker.evaluate_vat_profiles(batch["actions"], policy_with_24_percent_profile())
-        self.assertTrue(any(item["severity"] == "error" and "rounding evidence" in item["summary"] for item in report))
+        self.assertTrue(any("evidence binding" in item["summary"] for item in report))
 
     def test_checker_fails_unproven_foreign_rate(self) -> None:
         action = payment_action(
@@ -362,6 +389,26 @@ class BookcheckerTests(unittest.TestCase):
         )
 
         self.assertEqual(findings[0]["severity"], "error")
+
+    def test_checker_requires_file_bindings_for_allocated_woo_tax_actions(self) -> None:
+        action = allocated_action_fixture(line_rate=24, vat_type_id="34")["actions"][0]
+        action["payload"]["line_items"][0]["vat_allocation_component"] = "goods"
+        action_batch = {
+            "period": "2025-11",
+            "actions": [action],
+            "reference_artifacts": [],
+        }
+
+        findings = bookchecker.evaluate_reference_artifacts(
+            action_batch,
+            cwd=ROOT,
+            company_dir=ROOT / "companies" / "example",
+            expected_company_id="EXAMPLE-ID",
+        )
+
+        summaries = " ".join(item["summary"] for item in findings)
+        self.assertIn("woo_tax_allocation", summaries)
+        self.assertIn("woo_tax_source", summaries)
 
     def test_checker_fails_company_batch_with_temp_source_reference(self) -> None:
         action = payment_action(

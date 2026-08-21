@@ -16,7 +16,12 @@ from typing import Any
 
 from exchange_rates import ExchangeRateError, lookup_rate
 from posting_policy import PostingPolicyError, action_policy_errors, load_posting_policy, resolve_sales_vat_profile
-from reference_artifacts import ReferenceArtifactError, validate_discovery, verify_file_binding
+from reference_artifacts import (
+    ReferenceArtifactError,
+    required_action_binding_kinds,
+    validate_discovery,
+    verify_file_binding,
+)
 from simplbooks_api import SimplbooksError, resolve_company_id, resolve_company_name
 
 
@@ -1001,6 +1006,53 @@ def evaluate_vat_profiles(actions: list[dict[str, Any]], posting_policy: dict[st
                     )
                 )
                 continue
+            if len(evidence) != 1:
+                findings.append(
+                    make_finding(
+                        section="account_and_vat_review",
+                        severity="error",
+                        summary="VAT profile API line must represent exactly one order component.",
+                        action_id=action_label(action),
+                    )
+                )
+                continue
+            evidence_binding = line.get("vat_evidence_binding")
+            allocation_ref = (
+                evidence_binding.get("allocation_ref")
+                if isinstance(evidence_binding, dict)
+                else None
+            )
+            tax_source_refs = (
+                evidence_binding.get("tax_source_refs")
+                if isinstance(evidence_binding, dict)
+                else None
+            )
+            valid_allocation_ref = (
+                isinstance(allocation_ref, dict)
+                and bool(str(allocation_ref.get("path") or "").strip())
+                and bool(re.fullmatch(r"[a-f0-9]{64}", str(allocation_ref.get("sha256") or "")))
+            )
+            valid_tax_refs = isinstance(tax_source_refs, list) and bool(tax_source_refs)
+            if valid_tax_refs:
+                valid_tax_refs = all(
+                    isinstance(item, dict)
+                    and bool(str(item.get("source_id") or "").strip())
+                    and bool(str(item.get("path") or "").strip())
+                    and bool(re.fullmatch(r"[a-f0-9]{64}", str(item.get("sha256") or "")))
+                    and isinstance(item.get("row_refs"), list)
+                    and bool(item.get("row_refs"))
+                    for item in tax_source_refs
+                )
+            if not valid_allocation_ref or not valid_tax_refs:
+                findings.append(
+                    make_finding(
+                        section="account_and_vat_review",
+                        severity="error",
+                        summary="VAT profile API line lacks a usable allocation and tax-source evidence binding.",
+                        action_id=action_label(action),
+                    )
+                )
+                continue
 
             try:
                 gross_amount = abs(decimal_value(line.get("gross_amount")))
@@ -1019,6 +1071,19 @@ def evaluate_vat_profiles(actions: list[dict[str, Any]], posting_policy: dict[st
                     seen_order_ids.add(order_id)
                     item_gross = abs(decimal_value(item.get("gross_amount")))
                     item_vat = abs(decimal_value(item.get("vat_amount")))
+                    item_profile = item.get("vat_profile")
+                    if not isinstance(item_profile, dict):
+                        raise SimplbooksError("component evidence lacks VAT profile provenance")
+                    profile_period = f"{item_profile.get('start')}/{item_profile.get('end') or 'open'}"
+                    item_vat_type_id = item_profile.get(
+                        "shipping_vat_type_id" if is_shipping else "goods_vat_type_id"
+                    )
+                    if (
+                        decimal_value(item_profile.get("rate")) != rate
+                        or profile_period != expected_period
+                        or str(item_vat_type_id or "") != expected_vat_type_id
+                    ):
+                        raise SimplbooksError("component evidence VAT profile provenance does not match policy")
                     if item_gross != item_gross.quantize(TOLERANCE) or item_vat != item_vat.quantize(TOLERANCE):
                         raise SimplbooksError("component evidence amounts must use whole cents")
                     evidence_gross += item_gross
@@ -1069,15 +1134,19 @@ def evaluate_reference_artifacts(
         return []
     findings: list[dict[str, Any]] = []
     bindings = action_batch.get("reference_artifacts") or []
-    by_kind = {str(item.get("kind") or ""): item for item in bindings}
-    required = {"posting_policy", "discovery_overview"}
-    if any(str((action.get("payload") or {}).get("currency") or "EUR").upper() != "EUR" for action in action_batch.get("actions") or []):
-        required.add("exchange_rates")
+    by_kind: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for item in bindings:
+        if isinstance(item, dict):
+            by_kind[str(item.get("kind") or "")].append(item)
+    required = required_action_binding_kinds(action_batch)
     for kind in sorted(required):
-        binding = by_kind.get(kind)
-        if binding is None:
+        if not by_kind.get(kind):
             findings.append(make_finding(section="duplicate_risk", severity="error", summary=f"Action batch is not bound to required {kind} artifact."))
+    for binding in bindings:
+        if not isinstance(binding, dict):
+            findings.append(make_finding(section="duplicate_risk", severity="error", summary="Action reference binding must be an object."))
             continue
+        kind = str(binding.get("kind") or "")
         try:
             path = verify_file_binding(binding, cwd=cwd)
             if kind == "discovery_overview":

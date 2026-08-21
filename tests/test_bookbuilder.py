@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import hashlib
 import sys
 import unittest
 from decimal import Decimal
@@ -215,6 +216,35 @@ def purchase_summary_action(
 
 
 class BookbuilderTests(unittest.TestCase):
+    def test_builder_binds_action_batch_to_allocation_and_tax_source_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            allocation_path = root / "allocation.json"
+            tax_path = root / "woocommerce-taxes.csv"
+            allocation_path.write_text("{}\n", encoding="utf-8")
+            tax_path.write_text("tax evidence\n", encoding="utf-8")
+            normalized = base_normalized("2025-11")
+            sale = allocated_sale_fixture(
+                product_gross=62.0, shipping_gross=62.0, product_vat=12.0, shipping_vat=12.0
+            )
+            sale["attributes"]["vat_allocation"].update({
+                "allocation_ref": {
+                    "path": "allocation.json", "sha256": hashlib.sha256(allocation_path.read_bytes()).hexdigest()
+                },
+                "tax_source_refs": [{
+                    "source_id": "woo-tax", "path": "woocommerce-taxes.csv",
+                    "sha256": hashlib.sha256(tax_path.read_bytes()).hexdigest(), "row_refs": ["csv:2"],
+                }],
+            })
+            normalized["records"]["sales"] = [sale]
+
+            bindings = bookbuilder.bind_woo_tax_reference_artifacts(normalized, cwd=root)
+
+            self.assertEqual([item["kind"] for item in bindings], ["woo_tax_allocation", "woo_tax_source"])
+            tax_path.write_text("changed\n", encoding="utf-8")
+            with self.assertRaisesRegex(bookbuilder.SimplbooksError, "changed"):
+                bookbuilder.bind_woo_tax_reference_artifacts(normalized, cwd=root)
+
     def test_builder_blocks_allocated_vat_without_effective_profile(self) -> None:
         normalized = base_normalized("2025-11")
         normalized["records"]["sales"] = [allocated_sale_fixture(
@@ -241,6 +271,54 @@ class BookbuilderTests(unittest.TestCase):
         self.assertEqual([line["vat_profile_rate"] for line in lines], [24, 24])
         self.assertEqual([line["vat_profile_period"] for line in lines], ["2025-07-01/open", "2025-07-01/open"])
 
+    def test_builder_emits_one_api_line_per_order_component_for_rounding(self) -> None:
+        normalized = base_normalized("2025-11")
+        sale = allocated_sale_fixture(
+            product_gross=0.06, shipping_gross=0.06, product_vat=0.02, shipping_vat=0.02
+        )
+        sale["gross_amount"] = 0.12
+        sale["net_amount"] = 0.08
+        allocation = sale["attributes"]["vat_allocation"]
+        allocation.update({
+            "allocated_order_ids": ["EXAMPLE-1", "EXAMPLE-2"],
+            "allocation_ref": {"path": "companies/example/artifacts/vat/2025-woo-tax-allocation.json", "sha256": "c" * 64},
+            "tax_source_refs": [{
+                "source_id": "woo-tax", "path": "companies/example/source/2025-pack/woocommerce-taxes.csv",
+                "sha256": "a" * 64, "row_refs": ["csv:2"],
+            }],
+            "component_vat_evidence": [
+                {
+                    "order_id": f"EXAMPLE-{index}", "source_row_id": "woo-tax:2",
+                    "processor_ref": f"pi_example_{index}", "country_code": "DE",
+                    "configured_rate": 22, "corrected_rate": 24,
+                    "fixed_product_gross": 0.03, "fixed_shipping_gross": 0.03,
+                    "product_vat": 0.01, "shipping_vat": 0.01,
+                    "source_refs": [],
+                    "vat_profile": {
+                        "start": "2025-07-01", "end": None, "rate": 24,
+                        "goods_vat_type_id": "34", "shipping_vat_type_id": "33",
+                    },
+                }
+                for index in (1, 2)
+            ],
+        })
+        normalized["records"]["sales"] = [sale]
+
+        batch = build_batch_with_policy(normalized, policy_with_24_percent_profile())
+        action = batch["actions"][0]
+        lines = action["payload"]["line_items"]
+
+        self.assertEqual(len(lines), 4)
+        self.assertEqual(
+            [(line["vat_allocation_component"], line["gross_amount"], line["vat_amount_hint"])
+             for line in lines],
+            [("goods", 0.03, 0.01), ("goods", 0.03, 0.01),
+             ("shipping", 0.03, 0.01), ("shipping", 0.03, 0.01)],
+        )
+        self.assertTrue(all(len(line["vat_allocation_component_evidence"]) == 1 for line in lines))
+        self.assertTrue(all(line["vat_evidence_binding"]["allocation_ref"]["sha256"] == "c" * 64 for line in lines))
+        self.assertEqual(action["payload"]["totals"]["vat_amount"], 0.04)
+
     def test_builder_and_checker_preserve_mixed_taxable_and_zero_rated_month_total(self) -> None:
         normalized = base_normalized("2024-04")
         summary = record(
@@ -264,7 +342,20 @@ class BookbuilderTests(unittest.TestCase):
         second.update({"order_id": "777", "event_date": "2024-04-23", "processor_ref": "pi_777"})
 
         woo_tax.apply_period_allocation(
-            normalized["records"], {"allocations": [allocation_item, second]}, "2024-04"
+            normalized["records"], {
+                "allocations": [allocation_item, second],
+                "_allocation_path": "companies/example/artifacts/vat/2024-woo-tax-allocation.json",
+                "_allocation_sha256": "c" * 64,
+                "_tax_evidence": [{
+                    "source_id": "woo-tax", "path": "companies/example/source/2024-pack/woocommerce-taxes.csv",
+                    "sha256": "a" * 64,
+                    "rows": [{"source_row_id": "woo-tax:2", "row_ref": "csv:2"}],
+                }],
+                "vat_periods": [{
+                    "start": "2024-01-01", "end": "2024-12-31", "rate": 22,
+                    "goods_vat_type_id": "25", "shipping_vat_type_id": "24",
+                }],
+            }, "2024-04"
         )
         policy = policy_with_mixed_22_percent_profile()
         batch = build_batch_with_policy(normalized, policy)
@@ -286,7 +377,7 @@ class BookbuilderTests(unittest.TestCase):
         })
         self.assertEqual(
             [(line["gross_amount"], line["suggested_vat_type_id"]) for line in taxable["payload"]["line_items"]],
-            [(61.0, "25"), (11.84, "24")],
+            [(30.5, "25"), (30.5, "25"), (5.92, "24"), (5.92, "24")],
         )
         self.assertEqual(zero_rated["payload"]["totals"], {
             "gross_amount": 62.70, "vat_amount": 0.0,

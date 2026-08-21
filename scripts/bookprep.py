@@ -991,6 +991,7 @@ def parse_woo_sales_csv(
                 "gross_sales": float(gross_sales),
                 "returns": float(returns),
                 "coupons": float(coupons),
+                "is_monthly_summary": row_start != row_end,
             },
             row_ref=f"csv:{line_no}",
         )

@@ -77,6 +77,19 @@ def period_allocation_fixture(*, period: str = "2025-11", order_id: str = "EXAMP
     return payload
 
 
+def monthly_woo_summary_fixture(*, gross: Decimal, vat: Decimal, period: str) -> dict[str, list[dict[str, Any]]]:
+    records = normalized_sales_fixture(gross=gross, vat=vat, order_id=f"{period}-30")
+    sale = records["sales"][0]
+    sale["record_id"] = f"woo:{period}"
+    sale["source_system"] = "woo"
+    sale["event_type"] = "woo_monthly_sales"
+    sale["event_date"] = f"{period}-30"
+    sale["external_ref"] = f"{period}-30"
+    sale["channel"] = "woo"
+    sale["attributes"] = {"orders": 2}
+    return records
+
+
 class WooTaxTests(unittest.TestCase):
     def test_apply_period_allocation_changes_vat_not_customer_gross(self) -> None:
         records = normalized_sales_fixture(
@@ -88,10 +101,29 @@ class WooTaxTests(unittest.TestCase):
         sale = records["sales"][0]
         self.assertEqual(Decimal(str(sale["gross_amount"])), Decimal("124.00"))
         self.assertEqual(Decimal(str(sale["vat_amount"])), Decimal("24.00"))
+        self.assertEqual(Decimal(str(sale["net_amount"])), Decimal("100.00"))
         self.assertEqual(sale["attributes"]["vat_allocation"]["shipping_vat"], 12.00)
+        self.assertEqual(sale["attributes"]["vat_allocation"]["product_net"], 50.00)
+        self.assertEqual(sale["attributes"]["vat_allocation"]["shipping_net"], 50.00)
+        self.assertEqual(
+            Decimal(str(sale["gross_amount"])),
+            Decimal(str(sale["net_amount"])) + Decimal(str(sale["vat_amount"])),
+        )
+        allocation_details = sale["attributes"]["vat_allocation"]
+        self.assertEqual(
+            Decimal(str(allocation_details["fixed_product_gross"])),
+            Decimal(str(allocation_details["product_net"])) + Decimal(str(allocation_details["product_vat"])),
+        )
+        self.assertEqual(
+            Decimal(str(allocation_details["fixed_shipping_gross"])),
+            Decimal(str(allocation_details["shipping_net"])) + Decimal(str(allocation_details["shipping_vat"])),
+        )
 
     def test_apply_period_allocation_does_not_tax_unlisted_export_order(self) -> None:
         records = normalized_sales_fixture(gross=Decimal("50.00"), vat=Decimal("0"), order_id="EXAMPLE-US-1")
+        records["sales"].append(
+            normalized_sales_fixture(gross=Decimal("124.00"), vat=Decimal("22.36"), order_id="EXAMPLE-EU-1")["sales"][0]
+        )
 
         woo_tax.apply_period_allocation(
             records,
@@ -100,6 +132,29 @@ class WooTaxTests(unittest.TestCase):
         )
 
         self.assertEqual(records["sales"][0]["vat_amount"], 0.0)
+
+    def test_apply_period_allocation_aggregates_monthly_woo_summary(self) -> None:
+        records = monthly_woo_summary_fixture(gross=Decimal("248.00"), vat=Decimal("44.72"), period="2025-11")
+        allocation = period_allocation_fixture()
+        allocation["allocations"].append({
+            **period_allocation_fixture(order_id="EXAMPLE-2")["allocations"][0],
+            "order_id": "EXAMPLE-2",
+        })
+
+        woo_tax.apply_period_allocation(records, allocation, "2025-11")
+
+        sale = records["sales"][0]
+        self.assertEqual(sale["vat_amount"], 48.0)
+        self.assertEqual(sale["net_amount"], 200.0)
+        self.assertEqual(sale["attributes"]["vat_allocation"]["allocated_order_ids"], ["EXAMPLE-1", "EXAMPLE-2"])
+        self.assertEqual(sale["attributes"]["vat_allocation"]["fixed_product_gross"], 124.0)
+        self.assertEqual(sale["attributes"]["vat_allocation"]["fixed_shipping_gross"], 124.0)
+
+    def test_apply_period_allocation_blocks_unmatched_allocated_order(self) -> None:
+        records = normalized_sales_fixture(gross=Decimal("50.00"), vat=Decimal("0"), order_id="EXAMPLE-US-1")
+
+        with self.assertRaisesRegex(woo_tax.WooTaxError, "no matching sale"):
+            woo_tax.apply_period_allocation(records, period_allocation_fixture(), "2025-11")
 
     def test_apply_period_allocation_rejects_gross_mismatch(self) -> None:
         records = normalized_sales_fixture(gross=Decimal("123.99"), vat=Decimal("22.36"), order_id="EXAMPLE-1")

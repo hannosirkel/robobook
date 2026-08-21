@@ -357,6 +357,70 @@ def allocation_order_id(record: dict[str, Any]) -> str:
     return ""
 
 
+def allocation_components(items: list[dict[str, Any]]) -> dict[str, Decimal]:
+    product_gross = sum(
+        (decimal_value(item.get("fixed_product_gross")) for item in items), Decimal("0")
+    )
+    shipping_gross = sum(
+        (decimal_value(item.get("fixed_shipping_gross")) for item in items), Decimal("0")
+    )
+    product_vat = sum(
+        (decimal_value(item.get("corrected_product_vat")) for item in items), Decimal("0")
+    )
+    shipping_vat = sum(
+        (decimal_value(item.get("corrected_shipping_vat")) for item in items), Decimal("0")
+    )
+    return {
+        "product_gross": product_gross,
+        "shipping_gross": shipping_gross,
+        "product_vat": product_vat,
+        "shipping_vat": shipping_vat,
+        "product_net": product_gross - product_vat,
+        "shipping_net": shipping_gross - shipping_vat,
+    }
+
+
+def is_monthly_woo_summary(sale: dict[str, Any], period: str) -> bool:
+    attributes = sale.get("attributes")
+    return (
+        sale.get("source_system") == "woo"
+        and str(sale.get("event_date") or "").startswith(period)
+        and (
+            sale.get("event_type") == "woo_monthly_sales"
+            or isinstance(attributes, dict) and attributes.get("is_monthly_summary") is True
+        )
+    )
+
+
+def apply_allocation_to_sale(
+    sale: dict[str, Any], items: list[dict[str, Any]], allocation: dict[str, Any], label: str
+) -> None:
+    components = allocation_components(items)
+    expected_gross = components["product_gross"] + components["shipping_gross"]
+    sale_gross = decimal_value(sale.get("gross_amount"))
+    if not same_money(expected_gross, sale_gross):
+        raise WooTaxError(
+            f"Woo tax allocation gross for {label} does not match processor gross "
+            f"({money(expected_gross)} != {money(sale_gross)})."
+        )
+
+    attributes = sale.setdefault("attributes", {})
+    if not isinstance(attributes, dict):
+        raise WooTaxError(f"Processor sale for {label} has invalid attributes.")
+    sale["vat_amount"] = decimal_number(components["product_vat"] + components["shipping_vat"])
+    sale["net_amount"] = decimal_number(components["product_net"] + components["shipping_net"])
+    attributes["vat_allocation"] = {
+        "fixed_product_gross": decimal_number(components["product_gross"]),
+        "fixed_shipping_gross": decimal_number(components["shipping_gross"]),
+        "product_net": decimal_number(components["product_net"]),
+        "shipping_net": decimal_number(components["shipping_net"]),
+        "product_vat": decimal_number(components["product_vat"]),
+        "shipping_vat": decimal_number(components["shipping_vat"]),
+        "allocation_path": allocation.get("_allocation_path"),
+        "allocated_order_ids": sorted(str(item["order_id"]) for item in items),
+    }
+
+
 def apply_period_allocation(
     records: dict[str, list[dict[str, Any]]], allocation: dict[str, Any], period: str
 ) -> None:
@@ -371,6 +435,18 @@ def apply_period_allocation(
         if order_id:
             allocations_by_order.setdefault(order_id, []).append(item)
 
+    summary_sales = [
+        sale
+        for sale in records.get("sales") or []
+        if isinstance(sale, dict) and is_monthly_woo_summary(sale, period)
+    ]
+    if len(summary_sales) > 1:
+        raise WooTaxError(f"Woo tax allocation found multiple monthly summary sales for {period}.")
+    if summary_sales:
+        apply_allocation_to_sale(summary_sales[0], period_allocations, allocation, f"monthly summary {period}")
+        return
+
+    consumed_orders: set[str] = set()
     for sale in records.get("sales") or []:
         if not isinstance(sale, dict):
             continue
@@ -378,39 +454,14 @@ def apply_period_allocation(
         matching = allocations_by_order.get(order_id)
         if not matching:
             continue
+        if order_id in consumed_orders:
+            raise WooTaxError(f"Woo tax allocation for order {order_id} matched more than one processor sale.")
+        apply_allocation_to_sale(sale, matching, allocation, f"order {order_id}")
+        consumed_orders.add(order_id)
 
-        fixed_product_gross = sum(
-            (decimal_value(item.get("fixed_product_gross")) for item in matching), Decimal("0")
-        )
-        fixed_shipping_gross = sum(
-            (decimal_value(item.get("fixed_shipping_gross")) for item in matching), Decimal("0")
-        )
-        expected_gross = fixed_product_gross + fixed_shipping_gross
-        processor_gross = decimal_value(sale.get("gross_amount"))
-        if not same_money(expected_gross, processor_gross):
-            raise WooTaxError(
-                f"Woo tax allocation gross for order {order_id} does not match processor gross "
-                f"({money(expected_gross)} != {money(processor_gross)})."
-            )
-
-        product_vat = sum(
-            (decimal_value(item.get("corrected_product_vat")) for item in matching), Decimal("0")
-        )
-        shipping_vat = sum(
-            (decimal_value(item.get("corrected_shipping_vat")) for item in matching), Decimal("0")
-        )
-        attributes = sale.setdefault("attributes", {})
-        if not isinstance(attributes, dict):
-            raise WooTaxError(f"Processor sale for order {order_id} has invalid attributes.")
-        sale["vat_amount"] = decimal_number(product_vat + shipping_vat)
-        attributes["vat_allocation"] = {
-            "fixed_product_gross": decimal_number(fixed_product_gross),
-            "fixed_shipping_gross": decimal_number(fixed_shipping_gross),
-            "product_vat": decimal_number(product_vat),
-            "shipping_vat": decimal_number(shipping_vat),
-            "allocation_path": allocation.get("_allocation_path"),
-            "allocated_order_ids": sorted(str(item["order_id"]) for item in matching),
-        }
+    missing_orders = sorted(set(allocations_by_order) - consumed_orders)
+    if missing_orders:
+        raise WooTaxError("Woo tax allocation has no matching sale for order(s): " + ", ".join(missing_orders))
 
 
 def annual_totals(payload: dict[str, Any]) -> dict[str, Decimal]:

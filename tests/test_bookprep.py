@@ -377,6 +377,7 @@ class BookprepTests(unittest.TestCase):
             self.assertEqual(sale["vat_amount"], 6.57)
             self.assertEqual(sale["quantity"], 2.0)
             self.assertEqual(sale["attributes"]["orders"], 2)
+            self.assertTrue(sale["attributes"]["is_monthly_summary"])
 
     def test_parse_bank_csv_creates_signed_bank_transactions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

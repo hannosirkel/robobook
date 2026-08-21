@@ -553,9 +553,12 @@ def apply_period_allocation(
     for sale in sales:
         order_id = allocation_order_id(sale)
         matching = allocations_by_order.get(order_id)
+        woo_linked = is_demonstrably_woo_linked_sale(sale, annual_allocations)
         if not matching:
-            if is_demonstrably_woo_linked_sale(sale, annual_allocations):
+            if woo_linked:
                 zero_unsupported_sale(sale)
+            continue
+        if not woo_linked:
             continue
         if order_id in consumed_orders:
             raise WooTaxError(f"Woo tax allocation for order {order_id} matched more than one processor sale.")

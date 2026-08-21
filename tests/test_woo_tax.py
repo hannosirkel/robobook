@@ -223,6 +223,21 @@ class WooTaxTests(unittest.TestCase):
         with self.assertRaisesRegex(woo_tax.WooTaxError, "no matching sale"):
             woo_tax.apply_period_allocation(records, period_allocation_fixture(), "2025-11")
 
+    def test_apply_period_allocation_does_not_match_unrelated_sale_by_external_ref(self) -> None:
+        records = normalized_sales_fixture(
+            gross=Decimal("124.00"), vat=Decimal("15.00"), order_id="MARKETPLACE-1"
+        )
+        unrelated = records["sales"][0]
+        unrelated.update({"source_system": "marketplace", "channel": "marketplace"})
+        unrelated["attributes"] = {}
+        unrelated["external_ref"] = "EXAMPLE-1"
+        original = copy.deepcopy(unrelated)
+
+        with self.assertRaisesRegex(woo_tax.WooTaxError, "no matching sale.*EXAMPLE-1"):
+            woo_tax.apply_period_allocation(records, period_allocation_fixture(), "2025-11")
+
+        self.assertEqual(unrelated, original)
+
     def test_apply_period_allocation_rejects_gross_mismatch(self) -> None:
         records = normalized_sales_fixture(gross=Decimal("123.99"), vat=Decimal("22.36"), order_id="EXAMPLE-1")
 

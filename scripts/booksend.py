@@ -929,6 +929,8 @@ def execute_batch(
     )
     if mode == "write" and has_foreign_actions and exchange_rate_cache is None:
         raise SimplbooksError("Write mode requires the annual ECB cache for foreign-currency actions.")
+
+    pretranslated: dict[str, dict[str, Any]] = {}
     for action in ordered_actions:
         validate_action_shape(action)
         if posting_policy is not None:
@@ -939,14 +941,26 @@ def execute_batch(
             if policy_errors:
                 raise SimplbooksError(f"{action_id(action)} posting-policy mismatch: {policy_errors[0]}")
 
+        pretranslated[action_id(action)] = translate_action_for_api(
+            action,
+            lookup=lookup,
+            allow_unresolved_dependencies=True,
+            exchange_rate_cache=exchange_rate_cache,
+        )
+
+    for action in ordered_actions:
         if action_successfully_submitted(action):
             continue
 
-        translated = translate_action_for_api(
-            action,
-            lookup=lookup,
-            allow_unresolved_dependencies=(mode == "dry-run"),
-            exchange_rate_cache=exchange_rate_cache,
+        translated = (
+            pretranslated[action_id(action)]
+            if mode == "dry-run"
+            else translate_action_for_api(
+                action,
+                lookup=lookup,
+                allow_unresolved_dependencies=False,
+                exchange_rate_cache=exchange_rate_cache,
+            )
         )
         translated_endpoint = normalized_endpoint(str(translated.get("endpoint") or ""))
         translated_payload = copy.deepcopy(translated.get("payload") or {})

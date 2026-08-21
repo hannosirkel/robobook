@@ -287,6 +287,21 @@ class BooksendTests(unittest.TestCase):
             booksend.execute_batch(action_batch=make_batch(actions=[action]), mode="write", client=client)
         self.assertEqual(client.calls, [])
 
+    def test_sender_prevalidates_entire_batch_before_any_client_call(self) -> None:
+        manual_action = invoice_action(key="example-2024-01-manual-inventory")
+        manual_action["action_type"] = "manual_inventory_writeoff"
+
+        for mode in ("dry-run", "write"):
+            with self.subTest(mode=mode):
+                client = FakeClient(responses=[{"_http_status": 201, "invoice_id": 501}])
+                with self.assertRaisesRegex(SimplbooksError, "manual inventory"):
+                    booksend.execute_batch(
+                        action_batch=make_batch(actions=[invoice_action(), manual_action]),
+                        mode=mode,
+                        client=client,
+                    )
+                self.assertEqual(client.calls, [])
+
     def test_sender_copies_reviewed_rate_and_translates_supplier_credit(self) -> None:
         translated = booksend.translate_action_for_api(purchase_credit_action(), lookup={})
 

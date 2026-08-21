@@ -2310,6 +2310,23 @@ def apply_posting_policy(
                     ) from exc
                 warehouse_id = line_values.get("warehouse_id")
                 line["warehouse_id_hint"] = str(warehouse_id) if warehouse_id not in (None, "") else None
+        review_notes = [
+            note
+            for note in action.get("review_notes") or []
+            if not str(note).startswith("Ambiguous entity mapping candidates:")
+        ]
+        action["review_notes"] = review_notes
+        required_ids: list[str | None] = [str((payload.get("counterparty") or {}).get("contact_id") or "")]
+        for line in payload.get("line_items") or []:
+            if role == "sales":
+                required_ids.extend(
+                    [line.get("suggested_income_account_id"), line.get("suggested_vat_type_id")]
+                )
+            else:
+                required_ids.extend(
+                    [line.get("suggested_expense_account_id"), line.get("suggested_vat_type_id")]
+                )
+        action["confidence"] = review_confidence(notes=review_notes, required_ids=required_ids)
     return unresolved
 
 

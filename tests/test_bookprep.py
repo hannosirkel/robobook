@@ -52,6 +52,29 @@ class BookprepTests(unittest.TestCase):
             self.assertIn("report-2023-pdf", canonical[0].preferred_over)
             self.assertNotIn("report-2023-csv-gsheet", canonical[0].preferred_over)
 
+    def test_choose_canonical_sources_treats_misnamed_xls_as_csv_duplicate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "orderHistory_2025.csv"
+            xls_path = root / "orderHistory_2025.xls"
+            csv_path.write_text(
+                "ReferenceID,QMLOrderID,Email,Name,Status,OrderType,Carrier,ShippingType,TrackingNumber,DateSubmitted,DateShipped\n",
+                encoding="utf-8",
+            )
+            xls_path.write_bytes(b"PK\x03\x04")
+
+            period_start, period_end = bookprep.parse_period("2025-01")
+            sources = [
+                bookprep.inspect_source_file(path=path, root_dir=root, period_start=period_start, period_end=period_end)
+                for path in (csv_path, xls_path)
+            ]
+            selected = bookprep.choose_canonical_sources([source for source in sources if source is not None])
+
+            canonical = [source for source in selected if source.canonical]
+            self.assertEqual(len(canonical), 1)
+            self.assertEqual(canonical[0].path, csv_path)
+            self.assertIn(bookprep.source_id_for_path(xls_path, root_dir=root), canonical[0].preferred_over)
+
     def test_gsheet_work_file_is_ignored(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -104,6 +127,95 @@ class BookprepTests(unittest.TestCase):
             self.assertEqual(len(sources), 1)
             self.assertEqual(sources[0].source_type, "csv")
             self.assertEqual(sources[0].source_system, "woo")
+
+    def test_printful_no_activity_marker_is_canonical_zero_activity_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = root / "2025-pack" / "Printful" / "no-activity-during-period"
+            marker.parent.mkdir(parents=True)
+            marker.touch()
+            period_start, period_end = bookprep.parse_period("2025-01")
+
+            sources = bookprep.inspect_sources(
+                source_dir=root,
+                root_dir=root,
+                period_start=period_start,
+                period_end=period_end,
+            )
+            records, exceptions = bookprep.aggregate_results(
+                sources=sources,
+                period_start=period_start,
+                period_end=period_end,
+                base_currency="EUR",
+            )
+
+            self.assertEqual(len(sources), 1)
+            self.assertTrue(sources[0].canonical)
+            self.assertEqual(sources[0].source_system, "printful")
+            self.assertEqual(sources[0].parser_name, "parse_no_activity_marker")
+            self.assertEqual(sources[0].covered_from, date(2025, 1, 1))
+            self.assertEqual(sources[0].covered_until, date(2025, 12, 31))
+            self.assertFalse(any(item["blocking"] for item in exceptions))
+            self.assertFalse(any(records.values()))
+
+    def test_printful_no_activity_marker_without_period_is_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = root / "Printful" / "no-activity-during-period"
+            marker.parent.mkdir()
+            marker.touch()
+            period_start, period_end = bookprep.parse_period("2025-01")
+
+            sources = bookprep.inspect_sources(
+                source_dir=root,
+                root_dir=root,
+                period_start=period_start,
+                period_end=period_end,
+            )
+            records, exceptions = bookprep.aggregate_results(
+                sources=sources,
+                period_start=period_start,
+                period_end=period_end,
+                base_currency="EUR",
+            )
+
+            self.assertEqual(sources[0].parser_name, "unrecognized_source")
+            self.assertTrue(any(item["blocking"] for item in exceptions))
+            self.assertFalse(any(records.values()))
+
+    def test_printful_monthly_no_activity_marker_does_not_cover_other_months(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = root / "2025-01" / "Printful" / "no-activity-during-period"
+            marker.parent.mkdir(parents=True)
+            marker.touch()
+            period_start, period_end = bookprep.parse_period("2025-11")
+
+            sources = bookprep.inspect_sources(
+                source_dir=root,
+                root_dir=root,
+                period_start=period_start,
+                period_end=period_end,
+            )
+
+            self.assertFalse(sources)
+
+    def test_printful_marker_ignores_year_in_ancestor_above_source_root(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="work-2025-") as tmp:
+            source_root = Path(tmp) / "source"
+            marker = source_root / "Printful" / "no-activity-during-period"
+            marker.parent.mkdir(parents=True)
+            marker.touch()
+            period_start, period_end = bookprep.parse_period("2025-01")
+
+            sources = bookprep.inspect_sources(
+                source_dir=source_root,
+                root_dir=source_root,
+                period_start=period_start,
+                period_end=period_end,
+            )
+
+            self.assertEqual(sources[0].parser_name, "unrecognized_source")
 
     def test_parse_woo_sales_csv_adds_sales_record_and_returns_warning(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -216,6 +328,36 @@ class BookprepTests(unittest.TestCase):
             self.assertEqual(records["sales"][0]["fee_amount"], 1.57)
             self.assertEqual(records["payouts"][0]["gross_amount"], 34.25)
 
+    def test_parse_paypal_csv_keeps_card_funding_and_conversions_out_of_payouts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "paypal_2025_report.CSV"
+            csv_path.write_text(
+                "Date,Name,Type,Status,Currency,Gross,Fee,Net,Transaction ID,Balance Impact\n"
+                "09/10/2025,,General Card Withdrawal,Completed,EUR,-13.27,0.00,-13.27,TX1,Debit\n"
+                "09/10/2025,,General Card Deposit,Completed,EUR,13.42,0.00,13.42,TX2,Credit\n"
+                "09/10/2025,,General Currency Conversion,Completed,USD,-14.94,0.00,-14.94,TX3,Debit\n"
+                "09/10/2025,Quartermaster Logistics LLC,General Payment,Completed,USD,-14.94,0.00,-14.94,TX4,Debit\n",
+                encoding="utf-8",
+            )
+            period_start, period_end = bookprep.parse_period("2025-10")
+            source = bookprep.inspect_source_file(path=csv_path, root_dir=root, period_start=period_start, period_end=period_end)
+            assert source is not None
+
+            records, exceptions = bookprep.parse_paypal_csv(
+                source,
+                period_start=period_start,
+                period_end=period_end,
+                base_currency="EUR",
+            )
+
+            self.assertFalse(exceptions)
+            self.assertEqual(len(records["payouts"]), 1)
+            self.assertEqual(records["payouts"][0]["external_ref"], "TX1")
+            self.assertEqual(len(records["other"]), 3)
+            self.assertFalse(records["sales"])
+            self.assertFalse(records["refunds"])
+
     def test_inspect_source_file_infers_quartermaster_sales_month_from_parent_year(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -291,6 +433,399 @@ class BookprepTests(unittest.TestCase):
             self.assertEqual(records["payouts"][0]["gross_amount"], 126.6)
             self.assertTrue(any("duplicate" in item["reason"].lower() for item in exceptions))
 
+    def test_parse_stripe_payouts_history_csv_maps_paid_payout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "stripe_payouts_history.csv"
+            csv_path.write_text(
+                '"payout_id","effective_at_utc","effective_at","currency","gross","fee","net","reporting_category","balance_transaction_id","description","payout_expected_arrival_date","payout_status","payout_reversed_at_utc","payout_reversed_at","payout_type","payout_description","payout_destination_id","trace_id","trace_id_status","application_fee"\n'
+                '"po_1","2025-01-02 00:00:57","2025-01-02 02:00:57","eur","67.15","0.00","67.15","payout","txn_1","STRIPE PAYOUT","2025-01-02 00:00:00","paid",,,"bank_account","STRIPE PAYOUT","ba_1","STRIPE-TRACE-1","supported",""\n',
+                encoding="utf-8",
+            )
+            period_start, period_end = bookprep.parse_period("2025-01")
+            source = bookprep.inspect_source_file(path=csv_path, root_dir=root, period_start=period_start, period_end=period_end)
+            assert source is not None
+            source.canonical = True
+
+            try:
+                records, exceptions = bookprep.aggregate_results(
+                    sources=[source],
+                    period_start=period_start,
+                    period_end=period_end,
+                    base_currency="EUR",
+                )
+            except Exception as exc:  # the unsupported format is the failing behavior under test
+                self.fail(f"Stripe payouts history format was not parsed: {exc}")
+
+            self.assertEqual(source.parser_name, "parse_stripe_payouts_csv")
+            self.assertFalse([item for item in exceptions if item["blocking"]])
+            self.assertEqual(len(records["payouts"]), 1)
+            payout = records["payouts"][0]
+            self.assertEqual(payout["event_date"], "2025-01-02")
+            self.assertEqual(payout["settlement_date"], "2025-01-02")
+            self.assertEqual(payout["gross_amount"], 67.15)
+            self.assertEqual(payout["net_amount"], 67.15)
+            self.assertEqual(payout["external_ref"], "po_1")
+            self.assertEqual(payout["attributes"]["stripe_balance_transaction_id"], "txn_1")
+            self.assertEqual(payout["attributes"]["trace_id"], "STRIPE-TRACE-1")
+
+    def test_parse_stripe_payouts_history_csv_blocks_unsettled_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "stripe_payouts_history.csv"
+            csv_path.write_text(
+                '"payout_id","effective_at_utc","currency","gross","fee","net","reporting_category","balance_transaction_id","payout_expected_arrival_date","payout_status","payout_reversed_at_utc"\n'
+                '"po_failed","2025-01-02 00:00:57","eur","10","0","10","payout","txn_failed","2025-01-02 00:00:00","failed",""\n'
+                '"po_canceled","2025-01-03 00:00:57","eur","11","0","11","payout","txn_canceled","2025-01-03 00:00:00","canceled",""\n'
+                '"po_pending","2025-01-04 00:00:57","eur","12","0","12","payout","txn_pending","2025-01-04 00:00:00","pending",""\n'
+                '"po_unknown","2025-01-05 00:00:57","eur","13","0","13","payout","txn_unknown","2025-01-05 00:00:00","review",""\n'
+                '"po_reversed","2025-01-06 00:00:57","eur","14","0","14","payout","txn_reversed","2025-01-06 00:00:00","paid","2025-01-07 00:00:00"\n',
+                encoding="utf-8",
+            )
+            period_start, period_end = bookprep.parse_period("2025-01")
+            source = bookprep.inspect_source_file(path=csv_path, root_dir=root, period_start=period_start, period_end=period_end)
+            assert source is not None
+            source.canonical = True
+
+            try:
+                records, exceptions = bookprep.aggregate_results(
+                    sources=[source],
+                    period_start=period_start,
+                    period_end=period_end,
+                    base_currency="EUR",
+                )
+            except Exception as exc:
+                self.fail(f"Stripe payout statuses were not handled conservatively: {exc}")
+
+            self.assertFalse(records["payouts"])
+            self.assertEqual(sum(bool(item["blocking"]) for item in exceptions), 3)
+            self.assertEqual(sum("skipped-status" in item["exception_id"] for item in exceptions), 2)
+
+    def test_parse_stripe_charges_csv_maps_needed_columns_and_emits_refund(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "stripe_balance_history.csv"
+            csv_path.write_text(
+                '"id","Created date (UTC)","Amount","Amount Refunded","Currency","Description","Fee","PaymentIntent ID","Refunded date (UTC)","Status","order_id (metadata)","customer_email (metadata)","customer_name (metadata)","tax_amount (metadata)"\n'
+                '"ch_paid","2025-04-20 07:03:21","35.82","0.00","eur","Order 701","0.79","pi_paid","","Paid","701","buyer@example.com","Buyer","0.00"\n'
+                '"ch_refunded","2025-05-02 10:00:00","10.00","10.00","eur","Order 702","0.50","pi_refunded","2025-05-03 11:00:00","Refunded","702","refund@example.com","Refund Buyer","657"\n',
+                encoding="utf-8",
+            )
+            period_start, period_end = bookprep.parse_period("2025-05")
+            source = bookprep.inspect_source_file(path=csv_path, root_dir=root, period_start=period_start, period_end=period_end)
+            assert source is not None
+
+            records, exceptions = bookprep.parse_stripe_balance_csv(
+                source,
+                period_start=period_start,
+                period_end=period_end,
+                base_currency="EUR",
+            )
+
+            self.assertFalse(exceptions)
+            self.assertEqual(len(records["sales"]), 1)
+            self.assertEqual(len(records["refunds"]), 1)
+            sale = records["sales"][0]
+            self.assertEqual(sale["event_type"], "stripe_charge")
+            self.assertEqual(sale["event_date"], "2025-05-02")
+            self.assertEqual(sale["settlement_date"], "2025-05-02")
+            self.assertEqual(sale["gross_amount"], 10.0)
+            self.assertEqual(sale["fee_amount"], 0.5)
+            self.assertEqual(sale["net_amount"], 9.5)
+            self.assertEqual(sale["vat_amount"], 6.57)
+            self.assertEqual(sale["external_ref"], "pi_refunded")
+            refund = records["refunds"][0]
+            self.assertEqual(refund["event_type"], "stripe_refund")
+            self.assertEqual(refund["event_date"], "2025-05-03")
+            self.assertEqual(refund["gross_amount"], -10.0)
+            self.assertEqual(refund["net_amount"], -10.0)
+            self.assertEqual(refund["vat_amount"], -6.57)
+
+    def test_parse_stripe_charges_csv_skips_failed_and_blocks_pending_or_unknown_statuses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "stripe_charges.csv"
+            csv_path.write_text(
+                '"id","Created date (UTC)","Amount","Amount Refunded","Currency","Fee","PaymentIntent ID","Refunded date (UTC)","Status"\n'
+                '"ch_failed","2025-05-01 10:00:00","10.00","0","eur","0.50","pi_failed","","Failed"\n'
+                '"ch_pending","2025-05-02 10:00:00","11.00","0","eur","0.50","pi_pending","","Pending"\n'
+                '"ch_unknown","2025-05-03 10:00:00","12.00","0","eur","0.50","pi_unknown","","Needs review"\n',
+                encoding="utf-8",
+            )
+            period_start, period_end = bookprep.parse_period("2025-05")
+            source = bookprep.inspect_source_file(path=csv_path, root_dir=root, period_start=period_start, period_end=period_end)
+            assert source is not None
+
+            records, exceptions = bookprep.parse_stripe_balance_csv(
+                source,
+                period_start=period_start,
+                period_end=period_end,
+                base_currency="EUR",
+            )
+
+            self.assertFalse(records["sales"])
+            self.assertTrue(any("failed" in item["reason"].lower() and not item["blocking"] for item in exceptions))
+            self.assertEqual(sum(bool(item["blocking"]) for item in exceptions), 2)
+
+    def test_parse_stripe_charges_csv_does_not_block_other_month_for_pending_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "stripe_charges.csv"
+            csv_path.write_text(
+                '"id","Created date (UTC)","Amount","Amount Refunded","Currency","Fee","PaymentIntent ID","Refunded date (UTC)","Status"\n'
+                '"ch_pending","2025-04-02 10:00:00","11.00","0","eur","0.50","pi_pending","","Pending"\n',
+                encoding="utf-8",
+            )
+            period_start, period_end = bookprep.parse_period("2025-05")
+            source = bookprep.inspect_source_file(path=csv_path, root_dir=root, period_start=period_start, period_end=period_end)
+            assert source is not None
+
+            records, exceptions = bookprep.parse_stripe_balance_csv(
+                source,
+                period_start=period_start,
+                period_end=period_end,
+                base_currency="EUR",
+            )
+
+            self.assertFalse(any(records.values()))
+            self.assertFalse(any(item["blocking"] for item in exceptions))
+
+    def test_parse_stripe_charges_csv_accepts_succeeded_skips_canceled_and_blocks_over_refund(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "stripe_charges.csv"
+            csv_path.write_text(
+                '"id","Created date (UTC)","Amount","Amount Refunded","Currency","Fee","PaymentIntent ID","Refunded date (UTC)","Status"\n'
+                '"ch_ok","2025-05-01 10:00:00","10.00","0","eur","0.50","pi_ok","","Succeeded"\n'
+                '"ch_canceled","2025-05-02 10:00:00","11.00","0","eur","0.50","pi_canceled","","Canceled"\n'
+                '"ch_bad_refund","2025-05-03 10:00:00","12.00","13.00","eur","0.50","pi_bad","2025-05-04 10:00:00","Refunded"\n',
+                encoding="utf-8",
+            )
+            period_start, period_end = bookprep.parse_period("2025-05")
+            source = bookprep.inspect_source_file(path=csv_path, root_dir=root, period_start=period_start, period_end=period_end)
+            assert source is not None
+
+            records, exceptions = bookprep.parse_stripe_balance_csv(
+                source,
+                period_start=period_start,
+                period_end=period_end,
+                base_currency="EUR",
+            )
+
+            self.assertEqual([record["external_ref"] for record in records["sales"]], ["pi_ok"])
+            self.assertTrue(any("canceled" in item["reason"].lower() and not item["blocking"] for item in exceptions))
+            self.assertTrue(any("exceeds charge" in item["reason"].lower() and item["blocking"] for item in exceptions))
+
+    def test_parse_stripe_charges_csv_blocks_refund_without_date(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "stripe_charges.csv"
+            csv_path.write_text(
+                '"id","Created date (UTC)","Amount","Amount Refunded","Currency","Fee","PaymentIntent ID","Refunded date (UTC)","Status","tax_amount (metadata)"\n'
+                '"ch_refund","2025-05-01 10:00:00","10.00","4.00","eur","0.50","pi_refund","","Partially refunded","2.00"\n',
+                encoding="utf-8",
+            )
+            period_start, period_end = bookprep.parse_period("2025-05")
+            source = bookprep.inspect_source_file(path=csv_path, root_dir=root, period_start=period_start, period_end=period_end)
+            assert source is not None
+
+            records, exceptions = bookprep.parse_stripe_balance_csv(
+                source,
+                period_start=period_start,
+                period_end=period_end,
+                base_currency="EUR",
+            )
+
+            self.assertEqual(len(records["sales"]), 1)
+            self.assertFalse(records["refunds"])
+            self.assertTrue(any("refund date" in item["reason"].lower() and item["blocking"] for item in exceptions))
+
+    def test_parse_stripe_charges_csv_rounds_partial_refund_vat_to_cents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "stripe_charges.csv"
+            csv_path.write_text(
+                '"id","Created date (UTC)","Amount","Amount Refunded","Currency","Fee","PaymentIntent ID","Refunded date (UTC)","Status","tax_amount (metadata)"\n'
+                '"ch_refund","2025-05-01 10:00:00","3.00","1.00","eur","0.10","pi_refund","2025-05-02 10:00:00","Partially refunded","100"\n',
+                encoding="utf-8",
+            )
+            period_start, period_end = bookprep.parse_period("2025-05")
+            source = bookprep.inspect_source_file(path=csv_path, root_dir=root, period_start=period_start, period_end=period_end)
+            assert source is not None
+
+            records, exceptions = bookprep.parse_stripe_balance_csv(
+                source,
+                period_start=period_start,
+                period_end=period_end,
+                base_currency="EUR",
+            )
+
+            self.assertFalse(exceptions)
+            self.assertEqual(records["refunds"][0]["vat_amount"], -0.33)
+
+    def test_aggregate_prefers_charges_sales_but_retains_balance_history_payouts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "stripe_charges.csv").write_text(
+                '"id","Created date (UTC)","Amount","Amount Refunded","Currency","Fee","PaymentIntent ID","Refunded date (UTC)","Status"\n'
+                '"ch_1","2025-05-01 10:00:00","10.00","0","eur","0.50","pi_1","","Paid"\n',
+                encoding="utf-8",
+            )
+            (root / "stripe_balance_history.csv").write_text(
+                '"id","Type","Source","Amount","Fee","Net","Currency","Created (UTC)","Available On (UTC)"\n'
+                '"txn_1","charge","ch_1","10.00","0.50","9.50","eur","2025-05-01 10:00","2025-05-03 00:00"\n'
+                '"txn_fee","fee","fee_1","-0.50","0.50","-0.50","eur","2025-05-01 10:00","2025-05-03 00:00"\n'
+                '"txn_payout","payout","po_1","-9.50","0","-9.50","eur","2025-05-04 10:00","2025-05-04 10:00"\n',
+                encoding="utf-8",
+            )
+            period_start, period_end = bookprep.parse_period("2025-05")
+            sources = bookprep.inspect_sources(
+                source_dir=root,
+                root_dir=root,
+                period_start=period_start,
+                period_end=period_end,
+            )
+
+            records, exceptions = bookprep.aggregate_results(
+                sources=sources,
+                period_start=period_start,
+                period_end=period_end,
+                base_currency="EUR",
+            )
+
+            self.assertEqual(len(records["sales"]), 1)
+            self.assertEqual(records["sales"][0]["attributes"]["stripe_export_type"], "charges")
+            self.assertEqual(len(records["payouts"]), 1)
+            self.assertEqual(len(records["fees"]), 1)
+            self.assertTrue(any("superseded" in item["reason"].lower() for item in exceptions))
+
+    def test_aggregate_prefers_payouts_history_duplicate_but_retains_balance_history_fee(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "stripe_payouts_history.csv").write_text(
+                '"payout_id","effective_at_utc","currency","gross","fee","net","reporting_category","balance_transaction_id","payout_expected_arrival_date","payout_status"\n'
+                '"po_1","2025-05-04 10:00:00","eur","9.50","0","9.50","payout","txn_payout","2025-05-04 10:00:00","paid"\n',
+                encoding="utf-8",
+            )
+            (root / "stripe_balance_history.csv").write_text(
+                '"id","Type","Source","Amount","Fee","Net","Currency","Created (UTC)","Available On (UTC)"\n'
+                '"txn_fee","fee","fee_1","-0.50","0.50","-0.50","eur","2025-05-01 10:00","2025-05-03 00:00"\n'
+                '"txn_payout","payout","po_1","-9.50","0","-9.50","eur","2025-05-04 10:00","2025-05-04 10:00"\n',
+                encoding="utf-8",
+            )
+            period_start, period_end = bookprep.parse_period("2025-05")
+            sources = bookprep.inspect_sources(
+                source_dir=root,
+                root_dir=root,
+                period_start=period_start,
+                period_end=period_end,
+            )
+
+            records, exceptions = bookprep.aggregate_results(
+                sources=sources,
+                period_start=period_start,
+                period_end=period_end,
+                base_currency="EUR",
+            )
+
+            self.assertEqual(len(records["payouts"]), 1)
+            self.assertEqual(records["payouts"][0]["attributes"]["stripe_export_type"], "payouts_history")
+            self.assertEqual(len(records["fees"]), 1)
+            self.assertTrue(any("payout" in item["reason"].lower() and "superseded" in item["reason"].lower() for item in exceptions))
+
+    def test_aggregate_retains_same_value_payouts_when_immutable_ids_differ(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "stripe_payouts_history.csv").write_text(
+                '"payout_id","effective_at_utc","currency","gross","fee","net","reporting_category","balance_transaction_id","payout_expected_arrival_date","payout_status"\n'
+                '"po_new","2025-05-04 10:00:00","eur","9.50","0","9.50","payout","txn_new","2025-05-04 10:00:00","paid"\n',
+                encoding="utf-8",
+            )
+            (root / "stripe_balance_history.csv").write_text(
+                '"id","Type","Source","Amount","Fee","Net","Currency","Created (UTC)","Available On (UTC)"\n'
+                '"txn_other","payout","po_other","-9.50","0","-9.50","eur","2025-05-04 10:00","2025-05-04 10:00"\n',
+                encoding="utf-8",
+            )
+            period_start, period_end = bookprep.parse_period("2025-05")
+            sources = bookprep.inspect_sources(
+                source_dir=root,
+                root_dir=root,
+                period_start=period_start,
+                period_end=period_end,
+            )
+
+            records, exceptions = bookprep.aggregate_results(
+                sources=sources,
+                period_start=period_start,
+                period_end=period_end,
+                base_currency="EUR",
+            )
+
+            self.assertEqual(len(records["payouts"]), 2)
+            self.assertTrue(any("possible duplicate" in item["reason"].lower() for item in exceptions))
+
+    def test_aggregate_retains_distinct_stripe_charges_with_same_date_and_amount(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "stripe_charges.csv").write_text(
+                '"id","Created date (UTC)","Amount","Amount Refunded","Currency","Fee","PaymentIntent ID","Refunded date (UTC)","Status"\n'
+                '"ch_1","2025-05-01 10:00:00","10.00","0","eur","0.50","pi_1","","Paid"\n',
+                encoding="utf-8",
+            )
+            (root / "stripe_balance_history.csv").write_text(
+                '"id","Type","Source","Amount","Fee","Net","Currency","Created (UTC)","Available On (UTC)"\n'
+                '"txn_2","charge","ch_2","10.00","0.50","9.50","eur","2025-05-01 10:00","2025-05-03 00:00"\n',
+                encoding="utf-8",
+            )
+            period_start, period_end = bookprep.parse_period("2025-05")
+            sources = bookprep.inspect_sources(
+                source_dir=root,
+                root_dir=root,
+                period_start=period_start,
+                period_end=period_end,
+            )
+
+            records, exceptions = bookprep.aggregate_results(
+                sources=sources,
+                period_start=period_start,
+                period_end=period_end,
+                base_currency="EUR",
+            )
+
+            self.assertEqual(len(records["sales"]), 2)
+            self.assertTrue(any("possible duplicate" in item["reason"].lower() for item in exceptions))
+
+    def test_aggregate_does_not_dedupe_distinct_charges_for_same_order_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "stripe_charges.csv").write_text(
+                '"id","Created date (UTC)","Amount","Amount Refunded","Currency","Fee","PaymentIntent ID","Refunded date (UTC)","Status","order_id (metadata)"\n'
+                '"ch_1","2025-05-01 10:00:00","10.00","0","eur","0.50","pi_1","","Paid","42"\n',
+                encoding="utf-8",
+            )
+            (root / "stripe_balance_history.csv").write_text(
+                '"id","Type","Source","Amount","Fee","Net","Currency","Created (UTC)","Available On (UTC)","order_id (metadata)"\n'
+                '"txn_2","charge","ch_2","20.00","0.50","19.50","eur","2025-05-02 10:00","2025-05-03 00:00","42"\n',
+                encoding="utf-8",
+            )
+            period_start, period_end = bookprep.parse_period("2025-05")
+            sources = bookprep.inspect_sources(
+                source_dir=root,
+                root_dir=root,
+                period_start=period_start,
+                period_end=period_end,
+            )
+
+            records, exceptions = bookprep.aggregate_results(
+                sources=sources,
+                period_start=period_start,
+                period_end=period_end,
+                base_currency="EUR",
+            )
+
+            self.assertEqual(len(records["sales"]), 2)
+            self.assertTrue(any("possible duplicate" in item["reason"].lower() for item in exceptions))
+
     def test_parse_stripe_invoice_pdf_creates_explicit_fee_record_for_service_month(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -362,6 +897,84 @@ class BookprepTests(unittest.TestCase):
             self.assertEqual(fee["gross_amount"], 32.8)
             self.assertEqual(fee["fee_amount"], 32.8)
             self.assertEqual(fee["channel"], "quartermaster")
+
+    def test_parse_quartermaster_sales_report_accepts_short_date_and_sums_product_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = pdf_source(root, "qm_sales_01.pdf", source_system="quartermaster")
+            pages = [
+                "Sales Report\n"
+                "Date\n1/31/2025\n"
+                "S.R. No.\n1504\n"
+                "Vendor\nPlepic Games LLC\n"
+                "Quartermaster Direct\n"
+                "This represents your sales report for January 2025\n"
+                "Total\nItem Description Qty Rate Amount\n"
+                "Lunar Base retail - Sold\nCopies\n43 9.66 415.38\n"
+                "Lunar Base demo - Sold Copies\n1 5.00 5.00\n"
+                "Picking Fee QML Picking Fee - $.40 per unit 44 -0.40 -17.60\n"
+                "$402.78\n"
+            ]
+            with mock.patch.object(bookprep, "extract_pdf_pages", return_value=pages):
+                records, exceptions = bookprep.parse_quartermaster_pdf(
+                    source,
+                    period_start=date(2025, 1, 1),
+                    period_end=date(2025, 1, 31),
+                    base_currency="EUR",
+                )
+
+            self.assertFalse(exceptions)
+            self.assertEqual(len(records["sales"]), 1)
+            self.assertEqual(records["sales"][0]["event_date"], "2025-01-31")
+            self.assertEqual(records["sales"][0]["quantity"], 44.0)
+            self.assertEqual(records["sales"][0]["gross_amount"], 420.38)
+            self.assertEqual(records["fees"][0]["gross_amount"], 17.6)
+
+    def test_inspect_quartermaster_pdf_uses_report_date_over_filename_month(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "2025-pack" / "Quartermaster"
+            root.mkdir(parents=True)
+            path = root / "qm_sales_12.pdf"
+            path.write_bytes(b"%PDF-1.4\n")
+            pages = ["Sales Report\nDate\n7/31/2025\nQuartermaster Direct\n"]
+            period_start, period_end = bookprep.parse_period("2025-07")
+
+            with (
+                mock.patch.object(bookprep, "PdfReader", object()),
+                mock.patch.object(bookprep, "extract_pdf_pages", return_value=pages),
+            ):
+                source = bookprep.inspect_source_file(
+                    path=path,
+                    root_dir=Path(tmp),
+                    period_start=period_start,
+                    period_end=period_end,
+                )
+
+            assert source is not None
+            self.assertEqual(source.covered_from, date(2025, 7, 31))
+            self.assertEqual(source.covered_until, date(2025, 7, 31))
+
+    def test_parse_quartermaster_zero_sales_report_is_valid_zero_activity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = pdf_source(root, "qm_sales_07.pdf", source_system="quartermaster")
+            pages = [
+                "Sales Report\nDate\n8/31/2025\nS.R. No.\n2385\n"
+                "Vendor\nPlepic Games LLC\nQuartermaster Direct\n"
+                "This represents your Sales Report for August 2025. NOTE: No sales for this pay period.\n"
+                "Lunar Base - Sold Copies\n0 5.00 0.00\n"
+                "Picking Fee QML Picking Fee - $.40 per unit 0 -0.40 0.00\n$0.00\n"
+            ]
+            with mock.patch.object(bookprep, "extract_pdf_pages", return_value=pages):
+                records, exceptions = bookprep.parse_quartermaster_pdf(
+                    source,
+                    period_start=date(2025, 8, 1),
+                    period_end=date(2025, 8, 31),
+                    base_currency="EUR",
+                )
+
+            self.assertFalse(exceptions)
+            self.assertFalse(any(records.values()))
 
     def test_parse_quartermaster_invoice_pdf_creates_usd_purchase_record(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -504,6 +1117,36 @@ class BookprepTests(unittest.TestCase):
             self.assertEqual(expense["net_amount"], 852.0)
             self.assertEqual(expense["vat_amount"], 9.24)
             self.assertEqual(expense["attributes"]["vendor_name"], "BALTI LOGISTIKA AS")
+
+    def test_parse_purchase_invoice_pdf_extracts_jajaa_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = pdf_source(root, "2025.10.30_JaJaa.pdf", source_system="document")
+            pages = [
+                "Kuupäev:\nTingimused:\nTähtaeg:\n5 päeva\n04.11.2025\n"
+                "Jajaa OÜ\nTatari 8/Sakala 22\n"
+                "11,30 20 Värviprint A4 300g 105\n"
+                "Plepic Games OÜ\nMaksja:\nJajaa OÜ\n30.10.2025\n"
+                "2505331 Arve nr.:\nEE100265839\n"
+                "KM-ta\n11,30 24%\nKM% KMsumma\n2,71\nKokku\n14,01\n"
+                "Tasumisel märkige palun arve number\nSWIFT: HABAEE2X\n"
+            ]
+            with mock.patch.object(bookprep, "extract_pdf_pages", return_value=pages):
+                records, exceptions = bookprep.parse_purchase_invoice_pdf(
+                    source,
+                    period_start=date(2025, 10, 1),
+                    period_end=date(2025, 10, 31),
+                    base_currency="EUR",
+                )
+
+            self.assertFalse(exceptions)
+            self.assertEqual(len(records["purchase_expenses"]), 1)
+            expense = records["purchase_expenses"][0]
+            self.assertEqual(expense["event_date"], "2025-10-30")
+            self.assertEqual(expense["external_ref"], "2505331")
+            self.assertEqual(expense["gross_amount"], 14.01)
+            self.assertEqual(expense["net_amount"], 11.3)
+            self.assertEqual(expense["vat_amount"], 2.71)
 
     def test_ostuarved_readme_note_becomes_canonical_purchase_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

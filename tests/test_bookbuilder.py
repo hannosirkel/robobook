@@ -361,6 +361,7 @@ class BookbuilderTests(unittest.TestCase):
         self.assertEqual(sales["payload"]["line_items"][0]["suggested_income_account_id"], "109")
         self.assertEqual(sales["payload"]["line_items"][0]["suggested_vat_type_id"], "12")
         self.assertEqual(sales["payload"]["line_items"][0]["warehouse_id_hint"], "6")
+        self.assertNotEqual(sales["confidence"], "low")
         incoming = find_action(batch, "create_incoming_summary")
         self.assertEqual(incoming["payload"]["bank_account_id"], "3")
         self.assertEqual(incoming["payload"]["counterparty"]["contact_id"], "29")

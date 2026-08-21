@@ -11,7 +11,7 @@ import unicodedata
 from calendar import monthrange
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable
 from xml.etree import ElementTree
@@ -53,6 +53,17 @@ ROW_EVENT_HEADERS = {
     },
     "paypal_csv": {"date", "time", "timezone", "name", "type", "status", "currency", "gross", "fee", "net", "transaction id"},
     "stripe_balance_csv": {"id", "type", "source", "amount", "fee", "net", "currency", "created (utc)", "available on (utc)"},
+    "stripe_payouts_csv": {
+        "payout id",
+        "effective at utc",
+        "currency",
+        "gross",
+        "fee",
+        "net",
+        "reporting category",
+        "balance transaction id",
+        "payout status",
+    },
     "quartermaster_orders_csv": {
         "referenceid",
         "qmlorderid",
@@ -172,6 +183,7 @@ def source_type_from_path(path: Path) -> str:
         ".csv": "csv",
         ".xml": "xml",
         ".xlsx": "xlsx",
+        ".xls": "xlsx",
         ".pdf": "pdf",
         ".json": "json",
     }
@@ -180,7 +192,7 @@ def source_type_from_path(path: Path) -> str:
 
 def canonical_group_for_path(path: Path) -> str:
     current = Path(path.name)
-    while current.suffix.lower() in {".gsheet", ".csv", ".xml", ".xlsx", ".pdf", ".json"}:
+    while current.suffix.lower() in {".gsheet", ".csv", ".xml", ".xls", ".xlsx", ".pdf", ".json"}:
         current = Path(current.stem)
     return slugify(current.name)
 
@@ -409,10 +421,14 @@ def read_csv_rows(path: Path) -> tuple[list[dict[str, str]], set[str]]:
 
 def detect_parser(path: Path, source_type: str, source_system: str, header_names: set[str] | None = None) -> str:
     headers = header_names or set()
+    if source_system == "printful" and slugify(path.name) == "no-activity-during-period":
+        return "parse_no_activity_marker"
     if source_type == "csv" and source_system == "woo":
         return "parse_woo_sales_csv"
     if source_type == "csv" and source_system == "paypal":
         return "parse_paypal_csv"
+    if source_type == "csv" and source_system == "stripe" and headers >= ROW_EVENT_HEADERS["stripe_payouts_csv"]:
+        return "parse_stripe_payouts_csv"
     if source_type == "csv" and source_system == "stripe":
         return "parse_stripe_balance_csv"
     if source_type == "csv" and source_system == "quartermaster":
@@ -448,6 +464,41 @@ def detect_parser(path: Path, source_type: str, source_system: str, header_names
     return "unrecognized_source"
 
 
+def infer_pdf_coverage(text: str, source_system: str) -> tuple[date, date] | None:
+    if source_system != "quartermaster" or "sales report" not in normalize_ascii(text).lower():
+        return None
+    match = re.search(r"Date\s+([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        report_date = datetime.strptime(match.group(1), "%m/%d/%Y").date()
+    except ValueError:
+        return None
+    return report_date, report_date
+
+
+def infer_no_activity_marker_coverage(path: Path, *, root_dir: Path) -> tuple[date, date] | None:
+    if slugify(path.name) != "no-activity-during-period":
+        return None
+    try:
+        relative_parts = path.resolve().relative_to(root_dir.resolve()).parts[:-1]
+    except ValueError:
+        return None
+    directory_names = [*relative_parts, root_dir.name]
+    for directory_name in reversed(directory_names):
+        normalized = normalize_ascii(directory_name).lower()
+        month_match = re.fullmatch(r"(20\d{2})[-_.](0[1-9]|1[0-2])", normalized)
+        if month_match:
+            year = int(month_match.group(1))
+            month = int(month_match.group(2))
+            return date(year, month, 1), month_end(year, month)
+        year_match = re.fullmatch(r"(20\d{2})(?:-pack)?", normalized)
+        if year_match:
+            year = int(year_match.group(1))
+            return date(year, 1, 1), date(year, 12, 31)
+    return None
+
+
 def source_id_for_path(path: Path, *, root_dir: Path) -> str:
     return slugify(display_path(path, root_dir).replace("/", "-"))
 
@@ -476,6 +527,7 @@ def inspect_source_file(
     source_type = source_type_from_path(path)
     header_names: set[str] | None = None
     parser_notes: list[str] = []
+    content_coverage: tuple[date, date] | None = None
 
     source_system = infer_source_system(path, source_type)
     if source_type == "csv":
@@ -490,12 +542,19 @@ def inspect_source_file(
         except SimplbooksError:
             pass
         else:
-            source_system = infer_pdf_source_system("\n".join(sample_pages[:2]), source_system)
+            sample_text = "\n".join(sample_pages[:2])
+            source_system = infer_pdf_source_system(sample_text, source_system)
+            content_coverage = infer_pdf_coverage(sample_text, source_system)
 
-    coverage = parse_filename_dates(path)
+    is_no_activity_marker = source_system == "printful" and slugify(path.name) == "no-activity-during-period"
+    marker_coverage = infer_no_activity_marker_coverage(path, root_dir=root_dir) if is_no_activity_marker else None
+    coverage = content_coverage or marker_coverage or parse_filename_dates(path)
     if coverage is None:
         coverage = (period_start, period_end)
-        parser_notes.append("Coverage could not be inferred from the filename; assumed target period.")
+        if is_no_activity_marker:
+            parser_notes.append("Zero-activity marker has no explicit period in its path and cannot be used as authoritative evidence.")
+        else:
+            parser_notes.append("Coverage could not be inferred from the filename; assumed target period.")
 
     descriptor = SourceDescriptor(
         path=path,
@@ -506,7 +565,11 @@ def inspect_source_file(
         covered_from=coverage[0],
         covered_until=coverage[1],
         canonical_group=canonical_group_for_path(path),
-        parser_name=detect_parser(path, source_type, source_system, header_names),
+        parser_name=(
+            "unrecognized_source"
+            if is_no_activity_marker and marker_coverage is None
+            else detect_parser(path, source_type, source_system, header_names)
+        ),
         parser_notes=parser_notes,
     )
 
@@ -806,6 +869,16 @@ def parser_result() -> dict[str, list[dict[str, Any]]]:
     }
 
 
+def parse_no_activity_marker(
+    source: SourceDescriptor,
+    *,
+    period_start: date,
+    period_end: date,
+    base_currency: str,
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    return parser_result(), []
+
+
 def update_coverage_from_dates(source: SourceDescriptor, dates: list[date]) -> None:
     if dates:
         source.covered_from = min(dates)
@@ -909,7 +982,11 @@ def parse_woo_sales_csv(
 
 def paypal_category(row: dict[str, str], gross_amount: Decimal) -> str:
     type_value = row.get("Type", "").strip().lower()
-    if "withdrawal" in type_value or "transfer" in type_value or "payout" in type_value or "deposit" in type_value:
+    if "withdrawal" in type_value or "payout" in type_value:
+        return "payouts"
+    if "deposit" in type_value or "currency conversion" in type_value or type_value in {"general payment", "payment reversal"}:
+        return "other"
+    if "transfer" in type_value:
         return "payouts"
     if "refund" in type_value or "reversal" in type_value or "chargeback" in type_value or gross_amount < 0:
         return "refunds"
@@ -1009,6 +1086,144 @@ def stripe_category(row: dict[str, str], amount: Decimal) -> str:
     return "sales"
 
 
+def parse_stripe_payouts_csv(
+    source: SourceDescriptor,
+    *,
+    period_start: date,
+    period_end: date,
+    base_currency: str,
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    rows, _ = read_csv_rows(source.path)
+    result = parser_result()
+    exceptions: list[dict[str, Any]] = []
+    seen_dates: list[date] = []
+    seen_payout_ids: set[str] = set()
+
+    for line_no, row in enumerate(rows, start=2):
+        payout_id = (row.get("payout_id") or "").strip()
+        effective_at = (row.get("effective_at_utc") or "").strip()
+        if not effective_at:
+            exceptions.append(
+                make_exception(
+                    source=source,
+                    exception_id=f"{source.source_id}:missing-effective-date:{line_no}",
+                    severity="error",
+                    reason="Stripe payout row has no effective_at_utc date.",
+                    blocking=True,
+                    row_ref=f"csv:{line_no}",
+                    suggested_follow_up="Re-export Stripe payout history with effective dates.",
+                )
+            )
+            continue
+
+        event_date = parse_date_value(effective_at)
+        if event_date < period_start or event_date > period_end:
+            continue
+        seen_dates.append(event_date)
+
+        if payout_id and payout_id in seen_payout_ids:
+            exceptions.append(
+                make_exception(
+                    source=source,
+                    exception_id=f"{source.source_id}:duplicate:{payout_id}",
+                    severity="warn",
+                    reason=f"Skipped duplicate Stripe payout row {payout_id}.",
+                    blocking=False,
+                    row_ref=f"csv:{line_no}",
+                )
+            )
+            continue
+        if payout_id:
+            seen_payout_ids.add(payout_id)
+
+        status = normalize_ascii(row.get("payout_status") or "").strip().lower()
+        reversed_at = (row.get("payout_reversed_at_utc") or "").strip()
+        if status in {"failed", "canceled", "cancelled"}:
+            exceptions.append(
+                make_exception(
+                    source=source,
+                    exception_id=f"{source.source_id}:skipped-status:{line_no}",
+                    severity="warn",
+                    reason=f"Skipped Stripe payout with non-settled status {row.get('payout_status')!r}.",
+                    blocking=False,
+                    row_ref=f"csv:{line_no}",
+                )
+            )
+            continue
+        if reversed_at or status != "paid":
+            reason = (
+                "Stripe payout was reversed and requires explicit reconciliation."
+                if reversed_at
+                else f"Stripe payout has pending or unknown status {row.get('payout_status')!r}."
+            )
+            exceptions.append(
+                make_exception(
+                    source=source,
+                    exception_id=f"{source.source_id}:unsettled:{line_no}",
+                    severity="error",
+                    reason=reason,
+                    blocking=True,
+                    row_ref=f"csv:{line_no}",
+                    suggested_follow_up="Resolve the payout status in Stripe or provide evidence of the reversal before reconciliation.",
+                )
+            )
+            continue
+
+        reporting_category = normalize_ascii(row.get("reporting_category") or "").strip().lower()
+        if reporting_category != "payout":
+            exceptions.append(
+                make_exception(
+                    source=source,
+                    exception_id=f"{source.source_id}:unexpected-category:{line_no}",
+                    severity="error",
+                    reason=f"Stripe payout export row has unexpected reporting category {row.get('reporting_category')!r}.",
+                    blocking=True,
+                    row_ref=f"csv:{line_no}",
+                )
+            )
+            continue
+
+        gross = abs(parse_decimal(row.get("gross")))
+        fee = abs(parse_decimal(row.get("fee")))
+        net = abs(parse_decimal(row.get("net")))
+        currency = (row.get("currency") or base_currency).strip().upper()
+        expected_arrival = (row.get("payout_expected_arrival_date") or "").strip()
+        settlement_date = parse_date_value(expected_arrival) if expected_arrival else event_date
+        description = (row.get("payout_description") or row.get("description") or "Stripe payout").strip()
+
+        category, record = make_record(
+            source=source,
+            category="payouts",
+            record_id=f"{source.source_id}:payout:{payout_id or line_no}",
+            event_type="stripe_payout",
+            event_date=event_date,
+            settlement_date=settlement_date,
+            description=description,
+            currency=currency,
+            gross_amount=gross,
+            net_amount=net,
+            fee_amount=fee,
+            external_ref=payout_id or None,
+            channel="stripe",
+            attributes={
+                "stripe_export_type": "payouts_history",
+                "stripe_payout_id": payout_id or None,
+                "stripe_balance_transaction_id": row.get("balance_transaction_id") or None,
+                "payout_status": row.get("payout_status") or None,
+                "payout_type": row.get("payout_type") or None,
+                "payout_destination_id": row.get("payout_destination_id") or None,
+                "trace_id": row.get("trace_id") or None,
+                "trace_id_status": row.get("trace_id_status") or None,
+                "application_fee": row.get("application_fee") or None,
+            },
+            row_ref=f"csv:{line_no}",
+        )
+        result[category].append(record)
+
+    update_coverage_from_dates(source, seen_dates)
+    return result, exceptions
+
+
 def parse_stripe_balance_csv(
     source: SourceDescriptor,
     *,
@@ -1021,8 +1236,167 @@ def parse_stripe_balance_csv(
     exceptions: list[dict[str, Any]] = []
     seen_dates: list[date] = []
     seen_transaction_ids: set[str] = set()
+    is_charges_export = bool(rows and "Created date (UTC)" in rows[0])
 
     for line_no, row in enumerate(rows, start=2):
+        if is_charges_export:
+            transaction_id = (row.get("id") or "").strip()
+            if transaction_id and transaction_id in seen_transaction_ids:
+                exceptions.append(
+                    make_exception(
+                        source=source,
+                        exception_id=f"{source.source_id}:duplicate:{transaction_id}",
+                        severity="warn",
+                        reason=f"Skipped duplicate Stripe charges-export row for transaction {transaction_id}.",
+                        blocking=False,
+                        row_ref=f"csv:{line_no}",
+                    )
+                )
+                continue
+            if transaction_id:
+                seen_transaction_ids.add(transaction_id)
+
+            event_date = parse_date_value(row["Created date (UTC)"])
+            amount = parse_decimal(row.get("Amount"))
+            fee = abs(parse_decimal(row.get("Fee")))
+            refunded = abs(parse_decimal(row.get("Amount Refunded")))
+            refunded_date_raw = (row.get("Refunded date (UTC)") or "").strip()
+            refunded_date = parse_date_value(refunded_date_raw) if refunded and refunded_date_raw else None
+            charge_in_period = period_start <= event_date <= period_end
+            refund_in_period = refunded_date is not None and period_start <= refunded_date <= period_end
+            if not charge_in_period and not refund_in_period:
+                continue
+
+            status = normalize_ascii(row.get("Status") or "").strip().lower()
+            successful_statuses = {"paid", "succeeded", "refunded", "partially refunded"}
+            skipped_statuses = {"failed", "canceled", "cancelled"}
+            if status in skipped_statuses:
+                exceptions.append(
+                    make_exception(
+                        source=source,
+                        exception_id=f"{source.source_id}:skipped-status:{line_no}",
+                        severity="warn",
+                        reason=f"Skipped Stripe charge with non-successful status {row.get('Status')!r}.",
+                        blocking=False,
+                        row_ref=f"csv:{line_no}",
+                    )
+                )
+                continue
+            if amount != 0 and status not in successful_statuses:
+                exceptions.append(
+                    make_exception(
+                        source=source,
+                        exception_id=f"{source.source_id}:unapproved-status:{line_no}",
+                        severity="error",
+                        reason=f"Stripe charge has pending or unknown status {row.get('Status')!r}; it cannot be normalized as a completed sale.",
+                        blocking=True,
+                        row_ref=f"csv:{line_no}",
+                        suggested_follow_up="Resolve the charge status in Stripe or provide a final-status export.",
+                    )
+                )
+                continue
+            if refunded > abs(amount):
+                exceptions.append(
+                    make_exception(
+                        source=source,
+                        exception_id=f"{source.source_id}:refund-exceeds-charge:{line_no}",
+                        severity="error",
+                        reason=f"Stripe refunded amount {refunded} exceeds charge amount {abs(amount)}.",
+                        blocking=True,
+                        row_ref=f"csv:{line_no}",
+                        suggested_follow_up="Verify the Stripe charge and refund export values.",
+                    )
+                )
+                continue
+            currency = row.get("Currency", "").strip().upper() or base_currency
+            payment_intent_id = (row.get("PaymentIntent ID") or "").strip()
+            external_ref = payment_intent_id or transaction_id or None
+            customer_ref = (
+                row.get("customer_name (metadata)")
+                or row.get("customer_email (metadata)")
+                or row.get("order_id (metadata)")
+                or row.get("Description")
+                or "unknown reference"
+            )
+            description = f"Stripe charge - {customer_ref}"
+            attributes = {
+                "stripe_balance_transaction_id": transaction_id,
+                "stripe_source_id": payment_intent_id or transaction_id,
+                "stripe_export_type": "charges",
+                "status": row.get("Status"),
+                "payment_type": row.get("payment_type (metadata)"),
+                "site_url": row.get("site_url (metadata)"),
+                "order_id": row.get("order_id (metadata)"),
+                "order_key": row.get("order_key (metadata)"),
+                "customer_email": row.get("customer_email (metadata)"),
+                "customer_name": row.get("customer_name (metadata)"),
+            }
+
+            tax_amount = abs(parse_decimal(row.get("tax_amount (metadata)"))) / Decimal("100")
+            if charge_in_period and amount != 0:
+                seen_dates.append(event_date)
+                category_name, record = make_record(
+                    source=source,
+                    category="sales",
+                    record_id=f"{source.source_id}:sales:{line_no}",
+                    event_type="stripe_charge",
+                    event_date=event_date,
+                    settlement_date=event_date,
+                    description=description,
+                    currency=currency,
+                    gross_amount=amount,
+                    net_amount=amount - fee,
+                    vat_amount=tax_amount,
+                    fee_amount=fee,
+                    external_ref=external_ref,
+                    channel="stripe",
+                    country_code=(row.get("Card Address Country") or row.get("Shipping Address Country") or "").strip().upper() or None,
+                    attributes=attributes,
+                    row_ref=f"csv:{line_no}",
+                )
+                result[category_name].append(record)
+
+            if refunded and not refunded_date_raw and charge_in_period:
+                exceptions.append(
+                    make_exception(
+                        source=source,
+                        exception_id=f"{source.source_id}:refund-date-missing:{line_no}",
+                        severity="error",
+                        reason="Stripe charge reports a refunded amount but has no refund date.",
+                        blocking=True,
+                        row_ref=f"csv:{line_no}",
+                        suggested_follow_up="Export Stripe charges with the Refunded date (UTC) column populated.",
+                    )
+                )
+            elif refunded and refunded_date is not None:
+                if refund_in_period:
+                    seen_dates.append(refunded_date)
+                    refund_tax = Decimal("0")
+                    if amount != 0:
+                        refund_tax = (tax_amount * refunded / abs(amount)).quantize(
+                            Decimal("0.01"), rounding=ROUND_HALF_UP
+                        )
+                    category_name, record = make_record(
+                        source=source,
+                        category="refunds",
+                        record_id=f"{source.source_id}:refunds:{line_no}",
+                        event_type="stripe_refund",
+                        event_date=refunded_date,
+                        settlement_date=refunded_date,
+                        description=f"Stripe refund - {customer_ref}",
+                        currency=currency,
+                        gross_amount=-refunded,
+                        net_amount=-refunded,
+                        vat_amount=-refund_tax,
+                        external_ref=external_ref,
+                        channel="stripe",
+                        country_code=(row.get("Card Address Country") or row.get("Shipping Address Country") or "").strip().upper() or None,
+                        attributes=attributes,
+                        row_ref=f"csv:{line_no}",
+                    )
+                    result[category_name].append(record)
+            continue
+
         event_date = parse_date_value(row["Created (UTC)"])
         if event_date < period_start or event_date > period_end:
             continue
@@ -1071,6 +1445,7 @@ def parse_stripe_balance_csv(
                 attributes={
                     "stripe_balance_transaction_id": transaction_id,
                     "stripe_source_id": row.get("Source"),
+                    "stripe_export_type": "balance_history",
                     "order_id": row.get("order_id (metadata)"),
                 },
                 row_ref=f"csv:{line_no}",
@@ -1099,6 +1474,7 @@ def parse_stripe_balance_csv(
                 attributes={
                     "stripe_balance_transaction_id": transaction_id,
                     "stripe_source_id": row.get("Source"),
+                    "stripe_export_type": "balance_history",
                     "order_id": row.get("order_id (metadata)"),
                 },
                 row_ref=f"csv:{line_no}",
@@ -1129,6 +1505,7 @@ def parse_stripe_balance_csv(
             attributes={
                 "stripe_balance_transaction_id": transaction_id,
                 "stripe_source_id": row.get("Source"),
+                "stripe_export_type": "balance_history",
                 "reason": row.get("reason (metadata)"),
                 "payment_type": row.get("payment_type (metadata)"),
                 "site_url": row.get("site_url (metadata)"),
@@ -2039,10 +2416,10 @@ def parse_quartermaster_pdf(
     normalized = normalize_ascii(full_text).lower()
 
     if "sales report" in normalized and "quartermaster direct" in normalized:
-        report_date_text = first_match(full_text, [r"Date\s+([0-9]{2}/[0-9]{2}/[0-9]{4})"])
+        report_date_text = first_match(full_text, [r"Date\s+([0-9]{1,2}/[0-9]{1,2}/[0-9]{4})"])
         report_number = first_match(full_text, [r"S\.R\.\s*No\.\s*([A-Z0-9-]+)"])
         report_label = first_match(full_text, [r"This represents your sales report for ([A-Za-z]+\s+\d{4})"])
-        sold_match = re.search(
+        sold_matches = re.findall(
             r"Sold\s+Copies\s+(\d+)\s+([0-9.,]+)\s+([0-9.,]+)",
             full_text,
             flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
@@ -2053,7 +2430,12 @@ def parse_quartermaster_pdf(
             flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
         )
         report_total_matches = re.findall(r"\$\s*([0-9,]+\.\d{2})", full_text)
-        if report_date_text is None or sold_match is None or fee_match is None:
+        if report_date_text is not None and "no sales for this pay period" in normalized:
+            report_date = parse_quartermaster_date_value(report_date_text)
+            if period_start <= report_date <= period_end:
+                update_coverage_from_dates(source, [report_date])
+            return result, []
+        if report_date_text is None or not sold_matches or fee_match is None:
             return result, [
                 make_pdf_dependency_exception(
                     source,
@@ -2066,9 +2448,9 @@ def parse_quartermaster_pdf(
         if report_date < period_start or report_date > period_end:
             return result, []
 
-        sold_quantity = parse_decimal(sold_match.group(1))
-        sold_rate = parse_decimal(sold_match.group(2))
-        sold_amount = parse_decimal(sold_match.group(3))
+        sold_quantity = sum((parse_decimal(match[0]) for match in sold_matches), Decimal("0"))
+        sold_amount = sum((parse_decimal(match[2]) for match in sold_matches), Decimal("0"))
+        sold_rate = sold_amount / sold_quantity if sold_quantity else Decimal("0")
         fee_quantity = parse_decimal(fee_match.group(1))
         fee_rate = abs(parse_decimal(fee_match.group(2)))
         fee_amount = abs(parse_decimal(fee_match.group(3)))
@@ -2411,6 +2793,7 @@ def parse_purchase_invoice_pdf(
         [
             r"Invoice Number\s+([A-Z0-9-]+)",
             r"Invoice #([A-Z0-9-]+)",
+            r"([A-Z0-9-]+)\s+Arve nr\.?:",
             r"Arve number\s+([A-Z0-9-]+)",
             r"Arve nr\s+([A-Z0-9-]+)",
             r"Arve\s+([A-Z0-9-]+)\s+Arve kuupaev",
@@ -2426,6 +2809,7 @@ def parse_purchase_invoice_pdf(
             r"Arve kuupaev:?\s*([0-9.]+)",
             r"Arve kuup[aä]ev:?\s*([0-9.]+)",
             r"Kuupäev\s+([0-9.]+)",
+            r"Maksja:\s*[^\n]+\s+([0-9]{2}\.[0-9]{2}\.[0-9]{4})",
             r"Ostetud:\s*([0-9.]+\s+[0-9:]+)",
         ],
     )
@@ -2456,6 +2840,11 @@ def parse_purchase_invoice_pdf(
         full_text,
         flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
     )
+    jajaa_summary_match = re.search(
+        r"KM-ta\s+([0-9.,]+)\s+\d+%\s+KM%\s+KMsumma\s+([0-9.,]+)\s+Kokku\s+([0-9.,]+)",
+        full_text,
+        flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
+    )
 
     gross_amount = first_decimal_match(
         full_text,
@@ -2475,6 +2864,8 @@ def parse_purchase_invoice_pdf(
         gross_amount = parse_currency_amount(omniva_summary_match.group(4))
     if gross_amount is None and dpd_summary_match:
         gross_amount = parse_currency_amount(dpd_summary_match.group(3))
+    if gross_amount is None and jajaa_summary_match:
+        gross_amount = parse_currency_amount(jajaa_summary_match.group(3))
     if gross_amount is None:
         return result, [
             make_pdf_dependency_exception(
@@ -2498,6 +2889,8 @@ def parse_purchase_invoice_pdf(
         vat_amount = parse_currency_amount(omniva_summary_match.group(2))
     if vat_amount == Decimal("0") and dpd_summary_match:
         vat_amount = parse_currency_amount(dpd_summary_match.group(2))
+    if vat_amount == Decimal("0") and jajaa_summary_match:
+        vat_amount = parse_currency_amount(jajaa_summary_match.group(2))
 
     net_amount = first_decimal_match(
         full_text,
@@ -2513,6 +2906,8 @@ def parse_purchase_invoice_pdf(
         net_amount = parse_currency_amount(omniva_summary_match.group(1))
     elif dpd_summary_match:
         net_amount = parse_currency_amount(dpd_summary_match.group(1))
+    elif jajaa_summary_match:
+        net_amount = parse_currency_amount(jajaa_summary_match.group(1))
 
     fallback_vendor = normalize_ascii(source.path.stem).strip() or source.source_system or "supplier"
     vendor_name = vendor_name_from_text(full_text, fallback=fallback_vendor)
@@ -2598,8 +2993,10 @@ def parse_purchase_note_markdown(
 
 
 PARSERS: dict[str, Callable[..., tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]]] = {
+    "parse_no_activity_marker": parse_no_activity_marker,
     "parse_woo_sales_csv": parse_woo_sales_csv,
     "parse_paypal_csv": parse_paypal_csv,
+    "parse_stripe_payouts_csv": parse_stripe_payouts_csv,
     "parse_stripe_balance_csv": parse_stripe_balance_csv,
     "parse_quartermaster_orders_csv": parse_quartermaster_orders_csv,
     "parse_printful_orders_csv": parse_printful_orders_csv,
@@ -2716,6 +3113,170 @@ def aggregate_results(
         for category, values in parsed_records.items():
             records[category].extend(values)
         exceptions.extend(parsed_exceptions)
+
+    for category in ("sales", "refunds"):
+        charges_records = [
+            record
+            for record in records[category]
+            if record.get("attributes", {}).get("stripe_export_type") == "charges"
+        ]
+        balance_records = [
+            record
+            for record in records[category]
+            if record.get("attributes", {}).get("stripe_export_type") == "balance_history"
+        ]
+        if not charges_records or not balance_records:
+            continue
+
+        def stripe_immutable_identities(record: dict[str, Any]) -> set[tuple[str, str]]:
+            attributes = record.get("attributes", {})
+            identities: set[tuple[str, str]] = set()
+            for value in (
+                attributes.get("stripe_balance_transaction_id"),
+                attributes.get("stripe_source_id"),
+                record.get("external_ref"),
+            ):
+                normalized = str(value or "").strip()
+                if normalized.startswith("ch_"):
+                    identities.add(("charge", normalized))
+                elif normalized.startswith("pi_"):
+                    identities.add(("payment_intent", normalized))
+            return identities
+
+        charge_identities = [stripe_immutable_identities(record) for record in charges_records]
+        charge_signatures = {
+            (record.get("event_date"), abs(float(record.get("gross_amount") or 0)), record.get("currency"))
+            for record in charges_records
+        }
+        charge_order_ids = {
+            str(record.get("attributes", {}).get("order_id") or "").strip()
+            for record in charges_records
+            if str(record.get("attributes", {}).get("order_id") or "").strip()
+        }
+        superseded_records = []
+        possible_duplicate_records = []
+        for record in balance_records:
+            identities = stripe_immutable_identities(record)
+            signature = (record.get("event_date"), abs(float(record.get("gross_amount") or 0)), record.get("currency"))
+            order_id = str(record.get("attributes", {}).get("order_id") or "").strip()
+            if any(identities & candidate for candidate in charge_identities):
+                superseded_records.append(record)
+            elif signature in charge_signatures or (order_id and order_id in charge_order_ids):
+                possible_duplicate_records.append(record)
+
+        charges_source_id = charges_records[0]["source_refs"][0]["source_id"]
+        charges_source = next(source for source in sources if source.source_id == charges_source_id)
+        if possible_duplicate_records:
+            exceptions.append(
+                make_exception(
+                    source=charges_source,
+                    exception_id=f"{charges_source.source_id}:{category}:possible-balance-history-duplicate",
+                    severity="warn",
+                    reason=f"Possible duplicate Stripe {category} rows share a date, amount, and currency across Charges and Balance History exports, but no immutable identifier matched; both records were retained.",
+                    blocking=False,
+                )
+            )
+        if not superseded_records:
+            continue
+
+        superseded_ids = {id(record) for record in superseded_records}
+        records[category] = [record for record in records[category] if id(record) not in superseded_ids]
+        removed_source_ids = {
+            record["source_refs"][0]["source_id"] for record in superseded_records
+        }
+        for source in sources:
+            if source.source_id in removed_source_ids:
+                source.parser_notes.append(
+                    f"Stripe Balance History {category} rows were superseded by the Charges export; fee and payout rows remain authoritative."
+                )
+        exceptions.append(
+            make_exception(
+                source=charges_source,
+                exception_id=f"{charges_source.source_id}:{category}:balance-history-superseded",
+                severity="warn",
+                reason=f"Stripe Balance History {category} rows were superseded by the Charges export to prevent duplicate normalization; fee and payout evidence was retained.",
+                blocking=False,
+            )
+        )
+
+    payout_history_records = [
+        record
+        for record in records["payouts"]
+        if record.get("attributes", {}).get("stripe_export_type") == "payouts_history"
+    ]
+    balance_payout_records = [
+        record
+        for record in records["payouts"]
+        if record.get("attributes", {}).get("stripe_export_type") == "balance_history"
+    ]
+    if payout_history_records and balance_payout_records:
+        def payout_immutable_identities(record: dict[str, Any]) -> set[tuple[str, str]]:
+            attributes = record.get("attributes", {})
+            export_type = attributes.get("stripe_export_type")
+            payout_id = (
+                attributes.get("stripe_payout_id")
+                if export_type == "payouts_history"
+                else attributes.get("stripe_source_id")
+            )
+            balance_transaction_id = attributes.get("stripe_balance_transaction_id")
+            identities = set()
+            if payout_id and str(payout_id).strip():
+                identities.add(("payout", str(payout_id).strip()))
+            if balance_transaction_id and str(balance_transaction_id).strip():
+                identities.add(("balance_transaction", str(balance_transaction_id).strip()))
+            return identities
+
+        authoritative_identities = [
+            payout_immutable_identities(record) for record in payout_history_records
+        ]
+        authoritative_signatures = {
+            (record.get("event_date"), abs(float(record.get("gross_amount") or 0)), record.get("currency"))
+            for record in payout_history_records
+        }
+        superseded_payouts = []
+        possible_duplicate_payouts = []
+        for record in balance_payout_records:
+            identities = payout_immutable_identities(record)
+            signature = (record.get("event_date"), abs(float(record.get("gross_amount") or 0)), record.get("currency"))
+            if any(identities & candidate for candidate in authoritative_identities):
+                superseded_payouts.append(record)
+            elif signature in authoritative_signatures:
+                possible_duplicate_payouts.append(record)
+
+        payout_source_id = payout_history_records[0]["source_refs"][0]["source_id"]
+        payout_source = next(source for source in sources if source.source_id == payout_source_id)
+        if possible_duplicate_payouts:
+            exceptions.append(
+                make_exception(
+                    source=payout_source,
+                    exception_id=f"{payout_source.source_id}:possible-balance-history-payout-duplicate",
+                    severity="warn",
+                    reason="Possible duplicate Stripe payouts share a date, amount, and currency across Payouts History and Balance History, but no immutable identifier matched; both records were retained.",
+                    blocking=False,
+                )
+            )
+        if superseded_payouts:
+            superseded_ids = {id(record) for record in superseded_payouts}
+            records["payouts"] = [
+                record for record in records["payouts"] if id(record) not in superseded_ids
+            ]
+            removed_source_ids = {
+                record["source_refs"][0]["source_id"] for record in superseded_payouts
+            }
+            for source in sources:
+                if source.source_id in removed_source_ids:
+                    source.parser_notes.append(
+                        "Stripe Balance History payout rows were superseded by matching Payouts History rows; fee rows remain authoritative."
+                    )
+            exceptions.append(
+                make_exception(
+                    source=payout_source,
+                    exception_id=f"{payout_source.source_id}:balance-history-payouts-superseded",
+                    severity="warn",
+                    reason="Matching Stripe Balance History payout rows were superseded by the Payouts History export to prevent duplicate normalization; fee evidence was retained.",
+                    blocking=False,
+                )
+            )
 
     if not any(records.values()):
         exceptions.append(

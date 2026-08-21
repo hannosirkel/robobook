@@ -263,6 +263,38 @@ class BookcheckerTests(unittest.TestCase):
 
         self.assertTrue(any("cache" in item["summary"].lower() for item in findings))
 
+    def test_checker_rejects_rate_requested_for_different_document_date(self) -> None:
+        action = payment_action(
+            key="example-2024-03-payment-vendor",
+            period="2024-03",
+            amount=10.0,
+            linked_purchase_action="example-2024-03-purchase-vendor",
+            source_path="companies/example/artifacts/normalized/2024-03.json",
+            record_ref="bank:1",
+        )
+        action["payload"].update(
+            {
+                "currency": "USD",
+                "currency_rate": 0.92498,
+                "currency_rate_provider": "ECB",
+                "currency_rate_requested_date": "2024-01-31",
+                "currency_rate_effective_date": "2024-01-31",
+                "currency_rate_source_url": "https://api.frankfurter.dev/v2/rates?providers=ECB",
+            }
+        )
+        cache = {
+            "provider": "ECB",
+            "year": 2024,
+            "base": "USD",
+            "quote": "EUR",
+            "source_url": "https://api.frankfurter.dev/v2/rates?providers=ECB",
+            "rates": [{"date": "2024-01-31", "base": "USD", "quote": "EUR", "rate": "0.92498"}],
+        }
+
+        findings = bookchecker.evaluate_exchange_rates({"actions": [action]}, exchange_rate_cache=cache)
+
+        self.assertTrue(any("document date" in item["summary"].lower() for item in findings))
+
     def test_checker_fails_blocking_unresolved_dependency(self) -> None:
         findings = bookchecker.evaluate_unresolved_dependencies(
             {
@@ -313,6 +345,50 @@ class BookcheckerTests(unittest.TestCase):
         )
 
         self.assertTrue(any(item["severity"] == "error" for item in findings))
+
+    def test_checker_rejects_absolute_and_traversal_source_references(self) -> None:
+        for source_path in ("/tmp/outside.json", "../other-company/source/file.csv"):
+            with self.subTest(source_path=source_path):
+                action = payment_action(
+                    key="example-2024-01-payment-vendor",
+                    period="2024-01",
+                    amount=10.0,
+                    linked_purchase_action="example-2024-01-purchase-vendor",
+                    source_path=source_path,
+                    record_ref="bank:1",
+                )
+                findings = bookchecker.evaluate_source_locations(
+                    {"actions": [action]},
+                    company_dir=Path("companies/example"),
+                    cwd=ROOT,
+                    action_path=ROOT / "companies/example/artifacts/actions/2024-01.yaml",
+                )
+                self.assertTrue(any(item["severity"] == "error" for item in findings))
+
+    def test_checker_accepts_company_source_fragment_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            company_dir = root / "companies" / "example"
+            source_path = company_dir / "source" / "README.md"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text("evidence", encoding="utf-8")
+            action = payment_action(
+                key="example-2024-01-payment-vendor",
+                period="2024-01",
+                amount=10.0,
+                linked_purchase_action="example-2024-01-purchase-vendor",
+                source_path=f"{source_path}#invoice.jpg",
+                record_ref="bank:1",
+            )
+
+            findings = bookchecker.evaluate_source_locations(
+                {"actions": [action]},
+                company_dir=company_dir,
+                cwd=root,
+                action_path=company_dir / "artifacts/actions/2024-01.yaml",
+            )
+
+        self.assertEqual(findings, [])
 
     def test_checker_requires_supplier_credit_contact(self) -> None:
         action = {

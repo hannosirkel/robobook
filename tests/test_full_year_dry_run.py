@@ -146,6 +146,31 @@ class FullYearDryRunTests(unittest.TestCase):
         self.assertEqual(summary["blocking_dependency_count"], 1)
         self.assertEqual(summary["canonical_source_reference_count"], 1)
 
+    def test_acceptance_requires_configured_credit_and_document_outcomes(self) -> None:
+        summary = {
+            "foreign_action_count": 1,
+            "ecb_provenance_count": 1,
+            "source_reference_count": 1,
+            "canonical_source_reference_count": 1,
+            "raw_source_reference_count": 1,
+            "canonical_raw_source_reference_count": 1,
+            "unsafe_paypal_stripe_count": 0,
+            "policy_mapping_mismatch_count": 0,
+            "supplier_credit_totals": {},
+            "suppressed_external_refs": [],
+            "blocking_dependencies": [{"kind": "contact_mapping", "label": "paypal"}],
+        }
+        expectations = {
+            "supplier_credit_totals": {"2024-05": {"EUR": 11.4}},
+            "suppressed_external_refs": ["EE24111268"],
+            "allowed_blocking_dependencies": [{"kind": "contact_mapping", "label": "paypal"}],
+        }
+
+        issues = full_year_dry_run.reference_acceptance_issues(summary, expectations=expectations)
+
+        self.assertTrue(any("11.4" in issue for issue in issues))
+        self.assertTrue(any("EE24111268" in issue for issue in issues))
+
     def test_parse_json_output_accepts_json_objects_only(self) -> None:
         self.assertEqual(full_year_dry_run.parse_json_output('{"ok": true}'), {"ok": True})
         self.assertIsNone(full_year_dry_run.parse_json_output(""))

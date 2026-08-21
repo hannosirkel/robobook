@@ -44,6 +44,18 @@ def validate_posting_policy(payload: dict[str, Any]) -> None:
         for label, contact_id in mappings.items():
             normalize_id(contact_id, field_name=f"contacts[{role!r}][{label!r}]")
 
+    def validate_mapping_ids(value: Any, *, path: str) -> None:
+        if not isinstance(value, dict):
+            raise PostingPolicyError(f"{path} must be an object.")
+        for key, child in value.items():
+            child_path = f"{path}[{key!r}]"
+            if isinstance(child, dict):
+                validate_mapping_ids(child, path=child_path)
+            elif str(key).endswith("_id"):
+                normalize_id(child, field_name=child_path)
+
+    validate_mapping_ids(payload["mappings"], path="mappings")
+
 
 def load_posting_policy(path: Path) -> dict[str, Any]:
     try:
@@ -89,3 +101,84 @@ def resolve_supplier_alias(policy: dict[str, Any], value: str) -> str:
     supplier = slugify(value)
     aliases = {slugify(key): slugify(alias) for key, alias in (policy.get("supplier_aliases") or {}).items()}
     return aliases.get(supplier, supplier)
+
+
+def action_policy_errors(action: dict[str, Any], policy: dict[str, Any]) -> list[str]:
+    """Independently compare every submit-capable ID in an action with explicit policy."""
+    payload = action.get("payload") or {}
+    action_type = str(action.get("action_type") or "")
+    if action_type in {"create_invoice_summary", "create_credit_invoice_summary"}:
+        role = "sales"
+        label = str((payload.get("summary_scope") or {}).get("channel_or_source") or "")
+    elif action_type == "create_incoming_summary" or (
+        action_type == "create_purchase_summary" and slugify(str(payload.get("vendor_hint") or "")) in {"paypal", "stripe"}
+    ):
+        role = "processors"
+        label = str(payload.get("counterparty_hint") or payload.get("vendor_hint") or "")
+    elif action_type in {"create_purchase_summary", "create_purchase_credit_summary", "create_payment_summary"}:
+        role = "suppliers"
+        label = str(payload.get("vendor_hint") or payload.get("counterparty_hint") or "")
+    else:
+        return []
+
+    errors: list[str] = []
+    try:
+        expected_contact = resolve_contact(policy, role=role, label=label)
+    except PostingPolicyError as exc:
+        errors.append(str(exc))
+    else:
+        actual_contact = str((payload.get("counterparty") or {}).get("contact_id") or "")
+        if actual_contact != expected_contact:
+            errors.append(f"Contact ID {actual_contact!r} does not match policy ID {expected_contact!r} for {role}/{label}.")
+
+    if action_type in {"create_incoming_summary", "create_payment_summary"}:
+        allowed = {normalize_id(value, field_name="bank_accounts") for value in (policy.get("bank_accounts") or {}).values()}
+        if str(payload.get("bank_account_id") or "") not in allowed:
+            errors.append("Cash action bank_account_id is not one of the explicit posting-policy accounts.")
+
+    family = ""
+    if role == "sales":
+        tax_profile = str((payload.get("summary_scope") or {}).get("tax_profile") or "")
+        if not tax_profile:
+            tax_profile = "taxable" if float((payload.get("totals") or {}).get("vat_amount") or 0) else "non-taxable"
+        family = f"{slugify(label)}-{slugify(tax_profile)}"
+    elif action_type == "create_purchase_summary" and role == "processors":
+        family = f"fees-{slugify(label)}"
+    elif action_type in {"create_purchase_summary", "create_purchase_credit_summary"}:
+        family = f"purchase-{slugify(label)}"
+    if not family:
+        return errors
+
+    family_values = (policy.get("mappings") or {}).get(family)
+    if not isinstance(family_values, dict):
+        errors.append(f"Posting family {family!r} is absent from the explicit posting policy.")
+        return errors
+    if str(payload.get("posting_policy_family") or "") != family:
+        errors.append(f"Action is not bound to posting-policy family {family!r}.")
+
+    for line in payload.get("line_items") or []:
+        line_role = str(line.get("line_role") or "")
+        if role == "sales":
+            shipping = line_role.endswith("_shipping")
+            account_field = "shipping_income_account_id" if shipping else "income_account_id"
+            vat_field = "shipping_vat_type_id" if shipping else "vat_type_id"
+            expected_account = normalize_id(family_values.get(account_field), field_name=f"mappings[{family}][{account_field}]")
+            expected_vat = normalize_id(family_values.get(vat_field), field_name=f"mappings[{family}][{vat_field}]")
+            if str(line.get("suggested_income_account_id") or "") != expected_account:
+                errors.append(f"Line income account does not match policy family {family!r}.")
+        else:
+            line_key = slugify(str(line.get("description") or line_role))
+            line_values = (family_values.get("lines") or {}).get(line_key, family_values)
+            expected_account = normalize_id(line_values.get("expense_account_id"), field_name=f"mappings[{family}][{line_key}].expense_account_id")
+            expected_vat = normalize_id(line_values.get("vat_type_id"), field_name=f"mappings[{family}][{line_key}].vat_type_id")
+            if str(line.get("posting_policy_line_key") or "") != line_key:
+                errors.append(f"Line is not bound to posting-policy key {line_key!r}.")
+            if str(line.get("suggested_expense_account_id") or "") != expected_account:
+                errors.append(f"Line expense account does not match policy family {family!r}.")
+        if str(line.get("suggested_vat_type_id") or "") != expected_vat:
+            errors.append(f"Line VAT type does not match policy family {family!r}.")
+        expected_warehouse = family_values.get("warehouse_id") if role == "sales" else line_values.get("warehouse_id")
+        actual_warehouse = line.get("warehouse_id_hint")
+        if str(actual_warehouse or "") != str(expected_warehouse or ""):
+            errors.append(f"Line warehouse does not match policy family {family!r}.")
+    return errors

@@ -15,7 +15,9 @@ from pathlib import Path
 from typing import Any
 
 from exchange_rates import ExchangeRateError, lookup_rate
-from simplbooks_api import SimplbooksError, resolve_company_name
+from posting_policy import PostingPolicyError, action_policy_errors, load_posting_policy
+from reference_artifacts import ReferenceArtifactError, validate_discovery, verify_file_binding
+from simplbooks_api import SimplbooksError, resolve_company_id, resolve_company_name
 
 
 TOLERANCE = Decimal("0.01")
@@ -164,20 +166,27 @@ def evaluate_source_locations(
     action_batch: dict[str, Any],
     *,
     company_dir: Path | None,
+    cwd: Path | None = None,
+    action_path: Path | None = None,
 ) -> list[dict[str, Any]]:
     if company_dir is None:
         return []
     findings: list[dict[str, Any]] = []
+    cwd = (cwd or Path.cwd()).resolve()
+    action_path = action_path or cwd / company_dir / "artifacts" / "actions" / "batch.yaml"
+    company_root = (company_dir if company_dir.is_absolute() else cwd / company_dir).resolve()
+    allowed_roots = (company_root / "source", company_root / "artifacts")
     for action in action_batch.get("actions") or []:
         for ref in action.get("source_refs") or []:
             path_text = str(ref.get("path") or "")
-            path_parts = Path(path_text).parts
-            wrong_company = (
-                len(path_parts) >= 3
-                and path_parts[0] == "companies"
-                and (path_parts[1] != company_dir.name or path_parts[2] not in {"source", "artifacts"})
+            resolved = resolve_path(path_text, cwd=cwd, action_path=action_path).resolve()
+            outside_company = not any(resolved.is_relative_to(root) for root in allowed_roots)
+            has_traversal = ".." in Path(path_text).parts
+            parts = Path(path_text).parts
+            explicit_other_company = (
+                len(parts) >= 2 and parts[0] == "companies" and parts[1] != company_dir.name
             )
-            if is_temp_source_path(path_text) or wrong_company:
+            if is_temp_source_path(path_text) or has_traversal or explicit_other_company or outside_company:
                 findings.append(
                     make_finding(
                         section="source_reference_coverage",
@@ -194,16 +203,28 @@ def evaluate_resolved_record_source_locations(
     action: dict[str, Any],
     resolved_sources: list[dict[str, Any]],
     company_dir: Path | None,
+    cwd: Path | None = None,
+    action_path: Path | None = None,
 ) -> list[dict[str, Any]]:
     if company_dir is None:
         return []
     findings: list[dict[str, Any]] = []
+    cwd = (cwd or Path.cwd()).resolve()
+    action_path = action_path or cwd / company_dir / "artifacts" / "actions" / "batch.yaml"
+    company_root = (company_dir if company_dir.is_absolute() else cwd / company_dir).resolve()
+    allowed_root = (company_root / "source").resolve()
     seen: set[str] = set()
     for resolved in resolved_sources:
         record = resolved.get("record") or {}
         for ref in record.get("source_refs") or []:
             path_text = str(ref.get("path") or "")
-            if not is_temp_source_path(path_text) or path_text in seen:
+            resolved = resolve_path(path_text, cwd=cwd, action_path=action_path).resolve()
+            unsafe = (
+                is_temp_source_path(path_text)
+                or ".." in Path(path_text).parts
+                or not resolved.is_relative_to(allowed_root)
+            )
+            if not unsafe or path_text in seen:
                 continue
             seen.add(path_text)
             findings.append(
@@ -218,7 +239,7 @@ def evaluate_resolved_record_source_locations(
 
 
 def resolve_path(path_text: str, *, cwd: Path, action_path: Path) -> Path:
-    candidate = Path(path_text)
+    candidate = Path(path_text.split("#", 1)[0])
     if candidate.is_absolute():
         return candidate
     cwd_candidate = cwd / candidate
@@ -800,6 +821,7 @@ def evaluate_exchange_rates(
         provider = str(payload.get("currency_rate_provider") or "")
         source_url = str(payload.get("currency_rate_source_url") or "")
         requested_date = str(payload.get("currency_rate_requested_date") or payload.get("document_date") or "")
+        document_date = str(payload.get("document_date") or "")
         effective_date = str(payload.get("currency_rate_effective_date") or "")
         errors: list[str] = []
         if rate <= 0:
@@ -808,6 +830,8 @@ def evaluate_exchange_rates(
             errors.append("currency_rate_provider=ECB")
         if not source_url.startswith("https://api.frankfurter.dev/v2/rates"):
             errors.append("Frankfurter source provenance")
+        if requested_date != document_date:
+            errors.append("a requested date equal to the summary document date")
         try:
             requested = datetime.fromisoformat(requested_date).date()
             effective = datetime.fromisoformat(effective_date).date()
@@ -882,6 +906,64 @@ def evaluate_unresolved_dependencies(action_batch: dict[str, Any]) -> list[dict[
                 action_id=str(dependency.get("action_id") or "") or None,
             )
         )
+    return findings
+
+
+def evaluate_posting_policy(
+    action_batch: dict[str, Any], posting_policy: dict[str, Any] | None
+) -> list[dict[str, Any]]:
+    if posting_policy is None:
+        return []
+    findings: list[dict[str, Any]] = []
+    for action in action_batch.get("actions") or []:
+        try:
+            errors = action_policy_errors(action, posting_policy)
+        except PostingPolicyError as exc:
+            errors = [str(exc)]
+        for error in errors:
+            findings.append(
+                make_finding(
+                    section="account_and_vat_review",
+                    severity="error",
+                    summary=error,
+                    action_id=action_label(action),
+                )
+            )
+    return findings
+
+
+def evaluate_reference_artifacts(
+    action_batch: dict[str, Any],
+    *,
+    cwd: Path,
+    company_dir: Path | None,
+    expected_company_id: str | None,
+) -> list[dict[str, Any]]:
+    if company_dir is None:
+        return []
+    findings: list[dict[str, Any]] = []
+    bindings = action_batch.get("reference_artifacts") or []
+    by_kind = {str(item.get("kind") or ""): item for item in bindings}
+    required = {"posting_policy", "discovery_overview"}
+    if any(str((action.get("payload") or {}).get("currency") or "EUR").upper() != "EUR" for action in action_batch.get("actions") or []):
+        required.add("exchange_rates")
+    for kind in sorted(required):
+        binding = by_kind.get(kind)
+        if binding is None:
+            findings.append(make_finding(section="duplicate_risk", severity="error", summary=f"Action batch is not bound to required {kind} artifact."))
+            continue
+        try:
+            path = verify_file_binding(binding, cwd=cwd)
+            if kind == "discovery_overview":
+                if expected_company_id is None:
+                    raise ReferenceArtifactError("Cannot verify discovery without company metadata ID.")
+                validate_discovery(
+                    load_json(path),
+                    year=int(str(action_batch.get("period") or "0")[:4]),
+                    company_id=expected_company_id,
+                )
+        except (ReferenceArtifactError, SimplbooksError) as exc:
+            findings.append(make_finding(section="duplicate_risk", severity="error", summary=str(exc)))
     return findings
 
 
@@ -1028,6 +1110,8 @@ def evaluate_action_batch(
     cwd: Path,
     company_dir: Path | None = None,
     exchange_rate_cache: dict[str, Any] | None = None,
+    posting_policy: dict[str, Any] | None = None,
+    expected_company_id: str | None = None,
 ) -> dict[str, Any]:
     findings: list[dict[str, Any]] = []
     payload_cache: dict[Path, dict[str, Any]] = {}
@@ -1037,7 +1121,23 @@ def evaluate_action_batch(
     findings.extend(evaluate_duplicates(action_batch))
     findings.extend(evaluate_exchange_rates(action_batch, exchange_rate_cache=exchange_rate_cache))
     findings.extend(evaluate_unresolved_dependencies(action_batch))
-    findings.extend(evaluate_source_locations(action_batch, company_dir=company_dir))
+    findings.extend(evaluate_posting_policy(action_batch, posting_policy))
+    findings.extend(
+        evaluate_reference_artifacts(
+            action_batch,
+            cwd=cwd,
+            company_dir=company_dir,
+            expected_company_id=expected_company_id,
+        )
+    )
+    findings.extend(
+        evaluate_source_locations(
+            action_batch,
+            company_dir=company_dir,
+            cwd=cwd,
+            action_path=action_path,
+        )
+    )
     findings.extend(
         evaluate_recon_alignment(
             action_batch=action_batch,
@@ -1069,6 +1169,8 @@ def evaluate_action_batch(
                 action=action,
                 resolved_sources=resolved_sources,
                 company_dir=company_dir,
+                cwd=cwd,
+                action_path=action_path,
             )
         )
         findings.extend(
@@ -1232,6 +1334,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--recon", help="Path to recon JSON. Defaults to companies/<company>/artifacts/recon/<period>.json")
     parser.add_argument("--policy-memo", help="Optional path to policy memo markdown")
     parser.add_argument("--exchange-rates", help="Annual ECB cache used to independently verify foreign rates")
+    parser.add_argument("--posting-policy", help="Explicit posting policy used to independently verify every submit-capable ID")
     parser.add_argument("--output", help="Optional output path for the Markdown check report")
     return parser
 
@@ -1253,6 +1356,11 @@ def main() -> int:
     recon_payload = load_json(recon_path)
     policy_text = load_optional_text(policy_path)
     exchange_rate_cache = load_json(exchange_rates_path) if exchange_rates_path and exchange_rates_path.exists() else None
+    posting_policy_path = Path(args.posting_policy) if args.posting_policy else (
+        company_dir / "artifacts" / "posting_policy.json" if company_dir is not None else None
+    )
+    posting_policy = load_posting_policy(posting_policy_path) if posting_policy_path and posting_policy_path.exists() else None
+    expected_company_id = resolve_company_id(None, company_dir=str(company_dir)) if company_dir is not None else None
 
     if action_batch.get("period") != args.period:
         raise SimplbooksError(
@@ -1273,6 +1381,8 @@ def main() -> int:
         cwd=cwd,
         company_dir=company_dir,
         exchange_rate_cache=exchange_rate_cache,
+        posting_policy=posting_policy,
+        expected_company_id=expected_company_id,
     )
 
     company_slug = str(action_batch.get("company_slug") or (company_dir.name if company_dir else action_path.stem))

@@ -92,6 +92,8 @@ def summarize_action_artifacts(*, company_dir: Path, year: int) -> dict[str, Any
     raw_source_reference_count = 0
     canonical_raw_source_reference_count = 0
     supplier_credit_totals: dict[str, dict[str, Decimal]] = defaultdict(lambda: defaultdict(Decimal))
+    suppressed_external_refs: list[str] = []
+    blocking_dependencies: list[dict[str, str]] = []
 
     policy_path = company_dir / "artifacts" / "posting_policy.json"
     posting_policy = json.loads(policy_path.read_text(encoding="utf-8")) if policy_path.exists() else {}
@@ -104,8 +106,22 @@ def summarize_action_artifacts(*, company_dir: Path, year: int) -> dict[str, Any
         batch = load_action_yaml(path)
         period = str(batch.get("period") or path.stem)
         suppressed_document_count += len(batch.get("already_present") or [])
+        suppressed_external_refs.extend(
+            str(item.get("external_ref"))
+            for item in batch.get("already_present") or []
+            if item.get("external_ref")
+        )
         blocking_dependency_count += sum(
             1 for item in batch.get("unresolved_dependencies") or [] if item.get("blocking")
+        )
+        blocking_dependencies.extend(
+            {
+                "kind": str(item.get("kind") or ""),
+                "label": str(item.get("label") or ""),
+                "family": str(item.get("family") or ""),
+            }
+            for item in batch.get("unresolved_dependencies") or []
+            if item.get("blocking")
         )
         for action in batch.get("actions") or []:
             payload = action.get("payload") or {}
@@ -165,10 +181,14 @@ def summarize_action_artifacts(*, company_dir: Path, year: int) -> dict[str, Any
         "canonical_raw_source_reference_count": canonical_raw_source_reference_count,
         "unsafe_paypal_stripe_count": unsafe_paypal_stripe_count,
         "policy_mapping_mismatch_count": policy_mapping_mismatch_count,
+        "suppressed_external_refs": sorted(set(suppressed_external_refs)),
+        "blocking_dependencies": blocking_dependencies,
     }
 
 
-def reference_acceptance_issues(reference_summary: dict[str, Any]) -> list[str]:
+def reference_acceptance_issues(
+    reference_summary: dict[str, Any], *, expectations: dict[str, Any] | None = None
+) -> list[str]:
     issues: list[str] = []
     if reference_summary["foreign_action_count"] != reference_summary["ecb_provenance_count"]:
         issues.append("Not every foreign-currency action has verified ECB provenance.")
@@ -180,6 +200,29 @@ def reference_acceptance_issues(reference_summary: dict[str, Any]) -> list[str]:
         issues.append("One or more PayPal actions reuse the Stripe contact.")
     if reference_summary["policy_mapping_mismatch_count"]:
         issues.append("One or more cash/Woo actions differ from the posting policy.")
+    expectations = expectations or {}
+    actual_credit_totals = reference_summary.get("supplier_credit_totals") or {}
+    for period, expected_currencies in (expectations.get("supplier_credit_totals") or {}).items():
+        for currency, expected_amount in expected_currencies.items():
+            actual_amount = (actual_credit_totals.get(period) or {}).get(currency)
+            if Decimal(str(actual_amount or 0)) != Decimal(str(expected_amount)):
+                issues.append(f"Expected supplier credit {period} {currency} {expected_amount}, found {actual_amount or 0}.")
+    actual_suppressed = set(reference_summary.get("suppressed_external_refs") or [])
+    for external_ref in expectations.get("suppressed_external_refs") or []:
+        if str(external_ref) not in actual_suppressed:
+            issues.append(f"Expected existing document {external_ref} to be suppressed from draft creation.")
+    allowed_dependencies = {
+        (str(item.get("kind") or ""), str(item.get("label") or ""), str(item.get("family") or ""))
+        for item in expectations.get("allowed_blocking_dependencies") or []
+    }
+    unexpected_dependencies = [
+        item
+        for item in reference_summary.get("blocking_dependencies") or []
+        if (str(item.get("kind") or ""), str(item.get("label") or ""), str(item.get("family") or ""))
+        not in allowed_dependencies
+    ]
+    if unexpected_dependencies:
+        issues.append(f"Found {len(unexpected_dependencies)} unexpected blocking dependency occurrence(s).")
     return issues
 
 
@@ -270,7 +313,10 @@ def run_full_year_dry_run(
             break
 
     reference_summary = summarize_action_artifacts(company_dir=company_dir, year=year)
-    acceptance_issues = reference_acceptance_issues(reference_summary)
+    policy_path = company_dir / "artifacts" / "posting_policy.json"
+    posting_policy = json.loads(policy_path.read_text(encoding="utf-8")) if policy_path.exists() else {}
+    expectations = ((posting_policy.get("year_expectations") or {}).get(str(year)) or {})
+    acceptance_issues = reference_acceptance_issues(reference_summary, expectations=expectations)
     if len(months) != len(target_periods):
         acceptance_issues.append(f"Expected {len(target_periods)} processed months, found {len(months)}.")
     overall_success = overall_success and not acceptance_issues

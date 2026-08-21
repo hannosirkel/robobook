@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 from collections import Counter, defaultdict
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -147,6 +148,7 @@ def build_year_overview(client: SimplbooksClient, *, year: int) -> dict[str, Any
     return {
         "year": year,
         "company_id": client.company_id,
+        "retrieved_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "technical_findings": [
             "Invoices and purchases support year-bounded list queries by created date.",
             "Receipts and payments do not show year range filters in the published spec, so this overview scans paginated lists and filters by year client-side.",

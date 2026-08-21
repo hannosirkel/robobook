@@ -15,7 +15,8 @@ from typing import Any
 from document_identity import document_identity, match_existing
 from exchange_rates import ExchangeRateError, lookup_rate
 from posting_policy import PostingPolicyError, load_posting_policy, resolve_bank_account, resolve_contact, resolve_mapping
-from simplbooks_api import SimplbooksError, resolve_company_name
+from reference_artifacts import ReferenceArtifactError, bind_file, validate_discovery
+from simplbooks_api import SimplbooksError, resolve_company_id, resolve_company_name
 
 
 PROCESSOR_KEYWORDS: dict[str, tuple[str, ...]] = {
@@ -1638,21 +1639,27 @@ def build_purchase_actions(
             review_notes.append(forced_note)
         review_notes.append(record_count_note(group_records))
 
-        bucketed_records: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+        bucketed_records: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
         for record in group_records:
             haystack = record_haystack(record)
             if group_label == "printful":
                 if any(keyword in haystack for keyword in ("order_charge", "shipping", "fullfil")):
+                    warehouse_profile = str(record.get("warehouse_id") or "").upper()
+                    description = "Orders shipping and fullfilment"
+                    if warehouse_profile:
+                        description += f" {warehouse_profile}"
                     bucket = (
                         printful_expense_account_id or expense_account_id or "",
                         printful_vat_type_id or zero_vat_type_id or "",
-                        "Orders shipping and fullfilment",
+                        description,
+                        warehouse_profile,
                     )
                 else:
                     bucket = (
                         printful_storage_account_id or expense_account_id or "",
                         printful_storage_vat_type_id or zero_vat_type_id or "",
                         "Storage fee for warehoused products",
+                        "",
                     )
             elif group_label in FULFILLMENT_KEYWORDS:
                 bucket = (
@@ -1663,6 +1670,7 @@ def build_purchase_actions(
                         else no_vat_purchase_vat_type_id or zero_vat_type_id or ""
                     ),
                     f"{group_label} fulfillment cost summary",
+                    "",
                 )
             else:
                 bucket = (
@@ -1673,11 +1681,12 @@ def build_purchase_actions(
                         else no_vat_purchase_vat_type_id or zero_vat_type_id or ""
                     ),
                     f"{group_label} {'taxable' if taxable_profile(record) == 'taxable' else 'non taxable'} cost summary",
+                    "",
                 )
             bucketed_records[bucket].append(record)
 
         lines: list[dict[str, Any]] = []
-        for (bucket_expense_account_id, bucket_vat_type_id, description), bucket_records in sorted(bucketed_records.items()):
+        for (bucket_expense_account_id, bucket_vat_type_id, description, warehouse_profile), bucket_records in sorted(bucketed_records.items()):
             gross_total = sum_amount(bucket_records, "gross_amount")
             vat_total = sum_amount(bucket_records, "vat_amount")
             if gross_total == 0 and vat_total == 0:
@@ -1690,7 +1699,7 @@ def build_purchase_actions(
                     "vat_amount_hint": decimal_number(vat_total),
                     "suggested_expense_account_id": bucket_expense_account_id or None,
                     "suggested_vat_type_id": bucket_vat_type_id or None,
-                    "warehouse_id_hint": maybe_single_warehouse(bucket_records),
+                    "warehouse_id_hint": warehouse_profile or None,
                     "record_count": len(bucket_records),
                 }
             )
@@ -2078,16 +2087,25 @@ def build_purchase_credit_actions(
     mapping_hints: dict[str, tuple[str | None, list[str]]],
     forced_note: str | None,
 ) -> list[dict[str, Any]]:
-    grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for record in records.get("purchase_credits", []):
-        key = (record_group_label(record, default="supplier"), record_currency(record, base_currency))
+        key = (
+            record_group_label(record, default="supplier"),
+            record_currency(record, base_currency),
+            taxable_profile(record),
+        )
         grouped[key].append(record)
 
     actions: list[dict[str, Any]] = []
     expense_account_id, _notes = mapping_hints["fulfillment_account"]
     zero_vat_type_id, _vat_notes = mapping_hints["zero_vat_type"]
     printful_expense_account_id, printful_vat_type_id = printful_purchase_mapping(entity_map)
-    for (group_label, currency), group_records in sorted(grouped.items()):
+    repeated_labels = {
+        label
+        for label, count in Counter(group_label for group_label, _currency, _tax_profile in grouped).items()
+        if count > 1
+    }
+    for (group_label, currency, tax_profile), group_records in sorted(grouped.items()):
         contact_id, contact_notes = preferred_contact_id(
             entity_map,
             group_label=group_label,
@@ -2117,7 +2135,7 @@ def build_purchase_credit_actions(
             "line_items": [
                 {
                     "line_role": "purchase_credit",
-                    "description": f"{group_label} supplier credit summary",
+                    "description": f"{group_label} supplier credit {tax_profile} summary",
                     "gross_amount": decimal_number(total),
                     "vat_amount_hint": decimal_number(vat_total),
                     "suggested_expense_account_id": account_id,
@@ -2130,7 +2148,10 @@ def build_purchase_credit_actions(
         actions.append(
             make_action(
                 period=period,
-                idempotency_key=f"{company_slug}-{period}-purchase-credit-{slugify(group_label)}",
+                idempotency_key=(
+                    f"{company_slug}-{period}-purchase-credit-{slugify(group_label)}"
+                    + (f"-{slugify(tax_profile)}" if group_label in repeated_labels else "")
+                ),
                 action_type="create_purchase_credit_summary",
                 endpoint="purchases/create",
                 payload=payload,
@@ -2228,9 +2249,30 @@ def apply_posting_policy(
         elif action_type in {"create_purchase_summary", "create_purchase_credit_summary"}:
             family = f"purchase-{slugify(label)}"
 
+        if not family:
+            continue
         family_values = (posting_policy.get("mappings") or {}).get(family)
         if not isinstance(family_values, dict):
+            for line in payload.get("line_items") or []:
+                for field_name in (
+                    "suggested_income_account_id",
+                    "suggested_expense_account_id",
+                    "suggested_vat_type_id",
+                    "warehouse_id_hint",
+                ):
+                    if field_name in line:
+                        line[field_name] = None
+            unresolved.append(
+                {
+                    "action_id": action.get("idempotency_key"),
+                    "kind": "posting_mapping",
+                    "family": family,
+                    "blocking": True,
+                    "reason": f"Posting family {family!r} is absent from the explicit posting policy.",
+                }
+            )
             continue
+        payload["posting_policy_family"] = family
         for line in payload.get("line_items") or []:
             line_role = str(line.get("line_role") or "")
             if role == "sales":
@@ -2247,15 +2289,27 @@ def apply_posting_policy(
                     line["warehouse_id_hint"] = resolve_mapping(
                         posting_policy, family=family, field_name="warehouse_id"
                     )
+                else:
+                    line["warehouse_id_hint"] = None
             else:
-                if family_values.get("expense_account_id") not in (None, ""):
-                    line["suggested_expense_account_id"] = resolve_mapping(
-                        posting_policy, family=family, field_name="expense_account_id"
+                line_key = slugify(str(line.get("description") or line_role))
+                line_values = (family_values.get("lines") or {}).get(line_key)
+                if line_values is None:
+                    line_values = family_values
+                if not isinstance(line_values, dict):
+                    raise SimplbooksError(f"Posting family {family!r} line {line_key!r} must be an object.")
+                line["posting_policy_line_key"] = line_key
+                try:
+                    line["suggested_expense_account_id"] = str(
+                        int(str(line_values.get("expense_account_id") or ""))
                     )
-                if family_values.get("vat_type_id") not in (None, ""):
-                    line["suggested_vat_type_id"] = resolve_mapping(
-                        posting_policy, family=family, field_name="vat_type_id"
-                    )
+                    line["suggested_vat_type_id"] = str(int(str(line_values.get("vat_type_id") or "")))
+                except ValueError as exc:
+                    raise SimplbooksError(
+                        f"Posting family {family!r} line {line_key!r} requires integer-like expense_account_id and vat_type_id."
+                    ) from exc
+                warehouse_id = line_values.get("warehouse_id")
+                line["warehouse_id_hint"] = str(warehouse_id) if warehouse_id not in (None, "") else None
     return unresolved
 
 
@@ -2606,8 +2660,15 @@ def main() -> int:
     discovery_overview = load_optional_json(discovery_overview_path)
     if posting_policy and posting_policy.get("company_slug") != normalized_payload.get("company_slug"):
         raise SimplbooksError("Posting policy company_slug does not match normalized company_slug.")
-    if discovery_overview and int(discovery_overview.get("year") or 0) != year:
-        raise SimplbooksError("Discovery overview year does not match action period year.")
+    if discovery_overview and company_dir is not None:
+        try:
+            validate_discovery(
+                discovery_overview,
+                year=year,
+                company_id=resolve_company_id(None, company_dir=str(company_dir)),
+            )
+        except ReferenceArtifactError as exc:
+            raise SimplbooksError(str(exc)) from exc
     repo_root = Path.cwd()
 
     batch = build_action_batch(
@@ -2625,6 +2686,17 @@ def main() -> int:
         discovery_overview=discovery_overview,
         force=args.force,
     )
+    bound_paths = [
+        ("posting_policy", posting_policy_path),
+        ("discovery_overview", discovery_overview_path),
+    ]
+    if foreign_currencies:
+        bound_paths.append(("exchange_rates", exchange_rates_path))
+    batch["reference_artifacts"] = [
+        bind_file(path, kind=kind, cwd=repo_root)
+        for kind, path in bound_paths
+        if path is not None
+    ]
     write_yaml(output_path, batch)
 
     company_slug = str(normalized_payload.get("company_slug") or (company_dir.name if company_dir else normalized_path.stem))

@@ -15,6 +15,8 @@ from typing import Any
 from bookbuilder import write_yaml
 from bookchecker import load_yaml
 from exchange_rates import ExchangeRateError, lookup_rate
+from posting_policy import PostingPolicyError, action_policy_errors, load_posting_policy
+from reference_artifacts import ReferenceArtifactError, validate_discovery, verify_file_binding
 from simplbooks_api import (
     SimplbooksClient,
     SimplbooksError,
@@ -534,12 +536,14 @@ def translate_action_for_api(
     draft_schema = str(payload.get("draft_schema") or "")
     currency = str(payload.get("currency") or "EUR").upper()
     if currency != "EUR" and exchange_rate_cache is not None:
+        requested_date = str(payload.get("currency_rate_requested_date") or payload.get("document_date") or "")
+        document_date = str(payload.get("document_date") or "")
+        if requested_date != document_date:
+            raise SimplbooksError(f"{action_id(action)} reviewed rate requested date must equal document date.")
         try:
             resolution = lookup_rate(
                 exchange_rate_cache,
-                requested_date=date.fromisoformat(
-                    str(payload.get("currency_rate_requested_date") or payload.get("document_date"))
-                ),
+                requested_date=date.fromisoformat(requested_date),
                 base=currency,
                 quote="EUR",
             )
@@ -895,6 +899,7 @@ def execute_batch(
     existing_request_log: list[dict[str, Any]] | None = None,
     reference_lookup: dict[str, dict[str, Any]] | None = None,
     exchange_rate_cache: dict[str, Any] | None = None,
+    posting_policy: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     ordered_actions = stable_execution_order(list(action_batch.get("actions") or []))
     lookup = dict(reference_lookup or {})
@@ -911,9 +916,15 @@ def execute_batch(
     )
     if mode == "write" and has_foreign_actions and exchange_rate_cache is None:
         raise SimplbooksError("Write mode requires the annual ECB cache for foreign-currency actions.")
-
     for action in ordered_actions:
         validate_action_shape(action)
+        if posting_policy is not None:
+            try:
+                policy_errors = action_policy_errors(action, posting_policy)
+            except PostingPolicyError as exc:
+                policy_errors = [str(exc)]
+            if policy_errors:
+                raise SimplbooksError(f"{action_id(action)} posting-policy mismatch: {policy_errors[0]}")
 
         if action_successfully_submitted(action):
             continue
@@ -1040,6 +1051,30 @@ def run_submission(
         check_report=check_report,
         check_path=check_path,
     )
+    if mode == "write":
+        if company_dir is None:
+            raise SimplbooksError("Write mode requires --company-dir for bound reference verification.")
+        resolved_company_id = resolve_company_id(company_id, company_dir=str(company_dir))
+        bindings = {str(item.get("kind") or ""): item for item in action_batch.get("reference_artifacts") or []}
+        required_bindings = ["posting_policy", "discovery_overview"]
+        if any(
+            str((action.get("payload") or {}).get("currency") or "EUR").upper() != "EUR"
+            for action in action_batch.get("actions") or []
+        ):
+            required_bindings.append("exchange_rates")
+        for kind in required_bindings:
+            if kind not in bindings:
+                raise SimplbooksError(f"Write mode action batch is not bound to required {kind} artifact.")
+            try:
+                bound_path = verify_file_binding(bindings[kind], cwd=cwd)
+                if kind == "discovery_overview":
+                    validate_discovery(
+                        load_json(bound_path),
+                        year=int(period[:4]),
+                        company_id=resolved_company_id,
+                    )
+            except ReferenceArtifactError as exc:
+                raise SimplbooksError(str(exc)) from exc
 
     company_slug = str(
         action_batch.get("company_slug")
@@ -1067,6 +1102,12 @@ def run_submission(
         if exchange_rate_cache_path is not None and exchange_rate_cache_path.exists()
         else None
     )
+    posting_policy_path = company_dir / "artifacts" / "posting_policy.json" if company_dir is not None else None
+    posting_policy = (
+        load_posting_policy(posting_policy_path)
+        if posting_policy_path is not None and posting_policy_path.exists()
+        else None
+    )
 
     if mode == "write" and client is None:
         resolved_company_id = resolve_company_id(company_id, company_dir=str(company_dir) if company_dir else None)
@@ -1085,6 +1126,7 @@ def run_submission(
         existing_request_log=(existing_submission or {}).get("request_log") or [],
         reference_lookup=reference_lookup,
         exchange_rate_cache=exchange_rate_cache,
+        posting_policy=posting_policy,
     )
     prior_request_count = len((existing_submission or {}).get("request_log") or [])
     current_request_log = submission["request_log"][prior_request_count:]

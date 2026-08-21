@@ -40,6 +40,19 @@ class PostingPolicyTests(unittest.TestCase):
             with self.assertRaises(posting_policy.PostingPolicyError):
                 posting_policy.load_posting_policy(path)
 
+    def test_policy_rejects_non_numeric_submit_mapping_id(self) -> None:
+        policy = {
+            "schema_version": "1.0",
+            "company_slug": "example",
+            "bank_accounts": {},
+            "contacts": {},
+            "mappings": {"purchase-printful": {"warehouse_id": "LV"}},
+            "supplier_aliases": {},
+        }
+
+        with self.assertRaises(posting_policy.PostingPolicyError):
+            posting_policy.validate_posting_policy(policy)
+
     def test_supplier_alias_resolution_is_explicit(self) -> None:
         policy = {"supplier_aliases": {"omniva": "as-eesti-post"}}
 

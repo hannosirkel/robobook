@@ -249,6 +249,58 @@ class BookbuilderTests(unittest.TestCase):
         self.assertTrue(any(item["external_ref"] == "EE24111268" for item in batch["already_present"]))
         self.assertFalse(any(action["payload"].get("vendor_hint") == "simplbooks-ou" for action in batch["actions"]))
 
+    def test_builder_splits_supplier_credits_by_tax_profile(self) -> None:
+        normalized = base_normalized(period="2024-07")
+        normalized["records"]["purchase_credits"].extend(
+            [
+                record(record_id="credit:zero", source_system="printful", event_type="supplier_credit", gross_amount=10, vat_amount=0, channel="printful"),
+                record(record_id="credit:taxable", source_system="printful", event_type="supplier_credit", gross_amount=12, vat_amount=2, channel="printful"),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            batch = bookbuilder.build_action_batch(
+                normalized_payload=normalized,
+                recon_payload=base_recon(period="2024-07"),
+                normalized_path=Path(tmp) / "normalized.json",
+                recon_path=Path(tmp) / "recon.json",
+                repo_root=Path(tmp),
+            )
+
+        credits = [a for a in batch["actions"] if a["action_type"] == "create_purchase_credit_summary"]
+        self.assertEqual(len(credits), 2)
+        self.assertEqual(sorted(a["payload"]["totals"]["vat_amount"] for a in credits), [0.0, 2.0])
+
+    def test_builder_clears_legacy_ids_when_policy_family_is_missing(self) -> None:
+        normalized = base_normalized()
+        normalized["records"]["purchase_expenses"].append(
+            record(record_id="vendor:1", source_system="vendor", event_type="purchase", gross_amount=10, channel="vendor")
+        )
+        policy = {
+            "schema_version": "1.0",
+            "company_slug": "example",
+            "bank_accounts": {},
+            "contacts": {"suppliers": {"vendor": "18"}},
+            "mappings": {},
+            "supplier_aliases": {},
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            batch = bookbuilder.build_action_batch(
+                normalized_payload=normalized,
+                recon_payload=base_recon(),
+                normalized_path=Path(tmp) / "normalized.json",
+                recon_path=Path(tmp) / "recon.json",
+                repo_root=Path(tmp),
+                posting_policy=policy,
+            )
+
+        action = find_action(batch, "create_purchase_summary")
+        line = action["payload"]["line_items"][0]
+        self.assertIsNone(line["suggested_expense_account_id"])
+        self.assertIsNone(line["suggested_vat_type_id"])
+        self.assertTrue(any(dep["kind"] == "posting_mapping" for dep in batch["unresolved_dependencies"]))
+
     def test_builder_applies_explicit_bank_and_sales_contact_policy(self) -> None:
         normalized = base_normalized()
         normalized["records"]["sales"].append(

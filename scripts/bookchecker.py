@@ -681,6 +681,7 @@ def evaluate_split_payment_groups(
     *,
     action_batch: dict[str, Any],
     resolved_sources_by_action: dict[str, list[dict[str, Any]]],
+    reviewed_assignment_action_ids: set[str] | None = None,
 ) -> tuple[set[str], list[dict[str, Any]]]:
     grouped_actions: dict[tuple[tuple[str, str], ...], list[dict[str, Any]]] = defaultdict(list)
     actions_by_id = {
@@ -690,6 +691,8 @@ def evaluate_split_payment_groups(
     }
 
     for action_id, resolved_sources in resolved_sources_by_action.items():
+        if action_id in (reviewed_assignment_action_ids or set()):
+            continue
         action = actions_by_id.get(action_id)
         if action is None:
             continue
@@ -1021,6 +1024,98 @@ def _direct_sale_invoice_errors(
     return errors
 
 
+def _historical_generated_targets(
+    *, action_path: Path, period: str
+) -> dict[str, tuple[dict[str, Any], str, str]]:
+    """Load prior action identity plus successful inserted-ID proof without trusting the cash draft."""
+    if action_path.parent.name != "actions":
+        return {}
+    submissions_dir = action_path.parent.parent / "submissions"
+    targets: dict[str, tuple[dict[str, Any], str, str]] = {}
+    for prior_path in sorted(action_path.parent.glob("*.yaml")):
+        if not re.fullmatch(r"\d{4}-\d{2}", prior_path.stem) or prior_path.stem >= period:
+            continue
+        prior_batch = load_yaml(prior_path)
+        submission_path = submissions_dir / f"{prior_path.stem}.json"
+        if not submission_path.exists():
+            continue
+        submission = load_json(submission_path)
+        if (
+            str(submission.get("period") or "") != prior_path.stem
+            or not str(prior_batch.get("batch_id") or "")
+            or str(submission.get("batch_id") or "") != str(prior_batch.get("batch_id") or "")
+            or not str(prior_batch.get("company_slug") or "")
+            or str(submission.get("company_slug") or "") != str(prior_batch.get("company_slug") or "")
+            or str(submission.get("action_file_sha256") or "") != file_sha256(prior_path)
+        ):
+            continue
+        successful_proofs: dict[str, tuple[str, str]] = {}
+        for entry in submission.get("request_log") or []:
+            if not isinstance(entry, dict) or entry.get("mode") != "write" or not entry.get("success"):
+                continue
+            inserted_id = entry.get("inserted_id")
+            key = str(entry.get("action_idempotency_key") or "")
+            if key and inserted_id not in (None, ""):
+                successful_proofs[key] = (
+                    str(inserted_id), str(entry.get("endpoint") or "")
+                )
+        for action in prior_batch.get("actions") or []:
+            if not isinstance(action, dict):
+                continue
+            key = action_label(action)
+            if key in successful_proofs:
+                inserted_id, endpoint = successful_proofs[key]
+                targets[key] = (action, inserted_id, endpoint)
+    return targets
+
+
+def _generated_target_errors(
+    *,
+    part: dict[str, Any],
+    settlement: dict[str, Any],
+    current_actions: dict[str, dict[str, Any]],
+    historical_actions: dict[str, tuple[dict[str, Any], str, str]],
+) -> list[str]:
+    disposition = str(part.get("disposition") or "")
+    target_kind = "invoice" if disposition == "generated_invoice_receipt" else "purchase"
+    target = part.get("target") or {}
+    target_keys = {
+        str(target.get(name) or "")
+        for name in ("action_key", "idempotency_key", "action_id")
+    } - {""}
+    if len(target_keys) != 1:
+        return ["Generated target must contain exactly one action key."]
+    target_key = next(iter(target_keys))
+    expected_action_type = "create_invoice_summary" if target_kind == "invoice" else "create_purchase_summary"
+    expected_schema = "invoice_summary_v1" if target_kind == "invoice" else "purchase_summary_v1"
+    expected_endpoint = "invoices/create" if target_kind == "invoice" else "purchases/create"
+    current = current_actions.get(target_key)
+    if current is not None:
+        errors: list[str] = []
+        if (
+            str(current.get("action_type") or "") != expected_action_type
+            or str((current.get("payload") or {}).get("draft_schema") or "") != expected_schema
+        ):
+            errors.append(f"Generated target {target_key!r} is not the required {target_kind} action/schema type.")
+        if list(settlement.get("depends_on") or []).count(target_key) != 1:
+            errors.append(f"Current-batch generated target {target_key!r} must appear exactly once in depends_on.")
+        return errors
+    historical = historical_actions.get(target_key)
+    if historical is None:
+        return [f"Generated target {target_key!r} is not resolved by current or successful historical evidence."]
+    historical_action, inserted_id, endpoint = historical
+    if (
+        str(historical_action.get("action_type") or "") != expected_action_type
+        or str((historical_action.get("payload") or {}).get("draft_schema") or "") != expected_schema
+    ):
+        return [f"Historical generated target {target_key!r} has the wrong {target_kind} action/schema type."]
+    if not inserted_id:
+        return [f"Historical generated target {target_key!r} lacks successful inserted-ID proof."]
+    if endpoint != expected_endpoint:
+        return [f"Historical generated target {target_key!r} has the wrong successful object endpoint proof."]
+    return []
+
+
 def evaluate_bank_statement_completeness(
     action_batch: dict[str, Any],
     *,
@@ -1119,6 +1214,7 @@ def evaluate_bank_statement_completeness(
         for action in action_batch.get("actions") or []
         if isinstance(action, dict)
     }
+    historical_actions = _historical_generated_targets(action_path=action_path, period=period)
     coverage: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for action in action_batch.get("actions") or []:
         if not isinstance(action, dict) or str((action.get("payload") or {}).get("draft_schema") or "") != "cash_settlement_v1":
@@ -1296,6 +1392,18 @@ def evaluate_bank_statement_completeness(
                 action_id=str(record.get("record_id") or "") or None,
             ))
         if manual_required:
+            manual_items = [item for item in items if item.get("kind") == "manual"]
+            api_items = [item for item in items if item.get("kind") == "action"]
+            if len(manual_items) != 1 or api_items:
+                findings.append(make_finding(
+                    section="bank_statement_completeness",
+                    severity="error",
+                    summary=(
+                        "Manual atomicity requires exactly one verified manual coverage item "
+                        "and zero API cash actions for the physical row."
+                    ),
+                    action_id=str(record.get("record_id") or "") or None,
+                ))
             continue
         unmatched_parts = set(range(len(allocation_parts)))
         assignment_failed = False
@@ -1341,6 +1449,19 @@ def evaluate_bank_statement_completeness(
                     allocation=allocation,
                     record=record,
                     actions_by_key=actions_by_key,
+                ):
+                    findings.append(make_finding(
+                        section="bank_statement_completeness", severity="error",
+                        summary=error, action_id=str(item["label"]),
+                    ))
+            if str(allocation_parts[assigned_index].get("disposition") or "") in {
+                "generated_invoice_receipt", "generated_purchase_payment"
+            }:
+                for error in _generated_target_errors(
+                    part=allocation_parts[assigned_index],
+                    settlement=action,
+                    current_actions=actions_by_key,
+                    historical_actions=historical_actions,
                 ):
                     findings.append(make_finding(
                         section="bank_statement_completeness", severity="error",
@@ -2184,6 +2305,7 @@ def evaluate_action_batch(
     split_payment_action_ids, split_payment_findings = evaluate_split_payment_groups(
         action_batch=action_batch,
         resolved_sources_by_action=resolved_sources_by_action,
+        reviewed_assignment_action_ids=set(assigned_cash_amounts),
     )
     findings.extend(split_payment_findings)
 

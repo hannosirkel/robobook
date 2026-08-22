@@ -44,8 +44,10 @@ The report is Markdown and follows the sections in `templates/check_report.templ
 - requires every cash-settlement action to bind exactly one physical bank row
 - compares statement business date, currency, signed amount, and exact source-account mapping
 - treats a complete verified manual statement-import dependency as one terminal coverage item
+- requires manual-financial rows to have exactly one verified manual item and zero API cash actions
 - keeps pending, blocking, malformed, or source-mismatched manual proof as a hard error
 - accepts reviewed API-only splits only through a bijective assignment by signed amount, disposition, and exact target
+- resolves generated invoice/purchase targets to the correct current action/schema with an exact dependency, or to immutable successful prior-action evidence with an inserted ID
 - binds each direct-sale receipt to its actual generated invoice, source-row line, and reviewed grouping/target values
 
 ### Arithmetic Consistency
@@ -53,6 +55,7 @@ The report is Markdown and follows the sections in `templates/check_report.templ
 - compares invoice and purchase draft totals against referenced normalized records
 - checks line-item totals against payload totals
 - checks each reviewed-split incoming/payment against its assigned part and proves the whole signed row sum once
+- excludes bijectively assigned reviewed parts from the legacy same-source multi-payment whole-row check
 
 ### Account And VAT Review
 

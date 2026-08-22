@@ -352,6 +352,163 @@ def bank_coverage_batch(*, period: str, allocation_path: Path, actions: list[dic
 
 
 class BookcheckerTests(unittest.TestCase):
+    def test_manual_required_row_rejects_api_cash_coverage_without_verified_manual_item(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            row = physical_bank_record(record_id="fee-api", amount=-7.0)
+            normalized_path, allocation_path = write_bank_coverage_fixture(tmp, [row])
+            allocations = json.loads(allocation_path.read_text(encoding="utf-8"))
+            allocations["allocations"][0].update({
+                "disposition": "bank_fee_payment",
+                "target": {"financial_transaction_kind": "bank-fee"},
+            })
+            allocation_path.write_text(json.dumps(allocations), encoding="utf-8")
+            action = exact_settlement_action(row=row, normalized_path=normalized_path)
+            batch = bank_coverage_batch(
+                period="2024-01", allocation_path=allocation_path, actions=[action]
+            )
+
+            findings = bookchecker.evaluate_bank_statement_completeness(
+                batch, action_path=tmp / "actions.yaml", cwd=tmp
+            )
+
+        self.assertTrue(any("manual atomicity" in item["summary"].lower() for item in findings))
+
+    def test_generated_receipt_target_requires_correct_current_type_and_dependency(self) -> None:
+        mutations = ("wrong_type", "missing_dependency")
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                row = physical_bank_record(record_id=f"generated-{mutation}", amount=20.0)
+                normalized_path, allocation_path = write_bank_coverage_fixture(tmp, [row])
+                allocations = json.loads(allocation_path.read_text(encoding="utf-8"))
+                allocations["allocations"][0].update({
+                    "disposition": "generated_invoice_receipt",
+                    "target": {"action_key": "generated-target", "document_type": "invoice"},
+                })
+                allocation_path.write_text(json.dumps(allocations), encoding="utf-8")
+                target = {
+                    "idempotency_key": "generated-target",
+                    "action_type": "create_invoice_summary",
+                    "payload": {"draft_schema": "invoice_summary_v1"},
+                    "source_refs": [],
+                    "confidence": "high",
+                }
+                receipt = exact_settlement_action(row=row, normalized_path=normalized_path)
+                receipt["payload"].pop("linked_invoice_id")
+                receipt["payload"]["linked_invoice_action"] = "generated-target"
+                receipt["depends_on"] = ["generated-target"]
+                if mutation == "wrong_type":
+                    target["action_type"] = "create_purchase_summary"
+                    target["payload"]["draft_schema"] = "purchase_summary_v1"
+                else:
+                    receipt["depends_on"] = []
+                batch = bank_coverage_batch(
+                    period="2024-01", allocation_path=allocation_path, actions=[target, receipt]
+                )
+
+                findings = bookchecker.evaluate_bank_statement_completeness(
+                    batch, action_path=tmp / "actions.yaml", cwd=tmp
+                )
+
+                self.assertTrue(any("generated target" in item["summary"].lower() for item in findings))
+
+    def test_generated_receipt_accepts_only_sha_bound_successful_historical_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            actions_dir = tmp / "artifacts" / "actions"
+            submissions_dir = tmp / "artifacts" / "submissions"
+            actions_dir.mkdir(parents=True)
+            submissions_dir.mkdir(parents=True)
+            prior_action = {
+                "idempotency_key": "prior-invoice",
+                "action_type": "create_invoice_summary",
+                "payload": {"draft_schema": "invoice_summary_v1"},
+            }
+            prior_path = actions_dir / "2024-01.yaml"
+            bookbuilder.write_yaml(prior_path, {
+                "company_slug": "example", "period": "2024-01",
+                "batch_id": "example-2024-01", "actions": [prior_action],
+            })
+            submission_path = submissions_dir / "2024-01.json"
+            submission = {
+                "company_slug": "example", "period": "2024-01",
+                "batch_id": "example-2024-01",
+                "action_file_sha256": bookchecker.file_sha256(prior_path),
+                "request_log": [{
+                    "mode": "write", "success": True, "inserted_id": "501",
+                    "endpoint": "invoices/create",
+                    "action_idempotency_key": "prior-invoice",
+                }],
+            }
+            submission_path.write_text(json.dumps(submission), encoding="utf-8")
+            row = physical_bank_record(
+                record_id="historical-receipt", amount=20.0, event_date="2024-02-15"
+            )
+            normalized_path, allocation_path = write_bank_coverage_fixture(tmp, [row])
+            allocations = json.loads(allocation_path.read_text(encoding="utf-8"))
+            allocations["allocations"][0].update({
+                "disposition": "generated_invoice_receipt",
+                "target": {"action_key": "prior-invoice", "document_type": "invoice"},
+            })
+            allocation_path.write_text(json.dumps(allocations), encoding="utf-8")
+            receipt = exact_settlement_action(row=row, normalized_path=normalized_path)
+            receipt["payload"].pop("linked_invoice_id")
+            receipt["payload"]["linked_invoice_action"] = "prior-invoice"
+            receipt["depends_on"] = []
+            batch = bank_coverage_batch(
+                period="2024-02", allocation_path=allocation_path, actions=[receipt]
+            )
+            action_path = actions_dir / "2024-02.yaml"
+
+            valid_findings = bookchecker.evaluate_bank_statement_completeness(
+                batch, action_path=action_path, cwd=tmp
+            )
+            submission["action_file_sha256"] = "0" * 64
+            submission_path.write_text(json.dumps(submission), encoding="utf-8")
+            stale_findings = bookchecker.evaluate_bank_statement_completeness(
+                batch, action_path=action_path, cwd=tmp
+            )
+
+        self.assertFalse(any("generated target" in item["summary"].lower() for item in valid_findings))
+        self.assertTrue(any("generated target" in item["summary"].lower() for item in stale_findings))
+
+    def test_generated_payment_target_requires_purchase_action_and_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            row = physical_bank_record(record_id="generated-payment", amount=-10.0)
+            normalized_path, allocation_path = write_bank_coverage_fixture(tmp, [row])
+            allocations = json.loads(allocation_path.read_text(encoding="utf-8"))
+            allocations["allocations"][0].update({
+                "disposition": "generated_purchase_payment",
+                "target": {"action_key": "generated-purchase", "document_type": "purchase"},
+            })
+            allocation_path.write_text(json.dumps(allocations), encoding="utf-8")
+            target = {
+                "idempotency_key": "generated-purchase",
+                "action_type": "create_purchase_summary",
+                "payload": {"draft_schema": "purchase_summary_v1"},
+            }
+            payment = exact_settlement_action(row=row, normalized_path=normalized_path)
+            payment["payload"].pop("linked_purchase_id")
+            payment["payload"]["linked_purchase_action"] = "generated-purchase"
+            payment["depends_on"] = ["generated-purchase"]
+            batch = bank_coverage_batch(
+                period="2024-01", allocation_path=allocation_path, actions=[target, payment]
+            )
+
+            valid_findings = bookchecker.evaluate_bank_statement_completeness(
+                batch, action_path=tmp / "actions.yaml", cwd=tmp
+            )
+            target["action_type"] = "create_invoice_summary"
+            target["payload"]["draft_schema"] = "invoice_summary_v1"
+            invalid_findings = bookchecker.evaluate_bank_statement_completeness(
+                batch, action_path=tmp / "actions.yaml", cwd=tmp
+            )
+
+        self.assertFalse(any("generated target" in item["summary"].lower() for item in valid_findings))
+        self.assertTrue(any("generated target" in item["summary"].lower() for item in invalid_findings))
+
     def test_checker_errors_when_action_batch_omits_one_bank_row(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -492,6 +649,66 @@ class BookcheckerTests(unittest.TestCase):
             and item["severity"] == "error"
             for item in mutated_evaluation["findings"]
         ))
+
+    def test_full_checker_excludes_bijectively_assigned_multi_payment_parts_from_legacy_grouping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            row = physical_bank_record(record_id="split-three", amount=20.0)
+            normalized_path, allocation_path = write_bank_coverage_fixture(tmp, [row])
+            allocations = json.loads(allocation_path.read_text(encoding="utf-8"))
+            allocations["allocations"][0].update({
+                "disposition": "reviewed_split",
+                "parts": [
+                    {"amount": 30.0, "disposition": "existing_invoice_receipt", "target": {"simplbooks_id": "119", "document_type": "invoice"}},
+                    {"amount": -5.0, "disposition": "existing_purchase_payment", "target": {"simplbooks_id": "88", "document_type": "purchase"}},
+                    {"amount": -5.0, "disposition": "existing_purchase_payment", "target": {"simplbooks_id": "89", "document_type": "purchase"}},
+                ],
+            })
+            allocation_path.write_text(json.dumps(allocations), encoding="utf-8")
+            incoming = exact_settlement_action(row=row, normalized_path=normalized_path)
+            incoming["payload"]["amount"] = 30.0
+            payments = []
+            for index, purchase_id in enumerate(("88", "89"), start=1):
+                payment = exact_settlement_action(row=row, normalized_path=normalized_path)
+                payment["idempotency_key"] = f"split-three-payment-{index}"
+                payment["payload"].update({
+                    "document_type": "payment", "amount": 5.0,
+                    "linked_purchase_id": purchase_id,
+                })
+                payments.append(payment)
+            batch = bank_coverage_batch(
+                period="2024-01", allocation_path=allocation_path,
+                actions=[incoming, *payments],
+            )
+            recon_path = tmp / "recon.json"
+            recon = base_recon()
+            recon_path.write_text(json.dumps(recon), encoding="utf-8")
+
+            evaluation = bookchecker.evaluate_action_batch(
+                action_batch=batch,
+                action_path=tmp / "actions.yaml",
+                recon_payload=recon,
+                recon_path=recon_path,
+                policy_text=None,
+                cwd=tmp,
+            )
+
+            mutated = copy.deepcopy(batch)
+            mutated["actions"][2]["payload"]["amount"] = 4.99
+            mutated_evaluation = bookchecker.evaluate_action_batch(
+                action_batch=mutated,
+                action_path=tmp / "actions.yaml",
+                recon_payload=recon,
+                recon_path=recon_path,
+                policy_text=None,
+                cwd=tmp,
+            )
+
+        self.assertEqual([
+            item for item in evaluation["findings"]
+            if item["section"] == "arithmetic_consistency" and item["severity"] == "error"
+        ], [])
+        self.assertEqual(mutated_evaluation["result"], "fail")
 
     def test_checker_rejects_cash_action_target_changed_after_allocation_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

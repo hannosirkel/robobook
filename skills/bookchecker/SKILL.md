@@ -66,6 +66,8 @@ Implemented deterministic checks:
 - direct-sale receipt linkage to the generated invoice action, physical source-row line, and reviewed grouping/target fields
 - exact statement date, signed amount, currency, and `(IBAN, currency)` bank-account mapping for every cash settlement
 - verified non-blocking statement-import dependencies as terminal coverage, without allowing pending proof to pass
+- manual-financial allocations as atomic rows: exactly one verified manual coverage item and no API cash action
+- generated settlement targets resolved to the correct current invoice/purchase action and dependency, or to SHA-bound successful historical action and inserted-ID proof
 
 ## Guardrails
 

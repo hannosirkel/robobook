@@ -394,6 +394,33 @@ class BookcheckerTests(unittest.TestCase):
 
         self.assertTrue(any("manual atomicity" in item["summary"].lower() for item in findings))
 
+    def test_reviewed_split_reimbursement_requires_atomic_manual_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            row = physical_bank_record(record_id="reimbursement-api", amount=-50.30)
+            normalized_path, allocation_path = write_bank_coverage_fixture(tmp, [row])
+            allocations = json.loads(allocation_path.read_text(encoding="utf-8"))
+            allocations["allocations"][0].update({
+                "disposition": "reviewed_split",
+                "target": {"document_type": "financial_transaction", "transaction_family": "reviewed_group"},
+                "parts": [{
+                    "amount": -50.30,
+                    "disposition": "expense_reimbursement_payment",
+                    "target": {"document_type": "financial_transaction", "transaction_family": "expense_reimbursement"},
+                }],
+            })
+            allocation_path.write_text(json.dumps(allocations), encoding="utf-8")
+            action = exact_settlement_action(row=row, normalized_path=normalized_path)
+            batch = bank_coverage_batch(
+                period="2024-01", allocation_path=allocation_path, actions=[action]
+            )
+
+            findings = bookchecker.evaluate_bank_statement_completeness(
+                batch, action_path=tmp / "actions.yaml", cwd=tmp
+            )
+
+        self.assertTrue(any("manual atomicity" in item["summary"].lower() for item in findings))
+
     def test_generated_receipt_target_requires_correct_current_type_and_dependency(self) -> None:
         mutations = ("wrong_type", "missing_dependency")
         for mutation in mutations:
@@ -1288,6 +1315,21 @@ class BookcheckerTests(unittest.TestCase):
         findings = bookchecker.evaluate_unresolved_dependencies({"unresolved_dependencies": [dependency]})
 
         self.assertTrue(any("bank_fee_payment" in item["summary"] and "negative" in item["summary"] for item in findings))
+
+    def test_checker_independently_rejects_positive_expense_reimbursement(self) -> None:
+        dependency = manual_financial_dependency(blocking=True, status="pending")
+        dependency.update({
+            "disposition": "expense_reimbursement_payment",
+            "physical_signed_amount": 50.30,
+            "target": {"transaction_family": "expense_reimbursement"},
+        })
+
+        findings = bookchecker.evaluate_unresolved_dependencies({"unresolved_dependencies": [dependency]})
+
+        self.assertTrue(any(
+            "expense_reimbursement_payment" in item["summary"] and "negative" in item["summary"]
+            for item in findings
+        ))
 
     def test_checker_rejects_api_owned_top_level_manual_dependency_dispositions(self) -> None:
         cases = (("existing_invoice_receipt", 7.0), ("generated_purchase_payment", -7.0))

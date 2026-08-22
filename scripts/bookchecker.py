@@ -1408,7 +1408,7 @@ def evaluate_bank_statement_completeness(
         manual_required = str(allocation.get("disposition") or "") in {"bank_fee_payment", "expense_reimbursement_payment", "clearing_transfer"}
         if str(allocation.get("disposition") or "") == "reviewed_split":
             manual_required = any(
-                str(part.get("disposition") or "") in {"bank_fee_payment", "clearing_transfer"}
+                str(part.get("disposition") or "") in {"bank_fee_payment", "expense_reimbursement_payment", "clearing_transfer"}
                 for part in allocation.get("parts") or [] if isinstance(part, dict)
             )
         allocation_parts = (
@@ -1764,7 +1764,7 @@ def manual_financial_dependency_errors(dependency: dict[str, Any]) -> list[str]:
         errors.append(f"Manual financial dependency {disposition} amount must be positive.")
     if (
         not split_parts
-        and disposition in {"generated_purchase_payment", "existing_purchase_payment", "bank_fee_payment"}
+        and disposition in {"generated_purchase_payment", "existing_purchase_payment", "bank_fee_payment", "expense_reimbursement_payment"}
         and physical_amount >= 0
     ):
         errors.append(f"Manual financial dependency {disposition} amount must be negative.")

@@ -61,7 +61,24 @@
             "type": "object",
             "additionalProperties": true,
             "required": ["amount"],
-            "properties": {"amount": {"type": "number"}}
+            "properties": {"amount": {"type": "number"}},
+            "allOf": [
+              {
+                "if": {"required": ["disposition"], "properties": {"disposition": {"const": "clearing_transfer"}}},
+                "then": {
+                  "required": ["target"],
+                  "properties": {
+                    "target": {
+                      "required": ["document_type", "transaction_family", "clearing_record_ids", "bridge_record_ids", "bridge_direction", "clearing_evidence", "clearing_totals", "clearing_relation", "bridge_amount"],
+                      "properties": {
+                        "document_type": {"const": "financial_transaction"},
+                        "transaction_family": {"type": "string", "minLength": 1}
+                      }
+                    }
+                  }
+                }
+              }
+            ]
           }
         },
         "review": {

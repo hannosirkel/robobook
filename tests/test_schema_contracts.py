@@ -319,6 +319,21 @@ class SchemaContractTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=malformed_equation)
 
+    def test_bank_allocation_schema_requires_proof_on_clearing_transfer_split_part(self) -> None:
+        malformed = bank_allocation_payload(allocations=[bank_allocation(
+            disposition="reviewed_split",
+            amount=-13.27,
+            target={"document_type": "financial_transaction", "transaction_family": "reviewed_group"},
+            parts=[{
+                "amount": -13.27,
+                "disposition": "clearing_transfer",
+                "target": {"document_type": "financial_transaction", "transaction_family": "internal_transfer"},
+            }],
+        )])
+
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=malformed)
+
     def test_bank_allocation_template_matches_strict_schema(self) -> None:
         artifact = json.loads((ROOT / "templates/bank-allocation.template.json").read_text(encoding="utf-8"))
         self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=artifact)

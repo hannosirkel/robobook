@@ -649,6 +649,24 @@ class BooksendTests(unittest.TestCase):
 
         self.assertEqual(client.calls, [])
 
+    def test_sender_rejects_positive_verified_expense_reimbursement_before_any_call(self) -> None:
+        dependency = manual_financial_dependency(status="verified", blocking=False)
+        dependency.update({
+            "disposition": "expense_reimbursement_payment",
+            "physical_signed_amount": 50.30,
+            "target": {"transaction_family": "expense_reimbursement"},
+        })
+        client = FakeClient(responses=[{"_http_status": 201, "invoice_id": 501}])
+
+        with self.assertRaisesRegex(SimplbooksError, "expense_reimbursement_payment.*negative"):
+            booksend.execute_batch(
+                action_batch=make_batch(actions=[invoice_action()], unresolved_dependencies=[dependency]),
+                mode="write",
+                client=client,
+            )
+
+        self.assertEqual(client.calls, [])
+
     def test_sender_rejects_invalid_verified_manual_dependency_dispositions_before_any_call(self) -> None:
         cases: list[tuple[str, dict]] = []
         for disposition, amount in (("existing_invoice_receipt", 7.0), ("generated_purchase_payment", -7.0)):

@@ -10,7 +10,6 @@ Governed by [`architecture`](https://github.com/hannosirkel/architecture).
 | --- | --- |
 | Profile | `application-public` |
 | Visibility | declared public, currently public |
-| Public-safe required | yes |
 | Languages | python |
 
 **Standards that apply here.** Read a standard before you change something it
@@ -20,10 +19,15 @@ governs.
 - [Security](https://github.com/hannosirkel/architecture/blob/main/standards/security.md) — secrets, public and private boundaries, workflow hardening
 - [Code quality](https://github.com/hannosirkel/architecture/blob/main/standards/code-quality.md) — gates, coaching, testing, review cutoff
 - [Repository contract](https://github.com/hannosirkel/architecture/blob/main/standards/repository-contract.md) — required files, profiles, skills
+- [Work routing](https://github.com/hannosirkel/architecture/blob/main/standards/work-routing.md) — where a change starts, and where a working plan belongs
 - Language standards: [python](https://github.com/hannosirkel/architecture/blob/main/standards/languages/python.md)
 
 **Never commit to a default branch.** Work in `~/app/.worktrees/robobook/<task>`,
 branch from `origin/main`, and open a pull request.
+
+**A working plan for this repository goes in `docs/working/`.** A change
+spanning several repositories with no clear owner starts in `architecture`
+instead.
 
 **This repository must be safe to publish.** Never commit a password, token, key, kubeconfig,
 rendered Secret, or live export. No repository here holds a secret value, and a
@@ -35,8 +39,8 @@ private one is no exception.
 uv tool install "habit-hooks[python,typescript]"
 ```
 
-Name every language in that one command. A later install naming a different
-extra silently replaces this one. Then re-run `habit-hooks`.
+Name every language in that one command: a later install naming a different
+extra silently replaces this one.
 
 <!-- END MANAGED ARCHITECTURE BASELINE -->
 

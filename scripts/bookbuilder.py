@@ -162,7 +162,28 @@ def canonical_record_sha256(record: dict[str, Any]) -> str:
     ).hexdigest()
 
 
-def normalized_inventory_quantity_proof(records: list[dict[str, Any]]) -> dict[str, Any] | None:
+def canonical_value_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def inventory_proof_envelope(
+    *, scope: dict[str, Any], contributors: list[dict[str, Any]], quantity: Decimal,
+) -> dict[str, Any]:
+    ordered = sorted(contributors, key=lambda item: (str(item["record_id"]), str(item["record_sha256"])))
+    return {
+        "status": "exact", "quantity": decimal_number(quantity),
+        "scope": scope, "scope_sha256": canonical_value_sha256(scope),
+        "contributor_count": len(ordered),
+        "contributor_set_sha256": canonical_value_sha256(ordered),
+        "contributors": ordered,
+    }
+
+
+def normalized_inventory_quantity_proof(
+    records: list[dict[str, Any]], *, group_label: str, direction: str,
+) -> dict[str, Any] | None:
     contributors: list[dict[str, Any]] = []
     total = Decimal("0")
     for record in records:
@@ -178,7 +199,16 @@ def normalized_inventory_quantity_proof(records: list[dict[str, Any]]) -> dict[s
         })
     if not contributors or total <= 0:
         return None
-    return {"status": "exact", "quantity": decimal_number(total), "contributors": contributors}
+    first = records[0]
+    scope = {
+        "kind": "normalized_sales_group",
+        "period": str(first.get("event_date") or "")[:7],
+        "record_category": "sales" if direction == "sales" else "refunds",
+        "group_label": group_label,
+        "currency": record_currency(first, "EUR"),
+        "tax_profile": taxable_profile(first),
+    }
+    return inventory_proof_envelope(scope=scope, contributors=contributors, quantity=total)
 
 
 def normalize_ascii(value: str) -> str:
@@ -1342,7 +1372,9 @@ def build_sales_lines(
         total_vat = sum_abs_amount(records, "vat_amount")
         revenue_gross = total_gross - total_shipping
         shipping_vat_type_id = shipping_standard_vat_id if total_vat != 0 else shipping_zero_vat_id
-        inventory_proof = normalized_inventory_quantity_proof(records)
+        inventory_proof = normalized_inventory_quantity_proof(
+            records, group_label=group_label, direction=direction,
+        )
         lines.append(
             {
                 "line_role": f"{direction}_revenue",
@@ -1380,7 +1412,9 @@ def build_sales_lines(
             gross_amount = sum_abs_amount(profile_records, "gross_amount")
             vat_amount = sum_abs_amount(profile_records, "vat_amount")
             shipping_amount = sum_abs_amount(profile_records, "shipping_amount")
-            inventory_proof = normalized_inventory_quantity_proof(profile_records)
+            inventory_proof = normalized_inventory_quantity_proof(
+                profile_records, group_label=group_label, direction=direction,
+            )
             lines.append(
                 {
                     "line_role": f"{direction}_revenue",
@@ -2613,16 +2647,21 @@ def build_direct_sale_actions(
                     "suggested_vat_type_id": vat_type_id,
                     "warehouse_id_hint": warehouse_id,
                     "article_id_hint": article_id,
-                    "inventory_quantity_proof": {
-                        "status": "exact",
-                        "quantity": decimal_number(entry["quantity"]),
-                        "contributors": [{
+                    "inventory_quantity_proof": inventory_proof_envelope(
+                        scope={
+                            "kind": "reviewed_direct_sale_allocation",
+                            "period": period,
+                            "record_category": "bank_transactions",
+                            "statement_id": str(entry["allocation"].get("statement_id") or ""),
+                        },
+                        quantity=entry["quantity"],
+                        contributors=[{
                             "record_id": str(entry["record"].get("record_id") or ""),
                             "quantity": decimal_number(entry["quantity"]),
                             "quantity_source": "reviewed_allocation_target",
                             "record_sha256": canonical_record_sha256(entry["record"]),
                         }],
-                    },
+                    ),
                     "record_count": 1,
                     "vat_profile_name": vat_profile_name,
                     "vat_profile_rate": vat_rate,

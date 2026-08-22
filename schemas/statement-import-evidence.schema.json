@@ -17,7 +17,7 @@
     "currency": {"type": "string", "pattern": "^[A-Z]{3}$"},
     "signed_amount": {"type": "number"},
     "simplbooks_transaction_id": {"type": "string", "minLength": 1},
-    "evidence_kind": {"enum": ["simplbooks_discovery", "simplbooks_ui_export"]},
+    "evidence_kind": {"const": "simplbooks_discovery"},
     "captured_at": {"type": "string", "format": "date-time"},
     "source_identity": {"$ref": "#/$defs/identity"},
     "evidence_source": {"$ref": "#/$defs/identity"}

@@ -5,10 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
+
+from reference_artifacts import ReferenceArtifactError, validate_discovery
 
 
 class StatementImportEvidenceError(RuntimeError):
@@ -82,14 +84,74 @@ def validate_evidence_shape(payload: Any) -> dict[str, Any]:
         raise StatementImportEvidenceError("Statement-import evidence signed_amount is invalid.") from exc
     if not amount.is_finite() or amount.quantize(Decimal("0.01")) != amount:
         raise StatementImportEvidenceError("Statement-import evidence signed_amount must be cent exact.")
-    if payload.get("evidence_kind") not in {"simplbooks_discovery", "simplbooks_ui_export"}:
+    if payload.get("evidence_kind") != "simplbooks_discovery":
         raise StatementImportEvidenceError("Statement-import evidence kind is unsupported.")
     _validate_source_identity(payload.get("source_identity"), label="source_identity")
     _validate_source_identity(payload.get("evidence_source"), label="evidence_source")
     return payload
 
 
-def load_bound_evidence(binding: Any, *, cwd: Path) -> dict[str, Any]:
+def discovery_cash_evidence_errors(
+    evidence: dict[str, Any], *, discovery_payloads: list[dict[str, Any]],
+    now: datetime | None = None, require_fresh: bool = True,
+) -> list[str]:
+    """Match typed evidence to one concrete SimplBooks cash discovery entry."""
+    errors: list[str] = []
+    transaction_year = int(str(evidence.get("transaction_date") or "")[:4] or 0)
+    matching_overviews: list[dict[str, Any]] = []
+    for overview in discovery_payloads:
+        if int(overview.get("year") or 0) != transaction_year:
+            continue
+        if require_fresh:
+            try:
+                validate_discovery(
+                    overview, year=transaction_year,
+                    company_id=_text(evidence.get("company_id")), now=now,
+                )
+            except (ReferenceArtifactError, ValueError) as exc:
+                errors.append(f"Statement-import discovery evidence is not fresh/valid: {exc}")
+                continue
+        elif (
+            _text(overview.get("company_id")) != _text(evidence.get("company_id"))
+            or not _text(overview.get("retrieved_at"))
+            or not isinstance(overview.get("document_index"), list)
+        ):
+            errors.append("Statement-import discovery evidence source is not a concrete SimplBooks overview.")
+            continue
+        matching_overviews.append(overview)
+    candidates = [
+        item
+        for overview in matching_overviews
+        for item in overview.get("document_index") or []
+        if isinstance(item, dict)
+        and item.get("document_type") in {"incoming", "payment"}
+        and _text(item.get("simplbooks_id")) == _text(evidence.get("simplbooks_transaction_id"))
+    ]
+    if len(candidates) != 1:
+        errors.append("Statement-import discovery must contain exactly one matching cash transaction.")
+        return errors
+    item = candidates[0]
+    try:
+        discovered_amount = Decimal(str(item.get("gross_amount")))
+        evidence_amount = Decimal(str(evidence.get("signed_amount")))
+    except (InvalidOperation, ValueError):
+        errors.append("Statement-import discovery cash amount is invalid.")
+        return errors
+    if item.get("document_type") == "payment":
+        discovered_amount = -abs(discovered_amount)
+    if (
+        _text(item.get("document_date")) != _text(evidence.get("transaction_date"))
+        or _text(item.get("currency")) != _text(evidence.get("currency"))
+        or discovered_amount != evidence_amount
+    ):
+        errors.append("Statement-import discovery cash transaction economics do not match evidence.")
+    return errors
+
+
+def load_bound_evidence(
+    binding: Any, *, cwd: Path, now: datetime | None = None,
+    require_fresh_discovery: bool = False,
+) -> dict[str, Any]:
     checked = _validate_binding(binding, label="statement-import evidence binding")
     path = _resolved(checked["path"], cwd=cwd)
     if not path.is_file():
@@ -106,6 +168,17 @@ def load_bound_evidence(binding: Any, *, cwd: Path) -> dict[str, Any]:
         source_path = _resolved(item["path"], cwd=cwd)
         if not source_path.is_file() or _sha256(source_path) != item["sha256"]:
             raise StatementImportEvidenceError(f"Statement-import {field} file/hash binding is invalid.")
+    source_path = _resolved(payload["evidence_source"]["path"], cwd=cwd)
+    try:
+        discovery_payload = json.loads(source_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise StatementImportEvidenceError(f"Statement-import discovery evidence cannot be parsed: {exc}") from exc
+    discovery_errors = discovery_cash_evidence_errors(
+        payload, discovery_payloads=[discovery_payload], now=now or datetime.now(UTC),
+        require_fresh=require_fresh_discovery,
+    )
+    if discovery_errors:
+        raise StatementImportEvidenceError(discovery_errors[0])
     return payload
 
 

@@ -39,6 +39,7 @@ from reference_artifacts import (
 from simplbooks_api import SimplbooksError, resolve_company_id, resolve_company_name
 from statement_import_evidence import (
     StatementImportEvidenceError,
+    discovery_cash_evidence_errors,
     evidence_identity_errors,
     load_bound_evidence,
 )
@@ -1629,6 +1630,58 @@ def _canonical_record_sha256(record: dict[str, Any]) -> str:
     ).hexdigest()
 
 
+def _canonical_value_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def _inventory_group_label(record: dict[str, Any]) -> str:
+    attributes = record.get("attributes") or {}
+    return str(
+        record.get("channel")
+        or attributes.get("processor")
+        or attributes.get("fulfillment_partner")
+        or record.get("source_system")
+        or "sales"
+    )
+
+
+def _inventory_scope_records(
+    scope: dict[str, Any], *, normalized_payloads: list[dict[str, Any]],
+    reviewed_allocations: dict[str, dict[str, Any]],
+) -> tuple[list[dict[str, Any]], str]:
+    category = str(scope.get("record_category") or "")
+    candidates = [
+        record
+        for payload in normalized_payloads
+        for record in ((payload.get("records") or {}).get(category) or [])
+        if isinstance(record, dict)
+    ]
+    if scope.get("kind") == "normalized_sales_group":
+        selected = [
+            record for record in candidates
+            if str(record.get("event_date") or "")[:7] == str(scope.get("period") or "")
+            and str(record.get("currency") or "EUR").upper() == str(scope.get("currency") or "").upper()
+            and _inventory_group_label(record) == str(scope.get("group_label") or "")
+            and ("taxable" if abs(decimal_value(record.get("vat_amount"))) > 0 else "non_taxable")
+            == str(scope.get("tax_profile") or "")
+        ]
+        return selected, "normalized_record"
+    if scope.get("kind") == "reviewed_direct_sale_allocation":
+        matches = [
+            (record, allocation)
+            for record in candidates
+            for allocation in [reviewed_allocations.get(str(record.get("record_id") or ""))]
+            if isinstance(allocation, dict)
+            and str(allocation.get("statement_id") or "") == str(scope.get("statement_id") or "")
+            and str(allocation.get("period") or "") == str(scope.get("period") or "")
+            and str(allocation.get("disposition") or "") == "direct_sale_receipt"
+        ]
+        return [record for record, _allocation in matches], "reviewed_allocation_target"
+    return [], ""
+
+
 def evaluate_inventory_quantities(
     *, action: dict[str, Any], resolved_sources: list[dict[str, Any]],
     reviewed_allocations: dict[str, dict[str, Any]],
@@ -1645,11 +1698,18 @@ def evaluate_inventory_quantities(
             continue
         proof = line.get("inventory_quantity_proof")
         problems: list[str] = []
-        if not isinstance(proof, dict) or set(proof) != {"status", "quantity", "contributors"}:
+        if "shipping" in str(line.get("line_role") or "").lower():
+            problems.append("Shipping line must not carry an inventory article.")
+        proof_fields = {
+            "status", "quantity", "scope", "scope_sha256", "contributor_count",
+            "contributor_set_sha256", "contributors",
+        }
+        if not isinstance(proof, dict) or set(proof) != proof_fields:
             problems.append("Inventory article line requires an exact quantity proof object.")
             contributors: list[Any] = []
         else:
             contributors = proof.get("contributors") if isinstance(proof.get("contributors"), list) else []
+            scope = proof.get("scope") if isinstance(proof.get("scope"), dict) else {}
             try:
                 line_quantity = decimal_value(line.get("quantity"))
                 proof_quantity = decimal_value(proof.get("quantity"))
@@ -1659,6 +1719,8 @@ def evaluate_inventory_quantities(
                 problems.append("Inventory article line and proof require the same exact positive quantity.")
             if not contributors:
                 problems.append("Inventory quantity proof requires contributors.")
+            if not scope or _canonical_value_sha256(scope) != str(proof.get("scope_sha256") or ""):
+                problems.append("Inventory quantity proof scope hash does not match its declared scope.")
         seen: set[str] = set()
         contributor_total = Decimal("0")
         for contributor in contributors:
@@ -1710,6 +1772,45 @@ def evaluate_inventory_quantities(
                 problems.append("Inventory contributor quantities do not reconcile to the article line.")
         except SimplbooksError:
             pass
+        normalized_payloads = []
+        seen_payload_ids: set[int] = set()
+        for item in resolved_sources:
+            payload = item.get("payload")
+            if isinstance(payload, dict) and id(payload) not in seen_payload_ids:
+                normalized_payloads.append(payload)
+                seen_payload_ids.add(id(payload))
+        if isinstance(proof, dict) and isinstance(proof.get("scope"), dict):
+            expected_records, quantity_source = _inventory_scope_records(
+                proof["scope"], normalized_payloads=normalized_payloads,
+                reviewed_allocations=reviewed_allocations,
+            )
+            expected_contributors: list[dict[str, Any]] = []
+            for record in expected_records:
+                if quantity_source == "reviewed_allocation_target":
+                    target = (reviewed_allocations.get(str(record.get("record_id") or "")) or {}).get("target") or {}
+                    quantity_value = target.get("quantity")
+                else:
+                    quantity_value = record.get("quantity")
+                try:
+                    quantity = decimal_value(quantity_value)
+                except SimplbooksError:
+                    quantity = Decimal("0")
+                if quantity <= 0:
+                    problems.append("Inventory semantic scope contains a record without exact positive quantity.")
+                    continue
+                expected_contributors.append({
+                    "record_id": str(record.get("record_id") or ""),
+                    "quantity": decimal_number(quantity),
+                    "quantity_source": quantity_source,
+                    "record_sha256": _canonical_record_sha256(record),
+                })
+            expected_contributors.sort(key=lambda item: (item["record_id"], item["record_sha256"]))
+            if (
+                contributors != expected_contributors
+                or int(proof.get("contributor_count") or -1) != len(expected_contributors)
+                or str(proof.get("contributor_set_sha256") or "") != _canonical_value_sha256(expected_contributors)
+            ):
+                problems.append("Inventory proof does not contain the complete contributor set for its semantic scope.")
         for problem in problems:
             findings.append(make_finding(
                 section="account_and_vat_review", severity="error", summary=problem,
@@ -1729,7 +1830,16 @@ def load_reviewed_allocation_index(
         raw = load_json(allocation_path)
         normalized_paths = _normalized_binding_paths(raw, cwd=cwd)
         payload = load_bank_allocations(allocation_path, normalized_year_paths=normalized_paths)
-        return period_allocations(payload, str(action_batch.get("period") or "")), []
+        allocations = period_allocations(payload, str(action_batch.get("period") or ""))
+        by_record_id: dict[str, dict[str, Any]] = {}
+        for allocation in allocations.values():
+            record_id = str(allocation.get("record_id") or "")
+            if not record_id or record_id in by_record_id:
+                raise BankAllocationError(
+                    f"Inventory allocation record_id index is missing or duplicated: {record_id!r}"
+                )
+            by_record_id[record_id] = allocation
+        return by_record_id, []
     except (BankAllocationError, ReferenceArtifactError, SimplbooksError, OSError, json.JSONDecodeError) as exc:
         return {}, [make_finding(
             section="account_and_vat_review", severity="error",
@@ -1740,6 +1850,7 @@ def load_reviewed_allocation_index(
 def manual_financial_dependency_errors(
     dependency: dict[str, Any], *, cwd: Path | None = None,
     expected_company_id: str | None = None, require_typed_context: bool = False,
+    discovery_payloads: list[dict[str, Any]] | None = None,
 ) -> list[str]:
     errors: list[str] = []
     allowed_top_level_dispositions = {
@@ -1905,7 +2016,45 @@ def manual_financial_dependency_errors(
                     evidence, dependency=dependency, expected_company_id=expected_company_id,
                     expected_transaction_id=str(proof.get("simplbooks_transaction_id") or ""),
                 ))
+                if not errors:
+                    if not discovery_payloads:
+                        errors.append(
+                            "Verified statement import proof requires fresh bound SimplBooks discovery evidence."
+                        )
+                    else:
+                        errors.extend(discovery_cash_evidence_errors(
+                            evidence, discovery_payloads=discovery_payloads,
+                            require_fresh=True,
+                        ))
     return errors
+
+
+def load_bound_discovery_payloads(
+    action_batch: dict[str, Any], *, cwd: Path, expected_company_id: str | None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    if expected_company_id is None:
+        return [], ["Fresh bound discovery validation requires the SimplBooks company ID."]
+    payloads: list[dict[str, Any]] = []
+    errors: list[str] = []
+    bindings = [
+        item for item in action_batch.get("reference_artifacts") or []
+        if isinstance(item, dict) and item.get("kind") == "discovery_overview"
+    ]
+    if not bindings:
+        return [], ["Action batch has no bound SimplBooks discovery overview."]
+    for binding in bindings:
+        try:
+            path = verify_file_binding(binding, cwd=cwd)
+            payload = load_json(path)
+            validate_discovery(
+                payload, year=int(payload.get("year") or 0),
+                company_id=expected_company_id,
+            )
+        except (ReferenceArtifactError, SimplbooksError, OSError, json.JSONDecodeError) as exc:
+            errors.append(str(exc))
+            continue
+        payloads.append(payload)
+    return payloads, errors
 
 
 def manual_financial_source_errors(
@@ -1975,12 +2124,24 @@ def evaluate_unresolved_dependencies(
     expected_company_id: str | None = None,
 ) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
+    discovery_payloads: list[dict[str, Any]] = []
+    discovery_errors: list[str] = []
+    if cwd is not None and any(
+        isinstance(item, dict)
+        and item.get("kind") == "manual_statement_import_financial_transaction"
+        and (item.get("statement_import_proof") or {}).get("status") == "verified"
+        for item in action_batch.get("unresolved_dependencies") or []
+    ):
+        discovery_payloads, discovery_errors = load_bound_discovery_payloads(
+            action_batch, cwd=cwd, expected_company_id=expected_company_id,
+        )
     for dependency in action_batch.get("unresolved_dependencies") or []:
         if str(dependency.get("kind") or "") == "manual_statement_import_financial_transaction":
             dependency_errors = manual_financial_dependency_errors(
                 dependency, cwd=cwd, expected_company_id=expected_company_id,
-                require_typed_context=True,
+                require_typed_context=True, discovery_payloads=discovery_payloads,
             )
+            dependency_errors.extend(discovery_errors)
             if action_path is not None and cwd is not None:
                 dependency_errors.extend(
                     manual_financial_source_errors(

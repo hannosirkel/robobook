@@ -356,43 +356,142 @@ def bank_coverage_batch(*, period: str, allocation_path: Path, actions: list[dic
 
 class BookcheckerTests(unittest.TestCase):
     def test_inventory_quantity_checker_rejects_tampered_normalized_contributor(self) -> None:
-        record = {"record_id": "woo:sale:1", "quantity": 2, "gross_amount": 40.0}
+        record = {
+            "record_id": "woo:sale:1", "quantity": 2, "gross_amount": 40.0,
+            "event_date": "2024-01-15", "currency": "EUR", "channel": "woo", "vat_amount": 0,
+        }
+        proof = bookbuilder.normalized_inventory_quantity_proof(
+            [record], group_label="woo", direction="sales"
+        )
+        proof["contributors"][0]["record_sha256"] = "0" * 64
         action = {"idempotency_key": "example-2024-01-inventory", "payload": {"line_items": [{
             "line_role": "sales_revenue", "article_id_hint": "3", "quantity": 2,
-            "inventory_quantity_proof": {
-                "status": "exact", "quantity": 2,
-                "contributors": [{
-                    "record_id": "woo:sale:1", "quantity": 2,
-                    "quantity_source": "normalized_record", "record_sha256": "0" * 64,
-                }],
-            },
+            "inventory_quantity_proof": proof,
         }]}}
+        normalized = base_normalized()
+        normalized["records"]["sales"] = [record]
 
         findings = bookchecker.evaluate_inventory_quantities(
             action=action,
-            resolved_sources=[{"record_ref": "woo:sale:1", "record": record}],
+            resolved_sources=[{"record_ref": "woo:sale:1", "record": record, "payload": normalized}],
             reviewed_allocations={},
         )
 
         self.assertTrue(any("SHA-256" in item["summary"] for item in findings))
 
     def test_inventory_quantity_checker_uses_builder_canonical_unicode_hash(self) -> None:
-        record = {"record_id": "woo:sale:unicode", "quantity": 1, "description": "Lunar mäng"}
+        record = {
+            "record_id": "woo:sale:unicode", "quantity": 1, "description": "Lunar mäng",
+            "event_date": "2024-01-15", "currency": "EUR", "channel": "woo", "vat_amount": 0,
+        }
+        proof = bookbuilder.normalized_inventory_quantity_proof(
+            [record], group_label="woo", direction="sales"
+        )
         action = {"idempotency_key": "example-2024-01-unicode", "payload": {"line_items": [{
             "line_role": "sales_revenue", "article_id_hint": "3", "quantity": 1,
-            "inventory_quantity_proof": {
-                "status": "exact", "quantity": 1,
-                "contributors": [{
-                    "record_id": record["record_id"], "quantity": 1,
-                    "quantity_source": "normalized_record",
-                    "record_sha256": bookbuilder.canonical_record_sha256(record),
-                }],
-            },
+            "inventory_quantity_proof": proof,
         }]}}
+        normalized = base_normalized()
+        normalized["records"]["sales"] = [record]
 
         findings = bookchecker.evaluate_inventory_quantities(
             action=action,
-            resolved_sources=[{"record_ref": record["record_id"], "record": record}],
+            resolved_sources=[{"record_ref": record["record_id"], "record": record, "payload": normalized}],
+            reviewed_allocations={},
+        )
+
+        self.assertEqual(findings, [])
+
+    def test_inventory_quantity_checker_rejects_omitted_record_from_declared_group(self) -> None:
+        first = record(record_id="woo:first", source_system="woo", channel="woo",
+                       event_type="woo_sale", gross_amount=20.0)
+        second = record(record_id="woo:second", source_system="woo", channel="woo",
+                        event_type="woo_sale", gross_amount=20.0)
+        first["quantity"] = second["quantity"] = 1
+        proof = bookbuilder.normalized_inventory_quantity_proof(
+            [first], group_label="woo", direction="sales"
+        )
+        action = {"idempotency_key": "example-2024-01-omitted", "payload": {"line_items": [{
+            "line_role": "sales_revenue", "article_id_hint": "3", "quantity": 1,
+            "inventory_quantity_proof": proof,
+        }]}}
+        normalized = base_normalized()
+        normalized["records"]["sales"] = [first, second]
+
+        findings = bookchecker.evaluate_inventory_quantities(
+            action=action,
+            resolved_sources=[{
+                "record_ref": first["record_id"], "record": first, "payload": normalized,
+            }],
+            reviewed_allocations={},
+        )
+
+        self.assertTrue(any("complete contributor set" in item["summary"] for item in findings), findings)
+
+    def test_inventory_quantity_checker_rejects_extra_or_reassigned_group_contributor(self) -> None:
+        woo = record(record_id="woo:one", source_system="woo", channel="woo",
+                     event_type="woo_sale", gross_amount=20.0)
+        quartermaster = record(record_id="qm:one", source_system="quartermaster", channel="quartermaster",
+                               event_type="quartermaster_sale", gross_amount=20.0)
+        woo["quantity"] = quartermaster["quantity"] = 1
+        normalized = base_normalized()
+        normalized["records"]["sales"] = [woo, quartermaster]
+        base_proof = bookbuilder.normalized_inventory_quantity_proof(
+            [woo], group_label="woo", direction="sales"
+        )
+        extra = copy.deepcopy(base_proof)
+        extra_contributor = bookbuilder.normalized_inventory_quantity_proof(
+            [quartermaster], group_label="quartermaster", direction="sales"
+        )["contributors"][0]
+        extra["contributors"].append(extra_contributor)
+        extra["contributors"].sort(key=lambda item: (item["record_id"], item["record_sha256"]))
+        extra["quantity"] = 2.0
+        extra["contributor_count"] = 2
+        extra["contributor_set_sha256"] = bookbuilder.canonical_value_sha256(extra["contributors"])
+        reassigned = copy.deepcopy(base_proof)
+        reassigned["scope"]["group_label"] = "quartermaster"
+        reassigned["scope_sha256"] = bookbuilder.canonical_value_sha256(reassigned["scope"])
+
+        for label, proof, quantity in (("extra", extra, 2), ("reassigned", reassigned, 1)):
+            with self.subTest(label=label):
+                action = {"idempotency_key": f"example-{label}", "payload": {"line_items": [{
+                    "line_role": "sales_revenue", "article_id_hint": "3", "quantity": quantity,
+                    "inventory_quantity_proof": proof,
+                }]}}
+                findings = bookchecker.evaluate_inventory_quantities(
+                    action=action,
+                    resolved_sources=[
+                        {"record_ref": woo["record_id"], "record": woo, "payload": normalized},
+                        {"record_ref": quartermaster["record_id"], "record": quartermaster, "payload": normalized},
+                    ],
+                    reviewed_allocations={},
+                )
+                self.assertTrue(any("complete contributor set" in item["summary"] for item in findings), findings)
+
+    def test_inventory_quantity_checker_accepts_multiple_complete_groups(self) -> None:
+        records = []
+        lines = []
+        for label in ("woo", "quartermaster"):
+            item = record(record_id=f"{label}:one", source_system=label, channel=label,
+                          event_type=f"{label}_sale", gross_amount=20.0)
+            item["quantity"] = 1
+            records.append(item)
+            lines.append({
+                "line_role": "sales_revenue", "article_id_hint": "3", "quantity": 1,
+                "inventory_quantity_proof": bookbuilder.normalized_inventory_quantity_proof(
+                    [item], group_label=label, direction="sales"
+                ),
+            })
+        normalized = base_normalized()
+        normalized["records"]["sales"] = records
+        action = {"idempotency_key": "example-multiple", "payload": {"line_items": lines}}
+
+        findings = bookchecker.evaluate_inventory_quantities(
+            action=action,
+            resolved_sources=[
+                {"record_ref": item["record_id"], "record": item, "payload": normalized}
+                for item in records
+            ],
             reviewed_allocations={},
         )
 

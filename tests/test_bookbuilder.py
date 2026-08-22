@@ -400,6 +400,27 @@ class BookbuilderTests(unittest.TestCase):
         self.assertTrue(all(len(item["source_refs"]) == 1 for item in receipts))
         self.assertTrue(all(item["source_refs"][0]["source_kind"] == "physical_bank" for item in receipts))
         self.assertEqual({tuple(item["depends_on"]) for item in receipts}, {(invoice["idempotency_key"],)})
+        allocation_by_record = {allocation["record_id"]: allocation for allocation in allocations.values()}
+        resolved = [
+            {"record_ref": row["record_id"], "record": row, "payload": normalized}
+            for row in rows
+        ]
+        self.assertEqual(
+            bookchecker.evaluate_inventory_quantities(
+                action=invoice, resolved_sources=resolved,
+                reviewed_allocations=allocation_by_record,
+            ),
+            [],
+        )
+        mutated = {key: dict(value) for key, value in allocation_by_record.items()}
+        mutated["direct-a"] = {
+            **mutated["direct-a"],
+            "target": {**mutated["direct-a"]["target"], "quantity": 2},
+        }
+        mutation_findings = bookchecker.evaluate_inventory_quantities(
+            action=invoice, resolved_sources=resolved, reviewed_allocations=mutated,
+        )
+        self.assertTrue(any("complete contributor set" in item["summary"] for item in mutation_findings))
 
     def test_direct_sale_grouping_does_not_cross_reviewed_posting_dimensions(self) -> None:
         normalized = base_normalized("2024-08")
@@ -1392,6 +1413,10 @@ class BookbuilderTests(unittest.TestCase):
         self.assertEqual(line["quantity"], 2.0)
         self.assertEqual(line["article_id_hint"], "3")
         self.assertEqual(line["inventory_quantity_proof"]["quantity"], 2.0)
+        self.assertEqual(line["inventory_quantity_proof"]["scope"]["kind"], "normalized_sales_group")
+        self.assertEqual(line["inventory_quantity_proof"]["contributor_count"], 1)
+        self.assertRegex(line["inventory_quantity_proof"]["scope_sha256"], r"^[a-f0-9]{64}$")
+        self.assertRegex(line["inventory_quantity_proof"]["contributor_set_sha256"], r"^[a-f0-9]{64}$")
 
     def test_inventory_article_is_blocked_for_mixed_known_and_missing_quantity(self) -> None:
         normalized = base_normalized()

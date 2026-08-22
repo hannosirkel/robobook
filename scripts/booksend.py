@@ -16,8 +16,12 @@ from bookbuilder import write_yaml
 from bookchecker import (
     evaluate_action_batch,
     evaluate_bank_statement_completeness,
+    evaluate_inventory_quantities,
+    load_reviewed_allocation_index,
+    load_bound_discovery_payloads,
     load_yaml,
     manual_financial_dependency_errors,
+    resolve_action_sources,
 )
 from exchange_rates import ExchangeRateError, lookup_rate
 from posting_policy import PostingPolicyError, action_policy_errors, load_posting_policy
@@ -478,8 +482,14 @@ def translate_invoice_payload(
 
 
 def inventory_quantity_proof_errors(line: dict[str, Any]) -> list[str]:
+    if "shipping" in str(line.get("line_role") or "").lower():
+        return ["shipping line must not carry an inventory article"]
     proof = line.get("inventory_quantity_proof")
-    if not isinstance(proof, dict) or set(proof) != {"status", "quantity", "contributors"}:
+    proof_fields = {
+        "status", "quantity", "scope", "scope_sha256", "contributor_count",
+        "contributor_set_sha256", "contributors",
+    }
+    if not isinstance(proof, dict) or set(proof) != proof_fields:
         return ["exact proof object is required"]
     if proof.get("status") != "exact":
         return ["status must be exact"]
@@ -516,6 +526,39 @@ def inventory_quantity_proof_errors(line: dict[str, Any]) -> list[str]:
         total += amount
     if total != line_quantity:
         return ["contributor quantities do not equal line quantity"]
+    scope = proof.get("scope")
+    if not isinstance(scope, dict):
+        return ["semantic scope is required"]
+    scope_kind = scope.get("kind")
+    expected_scope_fields = (
+        {"kind", "period", "record_category", "group_label", "currency", "tax_profile"}
+        if scope_kind == "normalized_sales_group"
+        else {"kind", "period", "record_category", "statement_id"}
+        if scope_kind == "reviewed_direct_sale_allocation"
+        else set()
+    )
+    if not expected_scope_fields or set(scope) != expected_scope_fields:
+        return ["semantic scope shape is invalid"]
+    if scope.get("record_category") not in {"sales", "refunds", "bank_transactions"}:
+        return ["semantic scope record category is invalid"]
+    canonical = lambda value: hashlib.sha256(  # noqa: E731
+        json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
+    if canonical(scope) != str(proof.get("scope_sha256") or ""):
+        return ["semantic scope hash is invalid"]
+    ordered = sorted(contributors, key=lambda item: (str(item["record_id"]), str(item["record_sha256"])))
+    if contributors != ordered:
+        return ["contributors must use canonical sorted order"]
+    if int(proof.get("contributor_count") or -1) != len(ordered):
+        return ["contributor count is invalid"]
+    if canonical(ordered) != str(proof.get("contributor_set_sha256") or ""):
+        return ["contributor set hash is invalid"]
+    required_source = (
+        "normalized_record" if scope_kind == "normalized_sales_group"
+        else "reviewed_allocation_target"
+    )
+    if any(item.get("quantity_source") != required_source for item in contributors):
+        return ["contributor quantity source does not match semantic scope"]
     return []
 
 
@@ -1240,6 +1283,38 @@ def execute_batch(
     cwd: Path | None = None,
     expected_company_id: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    inventory_actions = [
+        action for action in action_batch.get("actions") or []
+        if any(
+            isinstance(line, dict) and line.get("article_id_hint") not in (None, "")
+            for line in (action.get("payload") or {}).get("line_items") or []
+        )
+    ]
+    if inventory_actions and (action_path is None or cwd is None):
+        raise SimplbooksError(
+            "Inventory article prevalidation requires the bound action/source context before any client call."
+        )
+    if inventory_actions and action_path is not None and cwd is not None:
+        payload_cache: dict[Path, dict[str, Any]] = {}
+        index_cache: dict[Path, dict[str, tuple[str, dict[str, Any]]]] = {}
+        reviewed_allocations, allocation_findings = load_reviewed_allocation_index(action_batch, cwd=cwd)
+        inventory_findings = list(allocation_findings)
+        for action in inventory_actions:
+            resolved_sources, source_findings = resolve_action_sources(
+                action=action, action_path=action_path, cwd=cwd,
+                payload_cache=payload_cache, index_cache=index_cache,
+            )
+            inventory_findings.extend(source_findings)
+            inventory_findings.extend(evaluate_inventory_quantities(
+                action=action, resolved_sources=resolved_sources,
+                reviewed_allocations=reviewed_allocations,
+            ))
+        inventory_errors = [item for item in inventory_findings if item.get("severity") == "error"]
+        if inventory_errors:
+            raise SimplbooksError(
+                "Inventory quantity source prevalidation failed before translation or API calls: "
+                + str(inventory_errors[0].get("summary") or "unknown inventory proof error")
+            )
     if action_path is not None and cwd is not None:
         coverage_errors = [
             item
@@ -1262,11 +1337,18 @@ def execute_batch(
         if isinstance(dependency, dict)
         and str(dependency.get("kind") or "") == "manual_statement_import_financial_transaction"
     ]
+    discovery_payloads: list[dict[str, Any]] = []
+    discovery_errors: list[str] = []
+    if manual_dependencies and cwd is not None:
+        discovery_payloads, discovery_errors = load_bound_discovery_payloads(
+            action_batch, cwd=cwd, expected_company_id=expected_company_id,
+        )
     for dependency in manual_dependencies:
         dependency_errors = manual_financial_dependency_errors(
             dependency, cwd=cwd, expected_company_id=expected_company_id,
-            require_typed_context=True,
+            require_typed_context=True, discovery_payloads=discovery_payloads,
         )
+        dependency_errors.extend(discovery_errors)
         if dependency_errors:
             raise SimplbooksError(
                 "Action batch contains an invalid manual statement-import financial dependency "

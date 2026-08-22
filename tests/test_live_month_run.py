@@ -5,6 +5,7 @@ import json
 import sys
 import tempfile
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -100,7 +101,10 @@ class LiveMonthRunTests(unittest.TestCase):
             "simplbooks_transaction_id": "txn-1", "transaction_date": "2024-03-15",
             "currency": "EUR", "signed_amount": -7.0,
         }
-        overview = {"document_index": [{
+        overview = {
+            "year": 2024, "company_id": "123",
+            "retrieved_at": datetime.now(UTC).isoformat(),
+            "document_index": [{
             "document_type": "payment", "simplbooks_id": "txn-1",
             "document_date": "2024-03-15", "currency": "EUR", "gross_amount": 8.0,
         }]}
@@ -129,7 +133,14 @@ class LiveMonthRunTests(unittest.TestCase):
             )
             normalized = company_dir / "artifacts" / "normalized" / "2024-03.json"
             snapshot = root / "discovery-snapshot.json"
-            snapshot.write_text("{}\n", encoding="utf-8")
+            snapshot.write_text(json.dumps({
+                "year": 2024, "company_id": "123",
+                "retrieved_at": datetime.now(UTC).isoformat(),
+                "document_index": [{
+                    "document_type": "payment", "simplbooks_id": "txn-1",
+                    "document_date": "2024-03-15", "currency": "EUR", "gross_amount": 7.0,
+                }],
+            }), encoding="utf-8")
             evidence = {
                 "schema_version": "1.0", "company_slug": "example", "company_id": "123",
                 "period": "2024-03", "statement_id": "archive:fee-1", "record_id": "fee-1",
@@ -163,10 +174,13 @@ class LiveMonthRunTests(unittest.TestCase):
                 calls.append(cmd)
                 output = Path(cmd[cmd.index("--output") + 1])
                 output.parent.mkdir(parents=True, exist_ok=True)
-                output.write_text(json.dumps({"year": 2024, "document_index": []}), encoding="utf-8")
+                output.write_text(json.dumps({
+                    "year": 2024, "company_id": "123",
+                    "retrieved_at": datetime.now(UTC).isoformat(), "document_index": [],
+                }), encoding="utf-8")
                 return SimpleNamespace(returncode=0, stdout=json.dumps({"year": 2024}), stderr="")
 
-            with self.assertRaisesRegex(live_month_run.SimplbooksError, "does not contain exactly one"):
+            with self.assertRaisesRegex(live_month_run.SimplbooksError, "contain exactly one"):
                 live_month_run.run_live_month(
                     company_dir=company_dir, period="2024-03", python_executable="python3",
                     cwd=ROOT, confirm_write=True, run_command=fake_run,

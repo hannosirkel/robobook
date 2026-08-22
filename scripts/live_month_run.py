@@ -7,7 +7,6 @@ import json
 import re
 import subprocess
 import sys
-from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable
 
@@ -17,7 +16,11 @@ from full_year_dry_run import parse_json_output, submitted_month_state
 from reference_artifacts import ReferenceArtifactError, verify_file_binding
 from simplbooks_api import SimplbooksError
 from simplbooks_api import resolve_company_id
-from statement_import_evidence import StatementImportEvidenceError, load_bound_evidence
+from statement_import_evidence import (
+    StatementImportEvidenceError,
+    discovery_cash_evidence_errors,
+    load_bound_evidence,
+)
 
 
 CommandRunner = Callable[..., Any]
@@ -165,36 +168,11 @@ def _validate_refreshed_cash_evidence(
 ) -> None:
     if str(evidence.get("company_id") or "") != str(expected_company_id):
         raise SimplbooksError("Statement-import evidence company identity does not match live company metadata.")
-    if evidence.get("evidence_kind") != "simplbooks_discovery":
-        return
-    transaction_id = str(evidence.get("simplbooks_transaction_id") or "")
-    candidates = [
-        item
-        for overview in discovery_payloads
-        for item in overview.get("document_index") or []
-        if isinstance(item, dict)
-        and item.get("document_type") in {"incoming", "payment"}
-        and str(item.get("simplbooks_id") or "") == transaction_id
-    ]
-    if len(candidates) != 1:
-        raise SimplbooksError(
-            "Fresh SimplBooks discovery does not contain exactly one cash transaction for "
-            f"statement-import evidence ID {transaction_id}."
-        )
-    item = candidates[0]
-    try:
-        discovered = Decimal(str(item.get("gross_amount")))
-        expected = Decimal(str(evidence.get("signed_amount")))
-    except (InvalidOperation, ValueError) as exc:
-        raise SimplbooksError("Fresh cash discovery/evidence amount is invalid.") from exc
-    if item.get("document_type") == "payment":
-        discovered = -abs(discovered)
-    if (
-        str(item.get("document_date") or "") != str(evidence.get("transaction_date") or "")
-        or str(item.get("currency") or "") != str(evidence.get("currency") or "")
-        or discovered != expected
-    ):
-        raise SimplbooksError("Fresh SimplBooks cash transaction economics do not match typed statement-import evidence.")
+    errors = discovery_cash_evidence_errors(
+        evidence, discovery_payloads=discovery_payloads, require_fresh=True,
+    )
+    if errors:
+        raise SimplbooksError(errors[0])
 
 
 def _validate_live_statement_evidence(

@@ -20,7 +20,7 @@ def evidence(*, amount: float = -7.0, transaction_id: str = "txn-501") -> dict:
         "period": "2024-01", "statement_id": "archive:fee-1", "record_id": "bank:fee-1",
         "transaction_date": "2024-01-15", "iban": "EE123", "currency": "EUR",
         "signed_amount": amount, "simplbooks_transaction_id": transaction_id,
-        "evidence_kind": "simplbooks_ui_export", "captured_at": "2026-08-22T10:00:00Z",
+        "evidence_kind": "simplbooks_discovery", "captured_at": "2026-08-22T10:00:00Z",
         "source_identity": {
             "path": "normalized.json", "sha256": "a" * 64, "record_ref": "bank:fee-1",
         },
@@ -31,6 +31,34 @@ def evidence(*, amount: float = -7.0, transaction_id: str = "txn-501") -> dict:
 
 
 class StatementImportEvidenceTests(unittest.TestCase):
+    def test_unsupported_ui_evidence_cannot_be_verified(self) -> None:
+        item = evidence()
+        item["evidence_kind"] = "simplbooks_ui_export"
+
+        with self.assertRaisesRegex(statement_import_evidence.StatementImportEvidenceError, "unsupported"):
+            statement_import_evidence.validate_evidence_shape(item)
+
+    def test_discovery_evidence_source_must_be_a_matching_cash_index(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            normalized = root / "normalized.json"
+            discovery = root / "discovery.json"
+            normalized.write_text("{}\n", encoding="utf-8")
+            discovery.write_text("{}\n", encoding="utf-8")
+            item = evidence()
+            item["source_identity"].update({
+                "path": str(normalized), "sha256": hashlib.sha256(normalized.read_bytes()).hexdigest(),
+            })
+            item["evidence_source"].update({
+                "path": str(discovery), "sha256": hashlib.sha256(discovery.read_bytes()).hexdigest(),
+            })
+            path = root / "proof.json"
+            path.write_text(json.dumps(item), encoding="utf-8")
+            binding = {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+            with self.assertRaisesRegex(statement_import_evidence.StatementImportEvidenceError, "discovery"):
+                statement_import_evidence.load_bound_evidence(binding, cwd=root)
+
     def test_binding_rejects_nonexistent_and_wrong_hash(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

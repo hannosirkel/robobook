@@ -335,10 +335,14 @@
     "inventory_quantity_proof": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["status", "quantity", "contributors"],
+      "required": ["status", "quantity", "scope", "scope_sha256", "contributor_count", "contributor_set_sha256", "contributors"],
       "properties": {
         "status": {"const": "exact"},
         "quantity": {"type": "number", "minimum": 0.000000001},
+        "scope": {"$ref": "#/$defs/inventory_quantity_scope"},
+        "scope_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "contributor_count": {"type": "integer", "minimum": 1},
+        "contributor_set_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
         "contributors": {
           "type": "array",
           "minItems": 1,
@@ -346,6 +350,30 @@
           "items": {"$ref": "#/$defs/inventory_quantity_contributor"}
         }
       }
+    },
+    "inventory_quantity_scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "period", "record_category"],
+      "properties": {
+        "kind": {"enum": ["normalized_sales_group", "reviewed_direct_sale_allocation"]},
+        "period": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}$"},
+        "record_category": {"enum": ["sales", "refunds", "bank_transactions"]},
+        "group_label": {"type": "string", "minLength": 1},
+        "currency": {"type": "string", "pattern": "^[A-Z]{3}$"},
+        "tax_profile": {"enum": ["taxable", "non_taxable"]},
+        "statement_id": {"type": "string", "minLength": 1}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"kind": {"const": "normalized_sales_group"}}, "required": ["kind"]},
+          "then": {"required": ["group_label", "currency", "tax_profile"]}
+        },
+        {
+          "if": {"properties": {"kind": {"const": "reviewed_direct_sale_allocation"}}, "required": ["kind"]},
+          "then": {"required": ["statement_id"]}
+        }
+      ]
     },
     "inventory_line": {
       "type": "object",

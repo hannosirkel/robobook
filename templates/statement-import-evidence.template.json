@@ -10,8 +10,8 @@
   "currency": "EUR",
   "signed_amount": -7.0,
   "simplbooks_transaction_id": "transaction-501",
-  "evidence_kind": "simplbooks_ui_export",
+  "evidence_kind": "simplbooks_discovery",
   "captured_at": "2026-08-22T10:00:00Z",
   "source_identity": {"path": "companies/example/artifacts/normalized/2024-01.json", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "record_ref": "normalized-bank-record-id"},
-  "evidence_source": {"path": "companies/example/artifacts/evidence/statement-import-2024-01.json", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "record_ref": "transaction-501"}
+  "evidence_source": {"path": "companies/example/artifacts/discovery/2024-overview.json", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "record_ref": "transaction-501"}
 }

@@ -6,12 +6,14 @@ import sys
 import tempfile
 import unittest
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import bookbuilder  # noqa: E402
 import booksend  # noqa: E402
 import reference_artifacts  # noqa: E402
 from simplbooks_api import SimplbooksError  # noqa: E402
@@ -394,25 +396,38 @@ def manual_financial_dependency(*, status: str = "pending", blocking: bool = Tru
     }
 
 
-def bind_statement_import_evidence(root: Path, dependency: dict) -> None:
+def bind_statement_import_evidence(
+    root: Path, dependency: dict, *, retrieved_at: str | None = None,
+) -> dict:
     normalized = root / "normalized.json"
-    audit_export = root / "audit-export.json"
+    evidence_discovery = root / "evidence-discovery.json"
+    current_discovery = root / "current-discovery.json"
     normalized.write_text("{}\n", encoding="utf-8")
-    audit_export.write_text("{}\n", encoding="utf-8")
+    timestamp = retrieved_at or datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    discovery_payload = {
+        "year": 2024, "company_id": "123", "retrieved_at": timestamp,
+        "document_index": [{
+            "document_type": "payment", "simplbooks_id": "txn-501",
+            "document_date": dependency["date"], "currency": dependency["currency"],
+            "gross_amount": abs(dependency["physical_signed_amount"]),
+        }],
+    }
+    evidence_discovery.write_text(json.dumps(discovery_payload), encoding="utf-8")
+    current_discovery.write_text(json.dumps(discovery_payload), encoding="utf-8")
     evidence = {
         "schema_version": "1.0", "company_slug": "example", "company_id": "123",
         "period": "2024-01", "statement_id": dependency["statement_id"],
         "record_id": dependency["record_id"], "transaction_date": dependency["date"],
         "iban": dependency["iban"], "currency": dependency["currency"],
         "signed_amount": dependency["physical_signed_amount"],
-        "simplbooks_transaction_id": "txn-501", "evidence_kind": "simplbooks_ui_export",
-        "captured_at": "2026-08-22T00:00:00Z",
+        "simplbooks_transaction_id": "txn-501", "evidence_kind": "simplbooks_discovery",
+        "captured_at": timestamp,
         "source_identity": {
             "path": str(normalized), "sha256": booksend.file_sha256(normalized),
             "record_ref": dependency["record_id"],
         },
         "evidence_source": {
-            "path": str(audit_export), "sha256": booksend.file_sha256(audit_export),
+            "path": str(evidence_discovery), "sha256": booksend.file_sha256(evidence_discovery),
             "record_ref": "txn-501",
         },
     }
@@ -421,6 +436,7 @@ def bind_statement_import_evidence(root: Path, dependency: dict) -> None:
     dependency["statement_import_proof"]["evidence_binding"] = {
         "path": str(evidence_path), "sha256": booksend.file_sha256(evidence_path),
     }
+    return reference_artifacts.bind_file(current_discovery, kind="discovery_overview", cwd=root)
 
 
 class FakeClient:
@@ -631,13 +647,17 @@ class BooksendTests(unittest.TestCase):
             "suggested_vat_type_id": "22",
             "warehouse_id_hint": "6",
             "article_id_hint": "3",
-            "inventory_quantity_proof": {
-                "status": "exact", "quantity": 2,
-                "contributors": [{
+            "inventory_quantity_proof": bookbuilder.inventory_proof_envelope(
+                scope={
+                    "kind": "reviewed_direct_sale_allocation", "period": "2024-01",
+                    "record_category": "bank_transactions", "statement_id": "archive:sale:1",
+                },
+                quantity=Decimal("2"),
+                contributors=[{
                     "record_id": "source:sale:1", "quantity": 2,
-                    "quantity_source": "normalized_record", "record_sha256": "a" * 64,
+                    "quantity_source": "reviewed_allocation_target", "record_sha256": "a" * 64,
                 }],
-            },
+            ),
         }]
 
         translated = booksend.translate_action_for_api(action, lookup={})
@@ -661,17 +681,80 @@ class BooksendTests(unittest.TestCase):
         line = action["payload"]["line_items"][0]
         line.update({
             "article_id_hint": "3", "quantity": 2,
-            "inventory_quantity_proof": {
-                "status": "exact", "quantity": 2,
-                "contributors": [
+            "inventory_quantity_proof": bookbuilder.inventory_proof_envelope(
+                scope={
+                    "kind": "normalized_sales_group", "period": "2024-01",
+                    "record_category": "sales", "group_label": "woo",
+                    "currency": "EUR", "tax_profile": "non_taxable",
+                },
+                quantity=Decimal("2"),
+                contributors=[
                     {"record_id": "woo:1", "quantity": 1, "quantity_source": "normalized_record", "record_sha256": "a" * 64},
                     {"record_id": "woo:1", "quantity": 1, "quantity_source": "normalized_record", "record_sha256": "a" * 64},
                 ],
-            },
+            ),
         })
 
         with self.assertRaisesRegex(SimplbooksError, "unique"):
             booksend.translate_action_for_api(action, lookup={})
+
+    def test_sender_rejects_article_attached_to_shipping_line(self) -> None:
+        action = invoice_action(key="example-2024-01-inventory-shipping")
+        line = action["payload"]["line_items"][0]
+        line.update({
+            "line_role": "sales_shipping", "article_id_hint": "3", "quantity": 1,
+            "inventory_quantity_proof": bookbuilder.inventory_proof_envelope(
+                scope={
+                    "kind": "normalized_sales_group", "period": "2024-01",
+                    "record_category": "sales", "group_label": "woo",
+                    "currency": "EUR", "tax_profile": "non_taxable",
+                },
+                quantity=Decimal("1"),
+                contributors=[{
+                    "record_id": "woo:1", "quantity": 1,
+                    "quantity_source": "normalized_record", "record_sha256": "a" * 64,
+                }],
+            ),
+        })
+
+        with self.assertRaisesRegex(SimplbooksError, "shipping"):
+            booksend.translate_action_for_api(action, lookup={})
+
+    def test_sender_rejects_omitted_inventory_scope_record_before_client(self) -> None:
+        records = [
+            {
+                "record_id": f"woo:{index}", "quantity": 1, "event_date": "2024-01-15",
+                "currency": "EUR", "channel": "woo", "source_system": "woo",
+                "vat_amount": 0, "gross_amount": 20,
+            }
+            for index in (1, 2)
+        ]
+        proof = bookbuilder.normalized_inventory_quantity_proof(
+            [records[0]], group_label="woo", direction="sales"
+        )
+        action = invoice_action(key="example-2024-01-inventory-omitted")
+        action["payload"]["line_items"] = [{
+            "line_role": "sales_revenue", "description": "Lunar Base", "gross_amount": 20,
+            "vat_amount_hint": 0, "suggested_income_account_id": "3000",
+            "suggested_vat_type_id": "22", "article_id_hint": "3", "quantity": 1,
+            "inventory_quantity_proof": proof,
+        }]
+        client = FakeClient(responses=[{"_http_status": 201, "invoice_id": 501}])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            normalized_path = root / "normalized.json"
+            normalized_path.write_text(json.dumps({
+                "period": "2024-01", "records": {"sales": records},
+            }), encoding="utf-8")
+            action["source_refs"] = [{
+                "path": str(normalized_path), "record_ref": records[0]["record_id"], "note": None,
+            }]
+            with self.assertRaisesRegex(SimplbooksError, "complete contributor set"):
+                booksend.execute_batch(
+                    action_batch=make_batch(actions=[action]), mode="write", client=client,
+                    action_path=root / "actions.yaml", cwd=root,
+                )
+        self.assertEqual(client.calls, [])
 
     def test_sender_rejects_manual_financial_dependency_before_any_translation_or_call(self) -> None:
         dependency = manual_financial_dependency(blocking=False)
@@ -691,10 +774,12 @@ class BooksendTests(unittest.TestCase):
         dependency = manual_financial_dependency(status="verified", blocking=False)
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
-            bind_statement_import_evidence(tmp, dependency)
+            discovery_binding = bind_statement_import_evidence(tmp, dependency)
+            batch = make_batch(actions=[invoice_action()], unresolved_dependencies=[dependency])
+            batch["reference_artifacts"] = [discovery_binding]
             _batch, submission = booksend.execute_batch(
-                action_batch=make_batch(actions=[invoice_action()], unresolved_dependencies=[dependency]),
-                mode="dry-run", client=client, cwd=tmp,
+                action_batch=batch, mode="dry-run", client=client, cwd=tmp,
+                expected_company_id="123",
             )
 
         self.assertEqual(submission["summary"]["attempted_actions"], 1)
@@ -725,6 +810,56 @@ class BooksendTests(unittest.TestCase):
                 booksend.execute_batch(
                     action_batch=make_batch(actions=[invoice_action()], unresolved_dependencies=[dependency]),
                     mode="write", client=client, cwd=tmp, expected_company_id="wrong-company",
+                )
+        self.assertEqual(client.calls, [])
+
+    def test_sender_rejects_stale_discovery_evidence_before_client(self) -> None:
+        dependency = manual_financial_dependency(status="verified", blocking=False)
+        client = FakeClient(responses=[{"_http_status": 201, "invoice_id": 501}])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            discovery_binding = bind_statement_import_evidence(
+                tmp, dependency, retrieved_at="2024-01-15T00:00:00Z"
+            )
+            batch = make_batch(actions=[invoice_action()], unresolved_dependencies=[dependency])
+            batch["reference_artifacts"] = [discovery_binding]
+            with self.assertRaisesRegex(SimplbooksError, "fresh"):
+                booksend.execute_batch(
+                    action_batch=batch,
+                    mode="write", client=client, cwd=tmp, expected_company_id="123",
+                )
+        self.assertEqual(client.calls, [])
+
+    def test_sender_rejects_missing_bound_discovery_for_verified_proof_before_client(self) -> None:
+        dependency = manual_financial_dependency(status="verified", blocking=False)
+        client = FakeClient(responses=[{"_http_status": 201, "invoice_id": 501}])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            bind_statement_import_evidence(tmp, dependency)
+            with self.assertRaisesRegex(SimplbooksError, "fresh bound SimplBooks discovery"):
+                booksend.execute_batch(
+                    action_batch=make_batch(actions=[invoice_action()], unresolved_dependencies=[dependency]),
+                    mode="write", client=client, cwd=tmp, expected_company_id="123",
+                )
+        self.assertEqual(client.calls, [])
+
+    def test_sender_rejects_wrong_bound_discovery_cash_before_client(self) -> None:
+        dependency = manual_financial_dependency(status="verified", blocking=False)
+        client = FakeClient(responses=[{"_http_status": 201, "invoice_id": 501}])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            discovery_binding = bind_statement_import_evidence(tmp, dependency)
+            discovery_path = tmp / discovery_binding["path"]
+            discovery = json.loads(discovery_path.read_text(encoding="utf-8"))
+            discovery["document_index"][0]["gross_amount"] = 8.0
+            discovery_path.write_text(json.dumps(discovery), encoding="utf-8")
+            discovery_binding["sha256"] = booksend.file_sha256(discovery_path)
+            batch = make_batch(actions=[invoice_action()], unresolved_dependencies=[dependency])
+            batch["reference_artifacts"] = [discovery_binding]
+            with self.assertRaisesRegex(SimplbooksError, "economics"):
+                booksend.execute_batch(
+                    action_batch=batch, mode="write", client=client, cwd=tmp,
+                    expected_company_id="123",
                 )
         self.assertEqual(client.calls, [])
 

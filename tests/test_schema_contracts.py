@@ -509,6 +509,28 @@ class SchemaContractTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=artifact)
 
+    def test_action_batch_schema_types_inventory_scope_and_complete_set_binding(self) -> None:
+        artifact = bookchecker.load_yaml(ROOT / "templates/actions-period.template.yaml")
+        proof = bookbuilder.inventory_proof_envelope(
+            scope={
+                "kind": "normalized_sales_group", "period": "2024-01",
+                "record_category": "sales", "group_label": "woo",
+                "currency": "EUR", "tax_profile": "non_taxable",
+            },
+            quantity=bookbuilder.Decimal("1"),
+            contributors=[{
+                "record_id": "woo:1", "quantity": 1,
+                "quantity_source": "normalized_record", "record_sha256": "a" * 64,
+            }],
+        )
+        artifact["actions"][0]["payload"] = {"line_items": [{
+            "article_id_hint": "3", "quantity": 1, "inventory_quantity_proof": proof,
+        }]}
+        self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=artifact)
+        proof.pop("scope_sha256")
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=artifact)
+
     def test_action_batch_schema_restricts_top_level_manual_financial_dispositions(self) -> None:
         dependency = {
             "kind": "manual_statement_import_financial_transaction",

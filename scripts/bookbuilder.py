@@ -185,7 +185,7 @@ def normalized_inventory_quantity_proof(
     records: list[dict[str, Any]], *, group_label: str, direction: str,
 ) -> dict[str, Any] | None:
     contributors: list[dict[str, Any]] = []
-    total = Decimal(0)
+    total = Decimal("0")  # noqa: FURB157
     for record in records:
         quantity = decimal_value(record.get("quantity") or 0)
         if quantity <= 0:
@@ -860,13 +860,9 @@ def clean_resolved_review_notes(
     for note in notes:
         normalized = normalize_text(note)
         if contact_resolved and (
-            normalized.startswith("used ") and " contact mapping as a fallback " in normalized
-            or normalized.startswith(
-                (
-                    "no contact/client mapping matched",
-                    "ambiguous entity mapping candidates:",
-                )
-            )
+            normalized.startswith("used ") and " contact mapping as a fallback " in normalized  # noqa: PIE810
+            or normalized.startswith("no contact/client mapping matched")
+            or normalized.startswith("ambiguous entity mapping candidates:")
         ):
             continue
         if vat_resolved and "exact vat allocation between revenue and shipping still needs review" in normalized:
@@ -1389,7 +1385,7 @@ def build_sales_lines(
                 "suggested_income_account_id": revenue_account_id,
                 "suggested_vat_type_id": standard_vat_id if total_vat != 0 else zero_vat_id,
                 "warehouse_id_hint": maybe_single_warehouse(records) or default_warehouse_id,
-                "quantity": decimal_number(sum((decimal_value(record.get("quantity") or 0) for record in records), Decimal(0))) or None,
+                "quantity": decimal_number(sum((decimal_value(record.get("quantity") or 0) for record in records), Decimal("0"))) or None,  # noqa: FURB157
                 "inventory_quantity_proof": inventory_proof,
                 "record_count": len(records),
             }
@@ -1429,7 +1425,7 @@ def build_sales_lines(
                     "suggested_income_account_id": revenue_account_id,
                     "suggested_vat_type_id": standard_vat_id if profile_name == "taxable" else zero_vat_id,
                     "warehouse_id_hint": maybe_single_warehouse(profile_records) or default_warehouse_id,
-                    "quantity": decimal_number(sum((decimal_value(record.get("quantity") or 0) for record in profile_records), Decimal(0))) or None,
+                    "quantity": decimal_number(sum((decimal_value(record.get("quantity") or 0) for record in profile_records), Decimal("0"))) or None,  # noqa: FURB157
                     "inventory_quantity_proof": inventory_proof,
                     "record_count": len(profile_records),
                 }
@@ -2412,7 +2408,7 @@ def build_manual_financial_dependencies(
         if split_parts:
             signed_parts_total = sum(
                 (decimal_value(part["signed_amount"]) for part in split_parts),
-                Decimal(0),
+                Decimal("0"),  # noqa: FURB157
             )
             if signed_parts_total != physical_amount:
                 raise SimplbooksError(
@@ -2627,10 +2623,10 @@ def build_direct_sale_actions(
         contact_label = entries[0]["contact_label"]
         digest = hashlib.sha256(json.dumps(group_key, default=str).encode()).hexdigest()[:12]
         invoice_key = f"{company_slug}-{period}-sales-direct-{digest}"
-        invoice_total = sum((entry["gross_amount"] for entry in entries), Decimal(0))
+        invoice_total = sum((entry["gross_amount"] for entry in entries), Decimal("0"))  # noqa: FURB157
         invoice_vat = sum(
             (
-                entry["gross_amount"] * decimal_value(vat_rate) / (Decimal(100) + decimal_value(vat_rate))
+                entry["gross_amount"] * decimal_value(vat_rate) / (Decimal("100") + decimal_value(vat_rate))  # noqa: FURB157
             ).quantize(Decimal("0.01"))
             for entry in entries
         )
@@ -2638,7 +2634,7 @@ def build_direct_sale_actions(
         for entry in entries:
             gross_amount = entry["gross_amount"]
             vat_amount = (
-                gross_amount * decimal_value(vat_rate) / (Decimal(100) + decimal_value(vat_rate))
+                gross_amount * decimal_value(vat_rate) / (Decimal("100") + decimal_value(vat_rate))  # noqa: FURB157
             ).quantize(Decimal("0.01"))
             lines.append(
                 {
@@ -3220,9 +3216,11 @@ def apply_posting_policy(
         if action_type in {"create_invoice_summary", "create_credit_invoice_summary"}:
             role = "sales"
             label = str((payload.get("summary_scope") or {}).get("channel_or_source") or "")
+        elif action_type == "create_incoming_summary" and str(payload.get("settlement_family") or "") == "direct-sale":  # noqa: SIM114
+            role = "sales"
+            label = str(payload.get("counterparty_hint") or "")
         elif action_type == "create_incoming_summary" and (
-            str(payload.get("settlement_family") or "") == "direct-sale"
-            or payload.get("linked_invoice_id") not in (None, "")
+            payload.get("linked_invoice_id") not in (None, "")
             or payload.get("linked_invoice_action") not in (None, "")
         ):
             role = "sales"
@@ -3316,7 +3314,7 @@ def apply_posting_policy(
                 if not is_shipping and family_values.get("article_id") not in (None, ""):
                     proof = line.get("inventory_quantity_proof")
                     exact_quantity = decimal_value(line.get("quantity"))
-                    proof_quantity = decimal_value(proof.get("quantity")) if isinstance(proof, dict) else Decimal(0)
+                    proof_quantity = decimal_value(proof.get("quantity")) if isinstance(proof, dict) else Decimal("0")  # noqa: FURB157
                     contributors = proof.get("contributors") if isinstance(proof, dict) else None
                     if (
                         isinstance(proof, dict) and proof.get("status") == "exact"

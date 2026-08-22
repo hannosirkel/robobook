@@ -237,9 +237,11 @@ def action_policy_errors(action: dict[str, Any], policy: dict[str, Any]) -> list
     if action_type in {"create_invoice_summary", "create_credit_invoice_summary"}:
         role = "sales"
         label = str((payload.get("summary_scope") or {}).get("channel_or_source") or "")
+    elif action_type == "create_incoming_summary" and str(payload.get("settlement_family") or "") == "direct-sale":  # noqa: SIM114
+        role = "sales"
+        label = str(payload.get("counterparty_hint") or "")
     elif action_type == "create_incoming_summary" and (
-        str(payload.get("settlement_family") or "") == "direct-sale"
-        or payload.get("linked_invoice_id") not in (None, "")
+        payload.get("linked_invoice_id") not in (None, "")
         or payload.get("linked_invoice_action") not in (None, "")
     ):
         role = "sales"

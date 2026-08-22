@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-from __future__ import annotations
+from __future__ import annotations  # noqa: I001
 
 import argparse
 import copy
@@ -7,24 +7,21 @@ import json
 import re
 import subprocess
 import sys
-from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable  # noqa: UP035
 
 import booksend
-from bank_allocations import (
-    BankAllocationError,
-    load_bank_allocations,
-    period_allocations,
-)
+from bank_allocations import BankAllocationError, load_bank_allocations, period_allocations
 from full_year_dry_run import parse_json_output, submitted_month_state
 from reference_artifacts import ReferenceArtifactError, verify_file_binding
-from simplbooks_api import SimplbooksError, resolve_company_id
+from simplbooks_api import SimplbooksError
+from simplbooks_api import resolve_company_id
 from statement_import_evidence import (
     StatementImportEvidenceError,
     discovery_cash_evidence_errors,
     load_bound_evidence,
 )
+
 
 CommandRunner = Callable[..., Any]
 ApprovalCheckpoint = Callable[[Path], None]

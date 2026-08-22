@@ -1,4 +1,4 @@
-from __future__ import annotations
+from __future__ import annotations  # noqa: I001
 
 import hashlib
 import json
@@ -8,6 +8,7 @@ import unittest
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -334,19 +335,17 @@ class LiveMonthRunTests(unittest.TestCase):
         self.assertEqual(bound, list(map(str, discovery_paths)))
     def test_requires_explicit_confirmation_before_any_command(self) -> None:
         calls: list[list[str]] = []
-        with (
-            tempfile.TemporaryDirectory() as tmp,
-            self.assertRaisesRegex(live_month_run.SimplbooksError, "confirm-write"),
-        ):
-            live_month_run.run_live_month(
-                company_dir=Path(tmp) / "companies" / "example",
-                period="2024-03",
-                python_executable="python3",
-                cwd=ROOT,
-                confirm_write=False,
-                run_command=lambda cmd, **kwargs: calls.append(cmd),
-                approval_checkpoint=lambda _path: None,
-            )
+        with tempfile.TemporaryDirectory() as tmp:  # noqa: SIM117
+            with self.assertRaisesRegex(live_month_run.SimplbooksError, "confirm-write"):
+                live_month_run.run_live_month(
+                    company_dir=Path(tmp) / "companies" / "example",
+                    period="2024-03",
+                    python_executable="python3",
+                    cwd=ROOT,
+                    confirm_write=False,
+                    run_command=lambda cmd, **kwargs: calls.append(cmd),
+                    approval_checkpoint=lambda _path: None,
+                )
         self.assertEqual(calls, [])
 
     def test_refuses_successfully_submitted_month_before_discovery_or_build(self) -> None:

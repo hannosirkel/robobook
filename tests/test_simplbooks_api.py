@@ -13,8 +13,8 @@ from urllib import error
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import simplbooks_api  # noqa: E402, I001
 import examine_simplbooks_year  # noqa: E402
-import simplbooks_api  # noqa: E402
 
 
 class FakeResponse:

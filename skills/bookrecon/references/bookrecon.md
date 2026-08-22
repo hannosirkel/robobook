@@ -13,6 +13,7 @@ Optional inputs:
 
 - `--policy-memo`
 - `--entity-map`
+- `--bank-allocations`
 - `--previous-normalized`
 - `--output`
 - `--amount-threshold`
@@ -30,6 +31,8 @@ The file follows `schemas/recon-period.schema.json` and includes:
   - whether downstream draft building should proceed
 - `blocking_issue_count`
   - count of failing deterministic checks plus blocking exceptions
+- `bank_coverage`
+  - report-only physical-bank and clearing write-readiness summary; `coverage_ready` is not the legacy build gate
 - `checks`
   - deterministic reconciliation results with evidence refs
 - `exceptions`
@@ -76,6 +79,24 @@ The file follows `schemas/recon-period.schema.json` and includes:
 - compares canonical source-system coverage between months
 - warns when a previously seen source system disappears
 
+### Physical Bank Coverage
+
+- loads the current period's approved allocations from an annual, source-bound allocation artifact
+- compares immutable statement identity, record locator, period, signed amount, currency, and physical `(IBAN, currency)` ledger
+- totals credits, debits, and net movement per ledger; verifies opening plus movement equals closing only when the CAMT `statement_from`/`statement_to` scope exactly matches the target month
+- retains annual or other non-month CAMT scopes as supporting evidence for annual verification; malformed or partial scopes are report-only not-ready evidence
+- missing, duplicate, stale, malformed, or incomplete allocation evidence produces `physical-bank-coverage: warn` and `bank_coverage.coverage_ready: false` in Phase A
+
+### Clearing Continuity
+
+- groups `clearing_transactions` by structured `clearing_provider`, `clearing_account`, and currency
+- requires each movement to be referenced by a reviewed allocation or a normalized bridge reference
+- when opening and closing clearing balances are present, verifies opening plus movements equals closing; otherwise the check records the precise missing evidence
+- unresolved clearing emits a collision-safe `clearing-continuity:<provider>:<account>:<currency>: warn` and makes report-only bank write readiness false
+- emits structured movement/resolved/unresolved record-ID sets and matching counters in `bank_coverage`; annual orchestration must consume these fields, not parse check prose
+
+Each reconciliation artifact hash-binds its exact normalized-period input and reviewed annual bank-allocation input. Annual aggregation must load only the expected `YYYY-MM` filenames, verify payload company/period and both current bindings, and fail on missing, stale, or misdirected artifacts.
+
 ## Current Blocking Rules
 
 The current implementation blocks build when:
@@ -83,6 +104,8 @@ The current implementation blocks build when:
 - imported normalized exceptions are already blocking
 - bank receipts indicate processor activity but no processor-side export was normalized
 - a deterministic hard check fails
+
+Physical-bank coverage and clearing continuity warnings are intentionally excluded from this list in Phase A. They are decision-list evidence for later write-capable validation, so callers must not infer bank write readiness from `approve_for_build`.
 
 ## Current Limits
 

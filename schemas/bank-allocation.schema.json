@@ -1,0 +1,222 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.books/schemas/bank-allocation.schema.json",
+  "title": "Reviewed Bank Allocation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "company_slug", "year", "normalized_bindings", "allocations"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "company_slug": {"type": "string", "pattern": "^[a-z0-9-]+$"},
+    "year": {"type": "integer", "minimum": 1000, "maximum": 9999},
+    "normalized_bindings": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/binding"}
+    },
+    "allocations": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/allocation"}
+    }
+  },
+  "$defs": {
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+      }
+    },
+    "allocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["statement_id", "record_id", "iban", "period", "disposition", "amount", "currency", "target", "review"],
+      "properties": {
+        "statement_id": {"type": "string", "minLength": 1},
+        "record_id": {"type": "string", "minLength": 1},
+        "iban": {"type": "string", "minLength": 1},
+        "period": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}$"},
+        "disposition": {
+          "type": "string",
+          "enum": [
+            "generated_invoice_receipt",
+            "existing_invoice_receipt",
+            "generated_purchase_payment",
+            "existing_purchase_payment",
+            "direct_sale_receipt",
+            "bank_fee_payment",
+            "expense_reimbursement_payment",
+            "clearing_transfer",
+            "reviewed_split"
+          ]
+        },
+        "amount": {"type": "number"},
+        "currency": {"type": "string", "pattern": "^[A-Z]{3}$"},
+        "target": {"$ref": "#/$defs/target"},
+        "parts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": ["amount"],
+            "properties": {"amount": {"type": "number"}},
+            "allOf": [
+              {
+                "if": {"required": ["disposition"], "properties": {"disposition": {"const": "clearing_transfer"}}},
+                "then": {
+                  "required": ["target"],
+                  "properties": {
+                    "target": {
+                      "allOf": [
+                        {"$ref": "#/$defs/target"},
+                        {
+                          "required": ["document_type", "transaction_family", "clearing_record_ids", "bridge_record_ids", "bridge_direction", "clearing_evidence", "clearing_totals", "clearing_relation", "bridge_amount"],
+                          "properties": {
+                            "document_type": {"const": "financial_transaction"},
+                            "transaction_family": {"type": "string", "minLength": 1}
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "review": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "rationale"],
+          "properties": {
+            "status": {"type": "string", "enum": ["approved", "needs_review"]},
+            "rationale": {"type": "string", "minLength": 1}
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {"required": ["disposition"], "properties": {"disposition": {"const": "clearing_transfer"}}},
+          "then": {
+            "properties": {
+              "target": {
+                "required": ["document_type", "transaction_family", "clearing_record_ids", "bridge_record_ids", "bridge_direction", "clearing_evidence", "clearing_totals", "clearing_relation", "bridge_amount"],
+                "properties": {
+                  "document_type": {"const": "financial_transaction"},
+                  "transaction_family": {"type": "string", "minLength": 1}
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "clearingEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["record_id", "period", "currency", "amount", "provider", "account", "source_system"],
+      "properties": {
+        "record_id": {"type": "string", "minLength": 1},
+        "period": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}$"},
+        "currency": {"type": "string", "pattern": "^[A-Z]{3}$"},
+        "amount": {"type": "number"},
+        "provider": {"type": "string", "minLength": 1},
+        "account": {"type": "string", "minLength": 1},
+        "source_system": {"type": "string", "minLength": 1}
+      }
+    },
+    "fxProof": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["equation", "physical_record_id", "physical_currency", "physical_amount", "clearing_currency", "clearing_amount", "rate", "fee_amount", "rate_evidence"],
+      "properties": {
+        "equation": {"const": "absolute_clearing_times_rate_plus_fee_equals_physical"},
+        "physical_record_id": {"type": "string", "minLength": 1},
+        "physical_currency": {"type": "string", "pattern": "^[A-Z]{3}$"},
+        "physical_amount": {"type": "number"},
+        "clearing_currency": {"type": "string", "pattern": "^[A-Z]{3}$"},
+        "clearing_amount": {"type": "number"},
+        "rate": {"type": "number", "minimum": 0.000000001},
+        "fee_amount": {"type": "number"},
+        "rate_evidence": {"$ref": "#/$defs/binding"}
+      }
+    },
+    "clearingEquation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["equation", "role", "record_ids"],
+      "properties": {
+        "equation": {"type": "string", "enum": ["signed_sum_equals_zero", "absolute_source_times_rate_equals_destination", "single_record_equals_reviewed_fee"]},
+        "role": {"type": "string", "enum": ["balance_pair", "settlement_pair", "return_pair", "currency_conversion", "fee_leg"]},
+        "record_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "source_record_id": {"type": "string", "minLength": 1},
+        "destination_record_id": {"type": "string", "minLength": 1},
+        "reference_id": {"type": "string", "minLength": 1},
+        "rate": {"type": "number", "minimum": 0.000000001},
+        "currency": {"type": "string", "pattern": "^[A-Z]{3}$"},
+        "reviewed_amount": {"type": "number"}
+      },
+      "allOf": [
+        {
+          "if": {"required": ["equation"], "properties": {"equation": {"const": "signed_sum_equals_zero"}}},
+          "then": {"required": ["reference_id"]}
+        },
+        {
+          "if": {"required": ["equation"], "properties": {"equation": {"const": "absolute_source_times_rate_equals_destination"}}},
+          "then": {"required": ["source_record_id", "destination_record_id", "reference_id", "rate"]}
+        },
+        {
+          "if": {"required": ["equation"], "properties": {"equation": {"const": "single_record_equals_reviewed_fee"}}},
+          "then": {"required": ["currency", "reviewed_amount"]}
+        }
+      ]
+    },
+    "target": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": true,
+      "properties": {
+        "statement_import_proof": {"$ref": "#/$defs/statementImportProof"},
+        "clearing_record_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "bridge_record_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "bridge_direction": {"type": "string", "enum": ["same_as_physical", "opposite_physical"]},
+        "clearing_evidence": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/clearingEvidence"}},
+        "clearing_totals": {"type": "object", "minProperties": 1, "additionalProperties": {"type": "number"}},
+        "clearing_relation": {"type": "string", "enum": ["exact_amount", "reviewed_group"]},
+        "bridge_amount": {"type": "number"},
+        "clearing_equations": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/clearingEquation"}},
+        "fx_proof": {"$ref": "#/$defs/fxProof"},
+        "foreign_currency_pilot_required": {"type": "boolean"},
+        "target_currency": {"type": "string", "pattern": "^[A-Z]{3}$"},
+        "pilot_requirements": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
+      },
+      "allOf": [
+        {
+          "if": {"required": ["clearing_record_ids"]},
+          "then": {"required": ["bridge_record_ids", "bridge_direction", "clearing_evidence", "clearing_totals", "clearing_relation", "bridge_amount"]}
+        },
+        {
+          "if": {"required": ["fx_proof"]},
+          "then": {"required": ["clearing_record_ids", "bridge_record_ids", "bridge_direction"]}
+        },
+        {
+          "if": {"required": ["foreign_currency_pilot_required"], "properties": {"foreign_currency_pilot_required": {"const": true}}},
+          "then": {"required": ["target_currency", "pilot_requirements"]}
+        }
+      ]
+    },
+    "statementImportProof": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "required_evidence", "simplbooks_transaction_id", "evidence_binding"],
+      "properties": {
+        "status": {"const": "verified"},
+        "required_evidence": {"const": "live_discovery_or_audit"},
+        "simplbooks_transaction_id": {"type": "string", "minLength": 1},
+        "evidence_binding": {"$ref": "#/$defs/binding"}
+      }
+    }
+  }
+}

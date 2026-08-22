@@ -13,7 +13,16 @@ from pathlib import Path
 from typing import Any
 
 from bookbuilder import write_yaml
-from bookchecker import load_yaml
+from bookchecker import (
+    evaluate_action_batch,
+    evaluate_bank_statement_completeness,
+    evaluate_inventory_quantities,
+    load_reviewed_allocation_index,
+    load_bound_discovery_payloads,
+    load_yaml,
+    manual_financial_dependency_errors,
+    resolve_action_sources,
+)
 from exchange_rates import ExchangeRateError, lookup_rate
 from posting_policy import PostingPolicyError, action_policy_errors, load_posting_policy
 from reference_artifacts import (
@@ -380,6 +389,15 @@ def translate_invoice_payload(
     tasks = []
     for index, line in enumerate(payload.get("line_items") or [], start=1):
         gross_amount = abs(decimal_value(line.get("gross_amount")))
+        if line.get("article_id_hint") not in (None, ""):
+            proof_errors = inventory_quantity_proof_errors(action, line)
+            if proof_errors:
+                raise SimplbooksError(
+                    f"{action_id(action)} line {index} inventory quantity proof is invalid: {proof_errors[0]}"
+                )
+        quantity = abs(decimal_value(line.get("quantity") if line.get("quantity") not in (None, "") else 1))
+        if quantity <= 0:
+            raise SimplbooksError(f"{action_id(action)} line {index} quantity must be positive.")
         vat_amount_hint = line.get("vat_amount_hint")
         vat_amount = None if vat_amount_hint in (None, "") else abs(decimal_value(vat_amount_hint))
         task = compact_dict(
@@ -398,10 +416,15 @@ def translate_invoice_payload(
                     field_name=f"{action_id(action)} line {index} warehouse_id",
                     optional=True,
                 ),
+                "article_id": api_id(
+                    line.get("article_id_hint"),
+                    field_name=f"{action_id(action)} line {index} article_id",
+                    optional=True,
+                ),
                 "name": str(line.get("description") or f"Line {index}"),
                 "unit": "summary",
-                "amount": 1,
-                "price_per_unit": decimal_number(gross_amount),
+                "amount": decimal_number(quantity),
+                "price_per_unit": decimal_number(gross_amount / quantity),
                 "vat": (
                     reviewed_allocated_rate(
                         line,
@@ -456,6 +479,114 @@ def translate_invoice_payload(
             "Tasks": tasks,
         },
     }
+
+
+def inventory_quantity_action_contract_error(action: dict[str, Any], line: dict[str, Any]) -> str | None:
+    proof = line.get("inventory_quantity_proof")
+    scope = proof.get("scope") if isinstance(proof, dict) else None
+    category = str((scope or {}).get("record_category") or "") if isinstance(scope, dict) else ""
+    action_type = str(action.get("action_type") or "")
+    document_type = str((action.get("payload") or {}).get("document_type") or "")
+    line_role = str(line.get("line_role") or "")
+    sales_role = line_role == "sales_revenue" or ("sales" in line_role and "product" in line_role)
+    refund_role = line_role == "refund_revenue" or ("refund" in line_role and "product" in line_role)
+    contracts = {
+        "sales": action_type == "create_invoice_summary" and document_type == "invoice" and sales_role,
+        "refunds": action_type == "create_credit_invoice_summary" and document_type == "credit_note" and refund_role,
+        "bank_transactions": (
+            action_type == "create_invoice_summary"
+            and document_type == "invoice"
+            and line_role == "direct_sale_revenue"
+            and (scope or {}).get("kind") == "reviewed_direct_sale_allocation"
+        ),
+    }
+    if category in contracts and not contracts[category]:
+        return f"{category} inventory scope does not match the action contract"
+    return None
+
+
+def inventory_quantity_proof_errors(action: dict[str, Any], line: dict[str, Any]) -> list[str]:
+    if "shipping" in str(line.get("line_role") or "").lower():
+        return ["shipping line must not carry an inventory article"]
+    proof = line.get("inventory_quantity_proof")
+    proof_fields = {
+        "status", "quantity", "scope", "scope_sha256", "contributor_count",
+        "contributor_set_sha256", "contributors",
+    }
+    if not isinstance(proof, dict) or set(proof) != proof_fields:
+        return ["exact proof object is required"]
+    if proof.get("status") != "exact":
+        return ["status must be exact"]
+    try:
+        line_quantity = decimal_value(line.get("quantity"))
+        proof_quantity = decimal_value(proof.get("quantity"))
+    except SimplbooksError as exc:
+        return [str(exc)]
+    if line_quantity <= 0 or proof_quantity != line_quantity:
+        return ["positive line quantity must equal proof quantity"]
+    contributors = proof.get("contributors")
+    if not isinstance(contributors, list) or not contributors:
+        return ["contributors are required"]
+    total = Decimal("0")  # noqa: FURB157
+    seen: set[str] = set()
+    for contributor in contributors:
+        if not isinstance(contributor, dict) or set(contributor) != {
+            "record_id", "quantity", "quantity_source", "record_sha256"
+        }:
+            return ["contributor shape is invalid"]
+        record_id = str(contributor.get("record_id") or "").strip()
+        if not record_id:
+            return ["contributor record_id is required"]
+        if record_id in seen:
+            return ["contributor record IDs must be unique"]
+        seen.add(record_id)
+        if contributor.get("quantity_source") not in {"normalized_record", "reviewed_allocation_target"}:
+            return ["contributor quantity_source is invalid"]
+        if not re.fullmatch(r"[a-f0-9]{64}", str(contributor.get("record_sha256") or "")):
+            return ["contributor record SHA-256 is invalid"]
+        amount = decimal_value(contributor.get("quantity"))
+        if amount <= 0:
+            return ["contributor quantity must be positive"]
+        total += amount
+    if total != line_quantity:
+        return ["contributor quantities do not equal line quantity"]
+    scope = proof.get("scope")
+    if not isinstance(scope, dict):
+        return ["semantic scope is required"]
+    scope_kind = scope.get("kind")
+    expected_scope_fields = (
+        {"kind", "period", "record_category", "group_label", "currency", "tax_profile"}
+        if scope_kind == "normalized_sales_group"
+        else {"kind", "period", "record_category", "statement_id"}
+        if scope_kind == "reviewed_direct_sale_allocation"
+        else set()
+    )
+    if not expected_scope_fields or set(scope) != expected_scope_fields:
+        return ["semantic scope shape is invalid"]
+    if scope.get("record_category") not in {"sales", "refunds", "bank_transactions"}:
+        return ["semantic scope record category is invalid"]
+    canonical = lambda value: hashlib.sha256(  # noqa: E731, RUF100
+        json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
+    if canonical(scope) != str(proof.get("scope_sha256") or ""):
+        return ["semantic scope hash is invalid"]
+    ordered = sorted(contributors, key=lambda item: (str(item["record_id"]), str(item["record_sha256"])))
+    if contributors != ordered:
+        return ["contributors must use canonical sorted order"]
+    if int(proof.get("contributor_count") or -1) != len(ordered):
+        return ["contributor count is invalid"]
+    if canonical(ordered) != str(proof.get("contributor_set_sha256") or ""):
+        return ["contributor set hash is invalid"]
+    required_source = (
+        "normalized_record" if scope_kind == "normalized_sales_group"
+        else "reviewed_allocation_target"
+    )
+    if any(item.get("quantity_source") != required_source for item in contributors):
+        return ["contributor quantity source does not match semantic scope"]
+    contract_error = inventory_quantity_action_contract_error(action, line)
+    if contract_error:
+        return [contract_error]
+    return []
 
 
 def reviewed_currency_rate(payload: dict[str, Any], *, base_currency: str = "EUR") -> float:
@@ -564,6 +695,12 @@ def translate_cash_settlement_payload(
     }
 
     if document_type == "incoming":
+        linked_invoice_id = str(payload.get("linked_invoice_id") or "").strip()
+        linked_invoice_action = str(payload.get("linked_invoice_action") or "").strip()
+        if linked_invoice_id and linked_invoice_action:
+            raise SimplbooksError(
+                f"{action_id(action)} cannot carry both linked_invoice_id and linked_invoice_action."
+            )
         invoice_dependency = next(
             (
                 str(dependency)
@@ -572,6 +709,10 @@ def translate_cash_settlement_payload(
             ),
             None,
         )
+        if linked_invoice_id and invoice_dependency:
+            raise SimplbooksError(
+                f"{action_id(action)} cannot carry both linked_invoice_id and generated invoice dependency."
+            )
         translated = {
             "Incoming": compact_dict(
                 {
@@ -582,7 +723,19 @@ def translate_cash_settlement_payload(
                 }
             )
         }
-        if invoice_dependency:
+        if linked_invoice_id:
+            translated["invoice_id"] = api_id(
+                linked_invoice_id,
+                field_name=f"{action_id(action)} invoice_id",
+            )
+        elif linked_invoice_action:
+            translated["invoice_id"] = dependency_inserted_id(
+                lookup,
+                linked_invoice_action,
+                field_name=f"{action_id(action)} invoice_id",
+                allow_placeholder=allow_unresolved_dependencies,
+            )
+        elif invoice_dependency:
             translated["invoice_id"] = dependency_inserted_id(
                 lookup,
                 invoice_dependency,
@@ -595,9 +748,18 @@ def translate_cash_settlement_payload(
         }
 
     if document_type == "payment":
+        linked_purchase_id = str(payload.get("linked_purchase_id") or "").strip()
         linked_purchase_action = str(payload.get("linked_purchase_action") or "")
+        if linked_purchase_id and linked_purchase_action:
+            raise SimplbooksError(
+                f"{action_id(action)} cannot carry both linked_purchase_id and linked_purchase_action."
+            )
         if not linked_purchase_action:
             linked_purchase_action = next((str(dep) for dep in action.get("depends_on") or []), "")
+        if linked_purchase_id and linked_purchase_action:
+            raise SimplbooksError(
+                f"{action_id(action)} cannot carry both linked_purchase_id and generated purchase dependency."
+            )
         translated = {
             "Payment": compact_dict(
                 {
@@ -608,7 +770,12 @@ def translate_cash_settlement_payload(
                 }
             )
         }
-        if linked_purchase_action:
+        if linked_purchase_id:
+            translated["purchase_id"] = api_id(
+                linked_purchase_id,
+                field_name=f"{action_id(action)} purchase_id",
+            )
+        elif linked_purchase_action:
             translated["purchase_id"] = dependency_inserted_id(
                 lookup,
                 linked_purchase_action,
@@ -630,6 +797,10 @@ def translate_action_for_api(
     allow_unresolved_dependencies: bool = False,
     exchange_rate_cache: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if str(action.get("action_type") or "") == "manual_statement_import_financial_transaction":
+        raise SimplbooksError(
+            "manual statement-import financial transactions are UI-only and must not be translated into SimplBooks API calls."
+        )
     if str(action.get("action_type") or "") == "manual_inventory_writeoff":
         raise SimplbooksError(
             "manual inventory write-off actions are UI-only and must not be translated for Simplbooks API submission."
@@ -927,6 +1098,7 @@ def build_rollback_plan(action_batch: dict[str, Any], ordered_actions: list[dict
 def load_existing_submission(
     *,
     output_path: Path,
+    action_path: Path,
     batch_id: str,
     company_slug: str,
     period: str,
@@ -964,7 +1136,58 @@ def load_existing_submission(
                 normalized_log.append(entry)
         existing["request_log"] = normalized_log
 
+    successful_write_sha = str(existing.get("action_file_sha256") or "").strip()
+    current_batch_status = str(load_yaml(action_path).get("approval_status") or "")
+    freeze_required = existing.get("mode") == "write" and (
+        bool(successful_write_sha) or current_batch_status == "submitted"
+    )
+    if freeze_required:  # noqa: SIM102
+        if not successful_write_sha or successful_write_sha != file_sha256(action_path):
+            raise SimplbooksError(
+                "The submitted batch is immutable: its successful action-file SHA does not match "
+                f"the current YAML at {action_path}."
+            )
+
     return existing
+
+
+def validate_predecessor_submission(*, action_path: Path, period: str) -> None:
+    """Require the immediately preceding configured action batch to be immutable and successful."""
+    action_dir = action_path.parent
+    configured = sorted(
+        path.stem
+        for path in action_dir.glob("*.yaml")
+        if re.fullmatch(r"\d{4}-\d{2}", path.stem)
+    )
+    if period not in configured:
+        raise SimplbooksError(f"Current period {period} is absent from the configured action sequence.")
+    position = configured.index(period)
+    if position == 0:
+        return
+    predecessor = configured[position - 1]
+    predecessor_action_path = action_dir / f"{predecessor}.yaml"
+    submissions_dir = action_dir.parent / "submissions"
+    predecessor_submission_path = submissions_dir / f"{predecessor}.json"
+    if not predecessor_submission_path.exists():
+        raise SimplbooksError(
+            f"Write mode requires the previous month/configured period {predecessor} to have a successful submission."
+        )
+    predecessor_batch = load_yaml(predecessor_action_path)
+    predecessor_submission = load_json(predecessor_submission_path)
+    summary = predecessor_submission.get("summary") or {}
+    valid = (
+        str(predecessor_batch.get("approval_status") or "") == "submitted"
+        and predecessor_submission.get("mode") == "write"
+        and str(predecessor_submission.get("period") or "") == predecessor
+        and str(predecessor_submission.get("batch_id") or "") == str(predecessor_batch.get("batch_id") or "")
+        and str(predecessor_submission.get("action_file_sha256") or "") == file_sha256(predecessor_action_path)
+        and int(summary.get("failed_actions") or 0) == 0
+        and summary.get("stopped_on_failure") is False
+    )
+    if not valid:
+        raise SimplbooksError(
+            f"Write mode requires the previous month/configured period {predecessor} to be successfully submitted and immutable."
+        )
 
 
 def load_prior_action_lookup(
@@ -993,7 +1216,26 @@ def load_prior_action_lookup(
                 continue
             key = action_id(action)
             if key not in lookup:
-                lookup[key] = action
+                lookup[key] = copy.deepcopy(action)
+
+    submissions_dir = (
+        company_dir / "artifacts" / "submissions"
+        if company_dir is not None
+        else ((inferred_artifacts_dir(action_path) / "submissions") if inferred_artifacts_dir(action_path) else None)
+    )
+    if submissions_dir is None or not submissions_dir.exists():
+        return lookup
+    for path in sorted(submissions_dir.glob("*.json")):
+        if not re.fullmatch(r"\d{4}-\d{2}", path.stem) or path.stem >= period:
+            continue
+        submission = load_json(path)
+        for entry in submission.get("request_log") or []:
+            if not isinstance(entry, dict) or entry.get("mode") != "write" or not entry.get("success"):
+                continue
+            inserted_id = entry.get("inserted_id")
+            key = str(entry.get("action_idempotency_key") or "").strip()
+            if key in lookup and inserted_id not in (None, ""):
+                lookup[key]["inserted_id"] = inserted_id
     return lookup
 
 
@@ -1003,7 +1245,7 @@ def verify_submission_reference_artifacts(
     cwd: Path,
     period: str,
     company_id: str,
-) -> None:
+) -> dict[str, list[Path]]:
     bindings = action_batch.get("reference_artifacts") or []
     by_kind: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for binding in bindings:
@@ -1021,18 +1263,37 @@ def verify_submission_reference_artifacts(
             "Write mode action batch is not bound to required artifact(s): " + ", ".join(missing)
         )
 
+    singleton_kinds = {
+        "posting_policy",
+        "normalized_period",
+        "reconciliation",
+        "exchange_rates",
+        "bank_allocations",
+        "woo_tax_allocation",
+    }
+    duplicated = [kind for kind in sorted(singleton_kinds) if len(by_kind.get(kind) or []) > 1]
+    if duplicated:
+        raise SimplbooksError(
+            "Write mode action batch has duplicate singleton artifact binding(s): "
+            + ", ".join(duplicated)
+        )
+
+    verified: dict[str, list[Path]] = defaultdict(list)
     for binding in bindings:
         kind = str(binding.get("kind") or "")
         try:
             bound_path = verify_file_binding(binding, cwd=cwd)
+            verified[kind].append(bound_path)
             if kind == "discovery_overview":
+                overview = load_json(bound_path)
                 validate_discovery(
-                    load_json(bound_path),
-                    year=int(period[:4]),
+                    overview,
+                    year=int(overview.get("year") or 0),
                     company_id=company_id,
                 )
         except ReferenceArtifactError as exc:
             raise SimplbooksError(str(exc)) from exc
+    return dict(verified)
 
 
 def execute_batch(
@@ -1045,7 +1306,87 @@ def execute_batch(
     reference_lookup: dict[str, dict[str, Any]] | None = None,
     exchange_rate_cache: dict[str, Any] | None = None,
     posting_policy: dict[str, Any] | None = None,
+    action_path: Path | None = None,
+    cwd: Path | None = None,
+    expected_company_id: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    inventory_actions = [
+        action for action in action_batch.get("actions") or []
+        if any(
+            isinstance(line, dict) and line.get("article_id_hint") not in (None, "")
+            for line in (action.get("payload") or {}).get("line_items") or []
+        )
+    ]
+    if inventory_actions and (action_path is None or cwd is None):
+        raise SimplbooksError(
+            "Inventory article prevalidation requires the bound action/source context before any client call."
+        )
+    if inventory_actions and action_path is not None and cwd is not None:
+        payload_cache: dict[Path, dict[str, Any]] = {}
+        index_cache: dict[Path, dict[str, tuple[str, dict[str, Any]]]] = {}
+        reviewed_allocations, allocation_findings = load_reviewed_allocation_index(action_batch, cwd=cwd)
+        inventory_findings = list(allocation_findings)
+        for action in inventory_actions:
+            resolved_sources, source_findings = resolve_action_sources(
+                action=action, action_path=action_path, cwd=cwd,
+                payload_cache=payload_cache, index_cache=index_cache,
+            )
+            inventory_findings.extend(source_findings)
+            inventory_findings.extend(evaluate_inventory_quantities(
+                action=action, resolved_sources=resolved_sources,
+                reviewed_allocations=reviewed_allocations,
+            ))
+        inventory_errors = [item for item in inventory_findings if item.get("severity") == "error"]
+        if inventory_errors:
+            raise SimplbooksError(
+                "Inventory quantity source prevalidation failed before translation or API calls: "
+                + str(inventory_errors[0].get("summary") or "unknown inventory proof error")
+            )
+    if action_path is not None and cwd is not None:
+        coverage_errors = [
+            item
+            for item in evaluate_bank_statement_completeness(
+                action_batch,
+                action_path=action_path,
+                cwd=cwd,
+                posting_policy=posting_policy,
+            )
+            if item.get("severity") == "error"
+        ]
+        if coverage_errors:
+            raise SimplbooksError(
+                "Action batch bank statement completeness prevalidation failed before translation or API calls: "
+                + str(coverage_errors[0].get("summary") or "unknown coverage error")
+            )
+    manual_dependencies = [
+        dependency
+        for dependency in action_batch.get("unresolved_dependencies") or []
+        if isinstance(dependency, dict)
+        and str(dependency.get("kind") or "") == "manual_statement_import_financial_transaction"
+    ]
+    discovery_payloads: list[dict[str, Any]] = []
+    discovery_errors: list[str] = []
+    if manual_dependencies and cwd is not None:
+        discovery_payloads, discovery_errors = load_bound_discovery_payloads(
+            action_batch, cwd=cwd, expected_company_id=expected_company_id,
+        )
+    for dependency in manual_dependencies:
+        dependency_errors = manual_financial_dependency_errors(
+            dependency, cwd=cwd, expected_company_id=expected_company_id,
+            require_typed_context=True, discovery_payloads=discovery_payloads,
+        )
+        dependency_errors.extend(discovery_errors)
+        if dependency_errors:
+            raise SimplbooksError(
+                "Action batch contains an invalid manual statement-import financial dependency "
+                f"{dependency.get('record_id') or '<unknown>'}: {dependency_errors[0]}"
+            )
+        proof = dependency.get("statement_import_proof") or {}
+        if dependency.get("blocking") is not False or proof.get("status") != "verified":
+            raise SimplbooksError(
+                "Action batch contains a pending manual statement-import financial dependency; "
+                "no API action is translated or sent until live discovery/audit proves the import."
+            )
     ordered_actions = stable_execution_order(list(action_batch.get("actions") or []))
     lookup = dict(reference_lookup or {})
     lookup.update(action_lookup(ordered_actions))
@@ -1210,16 +1551,56 @@ def run_submission(
         check_report=check_report,
         check_path=check_path,
     )
+    verified_reference_paths: dict[str, list[Path]] = {}
+    exchange_rate_cache: dict[str, Any] | None = None
+    posting_policy: dict[str, Any] | None = None
     if mode == "write":
         if company_dir is None:
             raise SimplbooksError("Write mode requires --company-dir for bound reference verification.")
         resolved_company_id = resolve_company_id(company_id, company_dir=str(company_dir))
-        verify_submission_reference_artifacts(
+        verified_reference_paths = verify_submission_reference_artifacts(
             action_batch,
             cwd=cwd,
             period=period,
             company_id=resolved_company_id,
         )
+        validate_predecessor_submission(action_path=action_path, period=period)
+        recon_path = verified_reference_paths["reconciliation"][0]
+        normalized_path = verified_reference_paths["normalized_period"][0]
+        recon_payload = load_json(recon_path)
+        normalized_payload = load_json(normalized_path)
+        if str(recon_payload.get("period") or "") != period:
+            raise SimplbooksError("Bound reconciliation period does not match the action batch period.")
+        if str(normalized_payload.get("period") or "") != period:
+            raise SimplbooksError("Bound normalized period does not match the action batch period.")
+        if str(normalized_payload.get("company_slug") or "") != str(action_batch.get("company_slug") or ""):
+            raise SimplbooksError("Bound normalized company_slug does not match the action batch.")
+        try:
+            posting_policy = load_posting_policy(verified_reference_paths["posting_policy"][0])
+        except PostingPolicyError as exc:
+            raise SimplbooksError(str(exc)) from exc
+        if verified_reference_paths.get("exchange_rates"):
+            exchange_rate_cache = load_json(verified_reference_paths["exchange_rates"][0])
+        policy_memo_path = company_dir / "artifacts" / "policy_memo.md"
+        policy_text = policy_memo_path.read_text(encoding="utf-8") if policy_memo_path.exists() else None
+        evaluation = evaluate_action_batch(
+            action_batch=action_batch,
+            action_path=action_path,
+            recon_payload=recon_payload,
+            recon_path=recon_path,
+            policy_text=policy_text,
+            cwd=cwd,
+            company_dir=company_dir,
+            exchange_rate_cache=exchange_rate_cache,
+            posting_policy=posting_policy,
+            expected_company_id=resolved_company_id,
+        )
+        if evaluation["error_count"] or evaluation["warning_count"]:
+            first_finding = (evaluation.get("findings") or [{}])[0]
+            raise SimplbooksError(
+                "Write mode full checker prevalidation failed before any API call: "
+                + str(first_finding.get("summary") or "unknown checker finding")
+            )
 
     company_slug = str(
         action_batch.get("company_slug")
@@ -1228,6 +1609,7 @@ def run_submission(
     )
     existing_submission = load_existing_submission(
         output_path=output_path,
+        action_path=action_path,
         batch_id=str(action_batch.get("batch_id") or ""),
         company_slug=company_slug,
         period=period,
@@ -1237,22 +1619,23 @@ def run_submission(
         action_path=action_path,
         period=period,
     )
-    exchange_rate_cache_path = (
-        company_dir / "artifacts" / "reference" / f"ecb-rates-{period[:4]}.json"
-        if company_dir is not None
-        else None
-    )
-    exchange_rate_cache = (
-        load_json(exchange_rate_cache_path)
-        if exchange_rate_cache_path is not None and exchange_rate_cache_path.exists()
-        else None
-    )
-    posting_policy_path = company_dir / "artifacts" / "posting_policy.json" if company_dir is not None else None
-    posting_policy = (
-        load_posting_policy(posting_policy_path)
-        if posting_policy_path is not None and posting_policy_path.exists()
-        else None
-    )
+    if mode != "write":
+        exchange_rate_cache_path = (
+            company_dir / "artifacts" / "reference" / f"ecb-rates-{period[:4]}.json"
+            if company_dir is not None
+            else None
+        )
+        exchange_rate_cache = (
+            load_json(exchange_rate_cache_path)
+            if exchange_rate_cache_path is not None and exchange_rate_cache_path.exists()
+            else None
+        )
+        posting_policy_path = company_dir / "artifacts" / "posting_policy.json" if company_dir is not None else None
+        posting_policy = (
+            load_posting_policy(posting_policy_path)
+            if posting_policy_path is not None and posting_policy_path.exists()
+            else None
+        )
 
     if mode == "write" and client is None:
         resolved_company_id = resolve_company_id(company_id, company_dir=str(company_dir) if company_dir else None)
@@ -1272,11 +1655,16 @@ def run_submission(
         reference_lookup=reference_lookup,
         exchange_rate_cache=exchange_rate_cache,
         posting_policy=posting_policy,
+        action_path=action_path,
+        cwd=cwd,
+        expected_company_id=resolved_company_id if mode == "write" else None,
     )
     prior_request_count = len((existing_submission or {}).get("request_log") or [])
     current_request_log = submission["request_log"][prior_request_count:]
 
     write_yaml(action_path, updated_batch)
+    if mode == "write" and str(updated_batch.get("approval_status") or "") == "submitted":
+        submission["action_file_sha256"] = file_sha256(action_path)
     write_json(output_path, submission)
 
     company_name = resolve_company_name(company_dir=str(company_dir)) if company_dir is not None else None

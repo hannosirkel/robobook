@@ -3,6 +3,7 @@ from __future__ import annotations  # noqa: EXE001, I001
 
 import argparse
 import copy
+import hashlib
 import json
 import re
 import unicodedata
@@ -13,6 +14,15 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+from bank_allocations import (
+    BankAllocationError,
+    allocation_key,
+    bank_ledger_key,
+    load_bank_allocations,
+    period_allocations,
+    statement_identity,
+    validate_reviewed_amounts,
+)
 from document_identity import document_identity, match_existing
 from exchange_rates import ExchangeRateError, lookup_rate
 from posting_policy import PostingPolicyError, load_posting_policy, resolve_bank_account, resolve_contact, resolve_mapping, resolve_sales_vat_profile
@@ -144,6 +154,61 @@ def decimal_number(value: Decimal | None) -> float | None:
     if value is None:
         return None
     return float(value)
+
+
+def canonical_record_sha256(record: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(record, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def canonical_value_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def inventory_proof_envelope(
+    *, scope: dict[str, Any], contributors: list[dict[str, Any]], quantity: Decimal,
+) -> dict[str, Any]:
+    ordered = sorted(contributors, key=lambda item: (str(item["record_id"]), str(item["record_sha256"])))
+    return {
+        "status": "exact", "quantity": decimal_number(quantity),
+        "scope": scope, "scope_sha256": canonical_value_sha256(scope),
+        "contributor_count": len(ordered),
+        "contributor_set_sha256": canonical_value_sha256(ordered),
+        "contributors": ordered,
+    }
+
+
+def normalized_inventory_quantity_proof(
+    records: list[dict[str, Any]], *, group_label: str, direction: str,
+) -> dict[str, Any] | None:
+    contributors: list[dict[str, Any]] = []
+    total = Decimal("0")  # noqa: FURB157
+    for record in records:
+        quantity = decimal_value(record.get("quantity") or 0)
+        if quantity <= 0:
+            return None
+        total += quantity
+        contributors.append({
+            "record_id": str(record.get("record_id") or ""),
+            "quantity": decimal_number(quantity),
+            "quantity_source": "normalized_record",
+            "record_sha256": canonical_record_sha256(record),
+        })
+    if not contributors or total <= 0:
+        return None
+    first = records[0]
+    scope = {
+        "kind": "normalized_sales_group",
+        "period": str(first.get("event_date") or "")[:7],
+        "record_category": "sales" if direction == "sales" else "refunds",
+        "group_label": group_label,
+        "currency": record_currency(first, "EUR"),
+        "tax_profile": taxable_profile(first),
+    }
+    return inventory_proof_envelope(scope=scope, contributors=contributors, quantity=total)
 
 
 def normalize_ascii(value: str) -> str:
@@ -762,13 +827,48 @@ def record_count_note(records: list[dict[str, Any]]) -> str:
     return f"Built from {len(records)} normalized record(s)."
 
 
-def review_confidence(*, notes: list[str], required_ids: list[str | None]) -> str:
+def review_confidence(*, open_issues: list[str], required_ids: list[str | None]) -> str:
     missing_required = any(item in (None, "") for item in required_ids)
     if missing_required:
         return "low"
-    if notes:
+    if open_issues:
         return "medium"
     return "high"
+
+
+def unresolved_review_issues(notes: list[str]) -> list[str]:
+    """Separate actual accounting judgments from informational provenance."""
+    markers = (
+        "ambiguous entity mapping",
+        "pick the posting target manually",
+        "still needs review",
+        "no matching bank receipt",
+        "multiple warehouse ids",
+        "multiple customer country codes",
+        "forced despite",
+    )
+    return [note for note in notes if any(marker in normalize_text(note) for marker in markers)]
+
+
+def clean_resolved_review_notes(
+    notes: list[str],
+    *,
+    contact_resolved: bool,
+    vat_resolved: bool,
+) -> list[str]:
+    cleaned: list[str] = []
+    for note in notes:
+        normalized = normalize_text(note)
+        if contact_resolved and (
+            normalized.startswith("used ") and " contact mapping as a fallback " in normalized  # noqa: PIE810
+            or normalized.startswith("no contact/client mapping matched")
+            or normalized.startswith("ambiguous entity mapping candidates:")
+        ):
+            continue
+        if vat_resolved and "exact vat allocation between revenue and shipping still needs review" in normalized:
+            continue
+        cleaned.append(note)
+    return cleaned
 
 
 def policy_prefers_shipping_split(policy_text: str | None, shipping_total: Decimal) -> bool:
@@ -1272,6 +1372,9 @@ def build_sales_lines(
         total_vat = sum_abs_amount(records, "vat_amount")
         revenue_gross = total_gross - total_shipping
         shipping_vat_type_id = shipping_standard_vat_id if total_vat != 0 else shipping_zero_vat_id
+        inventory_proof = normalized_inventory_quantity_proof(
+            records, group_label=group_label, direction=direction,
+        )
         lines.append(
             {
                 "line_role": f"{direction}_revenue",
@@ -1282,6 +1385,8 @@ def build_sales_lines(
                 "suggested_income_account_id": revenue_account_id,
                 "suggested_vat_type_id": standard_vat_id if total_vat != 0 else zero_vat_id,
                 "warehouse_id_hint": maybe_single_warehouse(records) or default_warehouse_id,
+                "quantity": decimal_number(sum((decimal_value(record.get("quantity") or 0) for record in records), Decimal("0"))) or None,  # noqa: FURB157
+                "inventory_quantity_proof": inventory_proof,
                 "record_count": len(records),
             }
         )
@@ -1307,6 +1412,9 @@ def build_sales_lines(
             gross_amount = sum_abs_amount(profile_records, "gross_amount")
             vat_amount = sum_abs_amount(profile_records, "vat_amount")
             shipping_amount = sum_abs_amount(profile_records, "shipping_amount")
+            inventory_proof = normalized_inventory_quantity_proof(
+                profile_records, group_label=group_label, direction=direction,
+            )
             lines.append(
                 {
                     "line_role": f"{direction}_revenue",
@@ -1317,6 +1425,8 @@ def build_sales_lines(
                     "suggested_income_account_id": revenue_account_id,
                     "suggested_vat_type_id": standard_vat_id if profile_name == "taxable" else zero_vat_id,
                     "warehouse_id_hint": maybe_single_warehouse(profile_records) or default_warehouse_id,
+                    "quantity": decimal_number(sum((decimal_value(record.get("quantity") or 0) for record in profile_records), Decimal("0"))) or None,  # noqa: FURB157
+                    "inventory_quantity_proof": inventory_proof,
                     "record_count": len(profile_records),
                 }
             )
@@ -1477,7 +1587,7 @@ def build_sales_actions(
             if split_profiles:
                 payload["summary_scope"]["tax_profile"] = profile_name
             confidence = review_confidence(
-                notes=review_notes,
+                open_issues=unresolved_review_issues(review_notes),
                 required_ids=[profile_mapping_hints["revenue_account"][0]],
             )
             action = make_action(
@@ -1589,7 +1699,7 @@ def build_sales_actions(
             "line_items": lines,
         }
         confidence = review_confidence(
-            notes=review_notes,
+            open_issues=unresolved_review_issues(review_notes),
             required_ids=[refund_mapping_hints["revenue_account"][0]],
         )
         actions.append(
@@ -1714,7 +1824,10 @@ def build_fee_actions(
                 }
             ],
         }
-        confidence = review_confidence(notes=review_notes, required_ids=[processor_expense_account_id or fee_account_id, contact_id])
+        confidence = review_confidence(
+            open_issues=unresolved_review_issues(review_notes),
+            required_ids=[processor_expense_account_id or fee_account_id, contact_id],
+        )
         action = make_action(
             period=period,
             idempotency_key=idempotency_key,
@@ -1871,7 +1984,7 @@ def build_purchase_actions(
         }
         required_ids = [contact_id]
         required_ids.extend(line.get("suggested_expense_account_id") for line in lines)
-        confidence = review_confidence(notes=review_notes, required_ids=required_ids)
+        confidence = review_confidence(open_issues=unresolved_review_issues(review_notes), required_ids=required_ids)
         actions.append(
             make_action(
                 period=period,
@@ -1981,7 +2094,7 @@ def build_incoming_actions(
             "bank_receipt_total_hint": decimal_number(bank_total) if bank_records else None,
             "record_count": len(payout_records),
         }
-        confidence = review_confidence(notes=review_notes, required_ids=[bank_account_id])
+        confidence = review_confidence(open_issues=unresolved_review_issues(review_notes), required_ids=[bank_account_id])
         source_refs = source_refs_for_records(normalized_path_display, payout_records)
         source_refs.extend(source_refs_for_records(normalized_path_display, bank_records, note="Matching bank receipt evidence."))
         actions.append(
@@ -2145,7 +2258,7 @@ def build_payment_actions(
                 "linked_purchase_period": candidate["action_period"],
                 "record_count": len(bank_records),
             }
-            confidence = review_confidence(notes=review_notes, required_ids=[bank_account_id])
+            confidence = review_confidence(open_issues=unresolved_review_issues(review_notes), required_ids=[bank_account_id])
             depends_on = [candidate["action_id"]] if candidate["source"] == "current" else []
             actions.append(
                 make_action(
@@ -2160,6 +2273,758 @@ def build_payment_actions(
                     depends_on=depends_on,
                     expected_effect=f"Create a draft payment summary for {group_label} in Simplbooks.",
                     review_notes=review_notes,
+                )
+            )
+    return actions
+
+
+def settlement_action_key(
+    company_slug: str,
+    period: str,
+    role: str,
+    record_id: str,
+    part: int | None = None,
+) -> str:
+    """Return a stable cash-action key for one physical row or reviewed split part."""
+    digest = hashlib.sha256(record_id.encode()).hexdigest()[:12]
+    suffix = f"-{part}" if part is not None else ""
+    return f"{company_slug}-{period}-{role}-{digest}{suffix}"
+
+
+def physical_bank_allocation_key(record: dict[str, Any]) -> tuple[str, str, str]:
+    """Return the canonical reviewed-allocation key for one normalized bank row."""
+    try:
+        iban, currency = bank_ledger_key(record)
+        return statement_identity(record), iban, currency
+    except BankAllocationError as exc:
+        raise SimplbooksError(str(exc)) from exc
+
+
+def _allocation_parts(allocation: dict[str, Any]) -> list[tuple[dict[str, Any], int | None]]:
+    if str(allocation.get("disposition") or "") != "reviewed_split":
+        return [(allocation, None)]
+    parts = allocation.get("parts")
+    if not isinstance(parts, list) or not parts:
+        raise SimplbooksError("Reviewed split allocation requires at least one part.")
+    resolved: list[tuple[dict[str, Any], int | None]] = []
+    for index, part in enumerate(parts, start=1):
+        if not isinstance(part, dict):
+            raise SimplbooksError("Reviewed split allocation parts must be objects.")
+        if not str(part.get("disposition") or "") or not isinstance(part.get("target"), dict):
+            raise SimplbooksError("Each reviewed split part requires an exact disposition and target.")
+        resolved.append((part, index))
+    return resolved
+
+
+MANUAL_FINANCIAL_DISPOSITIONS = frozenset({"bank_fee_payment", "expense_reimbursement_payment", "clearing_transfer"})
+POSITIVE_BANK_DISPOSITIONS = frozenset(
+    {"generated_invoice_receipt", "existing_invoice_receipt", "direct_sale_receipt"}
+)
+NEGATIVE_BANK_DISPOSITIONS = frozenset(
+    {"generated_purchase_payment", "existing_purchase_payment", "bank_fee_payment", "expense_reimbursement_payment"}
+)
+
+
+def _validate_reviewed_disposition_signs(allocation: dict[str, Any]) -> None:
+    for part, _part_number in _allocation_parts(allocation):
+        disposition = str(part.get("disposition") or "")
+        amount = decimal_value(part.get("amount"))
+        if disposition in POSITIVE_BANK_DISPOSITIONS and amount <= 0:
+            raise SimplbooksError(f"Reviewed {disposition} amount must be positive.")
+        if disposition in NEGATIVE_BANK_DISPOSITIONS and amount >= 0:
+            raise SimplbooksError(f"Reviewed {disposition} amount must be negative.")
+
+
+def _requires_manual_financial_transaction(allocation: dict[str, Any]) -> bool:
+    return any(
+        str(part.get("disposition") or "") in MANUAL_FINANCIAL_DISPOSITIONS
+        for part, _part_number in _allocation_parts(allocation)
+    )
+
+
+def _approved_bank_allocations(
+    *,
+    records: dict[str, list[dict[str, Any]]],
+    allocations: dict[tuple[str, str, str], dict[str, Any]],
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    reviewed: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    if not allocations:
+        return reviewed
+    try:
+        validate_reviewed_amounts(list(allocations.values()))
+    except BankAllocationError as exc:
+        raise SimplbooksError(str(exc)) from exc
+    for allocation in allocations.values():
+        _validate_reviewed_disposition_signs(allocation)
+    for record in records.get("bank_transactions", []):
+        if str(record.get("source_system") or "") != "bank":
+            continue
+        key = physical_bank_allocation_key(record)
+        allocation = allocations.get(key)
+        if not allocation or str((allocation.get("review") or {}).get("status") or "") != "approved":
+            continue
+        try:
+            if allocation_key(allocation) != key:
+                raise SimplbooksError(
+                    f"Reviewed allocation key does not match physical bank row {record.get('record_id') or '<unknown>'}."
+                )
+        except BankAllocationError as exc:
+            raise SimplbooksError(str(exc)) from exc
+        physical_amount = decimal_value(record.get("gross_amount"))
+        allocation_amount = decimal_value(allocation.get("amount"))
+        if physical_amount != allocation_amount:
+            raise SimplbooksError(
+                f"Reviewed allocation amount does not match physical bank row {record.get('record_id') or '<unknown>'}."
+            )
+        reviewed.append((record, allocation))
+    return reviewed
+
+
+def build_manual_financial_dependencies(
+    *,
+    normalized_path_display: str,
+    records: dict[str, list[dict[str, Any]]],
+    allocations: dict[tuple[str, str, str], dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Describe UI statement-import work without inventing submit-capable API actions."""
+    dependencies: list[dict[str, Any]] = []
+    for record, allocation in _approved_bank_allocations(records=records, allocations=allocations):
+        if not _requires_manual_financial_transaction(allocation):
+            continue
+        record_id = str(record.get("record_id") or "").strip()
+        statement_id, iban, currency = allocation_key(allocation)
+        physical_amount = decimal_value(record.get("gross_amount"))
+        parts = _allocation_parts(allocation)
+        split_parts = [
+            {
+                "signed_amount": decimal_number(decimal_value(part.get("amount"))),
+                "disposition": str(part.get("disposition") or ""),
+                "target": copy.deepcopy(part.get("target") or {}),
+            }
+            for part, part_number in parts
+            if part_number is not None
+        ]
+        split_proof = None
+        if split_parts:
+            signed_parts_total = sum(
+                (decimal_value(part["signed_amount"]) for part in split_parts),
+                Decimal("0"),  # noqa: FURB157
+            )
+            if signed_parts_total != physical_amount:
+                raise SimplbooksError(
+                    f"Reviewed split parts must sum to physical bank row {record_id}: "
+                    f"{signed_parts_total} != {physical_amount}."
+                )
+            split_proof = {
+                "signed_parts_total": decimal_number(signed_parts_total),
+                "physical_signed_amount": decimal_number(physical_amount),
+                "equation": " + ".join(f"{decimal_value(part['signed_amount']):.2f}" for part in split_parts)
+                + f" = {physical_amount:.2f}",
+            }
+        rationale = str((allocation.get("review") or {}).get("rationale") or "").strip()
+        reviewed_proof = copy.deepcopy((allocation.get("target") or {}).get("statement_import_proof"))
+        statement_import_proof = reviewed_proof or {
+            "status": "pending",
+            "required_evidence": "live_discovery_or_audit",
+        }
+        proof_verified = (
+            isinstance(statement_import_proof, dict)
+            and statement_import_proof.get("status") == "verified"
+        )
+        source_ref = source_refs_for_records(normalized_path_display, [record], note=rationale)[0]
+        source_ref["source_kind"] = "physical_bank"
+        dependencies.append(
+            {
+                "kind": "manual_statement_import_financial_transaction",
+                "blocking": not proof_verified,
+                "reason": (
+                    f"Physical bank row {record_id} requires full SimplBooks statement import and live proof; "
+                    "no public financial-transaction API endpoint is confirmed."
+                ),
+                "disposition": str(allocation.get("disposition") or ""),
+                "statement_id": statement_id,
+                "record_id": record_id,
+                "date": str(record.get("event_date") or ""),
+                "iban": iban,
+                "currency": currency,
+                "physical_signed_amount": decimal_number(physical_amount),
+                "source_ref": source_ref,
+                "reviewed_rationale": rationale,
+                "target": copy.deepcopy(allocation.get("target") or {}),
+                "split_parts": split_parts,
+                "split_proof": split_proof,
+                "statement_import_proof": statement_import_proof,
+            }
+        )
+    return dependencies
+
+
+def build_foreign_currency_payment_pilot_dependencies(
+    *,
+    records: dict[str, list[dict[str, Any]]],
+    allocations: dict[tuple[str, str, str], dict[str, Any]],
+) -> list[dict[str, Any]]:
+    dependencies: list[dict[str, Any]] = []
+    for record, allocation in _approved_bank_allocations(records=records, allocations=allocations):
+        target = allocation.get("target") or {}
+        if not target.get("foreign_currency_pilot_required"):
+            continue
+        dependencies.append({
+            "kind": "foreign_currency_payment_pilot",
+            "blocking": True,
+            "reason": (
+                "First live base-currency payment against a foreign-currency purchase requires verified "
+                "applied ECB rate, linked purchase balance, and realized FX/fee treatment."
+            ),
+            "record_id": str(record.get("record_id") or ""),
+            "target_currency": str(target.get("target_currency") or ""),
+            "required_evidence": list(target.get("pilot_requirements") or []),
+        })
+    return dependencies
+
+
+def build_direct_sale_actions(
+    *,
+    company_slug: str,
+    period: str,
+    period_end: date,
+    normalized_path_display: str,
+    records: dict[str, list[dict[str, Any]]],
+    base_currency: str,
+    posting_policy: dict[str, Any] | None,
+    allocations: dict[tuple[str, str, str], dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Create reviewed direct-sale invoices and one exact receipt per physical row."""
+    candidates = [
+        (record, allocation)
+        for record, allocation in _approved_bank_allocations(records=records, allocations=allocations)
+        if str(allocation.get("disposition") or "") == "direct_sale_receipt"
+    ]
+    if not candidates:
+        return []
+    if posting_policy is None:
+        raise SimplbooksError("Direct-sale allocations require an explicit generic posting policy.")
+
+    grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
+    for record, allocation in candidates:
+        record_id = str(record.get("record_id") or "").strip()
+        physical_amount = decimal_value(record.get("gross_amount"))
+        if physical_amount <= 0:
+            raise SimplbooksError(f"Direct-sale receipt allocation for {record_id} must be positive.")
+        target = allocation.get("target") or {}
+        if not isinstance(target, dict):
+            raise SimplbooksError(f"Direct-sale target for {record_id} must be an object.")
+        if str(target.get("document_type") or "") != "invoice":
+            raise SimplbooksError(f"Direct-sale target for {record_id} must be an invoice.")
+        description = str(target.get("product_description") or target.get("description") or "").strip()
+        if not description:
+            raise SimplbooksError(f"Direct-sale target for {record_id} requires product_description.")
+        quantity = decimal_value(target.get("quantity"))
+        if quantity <= 0:
+            raise SimplbooksError(f"Direct-sale target for {record_id} requires a positive quantity.")
+        gross_amount = decimal_value(target.get("gross_amount"))
+        if gross_amount != physical_amount:
+            raise SimplbooksError(f"Direct-sale target gross amount must equal physical bank row {record_id}.")
+
+        contact_label = str(target.get("contact_label") or "direct-sale").strip()
+        family = slugify(str(target.get("posting_family") or ""))
+        vat_profile_name = slugify(str(target.get("vat_profile") or ""))
+        if not family or not vat_profile_name:
+            raise SimplbooksError(f"Direct-sale target for {record_id} requires posting_family and vat_profile.")
+        try:
+            contact_id = resolve_contact(posting_policy, role="sales", label=contact_label)
+            income_account_id = resolve_mapping(posting_policy, family=family, field_name="income_account_id")
+            mapped_vat_type_id = resolve_mapping(posting_policy, family=family, field_name="vat_type_id")
+            profile = resolve_sales_vat_profile(
+                posting_policy,
+                event_date=date.fromisoformat(str(record.get("event_date") or "")),
+            )
+            bank_account_id = resolve_bank_account(
+                posting_policy,
+                customer_account=allocation_key(allocation)[1],
+                currency=record_currency(record, base_currency),
+                allow_legacy_single_currency=(
+                    record_currency(record, base_currency).upper() == base_currency.upper()
+                ),
+            )
+        except (PostingPolicyError, ValueError) as exc:
+            raise SimplbooksError(f"Could not resolve direct-sale posting policy for {record_id}: {exc}") from exc
+        if mapped_vat_type_id != str(profile["goods_vat_type_id"]):
+            raise SimplbooksError(
+                f"Direct-sale posting family {family!r} VAT type does not match the transaction-date sales VAT profile."
+            )
+        family_values = (posting_policy.get("mappings") or {}).get(family) or {}
+        mapped_warehouse = family_values.get("warehouse_id")
+        warehouse_id = str(mapped_warehouse) if mapped_warehouse not in (None, "") else None
+        mapped_article = family_values.get("article_id")
+        article_id = str(mapped_article) if mapped_article not in (None, "") else None
+        if "warehouse_id" in target:
+            reviewed_warehouse = target.get("warehouse_id")
+            reviewed_warehouse = str(reviewed_warehouse) if reviewed_warehouse not in (None, "") else None
+            if reviewed_warehouse != warehouse_id:
+                raise SimplbooksError(
+                    f"Direct-sale target warehouse for {record_id} does not match posting family {family!r}."
+                )
+        if "article_id" in target:
+            reviewed_article = target.get("article_id")
+            reviewed_article = str(reviewed_article) if reviewed_article not in (None, "") else None
+            if reviewed_article != article_id:
+                raise SimplbooksError(
+                    f"Direct-sale target article for {record_id} does not match posting family {family!r}."
+                )
+        for field, expected in (
+            ("contact_id", contact_id),
+            ("income_account_id", income_account_id),
+            ("vat_type_id", mapped_vat_type_id),
+        ):
+            if target.get(field) not in (None, "") and str(target[field]) != expected:
+                raise SimplbooksError(f"Direct-sale target {field} for {record_id} does not match posting policy.")
+        profile_period = f"{profile['start']}/{profile['end'] or 'open'}"
+        group_key = (
+            period,
+            record_currency(record, base_currency),
+            contact_id,
+            vat_profile_name,
+            profile_period,
+            profile["rate"],
+            mapped_vat_type_id,
+            income_account_id,
+            warehouse_id,
+            article_id,
+        )
+        grouped[group_key].append(
+            {
+                "record": record,
+                "allocation": allocation,
+                "description": description,
+                "quantity": quantity,
+                "gross_amount": gross_amount,
+                "bank_account_id": bank_account_id,
+                "family": family,
+                "contact_label": contact_label,
+            }
+        )
+
+    actions: list[dict[str, Any]] = []
+    for group_key, entries in sorted(grouped.items(), key=lambda item: repr(item[0])):
+        (
+            _group_period,
+            currency,
+            contact_id,
+            vat_profile_name,
+            profile_period,
+            vat_rate,
+            vat_type_id,
+            income_account_id,
+            warehouse_id,
+            article_id,
+        ) = group_key
+        family = entries[0]["family"]
+        contact_label = entries[0]["contact_label"]
+        digest = hashlib.sha256(json.dumps(group_key, default=str).encode()).hexdigest()[:12]
+        invoice_key = f"{company_slug}-{period}-sales-direct-{digest}"
+        invoice_total = sum((entry["gross_amount"] for entry in entries), Decimal("0"))  # noqa: FURB157
+        invoice_vat = sum(
+            (
+                entry["gross_amount"] * decimal_value(vat_rate) / (Decimal("100") + decimal_value(vat_rate))  # noqa: FURB157
+            ).quantize(Decimal("0.01"))
+            for entry in entries
+        )
+        lines = []
+        for entry in entries:
+            gross_amount = entry["gross_amount"]
+            vat_amount = (
+                gross_amount * decimal_value(vat_rate) / (Decimal("100") + decimal_value(vat_rate))  # noqa: FURB157
+            ).quantize(Decimal("0.01"))
+            lines.append(
+                {
+                    "line_role": "direct_sale_revenue",
+                    "description": entry["description"],
+                    "quantity": decimal_number(entry["quantity"]),
+                    "gross_amount": decimal_number(gross_amount),
+                    "vat_amount_hint": decimal_number(vat_amount),
+                    "suggested_income_account_id": income_account_id,
+                    "suggested_vat_type_id": vat_type_id,
+                    "warehouse_id_hint": warehouse_id,
+                    "article_id_hint": article_id,
+                    "inventory_quantity_proof": inventory_proof_envelope(
+                        scope={
+                            "kind": "reviewed_direct_sale_allocation",
+                            "period": period,
+                            "record_category": "bank_transactions",
+                            "statement_id": str(entry["allocation"].get("statement_id") or ""),
+                        },
+                        quantity=entry["quantity"],
+                        contributors=[{
+                            "record_id": str(entry["record"].get("record_id") or ""),
+                            "quantity": decimal_number(entry["quantity"]),
+                            "quantity_source": "reviewed_allocation_target",
+                            "record_sha256": canonical_record_sha256(entry["record"]),
+                        }],
+                    ),
+                    "record_count": 1,
+                    "vat_profile_name": vat_profile_name,
+                    "vat_profile_rate": vat_rate,
+                    "vat_profile_period": profile_period,
+                }
+            )
+        physical_refs = [
+            {**ref, "source_kind": "physical_bank"}
+            for ref in source_refs_for_records(
+                normalized_path_display,
+                [entry["record"] for entry in entries],
+            )
+        ]
+        invoice_payload = {
+            "draft_schema": "invoice_summary_v1",
+            "document_type": "invoice",
+            "document_date": period_end.isoformat(),
+            "currency": currency,
+            "summary_scope": {
+                "channel_or_source": contact_label,
+                "tax_profile": vat_profile_name,
+                "posting_family": family,
+                "record_count": len(entries),
+            },
+            "totals": {
+                "gross_amount": decimal_number(invoice_total),
+                "vat_amount": decimal_number(invoice_vat),
+                "shipping_amount": 0.0,
+                "fee_amount_observed": 0.0,
+            },
+            "counterparty": {
+                "contact_id": contact_id,
+                "display_name_hint": "Monthly reviewed direct sales",
+            },
+            "posting_policy_family": family,
+            "line_items": lines,
+        }
+        actions.append(
+            make_action(
+                period=period,
+                idempotency_key=invoice_key,
+                action_type="create_invoice_summary",
+                endpoint="invoices/create",
+                payload=invoice_payload,
+                source_refs=physical_refs,
+                reason="Create one monthly invoice for reviewed direct bank sales sharing an exact posting tuple.",
+                confidence="high",
+                depends_on=[],
+                expected_effect="Create one reviewed direct-sale invoice in SimplBooks.",
+                review_notes=[str((entry["allocation"].get("review") or {}).get("rationale") or "") for entry in entries],
+            )
+        )
+        for entry in entries:
+            record = entry["record"]
+            allocation = entry["allocation"]
+            record_id = str(record.get("record_id") or "")
+            receipt_ref = source_refs_for_records(normalized_path_display, [record])[0]
+            receipt_ref["source_kind"] = "physical_bank"
+            actions.append(
+                make_action(
+                    period=period,
+                    idempotency_key=settlement_action_key(company_slug, period, "incoming", record_id),
+                    action_type="create_incoming_summary",
+                    endpoint="incomings/create",
+                    payload={
+                        "draft_schema": "cash_settlement_v1",
+                        "document_type": "incoming",
+                        "document_date": str(record.get("event_date") or ""),
+                        "currency": currency,
+                        "counterparty": {
+                            "contact_id": contact_id,
+                            "display_name_hint": "Reviewed direct sale",
+                        },
+                        "counterparty_hint": entry["contact_label"],
+                        "settlement_family": "direct-sale",
+                        "bank_account_id": entry["bank_account_id"],
+                        "amount": decimal_number(entry["gross_amount"]),
+                        "linked_invoice_action": invoice_key,
+                        "record_count": 1,
+                    },
+                    source_refs=[receipt_ref],
+                    reason=f"Create the exact receipt for reviewed physical direct-sale row {record_id}.",
+                    confidence="high",
+                    depends_on=[invoice_key],
+                    expected_effect=f"Settle direct-sale invoice with physical bank row {record_id}.",
+                    review_notes=[str((allocation.get("review") or {}).get("rationale") or "")],
+                )
+            )
+    return actions
+
+
+def _generated_target_action_key(target: dict[str, Any]) -> str:
+    keys = [
+        str(target.get(name) or "").strip()
+        for name in ("action_key", "idempotency_key", "action_id")
+        if str(target.get(name) or "").strip()
+    ]
+    if len(set(keys)) != 1:
+        raise SimplbooksError("Generated settlement target requires exactly one action key.")
+    return keys[0]
+
+
+def _existing_target_id(target: dict[str, Any]) -> str:
+    value = str(target.get("simplbooks_id") or "").strip()
+    if not value:
+        raise SimplbooksError("Existing settlement target requires simplbooks_id.")
+    return value
+
+
+def historical_action_index(
+    *,
+    actions_dir: Path | None,
+    submissions_dir: Path | None,
+    current_period: str,
+) -> dict[str, dict[str, Any]]:
+    """Index prior action files and successful submission IDs without changing either artifact."""
+    if actions_dir is None or not actions_dir.exists():
+        return {}
+
+    from bookchecker import load_yaml
+
+    indexed: dict[str, dict[str, Any]] = {}
+    for path in sorted(actions_dir.glob("*.yaml")):
+        if not re.fullmatch(r"\d{4}-\d{2}", path.stem) or path.stem >= current_period:
+            continue
+        batch = load_yaml(path)
+        for action in batch.get("actions") or []:
+            if not isinstance(action, dict):
+                continue
+            key = str(action.get("idempotency_key") or "").strip()
+            if key and key not in indexed:
+                indexed[key] = copy.deepcopy(action)
+
+    if submissions_dir is None or not submissions_dir.exists():
+        return {}
+    successful_keys: set[str] = set()
+    for path in sorted(submissions_dir.glob("*.json")):
+        if not re.fullmatch(r"\d{4}-\d{2}", path.stem) or path.stem >= current_period:
+            continue
+        try:
+            submission = load_json(path)
+        except SimplbooksError:
+            continue
+        for entry in submission.get("request_log") or []:
+            if not isinstance(entry, dict) or entry.get("mode") != "write" or not entry.get("success"):
+                continue
+            inserted_id = entry.get("inserted_id")
+            key = str(entry.get("action_idempotency_key") or "").strip()
+            if key in indexed and inserted_id not in (None, ""):
+                indexed[key]["inserted_id"] = inserted_id
+                successful_keys.add(key)
+    return {key: indexed[key] for key in successful_keys}
+
+
+def build_exact_cash_actions(
+    *,
+    company_slug: str,
+    period: str,
+    normalized_path_display: str,
+    records: dict[str, list[dict[str, Any]]],
+    base_currency: str,
+    default_bank_account_id: str | None,
+    bank_account_notes: list[str],
+    entity_map: dict[str, Any] | None,
+    posting_policy: dict[str, Any] | None,
+    allocations: dict[tuple[str, str, str], dict[str, Any]],
+    current_actions: list[dict[str, Any]],
+    historical_actions: dict[str, dict[str, Any]],
+    discovery_overviews: list[dict[str, Any]] | None,
+    forced_note: str | None,
+) -> list[dict[str, Any]]:
+    """Build one settlement per approved physical bank row or explicitly reviewed split part."""
+    if not allocations:
+        return []
+    current_by_key = {str(action.get("idempotency_key") or ""): action for action in current_actions}
+    actions: list[dict[str, Any]] = []
+    for record in records.get("bank_transactions", []):
+        if str(record.get("source_system") or "") != "bank":
+            continue
+        key = physical_bank_allocation_key(record)
+        allocation = allocations.get(key)
+        if not allocation or str((allocation.get("review") or {}).get("status") or "") != "approved":
+            continue
+        record_id = str(record.get("record_id") or "").strip()
+        if not record_id:
+            raise SimplbooksError("Physical bank settlement requires record_id.")
+        try:
+            if allocation_key(allocation) != key:
+                raise SimplbooksError(f"Reviewed allocation key does not match physical bank row {record_id}.")
+        except BankAllocationError as exc:
+            raise SimplbooksError(str(exc)) from exc
+
+        document_date = str(record.get("event_date") or "")
+        if not document_date:
+            raise SimplbooksError(f"Physical bank settlement {record_id} requires event_date.")
+        currency = record_currency(record, base_currency)
+        if _requires_manual_financial_transaction(allocation) or str(allocation.get("disposition") or "") == "direct_sale_receipt":
+            # The physical row is atomic: dedicated direct-sale handling or one manual
+            # statement-import dependency owns the entire row.
+            continue
+        bank_account_id = default_bank_account_id
+        notes = list(bank_account_notes)
+        if posting_policy is not None:
+            try:
+                bank_account_id = resolve_bank_account(
+                    posting_policy,
+                    customer_account=key[1],
+                    currency=currency,
+                    allow_legacy_single_currency=len({record_currency(item, base_currency) for item in records.get("bank_transactions", []) if str(item.get("source_system") or "") == "bank"}) == 1,
+                )
+            except PostingPolicyError as exc:
+                raise SimplbooksError(str(exc)) from exc
+            notes = ["Applied exact source-bank-account mapping from the physical bank row."]
+
+        for part, part_number in _allocation_parts(allocation):
+            disposition = str(part.get("disposition") or "")
+            target = part.get("target") or {}
+            part_amount = decimal_value(part.get("amount") if part_number is not None else allocation.get("amount"))
+            if not isinstance(target, dict):
+                raise SimplbooksError(f"Settlement target for {record_id} must be an object.")
+            if disposition in {"generated_invoice_receipt", "existing_invoice_receipt", "direct_sale_receipt"} and part_amount <= 0:
+                raise SimplbooksError(f"Receipt settlement allocation for {record_id} must be positive.")
+            if disposition in {"generated_purchase_payment", "existing_purchase_payment", "bank_fee_payment"} and part_amount >= 0:
+                raise SimplbooksError(f"Payment settlement allocation for {record_id} must be negative.")
+            if disposition in {"generated_invoice_receipt", "existing_invoice_receipt"}:
+                document_type, action_type, endpoint, role, target_kind = "incoming", "create_incoming_summary", "incomings/create", "incoming", "invoice"
+            elif disposition in {"generated_purchase_payment", "existing_purchase_payment"}:
+                document_type, action_type, endpoint, role, target_kind = "payment", "create_payment_summary", "payments/create", "payment", "purchase"
+            else:
+                raise SimplbooksError(f"Unsupported exact cash disposition for {record_id}: {disposition!r}")
+            if str(target.get("document_type") or "") != target_kind:
+                raise SimplbooksError(f"Settlement target for {record_id} must be a {target_kind}.")
+
+            target_is_existing = disposition.startswith("existing_")
+            target_has_existing_id = bool(str(target.get("simplbooks_id") or "").strip())
+            target_has_generated_action = any(
+                bool(str(target.get(field) or "").strip())
+                for field in ("action_key", "idempotency_key", "action_id")
+            )
+            if target_has_existing_id and target_has_generated_action:
+                raise SimplbooksError(f"Settlement target for {record_id} cannot carry both existing and generated target fields.")
+            target_field = f"linked_{target_kind}_id" if target_is_existing else f"linked_{target_kind}_action"
+            target_value = _existing_target_id(target) if target_is_existing else _generated_target_action_key(target)
+            depends_on: list[str] = []
+            supporting_refs: list[dict[str, Any]] = []
+            generated_target_contact_id: Any = None
+            generated_target_label = ""
+            if target_is_existing:
+                if not discovery_overviews:
+                    raise SimplbooksError(f"Existing settlement target {target_value!r} requires a bound discovery overview.")
+                discovered = [
+                    item
+                    for overview in discovery_overviews
+                    for item in overview.get("document_index") or []
+                    if isinstance(item, dict)
+                    and str(item.get("simplbooks_id") or "") == target_value
+                    and str(item.get("document_type") or "") == target_kind
+                ]
+                if not discovered:
+                    raise SimplbooksError(
+                        f"Existing settlement target {target_value!r} is not proven by a bound {target_kind} discovery overview."
+                    )
+            if not target_is_existing:
+                target_action = current_by_key.get(target_value) or historical_actions.get(target_value)
+                if target_action is None:
+                    raise SimplbooksError(f"Generated settlement target {target_value!r} was not found for {record_id}.")
+                expected_action_type = "create_invoice_summary" if target_kind == "invoice" else "create_purchase_summary"
+                if str(target_action.get("action_type") or "") != expected_action_type:
+                    raise SimplbooksError(f"Generated settlement target {target_value!r} is not a {target_kind} action.")
+                if target_value in current_by_key:
+                    depends_on = [target_value]
+                elif target_action.get("inserted_id") in (None, ""):
+                    raise SimplbooksError(
+                        f"Prior generated settlement target {target_value!r} has no successful inserted_id."
+                    )
+                supporting_refs = [
+                    {
+                        **copy.deepcopy(source_ref),
+                        "note": "Linked generated target evidence.",
+                    }
+                    for source_ref in target_action.get("source_refs") or []
+                    if isinstance(source_ref, dict)
+                ]
+                target_counterparty = (target_action.get("payload") or {}).get("counterparty") or {}
+                if isinstance(target_counterparty, dict):
+                    generated_target_contact_id = target_counterparty.get("contact_id")
+                target_payload = target_action.get("payload") or {}
+                generated_target_label = str(
+                    target_payload.get("vendor_hint")
+                    or (target_payload.get("summary_scope") or {}).get("channel_or_source")
+                    or (target_counterparty.get("display_name_hint") if isinstance(target_counterparty, dict) else "")
+                    or ""
+                ).strip()
+
+                reviewed_contact_id = str(target.get("contact_id") or "").strip()
+                if reviewed_contact_id and reviewed_contact_id != str(generated_target_contact_id or ""):
+                    raise SimplbooksError(
+                        f"Settlement contact {reviewed_contact_id!r} conflicts with linked generated target {target_value!r}."
+                    )
+                reviewed_hint = str(target.get("counterparty_hint") or "").strip()
+                if reviewed_hint and slugify(reviewed_hint) != slugify(generated_target_label):
+                    raise SimplbooksError(
+                        f"Settlement counterparty hint {reviewed_hint!r} conflicts with linked generated target {target_value!r}."
+                    )
+
+            contact_id = target.get("contact_id")
+            if contact_id in (None, "") and generated_target_contact_id not in (None, ""):
+                contact_id = generated_target_contact_id
+                notes.append("Inherited the exact contact from the linked generated target action.")
+            if contact_id in (None, ""):
+                group_label = record_group_label(record, default="bank settlement")
+                contact_id, contact_notes = preferred_contact_id(
+                    entity_map,
+                    group_label=group_label,
+                    candidate_labels=contact_candidate_labels(group_label=group_label, records=[record]),
+                )
+                notes_for_action = notes + contact_notes
+            else:
+                notes_for_action = list(notes)
+            if forced_note:
+                notes_for_action.append(forced_note)
+            notes_for_action.append(str((allocation.get("review") or {}).get("rationale") or "Reviewed bank allocation."))
+
+            counterparty_hint = str(
+                target.get("counterparty_hint")
+                or generated_target_label
+                or record_group_label(record, default="bank settlement")
+            )
+
+            payload = {
+                "draft_schema": "cash_settlement_v1",
+                "document_type": document_type,
+                "document_date": document_date,
+                "currency": currency,
+                "counterparty": {
+                    "contact_id": str(contact_id) if contact_id not in (None, "") else None,
+                    "display_name_hint": counterparty_hint,
+                },
+                "counterparty_hint": counterparty_hint,
+                "bank_account_id": bank_account_id,
+                "amount": decimal_number(part_amount if document_type == "incoming" else -part_amount),
+                target_field: target_value,
+                "record_count": 1,
+            }
+            actions.append(
+                make_action(
+                    period=period,
+                    idempotency_key=settlement_action_key(company_slug, period, role, record_id, part_number),
+                    action_type=action_type,
+                    endpoint=endpoint,
+                    payload=payload,
+                    source_refs=[
+                        {**source_ref, "source_kind": "physical_bank"}
+                        for source_ref in source_refs_for_records(normalized_path_display, [record])
+                    ] + supporting_refs,
+                    reason=f"Create the exact {document_type} settlement for reviewed physical bank row {record_id}.",
+                    confidence=review_confidence(
+                        open_issues=unresolved_review_issues(notes_for_action),
+                        required_ids=[bank_account_id, str(contact_id or "")],
+                    ),
+                    depends_on=depends_on,
+                    expected_effect=f"Create one {document_type} settlement for physical bank row {record_id}.",
+                    review_notes=notes_for_action,
                 )
             )
     return actions
@@ -2294,7 +3159,10 @@ def build_purchase_credit_actions(
                 payload=payload,
                 source_refs=source_refs_for_records(normalized_path_display, group_records),
                 reason=f"Preserve {group_label} refund evidence as a separate supplier credit.",
-                confidence=review_confidence(notes=review_notes, required_ids=[contact_id, account_id, vat_type_id]),
+                confidence=review_confidence(
+                    open_issues=unresolved_review_issues(review_notes),
+                    required_ids=[contact_id, account_id, vat_type_id],
+                ),
                 depends_on=[],
                 expected_effect=f"Create a supplier credit for {group_label} in Simplbooks.",
                 review_notes=review_notes,
@@ -2348,6 +3216,15 @@ def apply_posting_policy(
         if action_type in {"create_invoice_summary", "create_credit_invoice_summary"}:
             role = "sales"
             label = str((payload.get("summary_scope") or {}).get("channel_or_source") or "")
+        elif action_type == "create_incoming_summary" and str(payload.get("settlement_family") or "") == "direct-sale":  # noqa: SIM114
+            role = "sales"
+            label = str(payload.get("counterparty_hint") or "")
+        elif action_type == "create_incoming_summary" and (
+            payload.get("linked_invoice_id") not in (None, "")
+            or payload.get("linked_invoice_action") not in (None, "")
+        ):
+            role = "sales"
+            label = str(payload.get("counterparty_hint") or "")
         elif action_type in {"create_incoming_summary"} or action_type == "create_purchase_summary" and str(payload.get("vendor_hint")) in PROCESSOR_KEYWORDS:
             role = "processors"
             label = str(payload.get("counterparty_hint") or payload.get("vendor_hint") or "")
@@ -2377,10 +3254,16 @@ def apply_posting_policy(
 
         family = ""
         if role == "sales":
-            tax_profile = str((payload.get("summary_scope") or {}).get("tax_profile") or "")
-            if not tax_profile:
-                tax_profile = "taxable" if decimal_value((payload.get("totals") or {}).get("vat_amount")) else "non-taxable"
-            family = f"{slugify(label)}-{slugify(tax_profile)}"
+            explicit_family = str((payload.get("summary_scope") or {}).get("posting_family") or "")
+            if action_type in {"create_invoice_summary", "create_credit_invoice_summary"}:
+                tax_profile = str((payload.get("summary_scope") or {}).get("tax_profile") or "")
+                if not tax_profile:
+                    tax_profile = "taxable" if decimal_value((payload.get("totals") or {}).get("vat_amount")) else "non-taxable"
+                family = (
+                    slugify(explicit_family)
+                    if explicit_family.strip()
+                    else f"{slugify(label)}-{slugify(tax_profile)}"
+                )
         elif action_type == "create_purchase_summary" and role == "processors":
             family = f"fees-{slugify(label)}"
         elif action_type in {"create_purchase_summary", "create_purchase_credit_summary"}:
@@ -2428,6 +3311,30 @@ def apply_posting_policy(
                     )
                 else:
                     line["warehouse_id_hint"] = None
+                if not is_shipping and family_values.get("article_id") not in (None, ""):
+                    proof = line.get("inventory_quantity_proof")
+                    exact_quantity = decimal_value(line.get("quantity"))
+                    proof_quantity = decimal_value(proof.get("quantity")) if isinstance(proof, dict) else Decimal("0")  # noqa: FURB157
+                    contributors = proof.get("contributors") if isinstance(proof, dict) else None
+                    if (
+                        isinstance(proof, dict) and proof.get("status") == "exact"
+                        and exact_quantity > 0 and proof_quantity == exact_quantity
+                        and isinstance(contributors, list) and contributors
+                    ):
+                        line["article_id_hint"] = resolve_mapping(
+                            posting_policy, family=family, field_name="article_id"
+                        )
+                    else:
+                        line["article_id_hint"] = None
+                        unresolved.append({
+                            "action_id": action.get("idempotency_key"),
+                            "kind": "inventory_quantity",
+                            "blocking": True,
+                            "reason": "Inventory article requires exact positive reviewed quantity for every contributing goods source.",
+                            "line_role": line_role,
+                        })
+                else:
+                    line["article_id_hint"] = None
                 allocation_component = str(line.get("vat_allocation_component") or "")
                 if allocation_component in {"goods", "shipping"}:
                     try:
@@ -2461,12 +3368,7 @@ def apply_posting_policy(
                     ) from exc
                 warehouse_id = line_values.get("warehouse_id")
                 line["warehouse_id_hint"] = str(warehouse_id) if warehouse_id not in (None, "") else None
-        review_notes = [
-            note
-            for note in action.get("review_notes") or []
-            if not str(note).startswith("Ambiguous entity mapping candidates:")
-        ]
-        action["review_notes"] = review_notes
+        review_notes = list(action.get("review_notes") or [])
         required_ids: list[str | None] = [str((payload.get("counterparty") or {}).get("contact_id") or "")]
         for line in payload.get("line_items") or []:
             if role == "sales":
@@ -2477,7 +3379,16 @@ def apply_posting_policy(
                 required_ids.extend(
                     [line.get("suggested_expense_account_id"), line.get("suggested_vat_type_id")]
                 )
-        action["confidence"] = review_confidence(notes=review_notes, required_ids=required_ids)
+        review_notes = clean_resolved_review_notes(
+            review_notes,
+            contact_resolved=bool(required_ids[0]),
+            vat_resolved=all(value not in (None, "") for value in required_ids[1:]),
+        )
+        action["review_notes"] = review_notes
+        action["confidence"] = review_confidence(
+            open_issues=unresolved_review_issues(review_notes),
+            required_ids=required_ids,
+        )
     return unresolved
 
 
@@ -2495,6 +3406,8 @@ def build_action_batch(
     posting_policy: dict[str, Any] | None = None,
     exchange_rate_cache: dict[str, Any] | None = None,
     discovery_overview: dict[str, Any] | None = None,
+    discovery_overviews: list[dict[str, Any]] | None = None,
+    bank_allocations: dict[tuple[str, str, str], dict[str, Any]] | None = None,
     force: bool = False,
 ) -> dict[str, Any]:
     if normalized_payload.get("period") != recon_payload.get("period"):
@@ -2532,34 +3445,35 @@ def build_action_batch(
             for record in records["bank_transactions"]
             if slugify(str(record.get("source_system") or "")) == "bank"
         ]
-        missing_source_accounts = [
-            str(record.get("record_id") or "<unknown>")
-            for record in source_bank_records
-            if not str((record.get("attributes") or {}).get("customer_account") or "").strip()
-        ]
-        if missing_source_accounts:
-            raise SimplbooksError(
-                f"Posting policy found bank row(s) missing source bank account: {', '.join(missing_source_accounts[:3])}."
-            )
-        source_accounts = {
-            re.sub(r"\s+", "", str((record.get("attributes") or {}).get("customer_account") or "")).upper()
-            for record in source_bank_records
-        }
-        source_accounts.discard("")
-        if len(source_accounts) != 1:
-            raise SimplbooksError("Posting policy requires exactly one source bank account in normalized bank rows.")
+        source_accounts: list[tuple[str, str]] = []
+        for record in source_bank_records:
+            try:
+                iban, currency = bank_ledger_key(record)
+            except BankAllocationError as exc:
+                raise SimplbooksError(
+                    f"Posting policy found bank row(s) missing source bank account: {record.get('record_id') or '<unknown>'}."
+                ) from exc
+            source_accounts.append((iban, currency))
+        currencies = {currency for _iban, currency in source_accounts}
         try:
-            bank_account_id = resolve_bank_account(posting_policy, customer_account=next(iter(source_accounts)))
+            for source_account, currency in source_accounts:
+                resolve_bank_account(
+                    posting_policy,
+                    customer_account=source_account,
+                    currency=currency,
+                    allow_legacy_single_currency=len(currencies) == 1,
+                )
         except PostingPolicyError as exc:
             raise SimplbooksError(str(exc)) from exc
-        bank_account_notes = ["Applied exact source-bank-account mapping from posting policy."]
+        bank_account_notes = ["Applied exact source-bank-account mapping from the physical bank row."]
     artifacts_dir = inferred_artifacts_dir(normalized_path)
-    prior_purchase_candidates = historical_purchase_candidates(
+    historical_actions = historical_action_index(
         actions_dir=(artifacts_dir / "actions") if artifacts_dir is not None else None,
+        submissions_dir=(artifacts_dir / "submissions") if artifacts_dir is not None else None,
         current_period=period,
     )
 
-    sales_actions, sales_action_ids, sales_action_ids_by_currency = build_sales_actions(
+    sales_actions, _sales_action_ids, _sales_action_ids_by_currency = build_sales_actions(
         company_slug=company_slug,
         period=period,
         period_end=period_end,
@@ -2571,7 +3485,7 @@ def build_action_batch(
         mapping_hints=mapping_hints,
         forced_note=forced_note,
     )
-    fee_actions, fee_action_ids = build_fee_actions(
+    fee_actions, _fee_action_ids = build_fee_actions(
         company_slug=company_slug,
         period=period,
         period_end=period_end,
@@ -2582,7 +3496,7 @@ def build_action_batch(
         mapping_hints=mapping_hints,
         forced_note=forced_note,
     )
-    purchase_actions, purchase_action_ids = build_purchase_actions(  # noqa: RUF059
+    purchase_actions, _purchase_action_ids = build_purchase_actions(
         company_slug=company_slug,
         period=period,
         period_end=period_end,
@@ -2604,38 +3518,48 @@ def build_action_batch(
         mapping_hints=mapping_hints,
         forced_note=forced_note,
     )
-    incoming_actions = build_incoming_actions(
+    direct_sale_actions = build_direct_sale_actions(
         company_slug=company_slug,
         period=period,
         period_end=period_end,
         normalized_path_display=normalized_path_display,
         records=records,
         base_currency=base_currency,
-        bank_account_id=bank_account_id,
-        bank_account_notes=bank_account_notes,
-        entity_map=entity_map,
-        sales_action_ids=sales_action_ids,
-        sales_action_ids_by_currency=sales_action_ids_by_currency,
-        fee_action_ids=fee_action_ids,
-        forced_note=forced_note,
+        posting_policy=posting_policy,
+        allocations=bank_allocations or {},
     )
-    payment_actions = build_payment_actions(
+    cash_actions = build_exact_cash_actions(
         company_slug=company_slug,
         period=period,
-        period_end=period_end,
         normalized_path_display=normalized_path_display,
         records=records,
         base_currency=base_currency,
-        bank_account_id=bank_account_id,
+        default_bank_account_id=bank_account_id,
         bank_account_notes=bank_account_notes,
         entity_map=entity_map,
-        purchase_actions=purchase_actions,
-        prior_purchase_candidates=prior_purchase_candidates,
+        posting_policy=posting_policy,
+        allocations=bank_allocations or {},
+        current_actions=sales_actions + fee_actions + purchase_actions + purchase_credit_actions + direct_sale_actions,
+        historical_actions=historical_actions,
+        discovery_overviews=discovery_overviews or ([discovery_overview] if discovery_overview else []),
         forced_note=forced_note,
     )
 
-    actions = sales_actions + fee_actions + purchase_actions + purchase_credit_actions + incoming_actions + payment_actions
+    actions = sales_actions + fee_actions + purchase_actions + purchase_credit_actions + direct_sale_actions + cash_actions
     unresolved_dependencies = apply_posting_policy(actions, posting_policy=posting_policy)
+    unresolved_dependencies.extend(
+        build_manual_financial_dependencies(
+            normalized_path_display=normalized_path_display,
+            records=records,
+            allocations=bank_allocations or {},
+        )
+    )
+    unresolved_dependencies.extend(
+        build_foreign_currency_payment_pilot_dependencies(
+            records=records,
+            allocations=bank_allocations or {},
+        )
+    )
     apply_exchange_rate_provenance(
         actions,
         base_currency=base_currency,
@@ -2739,6 +3663,22 @@ def resolve_reference_path(
     return (artifacts_dir / filename) if artifacts_dir is not None else None
 
 
+def resolve_bank_allocations_path(*, company_dir: Path | None, normalized_path: Path, period: str, override: str | None) -> Path | None:
+    if override:
+        return Path(override)
+    if company_dir is not None:
+        return company_dir / "artifacts" / "bank" / f"{period[:4]}-allocations.json"
+    artifacts_dir = inferred_artifacts_dir(normalized_path)
+    return (artifacts_dir / "bank" / f"{period[:4]}-allocations.json") if artifacts_dir is not None else None
+
+
+def normalized_year_paths(normalized_path: Path, *, period: str) -> list[Path]:
+    if normalized_path.parent.name != "normalized":
+        return [normalized_path]
+    paths = sorted(normalized_path.parent.glob(f"{period[:4]}-*.json"))
+    return paths or [normalized_path]
+
+
 def resolve_output_path(*, company_dir: Path | None, normalized_path: Path, period: str, override: str | None) -> Path:
     if override:
         return Path(override)
@@ -2761,7 +3701,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--company-profile", help="Optional path to company profile JSON")
     parser.add_argument("--posting-policy", help="Posting policy JSON; defaults to company artifacts/posting_policy.json")
     parser.add_argument("--exchange-rates", help="Annual ECB cache; defaults to company artifacts/reference/ecb-rates-<year>.json")
-    parser.add_argument("--discovery-overview", help="Refreshed Simplbooks overview; defaults to company artifacts/discovery/<year>-overview.json")
+    parser.add_argument(
+        "--discovery-overview",
+        action="append",
+        help="Refreshed Simplbooks overview; repeat to bind an existing target from another discovery year.",
+    )
+    parser.add_argument("--bank-allocations", help="Reviewed annual bank allocation artifact")
     parser.add_argument("--output", help="Optional output path for actions YAML")
     parser.add_argument("--force", action="store_true", help="Allow draft generation even when recon does not approve the month")
     return parser
@@ -2792,11 +3737,23 @@ def main() -> int:
         override=args.exchange_rates,
         filename=f"reference/ecb-rates-{year}.json",
     )
-    discovery_overview_path = resolve_reference_path(
+    discovery_overview_paths = (
+        [Path(value) for value in args.discovery_overview]
+        if args.discovery_overview
+        else [resolve_reference_path(
+            company_dir=company_dir,
+            normalized_path=normalized_path,
+            override=None,
+            filename=f"discovery/{year}-overview.json",
+        )]
+    )
+    discovery_overview_paths = [path for path in discovery_overview_paths if path is not None]
+    discovery_overview_path = discovery_overview_paths[0] if discovery_overview_paths else None
+    bank_allocations_path = resolve_bank_allocations_path(
         company_dir=company_dir,
         normalized_path=normalized_path,
-        override=args.discovery_overview,
-        filename=f"discovery/{year}-overview.json",
+        period=args.period,
+        override=args.bank_allocations,
     )
     output_path = resolve_output_path(company_dir=company_dir, normalized_path=normalized_path, period=args.period, override=args.output)
 
@@ -2825,18 +3782,32 @@ def main() -> int:
 
     posting_policy = load_posting_policy(posting_policy_path) if posting_policy_path and posting_policy_path.exists() else None
     exchange_rate_cache = load_optional_json(exchange_rates_path)
-    discovery_overview = load_optional_json(discovery_overview_path)
+    discovery_overviews = [payload for path in discovery_overview_paths if (payload := load_optional_json(path)) is not None]
+    discovery_overview = discovery_overviews[0] if discovery_overviews else None
+    bank_allocations: dict[tuple[str, str, str], dict[str, Any]] = {}
+    if bank_allocations_path is not None and bank_allocations_path.exists():
+        try:
+            bank_allocations = period_allocations(
+                load_bank_allocations(
+                    bank_allocations_path,
+                    normalized_year_paths=normalized_year_paths(normalized_path, period=args.period),
+                ),
+                args.period,
+            )
+        except BankAllocationError as exc:
+            raise SimplbooksError(f"Reviewed bank allocation artifact is not usable: {exc}") from exc
     if posting_policy and posting_policy.get("company_slug") != normalized_payload.get("company_slug"):
         raise SimplbooksError("Posting policy company_slug does not match normalized company_slug.")
-    if discovery_overview and company_dir is not None:
-        try:
-            validate_discovery(
-                discovery_overview,
-                year=year,
-                company_id=resolve_company_id(None, company_dir=str(company_dir)),
-            )
-        except ReferenceArtifactError as exc:
-            raise SimplbooksError(str(exc)) from exc
+    if discovery_overviews and company_dir is not None:
+        for overview in discovery_overviews:
+            try:
+                validate_discovery(
+                    overview,
+                    year=int(str(overview.get("year") or year)),
+                    company_id=resolve_company_id(None, company_dir=str(company_dir)),
+                )
+            except ReferenceArtifactError as exc:
+                raise SimplbooksError(str(exc)) from exc
     repo_root = Path.cwd()
     woo_tax_reference_bindings = bind_woo_tax_reference_artifacts(
         normalized_payload,
@@ -2856,12 +3827,18 @@ def main() -> int:
         posting_policy=posting_policy,
         exchange_rate_cache=exchange_rate_cache,
         discovery_overview=discovery_overview,
+        discovery_overviews=discovery_overviews,
+        bank_allocations=bank_allocations,
         force=args.force,
     )
     bound_paths = [
         ("posting_policy", posting_policy_path),
-        ("discovery_overview", discovery_overview_path),
+        *(("discovery_overview", path) for path in discovery_overview_paths),
+        ("normalized_period", normalized_path),
+        ("reconciliation", recon_path),
     ]
+    if bank_allocations_path is not None and bank_allocations_path.exists():
+        bound_paths.append(("bank_allocations", bank_allocations_path))
     if foreign_currencies:
         bound_paths.append(("exchange_rates", exchange_rates_path))
     batch["reference_artifacts"] = [

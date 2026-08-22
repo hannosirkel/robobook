@@ -1,0 +1,24 @@
+{
+  "schema_version": "1.0",
+  "company_slug": "example",
+  "year": 2024,
+  "normalized_bindings": [
+    {
+      "path": "companies/example/artifacts/normalized/2024-01.json",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  ],
+  "allocations": [
+    {
+      "statement_id": "archive:example-transfer",
+      "record_id": "bank-source:bank:2",
+      "iban": "EE123",
+      "period": "2024-01",
+      "disposition": "existing_invoice_receipt",
+      "amount": 330.0,
+      "currency": "EUR",
+      "target": {"simplbooks_id": "119", "document_type": "invoice"},
+      "review": {"status": "approved", "rationale": "Replace with a reviewed allocation."}
+    }
+  ]
+}

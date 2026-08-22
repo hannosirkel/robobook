@@ -86,6 +86,8 @@ Tracked but not yet parsed:
 - Keep Woo order-summary evidence nonfinancial: normalized gross, net, VAT, fee, and shipping amounts are zero. Retain only the reviewed matching fields documented in `references/bookprep.md`; do not copy customer names or email addresses into normalized records.
 - Emit exceptions instead of inventing refund or VAT splits that the source does not support directly.
 - Keep canonical source choice explicit via the embedded source manifest.
+- Treat `bank_transactions` as physical-bank records only; route provider-wallet movements to `clearing_transactions`.
+- When a bank CSV supersedes paired CAMT XML, retain CAMT `bank_balances` as supporting evidence without duplicating transaction rows.
 
 ## References
 

@@ -15,6 +15,7 @@ Optional inputs:
 - `--policy-memo`
 - `--entity-map`
 - `--company-profile`
+- `--bank-allocations`
 - `--output`
 - `--force`
 
@@ -42,9 +43,16 @@ mapping choices explicit inside the draft payload:
   - processor fee summaries
   - purchase-expense summaries
 - `incomings/create`
-  - payout settlement summaries
+  - one exact reviewed physical-bank receipt, linked to an invoice action or existing invoice ID
 - `payments/create`
-  - bank-payment summaries linked to purchase summaries
+  - one exact reviewed physical-bank payment, linked to a purchase action or existing purchase ID
+- `unresolved_dependencies`
+  - one exact blocking manual statement-import financial transaction per bank-fee or clearing row
+  - one atomic dependency containing every signed split part when any part needs manual financial handling
+  - top-level disposition is limited to `bank_fee_payment`, `clearing_transfer`, or `reviewed_split`;
+    API-owned receipt/payment dispositions appear only inside a split that contains a fee or transfer part
+  - pending proof remains blocking; later verified proof retains the SimplBooks transaction ID and
+    discovery/audit evidence reference before it can become non-blocking
 
 Each payload currently carries a `draft_schema` marker such as `invoice_summary_v1`,
 `purchase_summary_v1`, or `cash_settlement_v1`.
@@ -71,11 +79,17 @@ Each payload currently carries a `draft_schema` marker such as `invoice_summary_
 
 ### Cash Actions
 
-- payout rows produce draft `incomings/create` actions
-- partner-tagged bank debits can produce draft `payments/create` actions when there is a matching
-  purchase-summary action
-- bank account ID selection prefers `company_profile.json`, then falls back to `entity_map.json`
-  heuristics
+- only allocations with `review.status: approved` create cash actions
+- each physical row (or each reviewed split part) gets a distinct stable action key and keeps the
+  statement date, amount, currency, source reference, and mapped bank account
+- generated targets may be current actions or successful prior submissions; existing IDs must be
+  proven by a bound discovery overview
+- processor payouts and purchase records remain supporting evidence, never settlement heuristics
+- direct-sale allocations create API invoices and exact physical-row receipts only from approved
+  generic posting-policy mappings
+- bank-fee and clearing-transfer dispositions never create surrogate API business documents
+- any reviewed split containing manual financial handling suppresses every API cash action for that
+  physical row and proves that signed split parts sum to the statement amount
 
 ## Current Blocking Rule
 

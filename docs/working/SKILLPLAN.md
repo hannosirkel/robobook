@@ -457,6 +457,8 @@ Checks:
 
 - duplicate-risk check
 - missing source reference check
+- exact-once physical-bank coverage against the reviewed annual allocation artifact
+- clearing-ledger continuity and unresolved-movement review
 - arithmetic consistency
 - obviously wrong account/VAT usage
 - mismatch between action totals and reconciliation totals
@@ -491,8 +493,17 @@ Responsibilities:
 Guardrails:
 
 - no write without explicit confirmation
+- write mode reruns the independent checker from the hash-bound normalized, reconciliation, policy, discovery, rate, and bank-allocation inputs
+- require the exact preceding configured month, including the prior December across a year boundary, to be successfully submitted and immutable
+- never regenerate or mutate a successfully submitted action YAML; a matching successful submission SHA freezes it
 - no destructive cleanup by default
 - no master-data creation unless separately approved
+
+### Full-year dry run and live-month orchestration
+
+`scripts/full_year_dry_run.py` processes months chronologically, passes the reviewed annual bank allocation to reconciliation, building, and checking, and reports annual physical rows, allocated and uncovered rows, clearing movements, and unresolved clearing movements. Annual aggregation includes only periods successfully processed or verified frozen during that invocation. For each included period it loads the exact action batch, verifies the action's reconciliation path/SHA resolves to `recon/YYYY-MM.json`, then verifies that reconciliation's company/period and current normalized/allocation bindings before consuming structured clearing movement/resolution IDs. Failed and not-yet-run periods are reported explicitly as unprocessed, never filled from stale files; ordinary month failure returns a failed annual summary, while mismatched evidence for an included period remains fail-closed. A successfully submitted month is reported as `skipped_submitted` only when the unchanged YAML has a fully successful write log, matching frozen identities, and successful endpoint/method/result evidence for every action; `--force-build` never overrides that freeze. Submitted YAML backed by dry-run, partial, missing, or mismatched evidence stops orchestration instead of regenerating the batch.
+
+`scripts/live_month_run.py` is the fail-closed operator entry point for one live month. Explicit `--confirm-write` is required before it starts. It refreshes read-only discovery, rebuilds only a never-submitted month, requires the builder to report `draft` at the exact expected output path and verifies the resulting YAML binds that newly refreshed discovery artifact, runs the checker, pauses for the human to change only `approval_status` to `approved`, reruns the checker against that exact YAML, and invokes `booksend --mode write --confirm-write`. It refuses submitted or partial periods, missing or failed configured predecessors, checker errors or warnings, stale bindings, no-op or misdirected builder output, non-approval edits at the checkpoint, and unresolved dependencies. It never sets approval itself.
 
 ### 8. `bookaudit`
 

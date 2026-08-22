@@ -29,15 +29,17 @@ audit.
 2. Default to stopping when recon does not approve the month.
 3. Load `policy_memo.md`, `entity_map.json`, and `company_profile.json` when they exist.
 4. Use `scripts/bookbuilder.py` as the main entrypoint.
-5. Keep the batch in `draft` status and push unresolved mapping gaps into `review_notes`.
-6. Hand the resulting action file to `bookchecker` before any write-capable skill is used.
+5. Load the reviewed annual bank allocation artifact; only `review.status: approved` physical rows may create cash actions.
+6. Keep the batch in `draft` status and push unresolved mapping gaps into `review_notes`.
+7. Hand the resulting action file to `bookchecker` before any write-capable skill is used.
 
 ## Command
 
 ```bash
 python3 scripts/bookbuilder.py \
   --company-dir companies/example \
-  --period 2024-01
+  --period 2024-01 \
+  --bank-allocations companies/example/artifacts/bank/2024-allocations.json
 ```
 
 To intentionally inspect a blocked month without approving it for submit, force draft generation:
@@ -57,14 +59,21 @@ Implemented draft actions:
 - refund credit-note summaries via `invoices/create`
 - processor fee summaries via `purchases/create`
 - purchase-expense summaries via `purchases/create`
-- payout incoming summaries via `incomings/create`
-- purchase-linked payment summaries via `payments/create`
+- exact statement-row incoming settlements via `incomings/create`
+- exact statement-row purchase payments via `payments/create`
+- reviewed direct-sale monthly invoices plus exact statement-row receipts
+- blocking manual statement-import financial dependencies for bank fees, clearing transfers, and
+  atomic netted-fee rows
 
 ## Guardrails
 
 - Stop on blocked recon unless `--force` is explicit.
 - Keep `approval_status` as `draft`.
 - Never hide missing account, VAT, contact, or bank mappings; carry them in `review_notes`.
+- Never infer a cash action from payout, amount, or counterparty heuristics. A reviewed allocation must bind it to one exact generated or existing target.
+- Never manufacture purchases, payments, or incomings for bank fees, clearing transfers, or a
+  physical row whose reviewed split includes manual financial handling. Emit one blocking manual
+  statement-import dependency containing the whole row and every signed split part.
 - Prefer month summaries over per-order drafts unless later evidence requires finer granularity.
 
 ## References

@@ -37,10 +37,17 @@ def month_key(value: str) -> str:
     return value[:7] if isinstance(value, str) and len(value) >= 7 else "unknown"
 
 
-def summarise_documents(records: list[dict[str, Any]], *, date_field: str, sum_field: str) -> dict[str, Any]:
+def summarise_documents(
+    records: list[dict[str, Any]],
+    *,
+    date_field: str,
+    sum_field: str,
+    fallback_date_field: str | None = None,
+) -> dict[str, Any]:
     monthly: dict[str, dict[str, Any]] = defaultdict(lambda: {"count": 0, "sum": 0.0, "vat": 0.0, "total_sum": 0.0})
     for record in records:
-        bucket = monthly[month_key(record.get(date_field, ""))]
+        document_date = record.get(date_field) or (record.get(fallback_date_field, "") if fallback_date_field else "")
+        bucket = monthly[month_key(document_date)]
         bucket["count"] += 1
         bucket["sum"] += float(record.get(sum_field, 0) or 0)
         bucket["vat"] += float(record.get("vat", 0) or 0)
@@ -67,6 +74,10 @@ def scan_year_from_unfiltered_pages(
     return records
 
 
+def document_is_in_business_year(record: dict[str, Any], *, year: int) -> bool:
+    return date_in_year(record.get("transaction_date") or record.get("created") or "", year)
+
+
 def count_row_patterns(rows: list[dict[str, Any]], field_name: str) -> dict[str, int]:
     counter: Counter[str] = Counter()
     for row in rows:
@@ -80,15 +91,61 @@ def build_document_index(
     *,
     invoices: list[dict[str, Any]],
     purchases: list[dict[str, Any]],
+    incomings: list[dict[str, Any]] | None = None,
+    payments: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     index = [document_identity(record, document_type="invoice").to_dict() for record in invoices]
     index.extend(document_identity(record, document_type="purchase").to_dict() for record in purchases)
+    index.extend(cash_document_index_entry(record, document_type="incoming") for record in incomings or [])
+    index.extend(cash_document_index_entry(record, document_type="payment") for record in payments or [])
     return index
 
 
+def cash_document_index_entry(record: dict[str, Any], *, document_type: str) -> dict[str, Any]:
+    """Build a stable, read-only discovery entry for a live cash document."""
+    if document_type == "incoming":
+        date_field = "income_date"
+        amount_field = "income_sum"
+        linked_fields = (("invoice_id", "invoice"), ("purchase_id", "purchase"))
+    else:
+        date_field = "payment_date"
+        amount_field = "payment_sum"
+        linked_fields = (("purchase_id", "purchase"), ("invoice_id", "invoice"))
+
+    identity_input = {
+        **record,
+        "transaction_date": None,
+        "event_date": None,
+        "document_date": record.get(date_field),
+        "created": None,
+        "gross_amount": record.get(amount_field, record.get("sum", 0)),
+    }
+    entry = document_identity(identity_input, document_type=document_type).to_dict()
+    linked_document_id = None
+    linked_document_type = None
+    for field_name, candidate_type in linked_fields:
+        value = record.get(field_name)
+        if value not in (None, ""):
+            linked_document_id = str(value)
+            linked_document_type = candidate_type
+            break
+    counterparty = record.get("client_name") or record.get("counterparty_name") or record.get("supplier_name") or ""
+    description = record.get("description") or record.get("comment") or record.get("explanation") or ""
+    entry.update(
+        {
+            "linked_document_id": linked_document_id,
+            "linked_document_type": linked_document_type,
+            "income_account_id": str(record["income_account_id"]) if record.get("income_account_id") not in (None, "") else None,
+            "counterparty": str(counterparty),
+            "description": str(description),
+        }
+    )
+    return entry
+
+
 def build_year_overview(client: SimplbooksClient, *, year: int) -> dict[str, Any]:
-    start = f"{year}-01-01"
-    end = f"{year}-12-31"
+    start = f"{year}-01-01"  # noqa: F841
+    end = f"{year}-12-31"  # noqa: F841
 
     financial_accounts = [
         unwrap_single_key(item)[1]
@@ -107,17 +164,19 @@ def build_year_overview(client: SimplbooksClient, *, year: int) -> dict[str, Any
         for item in client.paginate("warehouses/list")
     ]
 
-    invoice_list_raw = client.paginate(
-        "invoices/list",
-        payload={"created_from": start, "created_until": end},
-    )
-    invoices = [unwrap_single_key(item)[1] for item in invoice_list_raw]
+    invoice_list_raw = client.paginate("invoices/list")
+    invoices = [
+        record
+        for record in (unwrap_single_key(item)[1] for item in invoice_list_raw)
+        if document_is_in_business_year(record, year=year)
+    ]
 
-    purchase_list_raw = client.paginate(
-        "purchases/list",
-        payload={"created_from": start, "created_until": end},
-    )
-    purchases = [unwrap_single_key(item)[1] for item in purchase_list_raw]
+    purchase_list_raw = client.paginate("purchases/list")
+    purchases = [
+        record
+        for record in (unwrap_single_key(item)[1] for item in purchase_list_raw)
+        if document_is_in_business_year(record, year=year)
+    ]
 
     receipts = scan_year_from_unfiltered_pages(
         client,
@@ -150,7 +209,7 @@ def build_year_overview(client: SimplbooksClient, *, year: int) -> dict[str, Any
         "company_id": client.company_id,
         "retrieved_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "technical_findings": [
-            "Invoices and purchases support year-bounded list queries by created date.",
+            "Invoices and purchases are scanned from unfiltered lists and selected by transaction_date, falling back to created only when transaction_date is absent.",
             "Receipts and payments do not show year range filters in the published spec, so this overview scans paginated lists and filters by year client-side.",
             "Invoice row details are available via invoices/get/{id}.",
             "Purchase row details are available via purchases/get/{id}.",
@@ -168,8 +227,8 @@ def build_year_overview(client: SimplbooksClient, *, year: int) -> dict[str, Any
             "payments": len(payments),
         },
         "monthly": {
-            "invoices": summarise_documents(invoices, date_field="created", sum_field="sum"),
-            "purchases": summarise_documents(purchases, date_field="created", sum_field="sum"),
+            "invoices": summarise_documents(invoices, date_field="transaction_date", fallback_date_field="created", sum_field="sum"),
+            "purchases": summarise_documents(purchases, date_field="transaction_date", fallback_date_field="created", sum_field="sum"),
             "receipts": summarise_documents(receipts, date_field="income_date", sum_field="income_sum"),
             "payments": summarise_documents(payments, date_field="payment_date", sum_field="payment_sum"),
         },
@@ -182,7 +241,12 @@ def build_year_overview(client: SimplbooksClient, *, year: int) -> dict[str, Any
             "purchase_vat_type_ids": count_row_patterns(purchase_rows, "vat_type_id"),
             "purchase_article_ids": count_row_patterns(purchase_rows, "article_id"),
         },
-        "document_index": build_document_index(invoices=invoices, purchases=purchases),
+        "document_index": build_document_index(
+            invoices=invoices,
+            purchases=purchases,
+            incomings=receipts,
+            payments=payments,
+        ),
         "samples": {
             "financial_accounts": financial_accounts[:10],
             "income_accounts": income_accounts[:10],

@@ -2,6 +2,7 @@ from __future__ import annotations  # noqa: I001
 
 import json
 import hashlib
+import os
 import sys
 import tempfile
 import unittest
@@ -74,6 +75,47 @@ def pdf_source(root: Path, name: str, *, source_system: str) -> bookprep.SourceD
 
 
 class BookprepTests(unittest.TestCase):
+    def test_write_json_preserves_generated_at_when_normalized_content_is_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "normalized.json"
+            original = {
+                "schema_version": "1.0",
+                "company_slug": "example",
+                "period": "2024-01",
+                "generated_at": "2026-08-22T10:00:00Z",
+                "records": {"bank_transactions": []},
+            }
+            bookprep.write_json(path, original)
+            original_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+
+            regenerated = {**original, "generated_at": "2026-08-22T11:00:00Z"}
+            with mock.patch.object(Path, "write_text", side_effect=AssertionError("unchanged output must not write")), \
+                    mock.patch("bookprep.os.replace") as replace:
+                bookprep.write_json(path, regenerated)
+
+            self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), original_hash)
+            self.assertEqual(json.loads(path.read_text())["generated_at"], original["generated_at"])
+            replace.assert_not_called()
+
+    def test_write_json_atomically_replaces_changed_normalized_content(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "normalized.json"
+            original = {"generated_at": "2026-08-22T10:00:00Z", "records": {"bank_transactions": []}}
+            changed = {"generated_at": "2026-08-22T11:00:00Z", "records": {"bank_transactions": [{"id": 1}]}}
+            bookprep.write_json(path, original)
+            old_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+
+            with mock.patch("bookprep.os.replace", wraps=os.replace) as replace:
+                bookprep.write_json(path, changed)
+
+            self.assertNotEqual(hashlib.sha256(path.read_bytes()).hexdigest(), old_sha)
+            self.assertEqual(json.loads(path.read_text()), changed)
+            replace.assert_called_once()
+            temporary, destination = map(Path, replace.call_args.args)
+            self.assertEqual(temporary.parent, path.parent)
+            self.assertEqual(destination, path)
+            self.assertFalse(temporary.exists())
+
     def test_parser_accepts_woo_tax_allocation_override(self) -> None:
         args = bookprep.build_parser().parse_args(
             [
@@ -570,6 +612,270 @@ class BookprepTests(unittest.TestCase):
             self.assertEqual(len(records["bank_transactions"]), 2)
             amounts = [record["gross_amount"] for record in records["bank_transactions"]]
             self.assertEqual(amounts, [126.6, -26.62])
+            self.assertTrue(all(record["source_system"] == "bank" for record in records["bank_transactions"]))
+
+    def test_camt_xml_emits_balances_without_duplicate_bank_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kontovv_2024.csv").write_text(
+                "Kliendi konto,Dokumendi number,Kuupäev,Saaja/maksja konto,Saaja/maksja nimi,Deebet/Kreedit (D/C),Summa,Viitenumber,Arhiveerimistunnus,Selgitus,Valuuta\n"
+                "EE00,DOC1,2024-01-02,ACC1,Customer,C,126.60,,ARCH1,Receipt,EUR\n"
+                "EE00,DOC2,2024-01-03,ACC2,Supplier,D,-26.62,,ARCH2,Payment,EUR\n",
+                encoding="utf-8",
+            )
+            (root / "kontovv_2024.xml").write_text(
+                "<Document><BkToCstmrStmt><Stmt><Acct><Id><IBAN>EE00</IBAN></Id><Ccy>EUR</Ccy></Acct>"
+                "<Bal><Tp><Cd>OPBD</Cd></Tp><Amt Ccy=\"EUR\">100.00</Amt><CdtDbtInd>CRDT</CdtDbtInd><Dt><Dt>2024-01-01</Dt></Dt></Bal>"
+                "<Ntry><Amt Ccy=\"EUR\">126.60</Amt><CdtDbtInd>CRDT</CdtDbtInd><BookgDt><Dt>2024-01-02</Dt></BookgDt>"
+                "<NtryDtls><TxDtls><Refs><AcctSvcrRef>ARCH1</AcctSvcrRef></Refs></TxDtls></NtryDtls></Ntry>"
+                "<Ntry><Amt Ccy=\"EUR\">26.62</Amt><CdtDbtInd>DBIT</CdtDbtInd><BookgDt><Dt>2024-01-03</Dt></BookgDt>"
+                "<NtryDtls><TxDtls><Refs><AcctSvcrRef>ARCH2</AcctSvcrRef></Refs></TxDtls></NtryDtls></Ntry>"
+                "</Stmt></BkToCstmrStmt></Document>",
+                encoding="utf-8",
+            )
+            period_start, period_end = bookprep.parse_period("2024-01")
+            sources = bookprep.inspect_sources(
+                source_dir=root,
+                root_dir=root,
+                period_start=period_start,
+                period_end=period_end,
+            )
+
+            records, exceptions = bookprep.aggregate_results(
+                sources=sources,
+                period_start=period_start,
+                period_end=period_end,
+                base_currency="EUR",
+            )
+
+            self.assertFalse(exceptions)
+            self.assertEqual(len(records["bank_transactions"]), 2)
+            self.assertEqual(len(records["bank_balances"]), 1)
+            balance = records["bank_balances"][0]
+            self.assertEqual(balance["attributes"]["iban"], "EE00")
+            self.assertEqual(balance["attributes"]["balance_type"], "OPBD")
+
+    def test_camt_xml_preserves_standard_same_date_balance_types(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            xml_path = root / "statement_2024-01.xml"
+            xml_path.write_text(
+                "<Document><BkToCstmrStmt><Stmt><Acct><Id><IBAN>EE11</IBAN></Id><Ccy>EUR</Ccy></Acct>"
+                "<Bal><Tp><CdOrPrtry><Cd>OPBD</Cd></CdOrPrtry></Tp><Amt Ccy=\"EUR\">10.00</Amt><Dt><Dt>2024-01-31</Dt></Dt></Bal>"
+                "<Bal><Tp><CdOrPrtry><Cd>CLBD</Cd></CdOrPrtry></Tp><Amt Ccy=\"EUR\">20.00</Amt><Dt><Dt>2024-01-31</Dt></Dt></Bal>"
+                "<Bal><Tp><CdOrPrtry><Cd>ITBD</Cd></CdOrPrtry></Tp><Amt Ccy=\"EUR\">15.00</Amt><Dt><Dt>2024-01-31</Dt></Dt></Bal>"
+                "</Stmt></BkToCstmrStmt></Document>",
+                encoding="utf-8",
+            )
+            start, end = bookprep.parse_period("2024-01")
+            source = bookprep.inspect_source_file(path=xml_path, root_dir=root, period_start=start, period_end=end)
+            assert source is not None
+
+            records, _ = bookprep.parse_camt_xml(source, period_start=start, period_end=end, base_currency="EUR")
+
+            self.assertEqual(
+                [record["attributes"]["balance_type"] for record in records["bank_balances"]],
+                ["OPBD", "CLBD", "ITBD"],
+            )
+
+    def test_camt_xml_binds_balances_and_entries_to_each_statement_account(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            xml_path = root / "statements_2024-01.xml"
+            xml_path.write_text(
+                "<Document><BkToCstmrStmt>"
+                "<Stmt><Acct><Id><IBAN>EE11</IBAN></Id><Ccy>EUR</Ccy></Acct>"
+                "<Bal><Tp><CdOrPrtry><Cd>CLBD</Cd></CdOrPrtry></Tp><Amt Ccy=\"EUR\">10.00</Amt><Dt><Dt>2024-01-31</Dt></Dt></Bal>"
+                "<Ntry><Amt Ccy=\"EUR\">5.00</Amt><CdtDbtInd>CRDT</CdtDbtInd><BookgDt><Dt>2024-01-15</Dt></BookgDt><AcctSvcrRef>EE11-REF</AcctSvcrRef></Ntry>"
+                "</Stmt>"
+                "<Stmt><Acct><Id><IBAN>EE22</IBAN></Id><Ccy>USD</Ccy></Acct>"
+                "<Bal><Tp><CdOrPrtry><Cd>CLBD</Cd></CdOrPrtry></Tp><Amt Ccy=\"USD\">20.00</Amt><Dt><Dt>2024-01-31</Dt></Dt></Bal>"
+                "<Ntry><Amt Ccy=\"USD\">7.00</Amt><CdtDbtInd>CRDT</CdtDbtInd><BookgDt><Dt>2024-01-16</Dt></BookgDt><AcctSvcrRef>EE22-REF</AcctSvcrRef></Ntry>"
+                "</Stmt>"
+                "</BkToCstmrStmt></Document>",
+                encoding="utf-8",
+            )
+            start, end = bookprep.parse_period("2024-01")
+            source = bookprep.inspect_source_file(path=xml_path, root_dir=root, period_start=start, period_end=end)
+            assert source is not None
+
+            records, _ = bookprep.parse_camt_xml(source, period_start=start, period_end=end, base_currency="EUR")
+
+            self.assertEqual(
+                {(record["attributes"]["iban"], record["currency"]) for record in records["bank_balances"]},
+                {("EE11", "EUR"), ("EE22", "USD")},
+            )
+            self.assertEqual(
+                {(record["attributes"]["iban"], record["currency"]) for record in records["bank_transactions"]},
+                {("EE11", "EUR"), ("EE22", "USD")},
+            )
+
+    def test_camt_with_different_stem_is_supporting_when_csv_evidence_matches_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kontovv_primary_2024-01.csv").write_text(
+                "Kliendi konto,Dokumendi number,Kuupäev,Saaja/maksja konto,Saaja/maksja nimi,Deebet/Kreedit (D/C),Summa,Viitenumber,Arhiveerimistunnus,Selgitus,Valuuta\n"
+                "EE00,DOC1,2024-01-02,ACC1,Customer,C,12.00,,ARCH1,Receipt,EUR\n",
+                encoding="utf-8",
+            )
+            (root / "statement_2024-01.xml").write_text(
+                "<Document><BkToCstmrStmt><Stmt><Acct><Id><IBAN>EE00</IBAN></Id><Ccy>EUR</Ccy></Acct>"
+                "<Bal><Tp><CdOrPrtry><Cd>CLBD</Cd></CdOrPrtry></Tp><Amt Ccy=\"EUR\">12.00</Amt><Dt><Dt>2024-01-31</Dt></Dt></Bal>"
+                "<Ntry><Amt Ccy=\"EUR\">12.00</Amt><CdtDbtInd>CRDT</CdtDbtInd><BookgDt><Dt>2024-01-02</Dt></BookgDt><AcctSvcrRef>ARCH1</AcctSvcrRef></Ntry>"
+                "</Stmt></BkToCstmrStmt></Document>",
+                encoding="utf-8",
+            )
+            start, end = bookprep.parse_period("2024-01")
+            sources = bookprep.inspect_sources(source_dir=root, root_dir=root, period_start=start, period_end=end)
+
+            records, exceptions = bookprep.aggregate_results(sources=sources, period_start=start, period_end=end, base_currency="EUR")
+
+            self.assertFalse(exceptions)
+            self.assertEqual(len(records["bank_transactions"]), 1)
+            self.assertEqual(len(records["bank_balances"]), 1)
+
+    def test_camt_is_supporting_when_csv_uses_account_servicer_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kontovv_primary_2024-01.csv").write_text(
+                "Kliendi konto,Dokumendi number,Kuupäev,Saaja/maksja konto,Saaja/maksja nimi,Deebet/Kreedit (D/C),Summa,Viitenumber,Arhiveerimistunnus,Konto teenusepakkuja viide,Kande viide,Selgitus,Valuuta\n"
+                "EE00,DOC1,2024-01-02,ACC1,Customer,C,12.00,,,SVC-0001,ENTRY-0001,Receipt,EUR\n",
+                encoding="utf-8",
+            )
+            (root / "statement_2024-01.xml").write_text(
+                "<Document><BkToCstmrStmt><Stmt><Acct><Id><IBAN>EE00</IBAN></Id><Ccy>EUR</Ccy></Acct>"
+                "<Ntry><Amt Ccy=\"EUR\">12.00</Amt><CdtDbtInd>CRDT</CdtDbtInd><BookgDt><Dt>2024-01-02</Dt></BookgDt><AcctSvcrRef>SVC-0001</AcctSvcrRef></Ntry>"
+                "</Stmt></BkToCstmrStmt></Document>",
+                encoding="utf-8",
+            )
+            start, end = bookprep.parse_period("2024-01")
+            sources = bookprep.inspect_sources(source_dir=root, root_dir=root, period_start=start, period_end=end)
+
+            records, exceptions = bookprep.aggregate_results(
+                sources=sources, period_start=start, period_end=end, base_currency="EUR"
+            )
+
+            self.assertEqual(len(records["bank_transactions"]), 1)
+            csv_record = records["bank_transactions"][0]
+            self.assertEqual(csv_record["external_ref"], "SVC-0001")
+            self.assertEqual(csv_record["attributes"]["account_servicer_reference"], "SVC-0001")
+            self.assertEqual(csv_record["attributes"]["entry_reference"], "ENTRY-0001")
+            self.assertFalse(any("duplicate-risk" in item["exception_id"] for item in exceptions))
+
+    def test_camt_xml_attaches_annual_statement_scope_to_balances(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            xml_path = root / "statement_2024.xml"
+            xml_path.write_text(
+                "<Document><BkToCstmrStmt><Stmt>"
+                "<FrToDt><FrDtTm>2024-01-01T00:00:00+02:00</FrDtTm><ToDtTm>2024-12-31T23:59:59+02:00</ToDtTm></FrToDt>"
+                "<Acct><Id><IBAN>EE11</IBAN></Id><Ccy>EUR</Ccy></Acct>"
+                "<Bal><Tp><CdOrPrtry><Cd>CLBD</Cd></CdOrPrtry></Tp><Amt Ccy=\"EUR\">20.00</Amt><Dt><Dt>2024-12-31</Dt></Dt></Bal>"
+                "</Stmt></BkToCstmrStmt></Document>",
+                encoding="utf-8",
+            )
+            start, end = bookprep.parse_period("2024-12")
+            source = bookprep.inspect_source_file(path=xml_path, root_dir=root, period_start=start, period_end=end)
+            assert source is not None
+
+            records, _ = bookprep.parse_camt_xml(source, period_start=start, period_end=end, base_currency="EUR")
+
+            balance = records["bank_balances"][0]
+            self.assertEqual(balance["attributes"]["statement_from"], "2024-01-01")
+            self.assertEqual(balance["attributes"]["statement_to"], "2024-12-31")
+
+    def test_camt_same_ledger_mismatched_reference_is_blocking_duplicate_risk(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kontovv_primary_2024-01.csv").write_text(
+                "Kliendi konto,Dokumendi number,Kuupäev,Saaja/maksja konto,Saaja/maksja nimi,Deebet/Kreedit (D/C),Summa,Viitenumber,Arhiveerimistunnus,Selgitus,Valuuta\n"
+                "EE00,DOC1,2024-01-02,ACC1,Customer,C,12.00,,ARCH1,Receipt,EUR\n",
+                encoding="utf-8",
+            )
+            (root / "statement_2024-01.xml").write_text(
+                "<Document><BkToCstmrStmt><Stmt><Acct><Id><IBAN>EE00</IBAN></Id><Ccy>EUR</Ccy></Acct>"
+                "<Ntry><Amt Ccy=\"EUR\">12.00</Amt><CdtDbtInd>CRDT</CdtDbtInd><BookgDt><Dt>2024-01-02</Dt></BookgDt><AcctSvcrRef>ARCH2</AcctSvcrRef></Ntry>"
+                "</Stmt></BkToCstmrStmt></Document>",
+                encoding="utf-8",
+            )
+            start, end = bookprep.parse_period("2024-01")
+            sources = bookprep.inspect_sources(source_dir=root, root_dir=root, period_start=start, period_end=end)
+
+            records, exceptions = bookprep.aggregate_results(sources=sources, period_start=start, period_end=end, base_currency="EUR")
+
+            self.assertEqual(len(records["bank_transactions"]), 2)
+            risk = next(item for item in exceptions if "duplicate-risk" in item["exception_id"])
+            self.assertTrue(risk["blocking"])
+            self.assertEqual(risk["severity"], "error")
+            self.assertIn("ARCH2", risk["reason"])
+            self.assertIn("EE00/EUR", risk["reason"])
+            self.assertIn("camt:1", risk["reason"])
+
+    def test_camt_for_unrelated_ledger_is_not_suppressed_by_csv(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kontovv_primary_2024-01.csv").write_text(
+                "Kliendi konto,Dokumendi number,Kuupäev,Saaja/maksja konto,Saaja/maksja nimi,Deebet/Kreedit (D/C),Summa,Viitenumber,Arhiveerimistunnus,Selgitus,Valuuta\n"
+                "EE00,DOC1,2024-01-02,ACC1,Customer,C,12.00,,ARCH1,Receipt,EUR\n",
+                encoding="utf-8",
+            )
+            (root / "savings_2024-01.xml").write_text(
+                "<Document><BkToCstmrStmt><Stmt><Acct><Id><IBAN>EE99</IBAN></Id><Ccy>EUR</Ccy></Acct>"
+                "<Bal><Tp><CdOrPrtry><Cd>CLBD</Cd></CdOrPrtry></Tp><Amt Ccy=\"EUR\">7.00</Amt><Dt><Dt>2024-01-31</Dt></Dt></Bal>"
+                "<Ntry><Amt Ccy=\"EUR\">7.00</Amt><CdtDbtInd>CRDT</CdtDbtInd><BookgDt><Dt>2024-01-03</Dt></BookgDt><AcctSvcrRef>ARCH2</AcctSvcrRef></Ntry>"
+                "</Stmt></BkToCstmrStmt></Document>",
+                encoding="utf-8",
+            )
+            start, end = bookprep.parse_period("2024-01")
+            sources = bookprep.inspect_sources(source_dir=root, root_dir=root, period_start=start, period_end=end)
+
+            records, exceptions = bookprep.aggregate_results(sources=sources, period_start=start, period_end=end, base_currency="EUR")
+
+            self.assertFalse(exceptions)
+            self.assertEqual(len(records["bank_transactions"]), 2)
+            self.assertEqual(
+                {
+                    record["attributes"].get("iban") or record["attributes"].get("customer_account")
+                    for record in records["bank_transactions"]
+                },
+                {"EE00", "EE99"},
+            )
+
+    def test_camt_suppresses_only_the_paired_statement_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "kontovv_primary_2024-01.csv").write_text(
+                "Kliendi konto,Dokumendi number,Kuupäev,Saaja/maksja konto,Saaja/maksja nimi,Deebet/Kreedit (D/C),Summa,Viitenumber,Arhiveerimistunnus,Selgitus,Valuuta\n"
+                "EE00,DOC1,2024-01-02,ACC1,Customer,C,12.00,,ARCH1,Receipt,EUR\n",
+                encoding="utf-8",
+            )
+            (root / "statement_2024-01.xml").write_text(
+                "<Document><BkToCstmrStmt>"
+                "<Stmt><Acct><Id><IBAN>EE00</IBAN></Id><Ccy>EUR</Ccy></Acct>"
+                "<Bal><Tp><CdOrPrtry><Cd>CLBD</Cd></CdOrPrtry></Tp><Amt Ccy=\"EUR\">12.00</Amt><Dt><Dt>2024-01-31</Dt></Dt></Bal>"
+                "<Ntry><Amt Ccy=\"EUR\">12.00</Amt><CdtDbtInd>CRDT</CdtDbtInd><BookgDt><Dt>2024-01-02</Dt></BookgDt><AcctSvcrRef>ARCH1</AcctSvcrRef></Ntry>"
+                "</Stmt>"
+                "<Stmt><Acct><Id><IBAN>EE99</IBAN></Id><Ccy>EUR</Ccy></Acct>"
+                "<Bal><Tp><CdOrPrtry><Cd>CLBD</Cd></CdOrPrtry></Tp><Amt Ccy=\"EUR\">7.00</Amt><Dt><Dt>2024-01-31</Dt></Dt></Bal>"
+                "<Ntry><Amt Ccy=\"EUR\">7.00</Amt><CdtDbtInd>CRDT</CdtDbtInd><BookgDt><Dt>2024-01-03</Dt></BookgDt><AcctSvcrRef>ARCH2</AcctSvcrRef></Ntry>"
+                "</Stmt>"
+                "</BkToCstmrStmt></Document>",
+                encoding="utf-8",
+            )
+            start, end = bookprep.parse_period("2024-01")
+            sources = bookprep.inspect_sources(source_dir=root, root_dir=root, period_start=start, period_end=end)
+
+            records, exceptions = bookprep.aggregate_results(sources=sources, period_start=start, period_end=end, base_currency="EUR")
+
+            self.assertFalse(exceptions)
+            self.assertEqual(len(records["bank_transactions"]), 2)
+            self.assertEqual(
+                {
+                    record["attributes"].get("iban") or record["attributes"].get("customer_account")
+                    for record in records["bank_transactions"]
+                },
+                {"EE00", "EE99"},
+            )
 
     def test_parse_paypal_csv_classifies_sales_refunds_and_payouts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -599,16 +905,16 @@ class BookprepTests(unittest.TestCase):
             self.assertEqual(records["sales"][0]["fee_amount"], 1.57)
             self.assertEqual(records["payouts"][0]["gross_amount"], 34.25)
 
-    def test_parse_paypal_csv_keeps_card_funding_and_conversions_out_of_payouts(self) -> None:
+    def test_parse_paypal_csv_routes_card_funding_conversions_and_supplier_payment_to_clearing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             csv_path = root / "paypal_2025_report.CSV"
             csv_path.write_text(
-                "Date,Name,Type,Status,Currency,Gross,Fee,Net,Transaction ID,Balance Impact\n"
-                "09/10/2025,,General Card Withdrawal,Completed,EUR,-13.27,0.00,-13.27,TX1,Debit\n"
-                "09/10/2025,,General Card Deposit,Completed,EUR,13.42,0.00,13.42,TX2,Credit\n"
-                "09/10/2025,,General Currency Conversion,Completed,USD,-14.94,0.00,-14.94,TX3,Debit\n"
-                "09/10/2025,Quartermaster Logistics LLC,General Payment,Completed,USD,-14.94,0.00,-14.94,TX4,Debit\n",
+                "Date,Name,Type,Status,Currency,Gross,Fee,Net,Transaction ID,Reference Txn ID,Balance Impact\n"
+                "09/10/2025,,General Card Withdrawal,Completed,EUR,-13.27,0.00,-13.27,TX1,TX4,Debit\n"
+                "09/10/2025,,General Card Deposit,Completed,EUR,13.42,0.00,13.42,TX2,TX4,Credit\n"
+                "09/10/2025,,General Currency Conversion,Completed,USD,-14.94,0.00,-14.94,TX3,TX4,Debit\n"
+                "09/10/2025,Quartermaster Logistics LLC,General Payment,Completed,USD,-14.94,0.00,-14.94,TX4,,Debit\n",
                 encoding="utf-8",
             )
             period_start, period_end = bookprep.parse_period("2025-10")
@@ -623,11 +929,163 @@ class BookprepTests(unittest.TestCase):
             )
 
             self.assertFalse(exceptions)
-            self.assertEqual(len(records["payouts"]), 1)
-            self.assertEqual(records["payouts"][0]["external_ref"], "TX1")
-            self.assertEqual(len(records["other"]), 3)
+            self.assertFalse(records["payouts"])
+            self.assertFalse(records["other"])
+            self.assertEqual(len(records["clearing_transactions"]), 4)
+            self.assertEqual(
+                [record["external_ref"] for record in records["clearing_transactions"]],
+                ["TX1", "TX2", "TX3", "TX4"],
+            )
+            self.assertTrue(
+                all(
+                    record["attributes"]["clearing_provider"] == "paypal"
+                    and record["attributes"]["clearing_account"] == "paypal_wallet"
+                    for record in records["clearing_transactions"]
+                )
+            )
             self.assertFalse(records["sales"])
             self.assertFalse(records["refunds"])
+
+    def test_paypal_general_customer_receipt_and_refund_reversal_stay_processor_activity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "paypal_2025_report.CSV"
+            csv_path.write_text(
+                "Date,Name,Type,Status,Currency,Gross,Fee,Net,Transaction ID,Reference Txn ID,Balance Impact\n"
+                "09/10/2025,Buyer,General Payment,Completed,EUR,20.00,-1.00,19.00,SALE1,,Credit\n"
+                "10/10/2025,Buyer,Payment Reversal,Completed,EUR,-20.00,0.00,-20.00,REV1,SALE1,Debit\n",
+                encoding="utf-8",
+            )
+            period_start, period_end = bookprep.parse_period("2025-10")
+            source = bookprep.inspect_source_file(
+                path=csv_path, root_dir=root, period_start=period_start, period_end=period_end
+            )
+            assert source is not None
+
+            records, exceptions = bookprep.parse_paypal_csv(
+                source, period_start=period_start, period_end=period_end, base_currency="EUR"
+            )
+
+        self.assertFalse(exceptions)
+        self.assertEqual([item["external_ref"] for item in records["sales"]], ["SALE1"])
+        self.assertEqual([item["external_ref"] for item in records["refunds"]], ["REV1"])
+        self.assertFalse(records["clearing_transactions"])
+
+    def test_unpaired_positive_paypal_payment_reversal_is_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "paypal_2025_report.CSV"
+            csv_path.write_text(
+                "Date,Name,Type,Status,Currency,Gross,Fee,Net,Transaction ID,Reference Txn ID,Balance Impact\n"
+                "10/10/2025,Unknown,Payment Reversal,Completed,EUR,20.00,0.00,20.00,REV1,UNKNOWN,Credit\n",
+                encoding="utf-8",
+            )
+            period_start, period_end = bookprep.parse_period("2025-10")
+            source = bookprep.inspect_source_file(
+                path=csv_path, root_dir=root, period_start=period_start, period_end=period_end
+            )
+            assert source is not None
+
+            records, exceptions = bookprep.parse_paypal_csv(
+                source, period_start=period_start, period_end=period_end, base_currency="EUR"
+            )
+
+        self.assertFalse(records["refunds"])
+        self.assertTrue(any(item["blocking"] and "ambiguous" in item["reason"].lower() for item in exceptions))
+
+    def test_paypal_reversal_with_mismatched_counterparty_is_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "paypal_2025_report.CSV"
+            csv_path.write_text(
+                "Date,Name,Type,Status,Currency,Gross,Fee,Net,Transaction ID,Reference Txn ID,Balance Impact\n"
+                "09/10/2025,Buyer A,General Payment,Completed,EUR,20.00,-1.00,19.00,SALE1,,Credit\n"
+                "10/10/2025,Buyer B,Payment Reversal,Completed,EUR,-20.00,0.00,-20.00,REV1,SALE1,Debit\n",
+                encoding="utf-8",
+            )
+            period_start, period_end = bookprep.parse_period("2025-10")
+            source = bookprep.inspect_source_file(
+                path=csv_path, root_dir=root, period_start=period_start, period_end=period_end
+            )
+            assert source is not None
+
+            records, exceptions = bookprep.parse_paypal_csv(
+                source, period_start=period_start, period_end=period_end, base_currency="EUR"
+            )
+
+        self.assertFalse(records["refunds"])
+        self.assertTrue(any(item["blocking"] and "ambiguous" in item["reason"].lower() for item in exceptions))
+
+    def test_paypal_provider_named_reversal_of_exact_funded_supplier_payment_is_clearing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "paypal_2025_report.CSV"
+            csv_path.write_text(
+                "Date,Name,Type,Status,Currency,Gross,Fee,Net,Transaction ID,Reference Txn ID,Balance Impact\n"
+                "09/10/2025,,General Card Withdrawal,Completed,EUR,-13.27,0.00,-13.27,FUND1,PAY1,Debit\n"
+                "09/10/2025,Supplier,General Payment,Pending,USD,-14.94,0.00,-14.94,PAY1,,Debit\n"
+                "10/10/2025,PayPal,Payment Reversal,Completed,USD,14.94,0.00,14.94,REV1,PAY1,Credit\n",
+                encoding="utf-8",
+            )
+            period_start, period_end = bookprep.parse_period("2025-10")
+            source = bookprep.inspect_source_file(
+                path=csv_path, root_dir=root, period_start=period_start, period_end=period_end
+            )
+            assert source is not None
+
+            records, exceptions = bookprep.parse_paypal_csv(
+                source, period_start=period_start, period_end=period_end, base_currency="EUR"
+            )
+
+        self.assertEqual(
+            [item["external_ref"] for item in records["clearing_transactions"]],
+            ["FUND1", "REV1"],
+        )
+        self.assertFalse(any(item["blocking"] for item in exceptions))
+
+    def test_pending_customer_receipt_cannot_authorize_completed_refund_reversal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "paypal_2025_report.CSV"
+            csv_path.write_text(
+                "Date,Name,Type,Status,Currency,Gross,Fee,Net,Transaction ID,Reference Txn ID,Balance Impact\n"
+                "09/10/2025,Buyer,General Payment,Pending,EUR,20.00,0.00,20.00,SALE1,,Credit\n"
+                "10/10/2025,Buyer,Payment Reversal,Completed,EUR,-20.00,0.00,-20.00,REV1,SALE1,Debit\n",
+                encoding="utf-8",
+            )
+            period_start, period_end = bookprep.parse_period("2025-10")
+            source = bookprep.inspect_source_file(
+                path=csv_path, root_dir=root, period_start=period_start, period_end=period_end
+            )
+            assert source is not None
+
+            records, exceptions = bookprep.parse_paypal_csv(
+                source, period_start=period_start, period_end=period_end, base_currency="EUR"
+            )
+
+        self.assertFalse(records["refunds"])
+        self.assertTrue(any(item["blocking"] and "ambiguous" in item["reason"].lower() for item in exceptions))
+
+    def test_ambiguous_outgoing_paypal_general_payment_is_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "paypal_2025_report.CSV"
+            csv_path.write_text(
+                "Date,Name,Type,Status,Currency,Gross,Fee,Net,Transaction ID,Reference Txn ID,Balance Impact\n"
+                "09/10/2025,Unknown,General Payment,Completed,USD,-14.94,0.00,-14.94,PAY1,,Debit\n",
+                encoding="utf-8",
+            )
+            period_start, period_end = bookprep.parse_period("2025-10")
+            source = bookprep.inspect_source_file(
+                path=csv_path, root_dir=root, period_start=period_start, period_end=period_end
+            )
+            assert source is not None
+            records, exceptions = bookprep.parse_paypal_csv(
+                source, period_start=period_start, period_end=period_end, base_currency="EUR"
+            )
+
+        self.assertFalse(records["clearing_transactions"])
+        self.assertTrue(any(item["blocking"] and "ambiguous" in item["reason"].lower() for item in exceptions))
 
     def test_inspect_source_file_infers_quartermaster_sales_month_from_parent_year(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1419,7 +1877,7 @@ class BookprepTests(unittest.TestCase):
             self.assertEqual(expense["net_amount"], 11.3)
             self.assertEqual(expense["vat_amount"], 2.71)
 
-    def test_ostuarved_readme_note_becomes_canonical_purchase_evidence(self) -> None:
+    def test_employee_paid_ostuarved_note_becomes_expense_report_evidence_not_supplier_payable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             ostuarved = root / "Ostuarved"
@@ -1453,12 +1911,14 @@ class BookprepTests(unittest.TestCase):
             )
 
             self.assertFalse([item for item in exceptions if item.get("blocking")])
-            self.assertEqual(len(records["purchase_expenses"]), 1)
-            expense = records["purchase_expenses"][0]
+            self.assertFalse(records["purchase_expenses"])
+            self.assertEqual(len(records["manual_adjustments"]), 1)
+            expense = records["manual_adjustments"][0]
             self.assertEqual(expense["gross_amount"], 82.1)
             self.assertEqual(expense["vat_amount"], 0.0)
             self.assertEqual(expense["attributes"]["vendor_name"], "Omniva")
             self.assertTrue(expense["attributes"]["manual_note"])
+            self.assertEqual(expense["attributes"]["expense_report_payee"], "Hanno")
 
     def test_parse_printful_pdf_creates_monthly_summary_and_storage_invoice(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1538,7 +1998,7 @@ class BookprepTests(unittest.TestCase):
             self.assertEqual(credit["external_ref"], "108021610")
             self.assertEqual(credit["attributes"]["source_gross_amount"], -11.4)
 
-    def test_parse_printful_wallet_csv_maps_cash_directions_and_preserves_currency(self) -> None:
+    def test_printful_wallet_rows_are_clearing_not_physical_bank(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             csv_path = root / "Wallet.csv"
@@ -1563,11 +2023,13 @@ class BookprepTests(unittest.TestCase):
             )
 
             self.assertFalse(exceptions)
-            self.assertEqual(len(records["bank_transactions"]), 3)
-            amounts = [record["gross_amount"] for record in records["bank_transactions"]]
-            currencies = [record["currency"] for record in records["bank_transactions"]]
+            self.assertEqual(records["bank_transactions"], [])
+            self.assertEqual(len(records["clearing_transactions"]), 3)
+            amounts = [record["gross_amount"] for record in records["clearing_transactions"]]
+            currencies = [record["currency"] for record in records["clearing_transactions"]]
             self.assertEqual(amounts, [-8.21, 3.55, -306.32])
             self.assertEqual(currencies, ["EUR", "EUR", "USD"])
+            self.assertEqual(records["clearing_transactions"][0]["attributes"]["clearing_provider"], "printful")
 
     def test_parse_printful_other_csv_extracts_monthly_service_charge(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

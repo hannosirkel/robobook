@@ -5,7 +5,9 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 import re
+import tempfile
 from calendar import month_name
 import unicodedata
 from calendar import monthrange
@@ -914,6 +916,8 @@ def parser_result() -> dict[str, list[dict[str, Any]]]:
         "fees": [],
         "payouts": [],
         "bank_transactions": [],
+        "clearing_transactions": [],
+        "bank_balances": [],
         "purchase_expenses": [],
         "purchase_credits": [],
         "inventory_movements": [],
@@ -1319,11 +1323,54 @@ def load_bound_woo_tax_allocation(
     return allocation
 
 
-def paypal_category(row: dict[str, str], gross_amount: Decimal) -> str:
+def paypal_category(
+    row: dict[str, str],
+    gross_amount: Decimal,
+    *,
+    funded_payment_ids: set[str] | None = None,
+    supplier_payment_parties: dict[str, str] | None = None,
+    customer_receipt_parties: dict[str, str] | None = None,
+) -> str:
     type_value = row.get("Type", "").strip().lower()
+    balance_impact = row.get("Balance Impact", "").strip().lower()
+    transaction_id = row.get("Transaction ID", "").strip()
+    reference_id = row.get("Reference Txn ID", "").strip()
+    funded_payment_ids = funded_payment_ids or set()
+    supplier_payment_parties = supplier_payment_parties or {}
+    customer_receipt_parties = customer_receipt_parties or {}
+    counterparty = " ".join(row.get("Name", "").split()).casefold()
+    if type_value == "general card withdrawal":
+        return "clearing_transactions" if gross_amount < 0 and balance_impact == "debit" and reference_id else "ambiguous"
+    if type_value == "general card deposit":
+        return "clearing_transactions" if gross_amount > 0 and balance_impact == "credit" and reference_id else "ambiguous"
+    if type_value == "general currency conversion":
+        sign_matches = (gross_amount < 0 and balance_impact == "debit") or (gross_amount > 0 and balance_impact == "credit")
+        return "clearing_transactions" if sign_matches and reference_id else "ambiguous"
+    if type_value == "general payment":
+        if gross_amount > 0 and balance_impact == "credit":
+            return "sales"
+        if gross_amount < 0 and balance_impact == "debit" and transaction_id in funded_payment_ids:
+            return "clearing_transactions"
+        return "ambiguous"
+    if type_value == "payment reversal":
+        if (
+            gross_amount > 0
+            and balance_impact == "credit"
+            and supplier_payment_parties.get(reference_id)
+            and counterparty in {supplier_payment_parties[reference_id], "paypal"}
+        ):
+            return "clearing_transactions"
+        if (
+            gross_amount < 0
+            and balance_impact == "debit"
+            and counterparty
+            and customer_receipt_parties.get(reference_id) == counterparty
+        ):
+            return "refunds"
+        return "ambiguous"
     if "withdrawal" in type_value or "payout" in type_value:
         return "payouts"
-    if "deposit" in type_value or "currency conversion" in type_value or type_value in {"general payment", "payment reversal"}:
+    if "deposit" in type_value or "currency conversion" in type_value:
         return "other"
     if "transfer" in type_value:
         return "payouts"
@@ -1345,6 +1392,35 @@ def parse_paypal_csv(
     result = parser_result()
     exceptions: list[dict[str, Any]] = []
     seen_dates: list[date] = []
+    funded_payment_ids = {
+        str(row.get("Reference Txn ID") or "").strip()
+        for row in rows
+        if str(row.get("Type") or "").strip().lower()
+        in {"general card withdrawal", "general card deposit", "general currency conversion"}
+        and str(row.get("Reference Txn ID") or "").strip()
+    }
+    def counterparty(row: dict[str, str]) -> str:
+        return " ".join(str(row.get("Name") or "").split()).casefold()
+
+    customer_receipt_parties = {
+        str(row.get("Transaction ID") or "").strip(): counterparty(row)
+        for row in rows
+        if str(row.get("Type") or "").strip().lower() == "general payment"
+        and str(row.get("Status") or "").strip().lower() in {"", "completed", "refunded"}
+        and parse_decimal(row.get("Gross")) > 0
+        and str(row.get("Balance Impact") or "").strip().lower() == "credit"
+        and str(row.get("Transaction ID") or "").strip()
+        and counterparty(row)
+    }
+    supplier_payment_parties = {
+        str(row.get("Transaction ID") or "").strip(): counterparty(row)
+        for row in rows
+        if str(row.get("Type") or "").strip().lower() == "general payment"
+        and parse_decimal(row.get("Gross")) < 0
+        and str(row.get("Balance Impact") or "").strip().lower() == "debit"
+        and str(row.get("Transaction ID") or "").strip() in funded_payment_ids
+        and counterparty(row)
+    }
 
     for line_no, row in enumerate(rows, start=2):
         event_date = parse_date_value(row["Date"])
@@ -1371,12 +1447,46 @@ def parse_paypal_csv(
         net = parse_decimal(row.get("Net"))
         shipping = abs(parse_decimal(row.get("Shipping and Handling Amount")))
         sales_tax = abs(parse_decimal(row.get("Sales Tax")))
-        category = paypal_category(row, gross)
+        category = paypal_category(
+            row,
+            gross,
+            funded_payment_ids=funded_payment_ids,
+            supplier_payment_parties=supplier_payment_parties,
+            customer_receipt_parties=customer_receipt_parties,
+        )
+        if category == "ambiguous":
+            exceptions.append(
+                make_exception(
+                    source=source,
+                    exception_id=f"{source.source_id}:paypal-routing:{line_no}",
+                    severity="error",
+                    reason="Ambiguous PayPal general movement lacks an exact signed balance-impact and reference bridge.",
+                    blocking=True,
+                    row_ref=f"csv:{line_no}",
+                )
+            )
+            continue
         if category == "payouts":
             gross = abs(gross)
             net = abs(net)
         type_slug = slugify(row.get("Type", "paypal-event")).replace("-", "_")
         currency = row.get("Currency", "").strip().upper() or base_currency
+
+        attributes = {
+            "status": status,
+            "item_title": row.get("Item Title"),
+            "item_id": row.get("Item ID"),
+            "balance_impact": row.get("Balance Impact"),
+            "from_email": row.get("From Email Address"),
+            "to_email": row.get("To Email Address"),
+            "quantity": row.get("Quantity"),
+            "reference_transaction_id": row.get("Reference Txn ID"),
+        }
+        if category == "clearing_transactions":
+            attributes.update({
+                "clearing_provider": "paypal",
+                "clearing_account": "paypal_wallet",
+            })
 
         category_name, record = make_record(
             source=source,
@@ -1395,15 +1505,7 @@ def parse_paypal_csv(
             external_ref=row.get("Transaction ID") or None,
             channel="paypal",
             country_code=(row.get("Country Code") or "").strip().upper() or None,
-            attributes={
-                "status": status,
-                "item_title": row.get("Item Title"),
-                "item_id": row.get("Item ID"),
-                "balance_impact": row.get("Balance Impact"),
-                "from_email": row.get("From Email Address"),
-                "to_email": row.get("To Email Address"),
-                "quantity": row.get("Quantity"),
-            },
+            attributes=attributes,
             row_ref=f"csv:{line_no}",
         )
         result[category_name].append(record)
@@ -1962,6 +2064,10 @@ def parse_bank_csv(
 
         currency = row.get("Valuuta", "").strip().upper() or base_currency
         description = row.get("Selgitus") or row.get("Saaja/maksja nimi") or "Bank transaction"
+        archive_identifier = str(row.get("Arhiveerimistunnus") or "").strip() or None
+        account_servicer_reference = str(row.get("Konto teenusepakkuja viide") or "").strip() or None
+        entry_reference = str(row.get("Kande viide") or "").strip() or None
+        document_number = str(row.get("Dokumendi number") or "").strip() or None
         category, record = make_record(
             source=source,
             category="bank_transactions",
@@ -1972,13 +2078,16 @@ def parse_bank_csv(
             currency=currency,
             gross_amount=amount,
             net_amount=amount,
-            external_ref=row.get("Arhiveerimistunnus") or row.get("Dokumendi number") or None,
+            external_ref=archive_identifier or account_servicer_reference or entry_reference or document_number,
             attributes={
                 "customer_account": row.get("Kliendi konto"),
                 "counterparty_account": row.get("Saaja/maksja konto"),
                 "counterparty_name": row.get("Saaja/maksja nimi"),
                 "reference_number": row.get("Viitenumber"),
                 "bank_bic": row.get("Saaja/maksja panga BIC"),
+                "archive_identifier": archive_identifier,
+                "account_servicer_reference": account_servicer_reference,
+                "entry_reference": entry_reference,
             },
             row_ref=f"csv:{line_no}",
         )
@@ -2220,7 +2329,7 @@ def parse_printful_wallet_csv(
         seen_dates.append(event_date)
         category, record = make_record(
             source=source,
-            category="bank_transactions",
+            category="clearing_transactions",
             record_id=f"{source.source_id}:wallet:{line_no}",
             event_type=event_type,
             event_date=event_date,
@@ -2234,6 +2343,8 @@ def parse_printful_wallet_csv(
             attributes={
                 "action": row.get("Action"),
                 "payment_instrument": payment_instrument,
+                "clearing_provider": "printful",
+                "clearing_account": "printful_wallet",
             },
             row_ref=f"csv:{line_no}",
         )
@@ -2378,57 +2489,133 @@ def parse_camt_xml(
 
     result = parser_result()
     seen_dates: list[date] = []
-
-    for index, entry in enumerate(root.findall(".//ns:Ntry" if ns else ".//Ntry", ns), start=1):
-        amount_text = entry.findtext("ns:Amt" if ns else "Amt", default="0", namespaces=ns)
-        amount = parse_decimal(amount_text)
-        credit_debit = entry.findtext("ns:CdtDbtInd" if ns else "CdtDbtInd", default="", namespaces=ns).strip().upper()
-        if credit_debit == "DBIT":
-            amount = -abs(amount)
-        elif credit_debit == "CRDT":
-            amount = abs(amount)
-
-        date_text = entry.findtext("ns:BookgDt/ns:Dt" if ns else "BookgDt/Dt", default="", namespaces=ns)
-        event_date = parse_date_value(date_text)
-        if event_date < period_start or event_date > period_end:
-            continue
-        seen_dates.append(event_date)
-
-        currency = base_currency
-        amount_node = entry.find("ns:Amt" if ns else "Amt", ns)
-        if amount_node is not None and amount_node.get("Ccy"):
-            currency = amount_node.get("Ccy", base_currency).upper()
-
-        description = entry.findtext(
-            "ns:NtryDtls/ns:TxDtls/ns:RmtInf/ns:Ustrd" if ns else "NtryDtls/TxDtls/RmtInf/Ustrd",
-            default="CAMT bank transaction",
-            namespaces=ns,
-        )
-        reference = entry.findtext(
-            "ns:AcctSvcrRef" if ns else "AcctSvcrRef",
-            default="",
-            namespaces=ns,
-        ) or entry.findtext(
-            "ns:NtryDtls/ns:TxDtls/ns:Refs/ns:AcctSvcrRef" if ns else "NtryDtls/TxDtls/Refs/AcctSvcrRef",
+    balance_keys: set[tuple[str, str, str, str]] = set()
+    balance_index = 0
+    entry_index = 0
+    for statement in root.findall(".//ns:Stmt" if ns else ".//Stmt", ns):
+        account = statement.find("ns:Acct" if ns else "Acct", ns)
+        iban = ""
+        account_currency = base_currency
+        if account is not None:
+            iban = (account.findtext("ns:Id/ns:IBAN" if ns else "Id/IBAN", default="", namespaces=ns) or "").strip().upper()
+            account_currency = (account.findtext("ns:Ccy" if ns else "Ccy", default=base_currency, namespaces=ns) or base_currency).strip().upper()
+        statement_from_text = statement.findtext(
+            "ns:FrToDt/ns:FrDtTm" if ns else "FrToDt/FrDtTm",
             default="",
             namespaces=ns,
         )
-
-        category, record = make_record(
-            source=source,
-            category="bank_transactions",
-            record_id=f"{source.source_id}:camt:{index}",
-            event_type="bank_credit" if amount >= 0 else "bank_debit",
-            event_date=event_date,
-            description=description,
-            currency=currency,
-            gross_amount=amount,
-            net_amount=amount,
-            external_ref=reference or None,
-            attributes={"credit_debit_indicator": credit_debit},
-            row_ref=f"xml:{index}",
+        statement_to_text = statement.findtext(
+            "ns:FrToDt/ns:ToDtTm" if ns else "FrToDt/ToDtTm",
+            default="",
+            namespaces=ns,
         )
-        result[category].append(record)
+        statement_from = parse_date_value(statement_from_text[:10]).isoformat() if statement_from_text else None
+        statement_to = parse_date_value(statement_to_text[:10]).isoformat() if statement_to_text else None
+
+        for balance in statement.findall("ns:Bal" if ns else "Bal", ns):
+            balance_index += 1
+            amount_node = balance.find("ns:Amt" if ns else "Amt", ns)
+            amount = parse_decimal(amount_node.text if amount_node is not None else "0")
+            currency = ((amount_node.get("Ccy") if amount_node is not None else None) or account_currency).upper()
+            credit_debit = balance.findtext("ns:CdtDbtInd" if ns else "CdtDbtInd", default="", namespaces=ns).strip().upper()
+            if credit_debit == "DBIT":
+                amount = -abs(amount)
+            elif credit_debit == "CRDT":
+                amount = abs(amount)
+            balance_type = balance.findtext(
+                "ns:Tp/ns:CdOrPrtry/ns:Cd" if ns else "Tp/CdOrPrtry/Cd",
+                default="",
+                namespaces=ns,
+            ).strip()
+            if not balance_type:
+                balance_type = balance.findtext("ns:Tp/ns:Cd" if ns else "Tp/Cd", default="other", namespaces=ns).strip() or "other"
+            date_text = balance.findtext("ns:Dt/ns:Dt" if ns else "Dt/Dt", default="", namespaces=ns)
+            if not date_text:
+                date_text = balance.findtext("ns:Dt/ns:DtTm" if ns else "Dt/DtTm", default="", namespaces=ns)
+            balance_date = parse_date_value(date_text)
+            key = (iban, currency, balance_type, balance_date.isoformat())
+            if key in balance_keys:
+                continue
+            balance_keys.add(key)
+            category, record = make_record(
+                source=source,
+                category="bank_balances",
+                record_id=f"{source.source_id}:camt-balance:{iban or 'unknown'}:{currency}:{balance_type}:{balance_date.isoformat()}",
+                event_type="bank_balance",
+                event_date=balance_date,
+                description=f"CAMT {balance_type} balance for {iban or 'unknown account'}",
+                currency=currency,
+                gross_amount=amount,
+                net_amount=amount,
+                attributes={
+                    "iban": iban or None,
+                    "balance_type": balance_type,
+                    "balance_date": balance_date.isoformat(),
+                    "credit_debit_indicator": credit_debit or None,
+                    "statement_from": statement_from,
+                    "statement_to": statement_to,
+                },
+                row_ref=f"xml:balance:{balance_index}",
+            )
+            result[category].append(record)
+
+        for entry in statement.findall("ns:Ntry" if ns else "Ntry", ns):
+            entry_index += 1
+            amount_text = entry.findtext("ns:Amt" if ns else "Amt", default="0", namespaces=ns)
+            amount = parse_decimal(amount_text)
+            credit_debit = entry.findtext("ns:CdtDbtInd" if ns else "CdtDbtInd", default="", namespaces=ns).strip().upper()
+            if credit_debit == "DBIT":
+                amount = -abs(amount)
+            elif credit_debit == "CRDT":
+                amount = abs(amount)
+
+            date_text = entry.findtext("ns:BookgDt/ns:Dt" if ns else "BookgDt/Dt", default="", namespaces=ns)
+            event_date = parse_date_value(date_text)
+            if event_date < period_start or event_date > period_end:
+                continue
+            seen_dates.append(event_date)
+
+            amount_node = entry.find("ns:Amt" if ns else "Amt", ns)
+            currency = ((amount_node.get("Ccy") if amount_node is not None else None) or account_currency).upper()
+            description = entry.findtext(
+                "ns:NtryDtls/ns:TxDtls/ns:RmtInf/ns:Ustrd" if ns else "NtryDtls/TxDtls/RmtInf/Ustrd",
+                default="CAMT bank transaction",
+                namespaces=ns,
+            )
+            reference = entry.findtext(
+                "ns:AcctSvcrRef" if ns else "AcctSvcrRef",
+                default="",
+                namespaces=ns,
+            ) or entry.findtext(
+                "ns:NtryDtls/ns:TxDtls/ns:Refs/ns:AcctSvcrRef" if ns else "NtryDtls/TxDtls/Refs/AcctSvcrRef",
+                default="",
+                namespaces=ns,
+            )
+            entry_reference = entry.findtext(
+                "ns:NtryRef" if ns else "NtryRef",
+                default="",
+                namespaces=ns,
+            )
+            category, record = make_record(
+                source=source,
+                category="bank_transactions",
+                record_id=f"{source.source_id}:camt:{entry_index}",
+                event_type="bank_credit" if amount >= 0 else "bank_debit",
+                event_date=event_date,
+                description=description,
+                currency=currency,
+                gross_amount=amount,
+                net_amount=amount,
+                external_ref=reference or None,
+                attributes={
+                    "iban": iban or None,
+                    "account_servicer_reference": reference or None,
+                    "entry_reference": entry_reference or None,
+                    "credit_debit_indicator": credit_debit,
+                },
+                row_ref=f"xml:{entry_index}",
+            )
+            result[category].append(record)
 
     update_coverage_from_dates(source, seen_dates)
     return result, []
@@ -3303,12 +3490,15 @@ def parse_purchase_note_markdown(
     net_amount = parse_decimal(context.get("net_amount"))
     vat_amount = parse_decimal(context.get("vat_amount"))
     target_source_id = str(context.get("target_source_id") or "")
+    payer_match = re.search(r"\bpaid\s+by\s+(.+)$", label, flags=re.IGNORECASE)
+    expense_report_payee = payer_match.group(1).strip() if payer_match else None
+    category_name = "manual_adjustments" if expense_report_payee else "purchase_expenses"
 
     category, record = make_record(
         source=source,
-        category="purchase_expenses",
-        record_id=f"{source.source_id}:purchase:{slugify(target_source_id or vendor_name)}",
-        event_type="purchase_note_markdown",
+        category=category_name,
+        record_id=f"{source.source_id}:{'expense-report' if expense_report_payee else 'purchase'}:{slugify(target_source_id or vendor_name)}",
+        event_type="expense_report_evidence" if expense_report_payee else "purchase_note_markdown",
         event_date=event_date,
         description=note_body or f"{vendor_name} manual purchase note",
         currency=base_currency,
@@ -3324,6 +3514,7 @@ def parse_purchase_note_markdown(
             "reverse_charge": bool(context.get("reverse_charge")),
             "target_source_id": target_source_id or None,
             "target_path": context.get("target_path"),
+            "expense_report_payee": expense_report_payee,
         },
     )
     result[category].append(record)
@@ -3408,6 +3599,67 @@ def missing_canonical_source_exceptions(sources: list[SourceDescriptor]) -> list
     return exceptions
 
 
+def physical_bank_ledger(record: dict[str, Any]) -> tuple[str, str] | None:
+    attributes = record.get("attributes") or {}
+    iban = str(attributes.get("iban") or attributes.get("customer_account") or "").strip()
+    currency = str(record.get("currency") or "").strip().upper()
+    if not iban or not currency:
+        return None
+    return re.sub(r"\s+", "", iban).upper(), currency
+
+
+def physical_bank_references(record: dict[str, Any]) -> set[str]:
+    attributes = record.get("attributes") or {}
+    return {
+        str(value).strip()
+        for value in (
+            record.get("external_ref"),
+            attributes.get("archive_identifier"),
+            attributes.get("account_servicer_reference"),
+            attributes.get("entry_reference"),
+        )
+        if str(value or "").strip()
+    }
+
+
+def sources_overlap(left: SourceDescriptor, right: SourceDescriptor) -> bool:
+    return not (left.covered_until < right.covered_from or right.covered_until < left.covered_from)
+
+
+def canonical_csv_records_for_camt_record(
+    *,
+    source: SourceDescriptor,
+    camt_record: dict[str, Any],
+    existing_bank_records: list[dict[str, Any]],
+    source_by_id: dict[str, SourceDescriptor],
+    canonical_csv_source_ids: set[str],
+) -> list[dict[str, Any]]:
+    csv_records = [
+        record
+        for record in existing_bank_records
+        if any(ref.get("source_id") in canonical_csv_source_ids for ref in record.get("source_refs", []))
+    ]
+    camt_ledger = physical_bank_ledger(camt_record)
+    if camt_ledger is None:
+        return []
+    matching_csv_records = [
+        record
+        for record in csv_records
+        if physical_bank_ledger(record) == camt_ledger
+    ]
+    if not matching_csv_records:
+        return []
+    matching_csv_sources = {
+        ref.get("source_id")
+        for record in matching_csv_records
+        for ref in record.get("source_refs", [])
+        if ref.get("source_id") in canonical_csv_source_ids
+    }
+    if not any(sources_overlap(source, source_by_id[source_id]) for source_id in matching_csv_sources):
+        return []
+    return matching_csv_records
+
+
 def aggregate_results(
     *,
     sources: list[SourceDescriptor],
@@ -3417,9 +3669,15 @@ def aggregate_results(
 ) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
     records = parser_result()
     exceptions: list[dict[str, Any]] = missing_canonical_source_exceptions(sources)
+    source_by_id = {source.source_id: source for source in sources}
+    canonical_csv_source_ids = {
+        source.source_id
+        for source in sources
+        if source.canonical and source.parser_name == "parse_bank_csv"
+    }
 
-    for source in sources:
-        if not source.canonical:
+    for source in sorted(sources, key=lambda candidate: (candidate.parser_name == "parse_camt_xml", candidate.rel_path)):
+        if not source.canonical and source.parser_name != "parse_camt_xml":
             continue
         parser = PARSERS.get(source.parser_name)
         if parser is None:
@@ -3451,8 +3709,56 @@ def aggregate_results(
                 period_end=period_end,
                 base_currency=base_currency,
             )
-        for category, values in parsed_records.items():
-            records[category].extend(values)
+        if source.parser_name == "parse_camt_xml":
+            supporting_records: list[dict[str, Any]] = []
+            for record in parsed_records["bank_transactions"]:
+                matching_csv_records = canonical_csv_records_for_camt_record(
+                    source=source,
+                    camt_record=record,
+                    existing_bank_records=records["bank_transactions"],
+                    source_by_id=source_by_id,
+                    canonical_csv_source_ids=canonical_csv_source_ids,
+                )
+                camt_references = physical_bank_references(record)
+                csv_references = set().union(
+                    *(physical_bank_references(csv_record) for csv_record in matching_csv_records)
+                )
+                if matching_csv_records and (not camt_references or camt_references & csv_references):
+                    supporting_records.append(record)
+                    continue
+                if matching_csv_records and camt_references:
+                    ledger = physical_bank_ledger(record)
+                    ledger_label = f"{ledger[0]}/{ledger[1]}" if ledger else "unknown ledger"
+                    references = ", ".join(sorted(camt_references))
+                    exceptions.append(
+                        make_exception(
+                            source=source,
+                            exception_id=f"{record['record_id']}:duplicate-risk",
+                            severity="error",
+                            reason=(
+                                f"CAMT record {record['record_id']} with AcctSvcrRef {references} overlaps "
+                                f"canonical CSV ledger {ledger_label} but does not match its immutable references."
+                            ),
+                            blocking=True,
+                            row_ref=(record.get("source_refs") or [{}])[0].get("row_ref"),
+                            suggested_follow_up="Review the paired bank CSV and CAMT statement before assigning this potential duplicate or missing physical-bank row.",
+                        )
+                    )
+            if supporting_records:
+                supporting_ids = {id(record) for record in supporting_records}
+                records["bank_transactions"].extend(
+                    record for record in parsed_records["bank_transactions"] if id(record) not in supporting_ids
+                )
+                records["bank_balances"].extend(parsed_records["bank_balances"])
+                source.parser_notes.append(
+                    "CAMT transaction rows with matching canonical CSV ledger evidence were retained only for immutable-reference cross-checking; CAMT balances were kept as supporting evidence."
+                )
+            else:
+                for category, values in parsed_records.items():
+                    records[category].extend(values)
+        elif source.canonical:
+            for category, values in parsed_records.items():
+                records[category].extend(values)
         exceptions.extend(parsed_exceptions)
 
     for category in ("sales", "refunds"):
@@ -3664,7 +3970,46 @@ def build_normalized_document(
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    existing_text: str | None = None
+    if path.exists() and "generated_at" in payload:
+        try:
+            existing_text = path.read_text(encoding="utf-8")
+            existing = json.loads(existing_text)
+        except (OSError, json.JSONDecodeError):
+            existing = None
+        if isinstance(existing, dict) and "generated_at" in existing:
+            existing_content = {key: value for key, value in existing.items() if key != "generated_at"}
+            regenerated_content = {key: value for key, value in payload.items() if key != "generated_at"}
+            if existing_content == regenerated_content:
+                payload = {**payload, "generated_at": existing["generated_at"]}
+    serialized = json.dumps(payload, indent=2, sort_keys=True)
+    if existing_text == serialized:
+        return
+
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def build_parser() -> argparse.ArgumentParser:

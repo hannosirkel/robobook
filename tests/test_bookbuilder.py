@@ -109,6 +109,57 @@ def find_action(batch: dict, action_type: str, *, endpoint: str | None = None) -
     raise AssertionError(f"Missing action {action_type} {endpoint or ''}")
 
 
+def actions_of_type(batch: dict, action_type: str) -> list[dict]:
+    return [action for action in batch["actions"] if action["action_type"] == action_type]
+
+
+def bank_row(*, record_id: str, amount: float, event_date: str) -> dict:
+    result = record(
+        record_id=record_id,
+        source_system="bank",
+        event_type="bank_credit" if amount > 0 else "bank_debit",
+        gross_amount=amount,
+        description=f"Bank movement {record_id}",
+        attributes={"iban": "EE123", "archive_identifier": record_id},
+    )
+    result["event_date"] = event_date
+    result["settlement_date"] = event_date
+    return result
+
+
+def existing_invoice_allocation(*, record_id: str, invoice_id: str) -> dict:
+    return {
+        "statement_id": f"archive:{record_id}",
+        "record_id": record_id,
+        "iban": "EE123",
+        "period": "2024-01",
+        "disposition": "existing_invoice_receipt",
+        "amount": 330.0,
+        "currency": "EUR",
+        "target": {"simplbooks_id": invoice_id, "document_type": "invoice"},
+        "review": {"status": "approved", "rationale": "Exact manual invoice match."},
+    }
+
+
+def build_with(*, bank: dict, allocation: dict) -> dict:
+    normalized = base_normalized(bank["event_date"][:7])
+    normalized["records"]["bank_transactions"] = [bank]
+    allocation = dict(allocation, period=normalized["period"], amount=bank["gross_amount"])
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        return bookbuilder.build_action_batch(
+            normalized_payload=normalized,
+            recon_payload=base_recon(normalized["period"]),
+            normalized_path=root / "normalized.json",
+            recon_path=root / "recon.json",
+            repo_root=root,
+            company_profile={"bank_account_ids": ["101"]},
+            bank_allocations={
+                (allocation["statement_id"], allocation["iban"], allocation["currency"]): allocation,
+            },
+        )
+
+
 def policy_with_24_percent_profile() -> dict:
     return {
         "schema_version": "1.0", "company_slug": "example", "bank_accounts": {},
@@ -216,6 +267,111 @@ def purchase_summary_action(
 
 
 class BookbuilderTests(unittest.TestCase):
+    def test_existing_manual_invoice_receipt_uses_statement_date_and_id(self) -> None:
+        batch = build_with(
+            bank=bank_row(record_id="receipt", amount=330.0, event_date="2024-01-08"),
+            allocation=existing_invoice_allocation(record_id="receipt", invoice_id="119"),
+        )
+
+        action = find_action(batch, "create_incoming_summary")
+        self.assertEqual(action["payload"]["document_date"], "2024-01-08")
+        self.assertEqual(action["payload"]["linked_invoice_id"], "119")
+        self.assertEqual(action["source_refs"][0]["record_ref"], "receipt")
+
+    def test_multiple_bank_receipts_create_multiple_actions_against_one_invoice(self) -> None:
+        normalized = base_normalized("2024-08")
+        rows = [
+            bank_row(record_id="receipt-a", amount=20.0, event_date="2024-08-04"),
+            bank_row(record_id="receipt-b", amount=20.0, event_date="2024-08-05"),
+        ]
+        normalized["records"]["bank_transactions"] = rows
+        normalized["records"]["sales"] = [
+            record(
+                record_id="direct-sale-summary",
+                source_system="direct",
+                channel="direct",
+                event_type="sales_summary",
+                gross_amount=40.0,
+            )
+        ]
+        allocations = {
+            (f"archive:{row['record_id']}", "EE123", "EUR"): {
+                "statement_id": f"archive:{row['record_id']}",
+                "record_id": row["record_id"],
+                "iban": "EE123",
+                "period": "2024-08",
+                "disposition": "generated_invoice_receipt",
+                "amount": 20.0,
+                "currency": "EUR",
+                "target": {"action_key": "example-2024-08-sales-direct", "document_type": "invoice"},
+                "review": {"status": "approved", "rationale": "Exact direct-sales allocation."},
+            }
+            for row in rows
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            batch = bookbuilder.build_action_batch(
+                normalized_payload=normalized,
+                recon_payload=base_recon("2024-08"),
+                normalized_path=root / "normalized.json",
+                recon_path=root / "recon.json",
+                repo_root=root,
+                company_profile={"bank_account_ids": ["101"]},
+                bank_allocations=allocations,
+            )
+
+        receipts = actions_of_type(batch, "create_incoming_summary")
+        self.assertEqual([action["payload"]["amount"] for action in receipts], [20.0, 20.0])
+        self.assertEqual(
+            {action["payload"]["linked_invoice_action"] for action in receipts},
+            {"example-2024-08-sales-direct"},
+        )
+
+    def test_exact_cash_actions_map_each_physical_bank_account(self) -> None:
+        normalized = base_normalized("2024-01")
+        rows = [
+            bank_row(record_id="receipt-one", amount=20.0, event_date="2024-01-08"),
+            bank_row(record_id="receipt-two", amount=20.0, event_date="2024-01-09"),
+        ]
+        rows[0]["attributes"]["customer_account"] = "EE111"
+        rows[1]["attributes"]["customer_account"] = "EE222"
+        normalized["records"]["bank_transactions"] = rows
+        allocations = {
+            (f"archive:{row['record_id']}", "EE123", "EUR"): {
+                "statement_id": f"archive:{row['record_id']}",
+                "record_id": row["record_id"],
+                "iban": "EE123",
+                "period": "2024-01",
+                "disposition": "existing_invoice_receipt",
+                "amount": 20.0,
+                "currency": "EUR",
+                "target": {"simplbooks_id": "119", "document_type": "invoice"},
+                "review": {"status": "approved", "rationale": "Exact invoice match."},
+            }
+            for row in rows
+        }
+        policy = {
+            "schema_version": "1.0", "company_slug": "example",
+            "bank_accounts": {"EE111": "3", "EE222": "4"},
+            "contacts": {}, "mappings": {}, "supplier_aliases": {},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            batch = bookbuilder.build_action_batch(
+                normalized_payload=normalized,
+                recon_payload=base_recon("2024-01"),
+                normalized_path=root / "normalized.json",
+                recon_path=root / "recon.json",
+                repo_root=root,
+                posting_policy=policy,
+                bank_allocations=allocations,
+            )
+
+        self.assertEqual(
+            [action["payload"]["bank_account_id"] for action in actions_of_type(batch, "create_incoming_summary")],
+            ["3", "4"],
+        )
+
     def test_processor_classifier_ignores_refs_nested_in_woo_vat_evidence(self) -> None:
         woo_sale = record(
             record_id="woo:sale:1",
@@ -576,7 +732,7 @@ class BookbuilderTests(unittest.TestCase):
         self.assertIsNone(line["suggested_vat_type_id"])
         self.assertTrue(any(dep["kind"] == "posting_mapping" for dep in batch["unresolved_dependencies"]))
 
-    def test_builder_applies_explicit_bank_and_sales_contact_policy(self) -> None:
+    def test_builder_does_not_create_unallocated_cash_actions_under_policy(self) -> None:
         normalized = base_normalized()
         normalized["records"]["sales"].append(
             record(
@@ -637,9 +793,7 @@ class BookbuilderTests(unittest.TestCase):
         self.assertEqual(sales["payload"]["line_items"][0]["suggested_vat_type_id"], "12")
         self.assertEqual(sales["payload"]["line_items"][0]["warehouse_id_hint"], "6")
         self.assertNotEqual(sales["confidence"], "low")
-        incoming = find_action(batch, "create_incoming_summary")
-        self.assertEqual(incoming["payload"]["bank_account_id"], "3")
-        self.assertEqual(incoming["payload"]["counterparty"]["contact_id"], "29")
+        self.assertFalse(actions_of_type(batch, "create_incoming_summary"))
 
     def test_builder_rejects_bank_row_without_source_account_under_policy(self) -> None:
         normalized = base_normalized()
@@ -695,7 +849,7 @@ class BookbuilderTests(unittest.TestCase):
                     repo_root=Path(tmp),
                 )
 
-    def test_builder_generates_sales_fee_purchase_and_cash_actions(self) -> None:
+    def test_builder_generates_business_documents_without_unallocated_cash_actions(self) -> None:
         normalized = base_normalized()
         normalized["records"]["sales"].append(
             record(
@@ -782,7 +936,7 @@ class BookbuilderTests(unittest.TestCase):
             )
 
         self.assertEqual(batch["approval_status"], "draft")
-        self.assertEqual(len(batch["actions"]), 5)
+        self.assertEqual(len(batch["actions"]), 3)
 
         sales_action = find_action(batch, "create_invoice_summary", endpoint="invoices/create")
         line_roles = [line["line_role"] for line in sales_action["payload"]["line_items"]]
@@ -795,12 +949,8 @@ class BookbuilderTests(unittest.TestCase):
         self.assertEqual(fee_action["payload"]["line_items"][0]["line_role"], "processor_fee")
         self.assertEqual(fee_action["payload"]["totals"]["gross_amount"], 4.0)
 
-        incoming_action = find_action(batch, "create_incoming_summary", endpoint="incomings/create")
-        self.assertEqual(incoming_action["payload"]["bank_account_id"], "101")
-        self.assertTrue(any(dep.endswith("-sales-paypal") for dep in incoming_action["depends_on"]))
-
-        payment_action = find_action(batch, "create_payment_summary", endpoint="payments/create")
-        self.assertEqual(payment_action["depends_on"][0], "example-2024-01-purchase-printful")
+        self.assertFalse(actions_of_type(batch, "create_incoming_summary"))
+        self.assertFalse(actions_of_type(batch, "create_payment_summary"))
 
     def test_builder_uses_channel_sales_once_when_processor_totals_match(self) -> None:
         normalized = base_normalized()
@@ -887,9 +1037,7 @@ class BookbuilderTests(unittest.TestCase):
         self.assertTrue(any("settlement evidence" in note for note in invoice_actions[0]["review_notes"]))
         self.assertFalse(any(line["line_role"] == "sales_shipping" for line in invoice_actions[0]["payload"]["line_items"]))
 
-        incoming_action = find_action(batch, "create_incoming_summary", endpoint="incomings/create")
-        self.assertIn("example-2024-01-sales-woo", incoming_action["depends_on"])
-        self.assertEqual(incoming_action["payload"]["amount"], 106.0)
+        self.assertFalse(actions_of_type(batch, "create_incoming_summary"))
 
     def test_force_allows_blocked_recon_and_marks_review_notes(self) -> None:
         normalized = base_normalized()
@@ -1156,7 +1304,7 @@ class BookbuilderTests(unittest.TestCase):
             [("Orders shipping and fullfilment", 7.9)],
         )
 
-    def test_builder_creates_supplier_payment_when_bank_counterparty_matches_purchase_group(self) -> None:
+    def test_builder_does_not_infer_supplier_payment_from_bank_counterparty(self) -> None:
         normalized = base_normalized()
         normalized["records"]["purchase_expenses"].append(
             record(
@@ -1207,15 +1355,9 @@ class BookbuilderTests(unittest.TestCase):
                 company_profile=company_profile,
             )
 
-        payment_action = next(
-            action for action in batch["actions"] if action["idempotency_key"].endswith("payment-acme-supplier-ou")
-        )
-        self.assertEqual(payment_action["payload"]["counterparty"]["contact_id"], "59")
-        self.assertEqual(payment_action["payload"]["amount"], 123.45)
-        self.assertEqual(payment_action["depends_on"], ["example-2024-01-purchase-acme-supplier-ou"])
-        self.assertTrue(any("supplier text" in note for note in payment_action["review_notes"]))
+        self.assertFalse(actions_of_type(batch, "create_payment_summary"))
 
-    def test_builder_treats_quartermaster_as_fulfillment_partner_for_purchase_mapping_and_payment(self) -> None:
+    def test_builder_treats_quartermaster_as_fulfillment_partner_without_inferred_payment(self) -> None:
         normalized = base_normalized()
         normalized["records"]["purchase_expenses"].append(
             record(
@@ -1272,10 +1414,7 @@ class BookbuilderTests(unittest.TestCase):
         self.assertEqual(purchase_action["payload"]["line_items"][0]["suggested_expense_account_id"], "612")
         self.assertEqual(purchase_action["payload"]["line_items"][0]["suggested_vat_type_id"], "11")
 
-        payment_action = next(action for action in batch["actions"] if action["idempotency_key"].endswith("payment-quartermaster"))
-        self.assertEqual(payment_action["depends_on"], ["example-2024-01-purchase-quartermaster"])
-        self.assertEqual(payment_action["payload"]["amount"], 21.0)
-        self.assertEqual(payment_action["payload"]["counterparty"]["contact_id"], "77")
+        self.assertFalse(actions_of_type(batch, "create_payment_summary"))
 
     def test_builder_adds_currency_suffix_when_same_purchase_group_repeats(self) -> None:
         normalized = base_normalized()
@@ -1382,9 +1521,8 @@ class BookbuilderTests(unittest.TestCase):
             )
 
         purchase_action = next(action for action in batch["actions"] if action["idempotency_key"].endswith("purchase-omniva"))
-        payment_action = next(action for action in batch["actions"] if action["idempotency_key"].endswith("payment-omniva"))
         self.assertEqual(purchase_action["payload"]["counterparty"]["contact_id"], "17")
-        self.assertEqual(payment_action["payload"]["counterparty"]["contact_id"], "17")
+        self.assertFalse(actions_of_type(batch, "create_payment_summary"))
         self.assertTrue(any("Eesti Post" in note for note in purchase_action["review_notes"]))
 
     def test_builder_posts_processor_refunds_using_merchant_sales_mapping(self) -> None:
@@ -1552,7 +1690,7 @@ class BookbuilderTests(unittest.TestCase):
 
         self.assertFalse(any(action["action_type"] == "create_payment_summary" for action in batch["actions"]))
 
-    def test_builder_splits_cross_month_supplier_payment_across_prior_purchases(self) -> None:
+    def test_builder_does_not_infer_cross_month_supplier_payments(self) -> None:
         normalized = base_normalized("2024-03")
         normalized["records"]["bank_transactions"].extend(
             [
@@ -1628,23 +1766,7 @@ class BookbuilderTests(unittest.TestCase):
             )
 
         payment_actions = [action for action in batch["actions"] if action["action_type"] == "create_payment_summary"]
-        self.assertEqual(len(payment_actions), 2)
-        self.assertEqual(sorted(action["payload"]["amount"] for action in payment_actions), [5.0, 12.0])
-        self.assertEqual(
-            sorted(action["payload"]["linked_purchase_action"] for action in payment_actions),
-            [
-                "example-2024-01-purchase-example-vendor",
-                "example-2024-02-purchase-example-vendor",
-            ],
-        )
-        self.assertTrue(all(action["depends_on"] == [] for action in payment_actions))
-        self.assertTrue(all(any("prior-period" in note for note in action["review_notes"]) for action in payment_actions))
-        self.assertTrue(
-            all(
-                all(ref["record_ref"] == "bank:example-vendor:settlement" for ref in action["source_refs"])
-                for action in payment_actions
-            )
-        )
+        self.assertEqual(payment_actions, [])
 
     def test_yaml_writer_emits_parseable_document(self) -> None:
         payload = {

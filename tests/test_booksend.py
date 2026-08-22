@@ -248,6 +248,19 @@ def payment_action(
     }
 
 
+def existing_invoice_incoming() -> dict:
+    action = incoming_action(depends_on=[])
+    action["payload"]["linked_invoice_id"] = "119"
+    return action
+
+
+def existing_purchase_payment() -> dict:
+    action = payment_action(depends_on=[])
+    action["payload"].pop("linked_purchase_action")
+    action["payload"]["linked_purchase_id"] = "88"
+    return action
+
+
 def make_batch(*, approval_status: str = "approved", actions: list[dict] | None = None) -> dict:
     return {
         "schema_version": "1.0",
@@ -275,6 +288,16 @@ class FakeClient:
 
 
 class BooksendTests(unittest.TestCase):
+    def test_translate_incoming_accepts_existing_invoice_id(self) -> None:
+        translated = booksend.translate_cash_settlement_payload(existing_invoice_incoming(), lookup={})
+
+        self.assertEqual(translated["payload"]["invoice_id"], 119)
+
+    def test_translate_payment_accepts_existing_purchase_id(self) -> None:
+        translated = booksend.translate_cash_settlement_payload(existing_purchase_payment(), lookup={})
+
+        self.assertEqual(translated["payload"]["purchase_id"], 88)
+
     def test_sender_rejects_manual_inventory_writeoff_before_translation(self) -> None:
         action = invoice_action()
         action["action_type"] = "manual_inventory_writeoff"
@@ -481,6 +504,37 @@ class BooksendTests(unittest.TestCase):
 
         self.assertEqual(submission["request_log"][0]["endpoint"], "payments/create")
         self.assertEqual(submission["request_log"][0]["payload"]["purchase_id"], 712)
+
+    def test_prior_lookup_uses_successful_submission_id_without_mutating_action_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            company_dir = root / "companies" / "example"
+            actions_dir = company_dir / "artifacts" / "actions"
+            submissions_dir = company_dir / "artifacts" / "submissions"
+            actions_dir.mkdir(parents=True)
+            submissions_dir.mkdir(parents=True)
+            prior = purchase_action(key="example-2024-01-purchase-prior")
+            booksend.write_yaml(actions_dir / "2024-01.yaml", {"actions": [prior]})
+            booksend.write_json(
+                submissions_dir / "2024-01.json",
+                {
+                    "request_log": [{
+                        "action_idempotency_key": "example-2024-01-purchase-prior",
+                        "mode": "write",
+                        "success": True,
+                        "inserted_id": 712,
+                    }]
+                },
+            )
+
+            lookup = booksend.load_prior_action_lookup(
+                company_dir=company_dir,
+                action_path=actions_dir / "2024-03.yaml",
+                period="2024-03",
+            )
+
+            self.assertEqual(lookup["example-2024-01-purchase-prior"]["inserted_id"], 712)
+            self.assertIsNone(prior["inserted_id"])
 
     def test_run_submission_reports_only_current_run_api_calls_on_rerun(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -37,7 +37,7 @@ class ReferenceArtifactTests(unittest.TestCase):
             with self.assertRaises(reference_artifacts.ReferenceArtifactError):
                 reference_artifacts.verify_file_binding(binding, cwd=Path(tmp))
 
-    def test_physical_bank_source_reference_is_detected_without_making_batch_binding_mandatory(self) -> None:
+    def test_physical_bank_source_reference_requires_bank_allocation_binding(self) -> None:
         batch = {
             "actions": [
                 {
@@ -48,7 +48,7 @@ class ReferenceArtifactTests(unittest.TestCase):
             ]
         }
         self.assertTrue(reference_artifacts.requires_bank_allocation_binding(batch))
-        self.assertNotIn("bank_allocations", reference_artifacts.required_action_binding_kinds(batch))
+        self.assertIn("bank_allocations", reference_artifacts.required_action_binding_kinds(batch))
 
 
 if __name__ == "__main__":

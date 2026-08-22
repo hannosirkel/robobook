@@ -15,6 +15,7 @@ Optional inputs:
 - `--policy-memo`
 - `--entity-map`
 - `--company-profile`
+- `--bank-allocations`
 - `--output`
 - `--force`
 
@@ -42,9 +43,9 @@ mapping choices explicit inside the draft payload:
   - processor fee summaries
   - purchase-expense summaries
 - `incomings/create`
-  - payout settlement summaries
+  - one exact reviewed physical-bank receipt, linked to an invoice action or existing invoice ID
 - `payments/create`
-  - bank-payment summaries linked to purchase summaries
+  - one exact reviewed physical-bank payment, linked to a purchase action or existing purchase ID
 
 Each payload currently carries a `draft_schema` marker such as `invoice_summary_v1`,
 `purchase_summary_v1`, or `cash_settlement_v1`.
@@ -71,11 +72,14 @@ Each payload currently carries a `draft_schema` marker such as `invoice_summary_
 
 ### Cash Actions
 
-- payout rows produce draft `incomings/create` actions
-- partner-tagged bank debits can produce draft `payments/create` actions when there is a matching
-  purchase-summary action
-- bank account ID selection prefers `company_profile.json`, then falls back to `entity_map.json`
-  heuristics
+- only allocations with `review.status: approved` create cash actions
+- each physical row (or each reviewed split part) gets a distinct stable action key and keeps the
+  statement date, amount, currency, source reference, and mapped bank account
+- generated targets may be current actions or successful prior submissions; existing IDs must be
+  proven by a bound discovery overview
+- processor payouts and purchase records remain supporting evidence, never settlement heuristics
+- `clearing_transfer`, direct-sale, and bank-fee dispositions do not create surrogate business
+  documents in this phase
 
 ## Current Blocking Rule
 

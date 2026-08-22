@@ -87,15 +87,13 @@ def required_action_binding_kinds(action_batch: dict[str, Any]) -> set[str]:
         if isinstance(line, dict)
     ):
         required.update({"woo_tax_allocation", "woo_tax_source"})
+    if requires_bank_allocation_binding(action_batch):
+        required.add("bank_allocations")
     return required
 
 
 def requires_bank_allocation_binding(action_batch: dict[str, Any]) -> bool:
-    """Report whether a future write-capable batch needs a bank-allocation binding.
-
-    Phase A intentionally exposes this calculation without adding it to the mandatory
-    action-batch binding set; write enforcement is introduced after report-only review.
-    """
+    """Report whether a write-capable batch contains physical bank settlement evidence."""
     return any(
         _is_physical_bank_source_ref(source_ref)
         for action in action_batch.get("actions") or []

@@ -564,6 +564,12 @@ def translate_cash_settlement_payload(
     }
 
     if document_type == "incoming":
+        linked_invoice_id = str(payload.get("linked_invoice_id") or "").strip()
+        linked_invoice_action = str(payload.get("linked_invoice_action") or "").strip()
+        if linked_invoice_id and linked_invoice_action:
+            raise SimplbooksError(
+                f"{action_id(action)} cannot carry both linked_invoice_id and linked_invoice_action."
+            )
         invoice_dependency = next(
             (
                 str(dependency)
@@ -582,7 +588,19 @@ def translate_cash_settlement_payload(
                 }
             )
         }
-        if invoice_dependency:
+        if linked_invoice_id:
+            translated["invoice_id"] = api_id(
+                linked_invoice_id,
+                field_name=f"{action_id(action)} invoice_id",
+            )
+        elif linked_invoice_action:
+            translated["invoice_id"] = dependency_inserted_id(
+                lookup,
+                linked_invoice_action,
+                field_name=f"{action_id(action)} invoice_id",
+                allow_placeholder=allow_unresolved_dependencies,
+            )
+        elif invoice_dependency:
             translated["invoice_id"] = dependency_inserted_id(
                 lookup,
                 invoice_dependency,
@@ -595,7 +613,12 @@ def translate_cash_settlement_payload(
         }
 
     if document_type == "payment":
+        linked_purchase_id = str(payload.get("linked_purchase_id") or "").strip()
         linked_purchase_action = str(payload.get("linked_purchase_action") or "")
+        if linked_purchase_id and linked_purchase_action:
+            raise SimplbooksError(
+                f"{action_id(action)} cannot carry both linked_purchase_id and linked_purchase_action."
+            )
         if not linked_purchase_action:
             linked_purchase_action = next((str(dep) for dep in action.get("depends_on") or []), "")
         translated = {
@@ -608,7 +631,12 @@ def translate_cash_settlement_payload(
                 }
             )
         }
-        if linked_purchase_action:
+        if linked_purchase_id:
+            translated["purchase_id"] = api_id(
+                linked_purchase_id,
+                field_name=f"{action_id(action)} purchase_id",
+            )
+        elif linked_purchase_action:
             translated["purchase_id"] = dependency_inserted_id(
                 lookup,
                 linked_purchase_action,
@@ -993,7 +1021,26 @@ def load_prior_action_lookup(
                 continue
             key = action_id(action)
             if key not in lookup:
-                lookup[key] = action
+                lookup[key] = copy.deepcopy(action)
+
+    submissions_dir = (
+        company_dir / "artifacts" / "submissions"
+        if company_dir is not None
+        else ((inferred_artifacts_dir(action_path) / "submissions") if inferred_artifacts_dir(action_path) else None)
+    )
+    if submissions_dir is None or not submissions_dir.exists():
+        return lookup
+    for path in sorted(submissions_dir.glob("*.json")):
+        if not re.fullmatch(r"\d{4}-\d{2}", path.stem) or path.stem >= period:
+            continue
+        submission = load_json(path)
+        for entry in submission.get("request_log") or []:
+            if not isinstance(entry, dict) or entry.get("mode") != "write" or not entry.get("success"):
+                continue
+            inserted_id = entry.get("inserted_id")
+            key = str(entry.get("action_idempotency_key") or "").strip()
+            if key in lookup and inserted_id not in (None, ""):
+                lookup[key]["inserted_id"] = inserted_id
     return lookup
 
 

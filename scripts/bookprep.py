@@ -1326,12 +1326,17 @@ def paypal_category(
     gross_amount: Decimal,
     *,
     funded_payment_ids: set[str] | None = None,
+    supplier_payment_parties: dict[str, str] | None = None,
+    customer_receipt_parties: dict[str, str] | None = None,
 ) -> str:
     type_value = row.get("Type", "").strip().lower()
     balance_impact = row.get("Balance Impact", "").strip().lower()
     transaction_id = row.get("Transaction ID", "").strip()
     reference_id = row.get("Reference Txn ID", "").strip()
     funded_payment_ids = funded_payment_ids or set()
+    supplier_payment_parties = supplier_payment_parties or {}
+    customer_receipt_parties = customer_receipt_parties or {}
+    counterparty = " ".join(row.get("Name", "").split()).casefold()
     if type_value == "general card withdrawal":
         return "clearing_transactions" if gross_amount < 0 and balance_impact == "debit" and reference_id else "ambiguous"
     if type_value == "general card deposit":
@@ -1346,9 +1351,21 @@ def paypal_category(
             return "clearing_transactions"
         return "ambiguous"
     if type_value == "payment reversal":
-        if gross_amount > 0 and balance_impact == "credit" and reference_id in funded_payment_ids:
+        if (
+            gross_amount > 0
+            and balance_impact == "credit"
+            and supplier_payment_parties.get(reference_id)
+            and counterparty in {supplier_payment_parties[reference_id], "paypal"}
+        ):
             return "clearing_transactions"
-        return "refunds"
+        if (
+            gross_amount < 0
+            and balance_impact == "debit"
+            and counterparty
+            and customer_receipt_parties.get(reference_id) == counterparty
+        ):
+            return "refunds"
+        return "ambiguous"
     if "withdrawal" in type_value or "payout" in type_value:
         return "payouts"
     if "deposit" in type_value or "currency conversion" in type_value:
@@ -1380,6 +1397,27 @@ def parse_paypal_csv(
         in {"general card withdrawal", "general card deposit", "general currency conversion"}
         and str(row.get("Reference Txn ID") or "").strip()
     }
+    def counterparty(row: dict[str, str]) -> str:
+        return " ".join(str(row.get("Name") or "").split()).casefold()
+
+    customer_receipt_parties = {
+        str(row.get("Transaction ID") or "").strip(): counterparty(row)
+        for row in rows
+        if str(row.get("Type") or "").strip().lower() == "general payment"
+        and parse_decimal(row.get("Gross")) > 0
+        and str(row.get("Balance Impact") or "").strip().lower() == "credit"
+        and str(row.get("Transaction ID") or "").strip()
+        and counterparty(row)
+    }
+    supplier_payment_parties = {
+        str(row.get("Transaction ID") or "").strip(): counterparty(row)
+        for row in rows
+        if str(row.get("Type") or "").strip().lower() == "general payment"
+        and parse_decimal(row.get("Gross")) < 0
+        and str(row.get("Balance Impact") or "").strip().lower() == "debit"
+        and str(row.get("Transaction ID") or "").strip() in funded_payment_ids
+        and counterparty(row)
+    }
 
     for line_no, row in enumerate(rows, start=2):
         event_date = parse_date_value(row["Date"])
@@ -1406,7 +1444,13 @@ def parse_paypal_csv(
         net = parse_decimal(row.get("Net"))
         shipping = abs(parse_decimal(row.get("Shipping and Handling Amount")))
         sales_tax = abs(parse_decimal(row.get("Sales Tax")))
-        category = paypal_category(row, gross, funded_payment_ids=funded_payment_ids)
+        category = paypal_category(
+            row,
+            gross,
+            funded_payment_ids=funded_payment_ids,
+            supplier_payment_parties=supplier_payment_parties,
+            customer_receipt_parties=customer_receipt_parties,
+        )
         if category == "ambiguous":
             exceptions.append(
                 make_exception(

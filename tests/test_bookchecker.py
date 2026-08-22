@@ -564,6 +564,26 @@ class BookcheckerTests(unittest.TestCase):
 
         self.assertTrue(bookchecker._allocation_part_matches_action(part, action=action, signed_amount=bookchecker.Decimal("20")))
 
+    def test_clearing_and_fx_proof_fields_are_supporting_not_target_identity(self) -> None:
+        row = physical_bank_record(record_id="purchase-payment", amount=-284.60)
+        action = exact_settlement_action(row=row, normalized_path=Path("normalized.json"))
+        action["payload"].pop("linked_purchase_id")
+        action["payload"]["linked_purchase_action"] = "purchase"
+        part = {
+            "disposition": "generated_purchase_payment", "amount": -284.60,
+            "target": {
+                "document_type": "purchase", "action_key": "purchase",
+                "clearing_record_ids": ["wallet:usd"], "bridge_record_ids": ["wallet:usd"],
+                "bridge_direction": "same_as_physical", "clearing_evidence": [],
+                "clearing_totals": {"USD": -306.32}, "clearing_relation": "reviewed_group",
+                "bridge_amount": -284.60, "fx_proof": {"rate": 0.9198876},
+            },
+        }
+
+        self.assertTrue(bookchecker._allocation_part_matches_action(
+            part, action=action, signed_amount=bookchecker.Decimal("-284.60")
+        ))
+
     def test_checker_errors_when_action_batch_omits_one_bank_row(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)

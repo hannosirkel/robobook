@@ -241,6 +241,50 @@ class SchemaContractTests(unittest.TestCase):
                 with self.assertRaises(AssertionError):
                     self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=artifact)
 
+    def test_bank_allocation_schema_rejects_malformed_clearing_and_fx_proof(self) -> None:
+        target = {
+            "document_type": "financial_transaction",
+            "transaction_family": "failed_transfer_and_return",
+            "clearing_record_ids": ["clearing:1"],
+        }
+        missing_proof = bank_allocation_payload(allocations=[
+            bank_allocation(disposition="clearing_transfer", amount=-13.27, target=target)
+        ])
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=missing_proof)
+
+        target.update({
+            "bridge_record_ids": ["clearing:1"], "bridge_direction": "opposite_physical",
+            "clearing_evidence": [{
+                "record_id": "clearing:1", "period": "2024-01", "currency": "USD", "amount": 14.94,
+                "provider": "processor", "account": "wallet", "source_system": "processor",
+            }],
+            "clearing_totals": {"USD": 14.94}, "clearing_relation": "reviewed_group",
+            "bridge_amount": -13.27,
+            "fx_proof": {
+                "equation": "absolute_clearing_times_rate_plus_fee_equals_physical",
+                "physical_record_id": "bank-source:bank:2", "physical_currency": "EUR", "physical_amount": -13.27,
+                "clearing_currency": "USD", "clearing_amount": 14.94, "rate": "bad", "fee_amount": 0,
+                "rate_evidence": {"path": "source.csv", "sha256": "a" * 64},
+            },
+        })
+        malformed_fx = bank_allocation_payload(allocations=[
+            bank_allocation(disposition="clearing_transfer", amount=-13.27, target=target)
+        ])
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=malformed_fx)
+
+    def test_bank_allocation_schema_types_foreign_currency_pilot(self) -> None:
+        target = {
+            "document_type": "purchase", "action_key": "purchase",
+            "foreign_currency_pilot_required": True,
+        }
+        malformed = bank_allocation_payload(allocations=[
+            bank_allocation(disposition="generated_purchase_payment", amount=-30.20, target=target)
+        ])
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=malformed)
+
     def test_bank_allocation_template_matches_strict_schema(self) -> None:
         artifact = json.loads((ROOT / "templates/bank-allocation.template.json").read_text(encoding="utf-8"))
         self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=artifact)

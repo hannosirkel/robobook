@@ -452,10 +452,12 @@ class BookreconTests(unittest.TestCase):
                 "document_type": "purchase",
                 "action_key": "example-2024-02-purchase-printful",
                 "clearing_record_ids": ["printful:wallet:feb29"],
+                "bridge_record_ids": ["printful:wallet:feb29"],
+                "bridge_direction": "same_as_physical",
                 "clearing_evidence": [{
                     "record_id": "printful:wallet:feb29", "period": "2024-02",
                     "currency": "EUR", "amount": -7.9,
-                    "provider": "printful", "account": "printful_wallet",
+                    "provider": "printful", "account": "printful_wallet", "source_system": "printful",
                 }],
                 "clearing_totals": {"EUR": -7.9},
                 "clearing_relation": "exact_amount",
@@ -500,10 +502,12 @@ class BookreconTests(unittest.TestCase):
             )
             reviewed["target"].update({
                 "clearing_record_ids": ["printful:wallet:feb29"],
+                "bridge_record_ids": ["printful:wallet:feb29"],
+                "bridge_direction": "same_as_physical",
                 "clearing_evidence": [{
                     "record_id": "printful:wallet:feb29", "period": "2024-03",
                     "currency": "EUR", "amount": -7.9,
-                    "provider": "printful", "account": "printful_wallet",
+                    "provider": "printful", "account": "printful_wallet", "source_system": "printful",
                 }],
                 "clearing_totals": {"EUR": -7.9}, "clearing_relation": "exact_amount",
                 "bridge_amount": -7.9,
@@ -516,6 +520,221 @@ class BookreconTests(unittest.TestCase):
 
         self.assertEqual(arbitrary["bank_coverage"]["unresolved_clearing_count"], 1)
         self.assertEqual(wrong_period["bank_coverage"]["unresolved_clearing_count"], 1)
+
+    def test_reviewed_group_requires_cent_exact_signed_bridge_leg_equation(self) -> None:
+        eur = record(
+            record_id="paypal:eur", source_system="paypal", event_type="paypal_card_deposit",
+            gross_amount=13.27, attributes={"clearing_provider": "paypal", "clearing_account": "wallet"},
+        )
+        usd = record(
+            record_id="paypal:unrelated-usd", source_system="paypal", event_type="paypal_conversion",
+            gross_amount=999.0, currency="USD",
+            attributes={"clearing_provider": "paypal", "clearing_account": "wallet"},
+        )
+        reviewed = allocation(
+            statement_id="archive:debit", record_id="bank:debit", amount=-13.27,
+            disposition="clearing_transfer",
+            target={
+                "document_type": "financial_transaction", "transaction_family": "failed_transfer_and_return",
+                "clearing_record_ids": ["paypal:eur", "paypal:unrelated-usd"],
+                "bridge_record_ids": ["paypal:unrelated-usd"], "bridge_direction": "opposite_physical",
+                "clearing_evidence": [
+                    {"record_id": "paypal:eur", "period": "2024-01", "currency": "EUR", "amount": 13.27,
+                     "provider": "paypal", "account": "wallet", "source_system": "paypal"},
+                    {"record_id": "paypal:unrelated-usd", "period": "2024-01", "currency": "USD", "amount": 999.0,
+                     "provider": "paypal", "account": "wallet", "source_system": "paypal"},
+                ],
+                "clearing_totals": {"EUR": 13.27, "USD": 999.0},
+                "clearing_relation": "reviewed_group", "bridge_amount": -13.27,
+            },
+        )
+
+        resolved = bookrecon._validated_clearing_allocation_references(
+            {"a": reviewed}, {"paypal:eur": eur, "paypal:unrelated-usd": usd},
+            allocation_company_slug="example", normalized_company_slug="example",
+        )
+
+        self.assertEqual(resolved, set())
+
+    def test_clearing_proof_rejects_company_mismatch(self) -> None:
+        movement = record(
+            record_id="paypal:leg", source_system="paypal", event_type="paypal_card_deposit",
+            gross_amount=13.27, attributes={"clearing_provider": "paypal", "clearing_account": "wallet"},
+        )
+        reviewed = allocation(
+            statement_id="archive:debit", record_id="bank:debit", amount=-13.27,
+            disposition="clearing_transfer",
+            target={
+                "document_type": "financial_transaction", "transaction_family": "failed_transfer_and_return",
+                "clearing_record_ids": ["paypal:leg"], "bridge_record_ids": ["paypal:leg"],
+                "bridge_direction": "opposite_physical",
+                "clearing_evidence": [{"record_id": "paypal:leg", "period": "2024-01", "currency": "EUR",
+                    "amount": 13.27, "provider": "paypal", "account": "wallet", "source_system": "paypal"}],
+                "clearing_totals": {"EUR": 13.27}, "clearing_relation": "reviewed_group", "bridge_amount": -13.27,
+            },
+        )
+
+        resolved = bookrecon._validated_clearing_allocation_references(
+            {"a": reviewed}, {"paypal:leg": movement},
+            allocation_company_slug="other", normalized_company_slug="example",
+        )
+
+        self.assertEqual(resolved, set())
+
+    def test_cross_currency_group_requires_bound_rate_and_cent_exact_equation(self) -> None:
+        movement = record(
+            record_id="printful:usd", source_system="printful", event_type="printful_wallet_deposit",
+            gross_amount=-306.32, currency="USD",
+            attributes={"clearing_provider": "printful", "clearing_account": "wallet"},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            evidence_path = root / "statement.csv"
+            evidence_path.write_text("306.32 USD, fee 2.82 EUR, rate 0.9198876", encoding="utf-8")
+            evidence = {
+                "path": "statement.csv",
+                "sha256": hashlib.sha256(evidence_path.read_bytes()).hexdigest(),
+            }
+            target = {
+                "document_type": "purchase", "action_key": "purchase",
+                "clearing_record_ids": ["printful:usd"], "bridge_record_ids": ["printful:usd"],
+                "bridge_direction": "same_as_physical",
+                "clearing_evidence": [{"record_id": "printful:usd", "period": "2024-01", "currency": "USD",
+                    "amount": -306.32, "provider": "printful", "account": "wallet", "source_system": "printful"}],
+                "clearing_totals": {"USD": -306.32}, "clearing_relation": "reviewed_group",
+                "bridge_amount": -284.60,
+                "fx_proof": {
+                    "equation": "absolute_clearing_times_rate_plus_fee_equals_physical",
+                    "physical_record_id": "bank:card", "physical_currency": "EUR", "physical_amount": -284.60,
+                    "clearing_currency": "USD", "clearing_amount": -306.32,
+                    "rate": 0.9198876, "fee_amount": 2.82, "rate_evidence": evidence,
+                },
+            }
+            reviewed = allocation(
+                statement_id="archive:card", record_id="bank:card", amount=-284.60,
+                disposition="generated_purchase_payment", target=target,
+            )
+
+            valid = bookrecon._validated_clearing_allocation_references(
+                {"a": reviewed}, {"printful:usd": movement},
+                allocation_company_slug="example", normalized_company_slug="example", repo_root=root,
+            )
+            reviewed["target"]["fx_proof"]["rate_evidence"]["sha256"] = "0" * 64
+            bad_binding = bookrecon._validated_clearing_allocation_references(
+                {"a": reviewed}, {"printful:usd": movement},
+                allocation_company_slug="example", normalized_company_slug="example", repo_root=root,
+            )
+
+        self.assertEqual(valid, {"printful:usd"})
+        self.assertEqual(bad_binding, set())
+
+    def test_cross_currency_group_rejects_mixed_currency_bridge_legs(self) -> None:
+        usd = record(
+            record_id="wallet:usd", source_system="wallet", event_type="conversion",
+            gross_amount=-10.0, currency="USD",
+            attributes={"clearing_provider": "wallet", "clearing_account": "wallet"},
+        )
+        eur = record(
+            record_id="wallet:eur", source_system="wallet", event_type="fee",
+            gross_amount=-1.0, currency="EUR",
+            attributes={"clearing_provider": "wallet", "clearing_account": "wallet"},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            evidence_path = root / "rate.txt"
+            evidence_path.write_text("reviewed rate", encoding="utf-8")
+            target = {
+                "document_type": "purchase", "action_key": "purchase",
+                "clearing_record_ids": ["wallet:usd", "wallet:eur"],
+                "bridge_record_ids": ["wallet:usd", "wallet:eur"],
+                "bridge_direction": "same_as_physical",
+                "clearing_evidence": [
+                    {"record_id": "wallet:usd", "period": "2024-01", "currency": "USD",
+                     "amount": -10.0, "provider": "wallet", "account": "wallet", "source_system": "wallet"},
+                    {"record_id": "wallet:eur", "period": "2024-01", "currency": "EUR",
+                     "amount": -1.0, "provider": "wallet", "account": "wallet", "source_system": "wallet"},
+                ],
+                "clearing_totals": {"USD": -10.0, "EUR": -1.0},
+                "clearing_relation": "reviewed_group", "bridge_amount": -10.0,
+                "fx_proof": {
+                    "equation": "absolute_clearing_times_rate_plus_fee_equals_physical",
+                    "physical_record_id": "bank:card", "physical_currency": "EUR", "physical_amount": -10.0,
+                    "clearing_currency": "USD", "clearing_amount": -11.0,
+                    "rate": 0.818181818, "fee_amount": -1.0,
+                    "rate_evidence": {"path": "rate.txt", "sha256": hashlib.sha256(evidence_path.read_bytes()).hexdigest()},
+                },
+            }
+            reviewed = allocation(
+                statement_id="archive:card", record_id="bank:card", amount=-10.0,
+                disposition="generated_purchase_payment", target=target,
+            )
+
+            resolved = bookrecon._validated_clearing_allocation_references(
+                {"a": reviewed}, {"wallet:usd": usd, "wallet:eur": eur},
+                allocation_company_slug="example", normalized_company_slug="example", repo_root=root,
+            )
+
+        self.assertEqual(resolved, set())
+
+    def test_duplicate_clearing_claims_reject_every_claimant_independent_of_order(self) -> None:
+        movement = record(
+            record_id="paypal:leg", source_system="paypal", event_type="paypal_card_deposit",
+            gross_amount=13.27, attributes={"clearing_provider": "paypal", "clearing_account": "wallet"},
+        )
+        target = {
+            "document_type": "financial_transaction", "transaction_family": "failed_transfer_and_return",
+            "clearing_record_ids": ["paypal:leg"], "bridge_record_ids": ["paypal:leg"],
+            "bridge_direction": "opposite_physical",
+            "clearing_evidence": [{"record_id": "paypal:leg", "period": "2024-01", "currency": "EUR",
+                "amount": 13.27, "provider": "paypal", "account": "wallet", "source_system": "paypal"}],
+            "clearing_totals": {"EUR": 13.27}, "clearing_relation": "reviewed_group", "bridge_amount": -13.27,
+        }
+        first = allocation(statement_id="a", record_id="a", amount=-13.27, disposition="clearing_transfer", target=target)
+        second = allocation(statement_id="b", record_id="b", amount=-13.27, disposition="clearing_transfer", target=target)
+
+        forward = bookrecon._validated_clearing_allocation_references(
+            {"a": first, "b": second}, {"paypal:leg": movement},
+            allocation_company_slug="example", normalized_company_slug="example",
+        )
+        reverse = bookrecon._validated_clearing_allocation_references(
+            {"b": second, "a": first}, {"paypal:leg": movement},
+            allocation_company_slug="example", normalized_company_slug="example",
+        )
+
+        self.assertEqual(forward, set())
+        self.assertEqual(reverse, set())
+
+    def test_duplicate_evidence_for_one_clearing_reference_is_rejected(self) -> None:
+        movement = record(
+            record_id="wallet:leg", source_system="wallet", event_type="deposit",
+            gross_amount=13.27, attributes={"clearing_provider": "wallet", "clearing_account": "wallet"},
+        )
+        evidence = {"record_id": "wallet:leg", "period": "2024-01", "currency": "EUR",
+                    "amount": 13.27, "provider": "wallet", "account": "wallet", "source_system": "wallet"}
+        reviewed = allocation(
+            statement_id="archive:debit", record_id="bank:debit", amount=-13.27,
+            disposition="clearing_transfer",
+            target={
+                "document_type": "financial_transaction", "transaction_family": "internal_transfer",
+                "clearing_record_ids": ["wallet:leg"], "bridge_record_ids": ["wallet:leg"],
+                "bridge_direction": "opposite_physical", "clearing_evidence": [evidence, dict(evidence)],
+                "clearing_totals": {"EUR": 13.27}, "clearing_relation": "reviewed_group",
+                "bridge_amount": -13.27,
+            },
+        )
+
+        resolved = bookrecon._validated_clearing_allocation_references(
+            {"a": reviewed}, {"wallet:leg": movement},
+            allocation_company_slug="example", normalized_company_slug="example",
+        )
+
+        self.assertEqual(resolved, set())
+
+    def test_supported_transfer_families_are_supplier_neutral(self) -> None:
+        rendered = " ".join(sorted(bookrecon.SUPPORTED_CLEARING_TRANSFER_FAMILIES)).lower()
+        self.assertNotIn("quartermaster", rendered)
+        self.assertNotIn("paypal", rendered)
+
     def test_processor_classifier_ignores_refs_nested_in_woo_vat_evidence(self) -> None:
         woo_sale = record(
             record_id="woo:1",
@@ -665,12 +884,14 @@ class BookreconTests(unittest.TestCase):
             disposition="clearing_transfer",
             target={
                 "document_type": "financial_transaction",
-                "transaction_family": "failed_payment_transfer_and_return",
+                "transaction_family": "failed_transfer_and_return",
                 "clearing_record_ids": ["paypal:clearing:return"],
+                "bridge_record_ids": ["paypal:clearing:return"],
+                "bridge_direction": "same_as_physical",
                 "clearing_evidence": [{
                     "record_id": "paypal:clearing:return", "period": "2024-01",
                     "currency": "EUR", "amount": 13.27,
-                    "provider": "paypal", "account": "paypal_wallet",
+                    "provider": "paypal", "account": "paypal_wallet", "source_system": "paypal",
                 }],
                 "clearing_totals": {"EUR": 13.27},
                 "clearing_relation": "exact_amount", "bridge_amount": 13.27,

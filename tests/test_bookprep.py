@@ -929,6 +929,78 @@ class BookprepTests(unittest.TestCase):
         self.assertEqual([item["external_ref"] for item in records["refunds"]], ["REV1"])
         self.assertFalse(records["clearing_transactions"])
 
+    def test_unpaired_positive_paypal_payment_reversal_is_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "paypal_2025_report.CSV"
+            csv_path.write_text(
+                "Date,Name,Type,Status,Currency,Gross,Fee,Net,Transaction ID,Reference Txn ID,Balance Impact\n"
+                "10/10/2025,Unknown,Payment Reversal,Completed,EUR,20.00,0.00,20.00,REV1,UNKNOWN,Credit\n",
+                encoding="utf-8",
+            )
+            period_start, period_end = bookprep.parse_period("2025-10")
+            source = bookprep.inspect_source_file(
+                path=csv_path, root_dir=root, period_start=period_start, period_end=period_end
+            )
+            assert source is not None
+
+            records, exceptions = bookprep.parse_paypal_csv(
+                source, period_start=period_start, period_end=period_end, base_currency="EUR"
+            )
+
+        self.assertFalse(records["refunds"])
+        self.assertTrue(any(item["blocking"] and "ambiguous" in item["reason"].lower() for item in exceptions))
+
+    def test_paypal_reversal_with_mismatched_counterparty_is_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "paypal_2025_report.CSV"
+            csv_path.write_text(
+                "Date,Name,Type,Status,Currency,Gross,Fee,Net,Transaction ID,Reference Txn ID,Balance Impact\n"
+                "09/10/2025,Buyer A,General Payment,Completed,EUR,20.00,-1.00,19.00,SALE1,,Credit\n"
+                "10/10/2025,Buyer B,Payment Reversal,Completed,EUR,-20.00,0.00,-20.00,REV1,SALE1,Debit\n",
+                encoding="utf-8",
+            )
+            period_start, period_end = bookprep.parse_period("2025-10")
+            source = bookprep.inspect_source_file(
+                path=csv_path, root_dir=root, period_start=period_start, period_end=period_end
+            )
+            assert source is not None
+
+            records, exceptions = bookprep.parse_paypal_csv(
+                source, period_start=period_start, period_end=period_end, base_currency="EUR"
+            )
+
+        self.assertFalse(records["refunds"])
+        self.assertTrue(any(item["blocking"] and "ambiguous" in item["reason"].lower() for item in exceptions))
+
+    def test_paypal_provider_named_reversal_of_exact_funded_supplier_payment_is_clearing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "paypal_2025_report.CSV"
+            csv_path.write_text(
+                "Date,Name,Type,Status,Currency,Gross,Fee,Net,Transaction ID,Reference Txn ID,Balance Impact\n"
+                "09/10/2025,,General Card Withdrawal,Completed,EUR,-13.27,0.00,-13.27,FUND1,PAY1,Debit\n"
+                "09/10/2025,Supplier,General Payment,Pending,USD,-14.94,0.00,-14.94,PAY1,,Debit\n"
+                "10/10/2025,PayPal,Payment Reversal,Completed,USD,14.94,0.00,14.94,REV1,PAY1,Credit\n",
+                encoding="utf-8",
+            )
+            period_start, period_end = bookprep.parse_period("2025-10")
+            source = bookprep.inspect_source_file(
+                path=csv_path, root_dir=root, period_start=period_start, period_end=period_end
+            )
+            assert source is not None
+
+            records, exceptions = bookprep.parse_paypal_csv(
+                source, period_start=period_start, period_end=period_end, base_currency="EUR"
+            )
+
+        self.assertEqual(
+            [item["external_ref"] for item in records["clearing_transactions"]],
+            ["FUND1", "REV1"],
+        )
+        self.assertFalse(any(item["blocking"] for item in exceptions))
+
     def test_ambiguous_outgoing_paypal_general_payment_is_blocking(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

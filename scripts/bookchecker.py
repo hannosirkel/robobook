@@ -927,7 +927,7 @@ def _allocation_part_matches_action(
     allowed_common_target_fields = {
         "document_type", "contact_id", "counterparty_hint", "external_number",
         "clearing_record_ids", "clearing_evidence", "clearing_totals",
-        "clearing_relation", "bridge_amount",
+        "clearing_relation", "bridge_amount", "bridge_record_ids", "bridge_direction", "fx_proof",
         "target_currency", "foreign_currency_pilot_required", "pilot_requirements",
     }
     if target.get("contact_id") not in (None, "") and str(

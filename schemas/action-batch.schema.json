@@ -367,11 +367,17 @@
       "allOf": [
         {
           "if": {"properties": {"kind": {"const": "normalized_sales_group"}}, "required": ["kind"]},
-          "then": {"required": ["group_label", "currency", "tax_profile"]}
+          "then": {
+            "required": ["group_label", "currency", "tax_profile"],
+            "properties": {"record_category": {"enum": ["sales", "refunds"]}}
+          }
         },
         {
           "if": {"properties": {"kind": {"const": "reviewed_direct_sale_allocation"}}, "required": ["kind"]},
-          "then": {"required": ["statement_id"]}
+          "then": {
+            "required": ["statement_id"],
+            "properties": {"record_category": {"const": "bank_transactions"}}
+          }
         }
       ]
     },
@@ -503,7 +509,40 @@
             "null"
           ]
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"action_type": {"const": "create_credit_invoice_summary"}},
+            "required": ["action_type"]
+          },
+          "then": {
+            "properties": {
+              "payload": {
+                "properties": {
+                  "line_items": {
+                    "items": {
+                      "if": {"required": ["article_id_hint"]},
+                      "then": {
+                        "properties": {
+                          "line_role": {"pattern": "^refund_(revenue|product)"},
+                          "inventory_quantity_proof": {
+                            "properties": {
+                              "scope": {
+                                "properties": {"record_category": {"const": "refunds"}}
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
     }
   }
 }

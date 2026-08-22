@@ -13,5 +13,5 @@
   "evidence_kind": "simplbooks_discovery",
   "captured_at": "2026-08-22T10:00:00Z",
   "source_identity": {"path": "companies/example/artifacts/normalized/2024-01.json", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "record_ref": "normalized-bank-record-id"},
-  "evidence_source": {"path": "companies/example/artifacts/discovery/2024-overview.json", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "record_ref": "transaction-501"}
+  "evidence_source": {"path": "companies/example/artifacts/discovery/snapshots/2024-20260822T100000Z-overview.json", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "record_ref": "transaction-501"}
 }

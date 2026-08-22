@@ -390,7 +390,7 @@ def translate_invoice_payload(
     for index, line in enumerate(payload.get("line_items") or [], start=1):
         gross_amount = abs(decimal_value(line.get("gross_amount")))
         if line.get("article_id_hint") not in (None, ""):
-            proof_errors = inventory_quantity_proof_errors(line)
+            proof_errors = inventory_quantity_proof_errors(action, line)
             if proof_errors:
                 raise SimplbooksError(
                     f"{action_id(action)} line {index} inventory quantity proof is invalid: {proof_errors[0]}"
@@ -481,7 +481,31 @@ def translate_invoice_payload(
     }
 
 
-def inventory_quantity_proof_errors(line: dict[str, Any]) -> list[str]:
+def inventory_quantity_action_contract_error(action: dict[str, Any], line: dict[str, Any]) -> str | None:
+    proof = line.get("inventory_quantity_proof")
+    scope = proof.get("scope") if isinstance(proof, dict) else None
+    category = str((scope or {}).get("record_category") or "") if isinstance(scope, dict) else ""
+    action_type = str(action.get("action_type") or "")
+    document_type = str((action.get("payload") or {}).get("document_type") or "")
+    line_role = str(line.get("line_role") or "")
+    sales_role = line_role == "sales_revenue" or ("sales" in line_role and "product" in line_role)
+    refund_role = line_role == "refund_revenue" or ("refund" in line_role and "product" in line_role)
+    contracts = {
+        "sales": action_type == "create_invoice_summary" and document_type == "invoice" and sales_role,
+        "refunds": action_type == "create_credit_invoice_summary" and document_type == "credit_note" and refund_role,
+        "bank_transactions": (
+            action_type == "create_invoice_summary"
+            and document_type == "invoice"
+            and line_role == "direct_sale_revenue"
+            and (scope or {}).get("kind") == "reviewed_direct_sale_allocation"
+        ),
+    }
+    if category in contracts and not contracts[category]:
+        return f"{category} inventory scope does not match the action contract"
+    return None
+
+
+def inventory_quantity_proof_errors(action: dict[str, Any], line: dict[str, Any]) -> list[str]:
     if "shipping" in str(line.get("line_role") or "").lower():
         return ["shipping line must not carry an inventory article"]
     proof = line.get("inventory_quantity_proof")
@@ -559,6 +583,9 @@ def inventory_quantity_proof_errors(line: dict[str, Any]) -> list[str]:
     )
     if any(item.get("quantity_source") != required_source for item in contributors):
         return ["contributor quantity source does not match semantic scope"]
+    contract_error = inventory_quantity_action_contract_error(action, line)
+    if contract_error:
+        return [contract_error]
     return []
 
 

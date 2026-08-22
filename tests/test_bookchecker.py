@@ -355,6 +355,60 @@ def bank_coverage_batch(*, period: str, allocation_path: Path, actions: list[dic
 
 
 class BookcheckerTests(unittest.TestCase):
+    def test_inventory_quantity_checker_rejects_invoice_with_refund_scope(self) -> None:
+        record = {
+            "record_id": "woo:refund:1", "quantity": 1, "gross_amount": -20.0,
+            "event_date": "2024-01-15", "currency": "EUR", "channel": "woo", "vat_amount": 0,
+        }
+        proof = bookbuilder.normalized_inventory_quantity_proof(
+            [record], group_label="woo", direction="refunds"
+        )
+        action = {
+            "idempotency_key": "example-2024-01-wrong-refund-scope",
+            "action_type": "create_invoice_summary",
+            "payload": {"document_type": "invoice", "line_items": [{
+                "line_role": "sales_revenue", "article_id_hint": "3", "quantity": 1,
+                "inventory_quantity_proof": proof,
+            }]},
+        }
+        normalized = base_normalized()
+        normalized["records"]["refunds"] = [record]
+
+        findings = bookchecker.evaluate_inventory_quantities(
+            action=action,
+            resolved_sources=[{"record_ref": record["record_id"], "record": record, "payload": normalized}],
+            reviewed_allocations={},
+        )
+
+        self.assertTrue(any("action contract" in item["summary"] for item in findings), findings)
+
+    def test_inventory_quantity_checker_rejects_credit_note_with_sales_scope(self) -> None:
+        record = {
+            "record_id": "woo:sale:wrong-credit", "quantity": 1, "gross_amount": 20.0,
+            "event_date": "2024-01-15", "currency": "EUR", "channel": "woo", "vat_amount": 0,
+        }
+        proof = bookbuilder.normalized_inventory_quantity_proof(
+            [record], group_label="woo", direction="sales"
+        )
+        action = {
+            "idempotency_key": "example-2024-01-wrong-sales-scope",
+            "action_type": "create_credit_invoice_summary",
+            "payload": {"document_type": "credit_note", "line_items": [{
+                "line_role": "refund_revenue", "article_id_hint": "3", "quantity": 1,
+                "inventory_quantity_proof": proof,
+            }]},
+        }
+        normalized = base_normalized()
+        normalized["records"]["sales"] = [record]
+
+        findings = bookchecker.evaluate_inventory_quantities(
+            action=action,
+            resolved_sources=[{"record_ref": record["record_id"], "record": record, "payload": normalized}],
+            reviewed_allocations={},
+        )
+
+        self.assertTrue(any("action contract" in item["summary"] for item in findings), findings)
+
     def test_inventory_quantity_checker_rejects_tampered_normalized_contributor(self) -> None:
         record = {
             "record_id": "woo:sale:1", "quantity": 2, "gross_amount": 40.0,
@@ -387,7 +441,7 @@ class BookcheckerTests(unittest.TestCase):
         proof = bookbuilder.normalized_inventory_quantity_proof(
             [record], group_label="woo", direction="sales"
         )
-        action = {"idempotency_key": "example-2024-01-unicode", "payload": {"line_items": [{
+        action = {"idempotency_key": "example-2024-01-unicode", "action_type": "create_invoice_summary", "payload": {"document_type": "invoice", "line_items": [{
             "line_role": "sales_revenue", "article_id_hint": "3", "quantity": 1,
             "inventory_quantity_proof": proof,
         }]}}
@@ -484,7 +538,10 @@ class BookcheckerTests(unittest.TestCase):
             })
         normalized = base_normalized()
         normalized["records"]["sales"] = records
-        action = {"idempotency_key": "example-multiple", "payload": {"line_items": lines}}
+        action = {
+            "idempotency_key": "example-multiple", "action_type": "create_invoice_summary",
+            "payload": {"document_type": "invoice", "line_items": lines},
+        }
 
         findings = bookchecker.evaluate_inventory_quantities(
             action=action,

@@ -531,6 +531,39 @@ class SchemaContractTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=artifact)
 
+    def test_action_batch_schema_rejects_credit_note_inventory_with_sales_scope(self) -> None:
+        artifact = bookchecker.load_yaml(ROOT / "templates/actions-period.template.yaml")
+        proof = bookbuilder.inventory_proof_envelope(
+            scope={
+                "kind": "normalized_sales_group", "period": "2024-01",
+                "record_category": "sales", "group_label": "woo",
+                "currency": "EUR", "tax_profile": "non_taxable",
+            },
+            quantity=bookbuilder.Decimal("1"),
+            contributors=[{
+                "record_id": "woo:1", "quantity": 1,
+                "quantity_source": "normalized_record", "record_sha256": "a" * 64,
+            }],
+        )
+        action = artifact["actions"][0]
+        action["action_type"] = "create_credit_invoice_summary"
+        action["payload"] = {"document_type": "credit_note", "line_items": [{
+            "line_role": "refund_revenue", "article_id_hint": "3", "quantity": 1,
+            "inventory_quantity_proof": proof,
+        }]}
+
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=artifact)
+
+    def test_statement_import_evidence_template_uses_immutable_discovery_snapshot(self) -> None:
+        artifact = json.loads(
+            (ROOT / "templates/statement-import-evidence.template.json").read_text(encoding="utf-8")
+        )
+
+        path = artifact["evidence_source"]["path"]
+        self.assertIn("snapshots", path)
+        self.assertNotEqual(path, "companies/example/artifacts/discovery/2024-overview.json")
+
     def test_action_batch_schema_restricts_top_level_manual_financial_dispositions(self) -> None:
         dependency = {
             "kind": "manual_statement_import_financial_transaction",

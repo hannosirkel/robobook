@@ -720,6 +720,100 @@ class BooksendTests(unittest.TestCase):
         with self.assertRaisesRegex(SimplbooksError, "shipping"):
             booksend.translate_action_for_api(action, lookup={})
 
+    def test_sender_rejects_invoice_with_refund_inventory_scope(self) -> None:
+        action = invoice_action(key="example-2024-01-wrong-refund-scope")
+        record = {
+            "record_id": "woo:refund:1", "quantity": 1, "event_date": "2024-01-15",
+            "currency": "EUR", "channel": "woo", "source_system": "woo",
+            "vat_amount": 0, "gross_amount": -20,
+        }
+        action["payload"]["line_items"] = [{
+            "line_role": "sales_revenue", "description": "Wrong refund scope", "gross_amount": 20,
+            "vat_amount_hint": 0, "suggested_income_account_id": "3000",
+            "suggested_vat_type_id": "22", "article_id_hint": "3", "quantity": 1,
+            "inventory_quantity_proof": bookbuilder.normalized_inventory_quantity_proof(
+                [record], group_label="woo", direction="refunds"
+            ),
+        }]
+
+        with self.assertRaisesRegex(SimplbooksError, "action contract"):
+            booksend.translate_action_for_api(action, lookup={})
+
+    def test_sender_rejects_credit_note_with_sales_inventory_scope(self) -> None:
+        action = invoice_action(key="example-2024-01-wrong-sales-scope")
+        action["action_type"] = "create_credit_invoice_summary"
+        action["payload"]["document_type"] = "credit_note"
+        record = {
+            "record_id": "woo:sale:1", "quantity": 1, "event_date": "2024-01-15",
+            "currency": "EUR", "channel": "woo", "source_system": "woo",
+            "vat_amount": 0, "gross_amount": 20,
+        }
+        action["payload"]["line_items"] = [{
+            "line_role": "refund_revenue", "description": "Wrong sales scope", "gross_amount": 20,
+            "vat_amount_hint": 0, "suggested_income_account_id": "3000",
+            "suggested_vat_type_id": "22", "article_id_hint": "3", "quantity": 1,
+            "inventory_quantity_proof": bookbuilder.normalized_inventory_quantity_proof(
+                [record], group_label="woo", direction="sales"
+            ),
+        }]
+
+        with self.assertRaisesRegex(SimplbooksError, "action contract"):
+            booksend.translate_action_for_api(action, lookup={})
+
+    def test_sender_direction_mismatch_prevalidation_makes_zero_client_calls(self) -> None:
+        cases = []
+        refund_record = {
+            "record_id": "woo:refund:preflight", "quantity": 1, "event_date": "2024-01-15",
+            "currency": "EUR", "channel": "woo", "source_system": "woo",
+            "vat_amount": 0, "gross_amount": -20,
+        }
+        invoice = invoice_action(key="example-2024-01-preflight-refund")
+        invoice["payload"]["line_items"] = [{
+            "line_role": "sales_revenue", "description": "Wrong refund scope", "gross_amount": 20,
+            "vat_amount_hint": 0, "suggested_income_account_id": "3000",
+            "suggested_vat_type_id": "22", "article_id_hint": "3", "quantity": 1,
+            "inventory_quantity_proof": bookbuilder.normalized_inventory_quantity_proof(
+                [refund_record], group_label="woo", direction="refunds"
+            ),
+        }]
+        cases.append((invoice, "refunds", refund_record))
+
+        sale_record = {
+            "record_id": "woo:sale:preflight", "quantity": 1, "event_date": "2024-01-15",
+            "currency": "EUR", "channel": "woo", "source_system": "woo",
+            "vat_amount": 0, "gross_amount": 20,
+        }
+        credit = invoice_action(key="example-2024-01-preflight-sales")
+        credit["action_type"] = "create_credit_invoice_summary"
+        credit["payload"]["document_type"] = "credit_note"
+        credit["payload"]["line_items"] = [{
+            "line_role": "refund_revenue", "description": "Wrong sales scope", "gross_amount": 20,
+            "vat_amount_hint": 0, "suggested_income_account_id": "3000",
+            "suggested_vat_type_id": "22", "article_id_hint": "3", "quantity": 1,
+            "inventory_quantity_proof": bookbuilder.normalized_inventory_quantity_proof(
+                [sale_record], group_label="woo", direction="sales"
+            ),
+        }]
+        cases.append((credit, "sales", sale_record))
+
+        for action, category, source_record in cases:
+            with self.subTest(category=category), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                normalized_path = root / "normalized.json"
+                normalized_path.write_text(json.dumps({
+                    "period": "2024-01", "records": {category: [source_record]},
+                }), encoding="utf-8")
+                action["source_refs"] = [{
+                    "path": str(normalized_path), "record_ref": source_record["record_id"], "note": None,
+                }]
+                client = FakeClient(responses=[{"_http_status": 201, "invoice_id": 501}])
+                with self.assertRaisesRegex(SimplbooksError, "action contract"):
+                    booksend.execute_batch(
+                        action_batch=make_batch(actions=[action]), mode="write", client=client,
+                        action_path=root / "actions.yaml", cwd=root,
+                    )
+                self.assertEqual(client.calls, [])
+
     def test_sender_rejects_omitted_inventory_scope_record_before_client(self) -> None:
         records = [
             {

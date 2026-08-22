@@ -1710,6 +1710,28 @@ def evaluate_inventory_quantities(
         else:
             contributors = proof.get("contributors") if isinstance(proof.get("contributors"), list) else []
             scope = proof.get("scope") if isinstance(proof.get("scope"), dict) else {}
+            category = str(scope.get("record_category") or "")
+            action_type = str(action.get("action_type") or "")
+            document_type = str((action.get("payload") or {}).get("document_type") or "")
+            line_role = str(line.get("line_role") or "")
+            sales_role = line_role == "sales_revenue" or ("sales" in line_role and "product" in line_role)
+            refund_role = line_role == "refund_revenue" or ("refund" in line_role and "product" in line_role)
+            action_contracts = {
+                "sales": action_type == "create_invoice_summary" and document_type == "invoice" and sales_role,
+                "refunds": (
+                    action_type == "create_credit_invoice_summary"
+                    and document_type == "credit_note"
+                    and refund_role
+                ),
+                "bank_transactions": (
+                    action_type == "create_invoice_summary"
+                    and document_type == "invoice"
+                    and line_role == "direct_sale_revenue"
+                    and scope.get("kind") == "reviewed_direct_sale_allocation"
+                ),
+            }
+            if category in action_contracts and not action_contracts[category]:
+                problems.append(f"{category} inventory scope does not match the action contract.")
             try:
                 line_quantity = decimal_value(line.get("quantity"))
                 proof_quantity = decimal_value(proof.get("quantity"))

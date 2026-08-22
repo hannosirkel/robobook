@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Build and validate reviewed, fixed-gross WooCommerce VAT allocations."""
+"""Build and validate reviewed, fixed-gross WooCommerce VAT allocations."""  # noqa: EXE001
 
-from __future__ import annotations
+from __future__ import annotations  # noqa: I001
 
 import argparse
 import copy
@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Sequence  # noqa: UP035
 
 from simplbooks_api import SimplbooksError, resolve_company_slug
 
@@ -60,7 +60,7 @@ def date_value(value: Any) -> date:
 def corrected_component(fixed_gross: Decimal, rate: Decimal) -> tuple[Decimal, Decimal]:
     if fixed_gross < 0 or rate < 0:
         raise WooTaxError("Fixed gross and VAT rate must be non-negative.")
-    vat = money(fixed_gross * rate / (Decimal("100") + rate))
+    vat = money(fixed_gross * rate / (Decimal("100") + rate))  # noqa: FURB157
     return fixed_gross - vat, vat
 
 
@@ -111,7 +111,7 @@ def build_month_totals(allocations: list[dict[str, Any]]) -> dict[str, dict[str,
         period = str(allocation.get("period") or "")
         if not period:
             raise WooTaxError("Allocation period is required to build monthly totals.")
-        bucket = totals.setdefault(period, {"gross": Decimal("0"), "original_vat": Decimal("0"), "corrected_vat": Decimal("0")})
+        bucket = totals.setdefault(period, {"gross": Decimal("0"), "original_vat": Decimal("0"), "corrected_vat": Decimal("0")})  # noqa: FURB157
         bucket["gross"] += decimal_value(allocation.get("fixed_product_gross"))
         bucket["gross"] += decimal_value(allocation.get("fixed_shipping_gross"))
         bucket["original_vat"] += decimal_value(allocation.get("original_order_tax"))
@@ -321,7 +321,7 @@ def validate_allocation(payload: dict[str, Any]) -> list[str]:
             ("original_shipping_tax", "shipping_tax", "original shipping tax"),
         ):
             try:
-                actual = sum((decimal_value(item.get(allocation_field)) for item in matched), Decimal("0"))
+                actual = sum((decimal_value(item.get(allocation_field)) for item in matched), Decimal("0"))  # noqa: FURB157
                 expected = decimal_value(source_row.get(source_field))
                 if not same_money(actual, expected):
                     errors.append(f"source row {row_id} allocated {description} does not equal source {source_field}")
@@ -330,7 +330,7 @@ def validate_allocation(payload: dict[str, Any]) -> list[str]:
         try:
             original_total = sum(
                 (decimal_value(item.get("original_order_tax")) + decimal_value(item.get("original_shipping_tax")) for item in matched),
-                Decimal("0"),
+                Decimal("0"),  # noqa: FURB157
             )
             expected_total = decimal_value(source_row.get("total_tax"))
             if not same_money(original_total, expected_total):
@@ -649,16 +649,16 @@ def is_woo_source_sale(sale: dict[str, Any]) -> bool:
 
 def allocation_components(items: list[dict[str, Any]]) -> dict[str, Decimal]:
     product_gross = sum(
-        (decimal_value(item.get("fixed_product_gross")) for item in items), Decimal("0")
+        (decimal_value(item.get("fixed_product_gross")) for item in items), Decimal("0")  # noqa: FURB157
     )
     shipping_gross = sum(
-        (decimal_value(item.get("fixed_shipping_gross")) for item in items), Decimal("0")
+        (decimal_value(item.get("fixed_shipping_gross")) for item in items), Decimal("0")  # noqa: FURB157
     )
     product_vat = sum(
-        (decimal_value(item.get("corrected_product_vat")) for item in items), Decimal("0")
+        (decimal_value(item.get("corrected_product_vat")) for item in items), Decimal("0")  # noqa: FURB157
     )
     shipping_vat = sum(
-        (decimal_value(item.get("corrected_shipping_vat")) for item in items), Decimal("0")
+        (decimal_value(item.get("corrected_shipping_vat")) for item in items), Decimal("0")  # noqa: FURB157
     )
     return {
         "product_gross": product_gross,
@@ -801,10 +801,10 @@ def apply_allocation_to_monthly_summary(
     source_shipping_net = decimal_value(sale.get("shipping_amount"))
     source_vat = decimal_value(sale.get("vat_amount"))
     original_product_vat = sum(
-        (decimal_value(item.get("original_order_tax")) for item in items), Decimal("0")
+        (decimal_value(item.get("original_order_tax")) for item in items), Decimal("0")  # noqa: FURB157
     )
     original_shipping_vat = sum(
-        (decimal_value(item.get("original_shipping_tax")) for item in items), Decimal("0")
+        (decimal_value(item.get("original_shipping_tax")) for item in items), Decimal("0")  # noqa: FURB157
     )
     original_vat = original_product_vat + original_shipping_vat
     if not same_money(source_vat, original_vat) or not same_money(
@@ -935,7 +935,7 @@ def apply_period_allocation(
 def annual_totals(payload: dict[str, Any]) -> dict[str, Decimal]:
     totals = build_month_totals(payload.get("allocations") or [])
     return {
-        field: money(sum((monthly[field] for monthly in totals.values()), Decimal("0")))
+        field: money(sum((monthly[field] for monthly in totals.values()), Decimal("0")))  # noqa: FURB157
         for field in ("gross", "original_vat", "corrected_vat")
     }
 

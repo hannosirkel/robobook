@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-from __future__ import annotations
+from __future__ import annotations  # noqa: EXE001, I001
 
 import argparse
 import json
@@ -100,7 +100,7 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
 
 def decimal_value(value: Any) -> Decimal:
     if value in (None, ""):
-        return Decimal("0")
+        return Decimal("0")  # noqa: FURB157
     try:
         return Decimal(str(value))
     except InvalidOperation as exc:
@@ -116,7 +116,7 @@ def decimal_number(value: Decimal | None) -> float | None:
 def decimal_text(value: Decimal) -> str:
     normalized = value.normalize()
     if normalized == normalized.to_integral():
-        return format(normalized.quantize(Decimal("1")), "f")
+        return format(normalized.quantize(Decimal("1")), "f")  # noqa: FURB157
     return format(normalized, "f")
 
 
@@ -237,14 +237,14 @@ def infer_fulfillment_partner(record: dict[str, Any]) -> str | None:
 
 
 def sum_amount(records: list[dict[str, Any]], field: str = "gross_amount") -> Decimal:
-    total = Decimal("0")
+    total = Decimal("0")  # noqa: FURB157
     for record in records:
         total += decimal_value(record.get(field))
     return total
 
 
 def sum_abs_amount(records: list[dict[str, Any]], field: str = "gross_amount") -> Decimal:
-    total = Decimal("0")
+    total = Decimal("0")  # noqa: FURB157
     for record in records:
         total += abs(decimal_value(record.get(field)))
     return total
@@ -262,8 +262,8 @@ def record_quantity(record: dict[str, Any]) -> Decimal:
             try:
                 return decimal_value(candidate)
             except SimplbooksError:
-                return Decimal("0")
-    return Decimal("0")
+                return Decimal("0")  # noqa: FURB157
+    return Decimal("0")  # noqa: FURB157
 
 
 def canonical_source_systems(payload: dict[str, Any]) -> set[str]:

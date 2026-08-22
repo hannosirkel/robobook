@@ -1,0 +1,3 @@
+# Tooling the Validate workflow needs and the application does not.
+# Renovate keeps these current; see renovate.json.
+ruff==0.16.4

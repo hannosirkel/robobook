@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-from __future__ import annotations
+from __future__ import annotations  # noqa: EXE001, I001
 
 import argparse
 import copy
@@ -222,7 +222,7 @@ def summarize_action_artifacts(*, company_dir: Path, year: int) -> dict[str, Any
                 unsafe_paypal_stripe_count += 1
             if label == "woo" and expected_woo_contact is not None and contact_id != str(expected_woo_contact):
                 policy_mapping_mismatch_count += 1
-            if action_type in {"create_incoming_summary", "create_payment_summary"} and allowed_bank_accounts:
+            if action_type in {"create_incoming_summary", "create_payment_summary"} and allowed_bank_accounts:  # noqa: SIM102
                 if str(payload.get("bank_account_id") or "") not in allowed_bank_accounts:
                     policy_mapping_mismatch_count += 1
             currency = str(payload.get("currency") or "EUR").upper()
@@ -237,7 +237,7 @@ def summarize_action_artifacts(*, company_dir: Path, year: int) -> dict[str, Any
                 source_reference_count += 1
                 ref_path = str(source_ref.get("path") or "")
                 relative_prefix = f"companies/{company_dir.name}/artifacts/normalized/"
-                if ref_path.startswith(str(company_dir / "artifacts" / "normalized")) or ref_path.startswith(relative_prefix):
+                if ref_path.startswith(str(company_dir / "artifacts" / "normalized")) or ref_path.startswith(relative_prefix):  # noqa: PIE810
                     canonical_source_reference_count += 1
 
     normalized_dir = company_dir / "artifacts" / "normalized"
@@ -246,7 +246,7 @@ def summarize_action_artifacts(*, company_dir: Path, year: int) -> dict[str, Any
         for source in payload.get("sources") or []:
             raw_source_reference_count += 1
             source_path = str(source.get("path") or "")
-            if source_path.startswith(str(company_dir / "source")) or source_path.startswith(
+            if source_path.startswith(str(company_dir / "source")) or source_path.startswith(  # noqa: PIE810
                 f"companies/{company_dir.name}/source/"
             ):
                 canonical_raw_source_reference_count += 1
@@ -390,7 +390,7 @@ def run_full_year_dry_run(
                 force_build=force_build,
                 woo_tax_allocation=woo_tax_allocation,
             )
-            run = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+            run = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)  # noqa: PLW1510
             step_summary = {
                 "step": step_name,
                 "script": script_name,

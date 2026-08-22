@@ -1,0 +1,34 @@
+{
+  // Layout checking for this repository. Wording is a review concern.
+  //
+  // Every rule turned off and every path ignored below is a baselined
+  // pre-existing finding, not a preference. Nothing here was reformatted.
+  "config": {
+    "default": true,
+
+    // 470 pre-existing findings once the ignores below are applied, spread
+    // across docs/, skills/, README.md, and the generated AGENTS.md section
+    // whose long standards links cannot wrap. Prose wraps at 80 columns by
+    // convention; a table row or a long URL cannot.
+    "MD013": false,
+
+    // 30 pre-existing findings, all in docs/. Baselined rather than fixed:
+    // inserting blank lines around every existing list is a repository-wide
+    // reformat that would destroy the review value of every later diff.
+    "MD032": false
+  },
+  "globs": ["**/*.md"],
+  "ignores": [
+    "node_modules/**",
+    // Symlink mirrors of skills/ for two other agent harnesses. Without this
+    // every finding in skills/ is reported three times.
+    ".claude/**",
+    ".opencode/**",
+    // Worked bookkeeping fixtures and generated run artifacts, not prose. This
+    // is data the pipeline reads and writes; it is not edited by hand.
+    "companies/**",
+    // Document templates, not documents. Their single trailing spaces are
+    // placeholder layout that a generator fills in.
+    "templates/**"
+  ]
+}

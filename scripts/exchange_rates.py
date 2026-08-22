@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-from __future__ import annotations
+from __future__ import annotations  # noqa: EXE001, I001
 
 import argparse
 import json
@@ -31,7 +31,7 @@ class RateResolution:
 
 
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")  # noqa: UP017
 
 
 def normalized_currency(value: str) -> str:

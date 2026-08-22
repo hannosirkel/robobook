@@ -1,4 +1,4 @@
-from __future__ import annotations
+from __future__ import annotations  # noqa: I001
 
 import copy
 import contextlib
@@ -15,7 +15,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-import woo_tax  # noqa: E402
+import woo_tax  # noqa: E402, I001
 import bookprep  # noqa: E402
 
 
@@ -418,7 +418,7 @@ class WooTaxTests(unittest.TestCase):
         self.assertNotIn("vat_allocation", sale["attributes"])
 
     def test_apply_period_allocation_blocks_unmatched_allocated_order(self) -> None:
-        records = normalized_sales_fixture(gross=Decimal("50.00"), vat=Decimal("0"), order_id="EXAMPLE-US-1")
+        records = normalized_sales_fixture(gross=Decimal("50.00"), vat=Decimal("0"), order_id="EXAMPLE-US-1")  # noqa: FURB157
 
         with self.assertRaisesRegex(woo_tax.WooTaxError, "no matching sale"):
             woo_tax.apply_period_allocation(records, period_allocation_fixture(), "2025-11")
@@ -456,18 +456,18 @@ class WooTaxTests(unittest.TestCase):
                 woo_tax.load_allocation(path, company_slug="example", year=2025)
 
     def test_corrected_component_preserves_fixed_gross(self) -> None:
-        net, vat = woo_tax.corrected_component(Decimal("124.00"), Decimal("24"))
+        net, vat = woo_tax.corrected_component(Decimal("124.00"), Decimal("24"))  # noqa: FURB157
         self.assertEqual(vat, Decimal("24.00"))
         self.assertEqual(net, Decimal("100.00"))
         self.assertEqual(net + vat, Decimal("124.00"))
 
     def test_select_vat_period_uses_effective_date(self) -> None:
         periods = [
-            woo_tax.VatPeriod(date(2024, 1, 1), date(2025, 6, 30), Decimal("22"), "25", "24"),
-            woo_tax.VatPeriod(date(2025, 7, 1), None, Decimal("24"), "34", "33"),
+            woo_tax.VatPeriod(date(2024, 1, 1), date(2025, 6, 30), Decimal("22"), "25", "24"),  # noqa: FURB157
+            woo_tax.VatPeriod(date(2025, 7, 1), None, Decimal("24"), "34", "33"),  # noqa: FURB157
         ]
-        self.assertEqual(woo_tax.select_vat_period(date(2025, 6, 30), periods).rate, Decimal("22"))
-        self.assertEqual(woo_tax.select_vat_period(date(2025, 7, 1), periods).rate, Decimal("24"))
+        self.assertEqual(woo_tax.select_vat_period(date(2025, 6, 30), periods).rate, Decimal("22"))  # noqa: FURB157
+        self.assertEqual(woo_tax.select_vat_period(date(2025, 7, 1), periods).rate, Decimal("24"))  # noqa: FURB157
 
     def test_validate_allocation_rejects_duplicate_and_unallocated_counts(self) -> None:
         payload = allocation_fixture()

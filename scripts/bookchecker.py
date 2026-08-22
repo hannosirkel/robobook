@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-from __future__ import annotations
+from __future__ import annotations  # noqa: EXE001, I001
 
 import argparse
 import hashlib
@@ -8,7 +8,7 @@ import re
 import subprocess
 import sys
 import unicodedata
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict  # noqa: F401
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
@@ -74,7 +74,7 @@ def normalize_text(value: Any) -> str:
 
 def decimal_value(value: Any) -> Decimal:
     if value in (None, ""):
-        return Decimal("0")
+        return Decimal("0")  # noqa: FURB157
     try:
         return Decimal(str(value))
     except InvalidOperation as exc:
@@ -410,7 +410,7 @@ def action_line_items(action: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def line_total(action: dict[str, Any]) -> Decimal:
-    total = Decimal("0")
+    total = Decimal("0")  # noqa: FURB157
     for item in action_line_items(action):
         total += decimal_value(item.get("gross_amount"))
     return total
@@ -571,7 +571,7 @@ def evaluate_arithmetic(
             bank_records = [record for category, record in paired_records if category == "bank_transactions"]
             expected_amount = sum(abs(decimal_value(record.get("gross_amount"))) for record in bank_records)
         else:
-            expected_amount = Decimal("0")
+            expected_amount = Decimal("0")  # noqa: FURB157
 
         if not (
             document_type == "payment"
@@ -1058,8 +1058,8 @@ def evaluate_vat_profiles(actions: list[dict[str, Any]], posting_policy: dict[st
                 gross_amount = abs(decimal_value(line.get("gross_amount")))
                 vat_amount = abs(decimal_value(line.get("vat_amount_hint")))
                 rate = Decimal(str(profile["rate"]))
-                evidence_gross = Decimal("0")
-                evidence_vat = Decimal("0")
+                evidence_gross = Decimal("0")  # noqa: FURB157
+                evidence_vat = Decimal("0")  # noqa: FURB157
                 seen_order_ids: set[str] = set()
                 rounding_error = False
                 for item in evidence:
@@ -1108,7 +1108,7 @@ def evaluate_vat_profiles(actions: list[dict[str, Any]], posting_policy: dict[st
                         raise SimplbooksError("component evidence amounts must use whole cents")
                     evidence_gross += item_gross
                     evidence_vat += item_vat
-                    expected_item_vat = (item_gross * rate / (Decimal("100") + rate)).quantize(
+                    expected_item_vat = (item_gross * rate / (Decimal("100") + rate)).quantize(  # noqa: FURB157
                         TOLERANCE, rounding=ROUND_HALF_UP
                     )
                     rounding_error = rounding_error or item_vat != expected_item_vat
@@ -1275,7 +1275,7 @@ def evaluate_historical_outliers(
 
     if draft_schema == "invoice_summary_v1":
         shipping_total = payload_total(action, "shipping_amount")
-        if shipping_total > 0 and "shipping revenue may be kept separate" in policy:
+        if shipping_total > 0 and "shipping revenue may be kept separate" in policy:  # noqa: SIM102
             if not any(str(line.get("line_role") or "").endswith("shipping") for line in line_items):
                 findings.append(
                     make_finding(
@@ -1286,8 +1286,8 @@ def evaluate_historical_outliers(
                     )
                 )
 
-        if "warehouse identity should be preserved" in policy:
-            if any(record.get("warehouse_id") not in (None, "") for record in referenced_records):
+        if "warehouse identity should be preserved" in policy:  # noqa: SIM102
+            if any(record.get("warehouse_id") not in (None, "") for record in referenced_records):  # noqa: SIM102
                 if any(line.get("warehouse_id_hint") in (None, "") for line in line_items):
                     findings.append(
                         make_finding(

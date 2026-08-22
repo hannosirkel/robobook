@@ -1,6 +1,6 @@
 # Task 1 Report: Reviewed Bank-Allocation Contract
 
-## Implementation summary
+## Initial implementation summary
 
 Implemented the generic annual bank-allocation contract for source-bound, reviewed physical-bank decisions.
 
@@ -12,7 +12,7 @@ Implemented the generic annual bank-allocation contract for source-bound, review
 - Added `bank_allocations` as an allowed action-batch reference-artifact kind.
 - Added a report-only `requires_bank_allocation_binding()` helper for batches that reference physical bank rows. Per the controller ruling, it is not yet added to mandatory existing action-batch binding enforcement.
 
-## Files
+## Initial files
 
 - Created `scripts/bank_allocations.py`
 - Created `schemas/bank-allocation.schema.json`
@@ -23,7 +23,7 @@ Implemented the generic annual bank-allocation contract for source-bound, review
 - Modified `tests/test_schema_contracts.py`
 - Modified `tests/test_reference_artifacts.py`
 
-## RED/GREEN evidence
+## Initial RED/GREEN evidence
 
 Initial contract run (RED):
 
@@ -68,7 +68,7 @@ python3 -m py_compile scripts/bank_allocations.py scripts/reference_artifacts.py
 
 Both completed with exit status 0.
 
-## Self-review
+## Initial self-review
 
 - The contract rejects the `ignore` escape hatch and permits only the eight reviewed dispositions from the brief.
 - Split allocations require non-empty components and cent-exact agreement with the signed statement amount.
@@ -77,13 +77,13 @@ Both completed with exit status 0.
 - No real-company source or artifact data was added.
 - The Phase-A controller constraint is preserved: detection exists but existing action-batch submission/check enforcement remains unchanged.
 
-## Concerns
+## Initial concerns
 
 None. Later phases need to consume `requires_bank_allocation_binding()` when they introduce mandatory write-capable enforcement.
 
 ## Fix Round 1
 
-### Implementation summary
+### Fix Round 1 implementation summary
 
 - Added `bank_allocation_coverage_errors()` and `prove_exact_bank_allocation_coverage()` for deterministic duplicate, missing, and extra physical statement-ID reporting. `load_bank_allocations()` remains deliberately partial-friendly for Phase A.
 - Added `bank_ledger_key(record)` for normalized physical `(IBAN, currency)` identity. It requires `source_system == "bank"`, strips IBAN whitespace, uppercases the IBAN and currency, and rejects missing account identifiers.
@@ -91,14 +91,14 @@ None. Later phases need to consume `requires_bank_allocation_binding()` when the
 - Enforced annual scope for allocation periods, normalized input periods, and physical statement event dates.
 - Tightened the JSON schema so normalized bindings require at least one item and allocation targets require at least one property. Empty `allocations` remains valid.
 
-### Files
+### Fix Round 1 files
 
 - Modified `scripts/bank_allocations.py`
 - Modified `schemas/bank-allocation.schema.json`
 - Modified `tests/test_bank_allocations.py`
 - Modified `tests/test_schema_contracts.py`
 
-### RED/GREEN evidence
+### Fix Round 1 RED/GREEN evidence
 
 Initial review-fix RED run:
 
@@ -145,7 +145,7 @@ python3 -m py_compile scripts/bank_allocations.py
 
 Both exited 0 before commit.
 
-### Self-review
+### Fix Round 1 self-review
 
 - The exact coverage proof is separate from default loading, preserving the report-only Phase-A ability to represent incomplete review work.
 - Its ordered errors are deterministic: duplicates, then missing IDs, then extra IDs, with each ID list sorted.
@@ -158,7 +158,7 @@ Both exited 0 before commit.
 
 `c5fab24 fix: harden bank allocation coverage contract`
 
-### Concerns
+### Fix Round 1 concerns
 
 None. Task 3/6 must call the exact coverage proof when report/write enforcement is introduced.
 
@@ -175,7 +175,7 @@ None. Task 3/6 must call the exact coverage proof when report/write enforcement 
 - `tests/test_schema_contracts.py::SchemaContractTests::test_bank_allocation_schema_requires_a_four_digit_year`
 - `tests/test_bank_allocations.py::BankAllocationTests::test_loader_accepts_only_four_digit_years`
 
-### RED/GREEN evidence
+### Fix Round 2 RED/GREEN evidence
 
 RED:
 
@@ -203,24 +203,24 @@ Ran 259 tests in 0.547s
 OK
 ```
 
-### Self-review
+### Fix Round 2 self-review
 
 - Schema and loader now share the exact `1000..9999` integer year domain.
 - Both layers are covered for all boundary values: `999`, `1000`, `9999`, and `10000`.
 - The schema test validator now evaluates `maximum`, so the contract bound is actively tested rather than only source-inspected.
 - No behavior beyond the year-domain alignment changed.
 
-### Commit
+### Fix Round 2 commit
 
 `07d9666 fix: align bank allocation year bounds`
 
-### Concerns
+### Fix Round 2 concerns
 
 None.
 
 ## Private Integration Fix Round
 
-### Implementation summary
+### Private integration implementation summary
 
 - Preserved `statement_identity(record)` exactly, while changing allocation identity to the canonical `(statement_id, normalized IBAN, uppercase currency)` tuple.
 - Added required `iban` to allocation validation, the JSON schema, template fixture, and test fixtures. IBAN normalization removes all whitespace and uppercases the value.
@@ -237,7 +237,7 @@ None.
 - `tests/test_bookrecon.py`
 - `tests/test_schema_contracts.py`
 
-### RED/GREEN evidence
+### Private integration RED/GREEN evidence
 
 RED (before production changes):
 
@@ -285,7 +285,7 @@ git diff --check
 
 Both final checks exited 0.
 
-### Self-review
+### Private integration self-review
 
 - The immutable archive/account-servicer/entry/composite statement-identity ordering is unchanged.
 - A wrong allocation IBAN is rejected during loading and exact-coverage proof reports the unmatched full key; matching statement ID, currency, and amount cannot bypass it.
@@ -293,10 +293,10 @@ Both final checks exited 0.
 - The reconciliation regression test proves that two rows with the same archive ID count as two exact physical rows, and the required statement-ID-only mutation makes that test fail.
 - No `companies/plepic` data was accessed or included.
 
-### Commit
+### Private integration commit
 
 `fix: key bank allocations by ledger and currency`
 
-### Concerns
+### Private integration concerns
 
 None.

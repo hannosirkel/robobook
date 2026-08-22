@@ -26,12 +26,14 @@ Do not use this skill for source parsing, reconciliation, draft generation, or p
 1. Start from `actions/<period>.yaml` and `actions/<period>.check.md`.
 2. Default to `--mode dry-run`.
 3. Require `approval_status: approved` or `submitted`, a passing check report that matches the batch ID and current action-file SHA, and `--confirm-write` before `--mode write`.
+   The first configured action period has no predecessor; every later configured period requires the immediately preceding batch to have a successful immutable write log.
 4. Use `scripts/booksend.py` as the main entrypoint.
 5. Let the runner translate draft schemas into live Simplbooks `create` payloads instead of posting the draft payloads directly.
    Foreign-currency drafts must carry the checker-reviewed ECB rate and provenance; the runner copies that rate and never invents one.
    Non-inventory supplier-credit drafts are translated into purchase invoices with negative line sums.
 6. Keep execution order dependency-stable and stop on the first hard failure unless `--continue-on-error` is explicit.
 7. Preserve the updated action file and submission log together so reruns remain auditable.
+   A fully successful write stores the resulting action-file SHA and any later YAML mismatch is rejected.
 
 ## Commands
 
@@ -75,6 +77,8 @@ Implemented write targets:
   translating any API action. A complete verified proof may become non-blocking only when it retains
   the SimplBooks transaction ID and audit/discovery evidence reference; the remaining API actions may
   then proceed.
+- Recompute physical-bank completeness from the bound allocation and normalized sources before translating any action or calling the API.
+- Reject out-of-order writes and any mutation of a successfully submitted action YAML.
 
 ## References
 

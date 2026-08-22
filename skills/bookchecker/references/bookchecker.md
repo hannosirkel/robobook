@@ -37,6 +37,16 @@ The report is Markdown and follows the sections in `templates/check_report.templ
 - fails when referenced paths do not exist
 - fails when `record_ref` is missing or cannot be resolved back to a normalized record
 
+### Bank Statement Completeness
+
+- reloads the bound annual bank-allocation artifact and its exact normalized hash bindings
+- fails on missing, duplicate, extra, stale, or wrong-ledger physical coverage
+- requires every cash-settlement action to bind exactly one physical bank row
+- compares statement business date, currency, signed amount, and exact source-account mapping
+- treats a complete verified manual statement-import dependency as one terminal coverage item
+- keeps pending, blocking, malformed, or source-mismatched manual proof as a hard error
+- accepts reviewed API-only splits only when their signed action amounts exactly equal the reviewed parts
+
 ### Arithmetic Consistency
 
 - compares invoice and purchase draft totals against referenced normalized records
@@ -46,9 +56,10 @@ The report is Markdown and follows the sections in `templates/check_report.templ
 ### Account And VAT Review
 
 - fails when low-confidence actions are present
+- fails approved batches that contain medium-confidence accounting judgments
 - fails when draft lines lack suggested account or VAT IDs
 - fails when cash-settlement drafts lack a bank account ID
-- warns when invoice drafts still lack a concrete contact/client ID
+- fails when document drafts lack a concrete contact/client ID
 
 ### Recon Alignment
 
@@ -69,5 +80,5 @@ If `PyYAML` is absent, it falls back to Ruby’s `YAML` loader and converts the 
 ## Current Limits
 
 - the checker only validates draft payload families currently emitted by `bookbuilder`
-- contact resolution is still treated as a warning because the current builder only emits hints
+- confidence reflects missing IDs and explicit open accounting judgments, not informational provenance notes
 - historical outlier checks are policy-driven heuristics, not a full recomputation of prior years

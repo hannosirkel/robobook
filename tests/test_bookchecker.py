@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sys
 import tempfile
 import unittest
@@ -262,7 +263,344 @@ def manual_financial_dependency(*, blocking: bool = False, status: str = "verifi
     }
 
 
+def physical_bank_record(*, record_id: str, amount: float, event_date: str = "2024-01-15") -> dict:
+    item = record(
+        record_id=record_id,
+        source_system="bank",
+        event_type="bank_credit" if amount > 0 else "bank_debit",
+        gross_amount=amount,
+    )
+    item.update({
+        "event_date": event_date,
+        "settlement_date": event_date,
+        "attributes": {"iban": "EE123", "archive_identifier": record_id},
+    })
+    return item
+
+
+def write_bank_coverage_fixture(tmp: Path, rows: list[dict]) -> tuple[Path, Path]:
+    normalized = base_normalized(rows[0]["event_date"][:7] if rows else "2024-01")
+    normalized["records"]["bank_transactions"] = rows
+    normalized_path = tmp / "normalized.json"
+    normalized_path.write_text(json.dumps(normalized), encoding="utf-8")
+    normalized_sha = hashlib.sha256(normalized_path.read_bytes()).hexdigest()
+    allocations = {
+        "schema_version": "1.0",
+        "company_slug": "example",
+        "year": 2024,
+        "normalized_bindings": [{"path": str(normalized_path), "sha256": normalized_sha}],
+        "allocations": [
+            {
+                "statement_id": f"archive:{row['record_id']}",
+                "record_id": row["record_id"],
+                "iban": "EE123",
+                "period": row["event_date"][:7],
+                "disposition": "existing_invoice_receipt" if row["gross_amount"] > 0 else "existing_purchase_payment",
+                "amount": row["gross_amount"],
+                "currency": "EUR",
+                "target": {
+                    "simplbooks_id": "119",
+                    "document_type": "invoice" if row["gross_amount"] > 0 else "purchase",
+                },
+                "review": {"status": "approved", "rationale": "Exact reviewed settlement."},
+            }
+            for row in rows
+        ],
+    }
+    allocation_path = tmp / "bank-allocations.json"
+    allocation_path.write_text(json.dumps(allocations), encoding="utf-8")
+    return normalized_path, allocation_path
+
+
+def exact_settlement_action(*, row: dict, normalized_path: Path) -> dict:
+    incoming = row["gross_amount"] > 0
+    return {
+        "idempotency_key": f"settlement-{row['record_id']}",
+        "action_type": "create_incoming_summary" if incoming else "create_payment_summary",
+        "payload": {
+            "draft_schema": "cash_settlement_v1",
+            "document_type": "incoming" if incoming else "payment",
+            "document_date": row["event_date"],
+            "currency": row["currency"],
+            "bank_account_id": "3",
+            "amount": abs(row["gross_amount"]),
+            ("linked_invoice_id" if incoming else "linked_purchase_id"): "119",
+        },
+        "source_refs": [{
+            "path": str(normalized_path),
+            "record_ref": row["record_id"],
+            "source_kind": "physical_bank",
+        }],
+        "confidence": "high",
+    }
+
+
+def bank_coverage_batch(*, period: str, allocation_path: Path, actions: list[dict], dependencies: list[dict] | None = None) -> dict:
+    return {
+        "company_slug": "example",
+        "period": period,
+        "approval_status": "approved",
+        "reference_artifacts": [{
+            "kind": "bank_allocations",
+            "path": str(allocation_path),
+            "sha256": hashlib.sha256(allocation_path.read_bytes()).hexdigest(),
+        }],
+        "actions": actions,
+        "unresolved_dependencies": dependencies or [],
+    }
+
+
 class BookcheckerTests(unittest.TestCase):
+    def test_checker_errors_when_action_batch_omits_one_bank_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            rows = [
+                physical_bank_record(record_id="receipt-1", amount=20.0),
+                physical_bank_record(record_id="receipt-2", amount=30.0),
+            ]
+            normalized_path, allocation_path = write_bank_coverage_fixture(tmp, rows)
+            batch = bank_coverage_batch(
+                period="2024-01",
+                allocation_path=allocation_path,
+                actions=[exact_settlement_action(row=rows[0], normalized_path=normalized_path)],
+            )
+
+            findings = bookchecker.evaluate_bank_statement_completeness(
+                batch, action_path=tmp / "actions.yaml", cwd=tmp
+            )
+
+        self.assertTrue(any(
+            item["severity"] == "error" and "uncovered physical bank row" in item["summary"]
+            for item in findings
+        ))
+
+    def test_checker_errors_on_duplicate_physical_bank_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            row = physical_bank_record(record_id="receipt-1", amount=20.0)
+            normalized_path, allocation_path = write_bank_coverage_fixture(tmp, [row])
+            action = exact_settlement_action(row=row, normalized_path=normalized_path)
+            duplicate = dict(action, idempotency_key="settlement-receipt-1-copy")
+            batch = bank_coverage_batch(
+                period="2024-01", allocation_path=allocation_path, actions=[action, duplicate]
+            )
+
+            findings = bookchecker.evaluate_bank_statement_completeness(
+                batch, action_path=tmp / "actions.yaml", cwd=tmp
+            )
+
+        self.assertTrue(any("duplicate physical bank coverage" in item["summary"] for item in findings))
+
+    def test_checker_rejects_cash_settlement_without_physical_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            row = physical_bank_record(record_id="receipt-1", amount=20.0)
+            normalized_path, allocation_path = write_bank_coverage_fixture(tmp, [row])
+            action = exact_settlement_action(row=row, normalized_path=normalized_path)
+            action["source_refs"][0].pop("source_kind")
+            batch = bank_coverage_batch(period="2024-01", allocation_path=allocation_path, actions=[action])
+
+            findings = bookchecker.evaluate_bank_statement_completeness(
+                batch, action_path=tmp / "actions.yaml", cwd=tmp
+            )
+
+        self.assertTrue(any("must reference exactly one physical bank row" in item["summary"] for item in findings))
+
+    def test_checker_accepts_exact_reviewed_split_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            row = physical_bank_record(record_id="split-1", amount=15.0)
+            normalized_path, allocation_path = write_bank_coverage_fixture(tmp, [row])
+            allocations = json.loads(allocation_path.read_text(encoding="utf-8"))
+            allocations["allocations"][0].update({
+                "disposition": "reviewed_split",
+                "parts": [
+                    {"amount": 20.0, "disposition": "existing_invoice_receipt", "target": {"simplbooks_id": "119", "document_type": "invoice"}},
+                    {"amount": -5.0, "disposition": "existing_purchase_payment", "target": {"simplbooks_id": "88", "document_type": "purchase"}},
+                ],
+            })
+            allocation_path.write_text(json.dumps(allocations), encoding="utf-8")
+            incoming = exact_settlement_action(row=row, normalized_path=normalized_path)
+            incoming["payload"]["amount"] = 20.0
+            payment = exact_settlement_action(row=row, normalized_path=normalized_path)
+            payment.update({"idempotency_key": "settlement-split-1-part-2", "action_type": "create_payment_summary"})
+            payment["payload"].update({"document_type": "payment", "amount": 5.0, "linked_purchase_id": "88"})
+            batch = bank_coverage_batch(period="2024-01", allocation_path=allocation_path, actions=[incoming, payment])
+
+            findings = bookchecker.evaluate_bank_statement_completeness(
+                batch, action_path=tmp / "actions.yaml", cwd=tmp
+            )
+
+        self.assertEqual(findings, [])
+
+    def test_checker_rejects_cash_action_target_changed_after_allocation_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            row = physical_bank_record(record_id="receipt-1", amount=20.0)
+            normalized_path, allocation_path = write_bank_coverage_fixture(tmp, [row])
+            action = exact_settlement_action(row=row, normalized_path=normalized_path)
+            action["payload"]["linked_invoice_id"] = "120"
+            batch = bank_coverage_batch(period="2024-01", allocation_path=allocation_path, actions=[action])
+
+            findings = bookchecker.evaluate_bank_statement_completeness(
+                batch, action_path=tmp / "actions.yaml", cwd=tmp
+            )
+
+        self.assertTrue(any("reviewed target" in item["summary"] for item in findings))
+
+    def test_checker_errors_on_month_end_date_substitution_and_currency_amount_changes(self) -> None:
+        mutations = {
+            "statement date": ("document_date", "2024-01-31"),
+            "currency": ("currency", "USD"),
+            "signed amount": ("amount", 19.99),
+        }
+        for expected, (field, value) in mutations.items():
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                row = physical_bank_record(record_id="receipt-1", amount=20.0)
+                normalized_path, allocation_path = write_bank_coverage_fixture(tmp, [row])
+                action = exact_settlement_action(row=row, normalized_path=normalized_path)
+                action["payload"][field] = value
+                batch = bank_coverage_batch(period="2024-01", allocation_path=allocation_path, actions=[action])
+
+                findings = bookchecker.evaluate_bank_statement_completeness(
+                    batch, action_path=tmp / "actions.yaml", cwd=tmp
+                )
+
+                self.assertTrue(any(expected in item["summary"] for item in findings), findings)
+
+    def test_checker_counts_verified_manual_dependency_as_exact_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            row = physical_bank_record(record_id="bank:fee:1", amount=-7.0)
+            normalized_path, allocation_path = write_bank_coverage_fixture(tmp, [row])
+            allocations = json.loads(allocation_path.read_text(encoding="utf-8"))
+            allocations["allocations"][0].update({
+                "disposition": "bank_fee_payment",
+                "target": {"financial_transaction_kind": "bank-fee"},
+            })
+            allocation_path.write_text(json.dumps(allocations), encoding="utf-8")
+            dependency = manual_financial_dependency(blocking=False, status="verified")
+            dependency["source_ref"]["path"] = str(normalized_path)
+            dependency["statement_id"] = "archive:bank:fee:1"
+            batch = bank_coverage_batch(
+                period="2024-01", allocation_path=allocation_path, actions=[], dependencies=[dependency]
+            )
+
+            findings = bookchecker.evaluate_bank_statement_completeness(
+                batch, action_path=tmp / "actions.yaml", cwd=tmp
+            )
+
+        self.assertEqual(findings, [])
+
+    def test_checker_rejects_verified_manual_dependency_that_changed_reviewed_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            row = physical_bank_record(record_id="bank:fee:1", amount=-7.0)
+            normalized_path, allocation_path = write_bank_coverage_fixture(tmp, [row])
+            allocations = json.loads(allocation_path.read_text(encoding="utf-8"))
+            allocations["allocations"][0].update({
+                "disposition": "bank_fee_payment",
+                "target": {"financial_transaction_kind": "bank-fee"},
+            })
+            allocation_path.write_text(json.dumps(allocations), encoding="utf-8")
+            dependency = manual_financial_dependency(blocking=False, status="verified")
+            dependency.update({
+                "statement_id": "archive:bank:fee:1",
+                "target": {"financial_transaction_kind": "internal-transfer"},
+            })
+            dependency["source_ref"]["path"] = str(normalized_path)
+            batch = bank_coverage_batch(
+                period="2024-01", allocation_path=allocation_path, actions=[], dependencies=[dependency]
+            )
+
+            findings = bookchecker.evaluate_bank_statement_completeness(
+                batch, action_path=tmp / "actions.yaml", cwd=tmp
+            )
+
+        self.assertTrue(any("manual coverage does not match" in item["summary"] for item in findings))
+
+    def test_checker_rejects_clearing_record_masquerading_as_physical_bank(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            row = physical_bank_record(record_id="receipt-1", amount=20.0)
+            normalized_path, allocation_path = write_bank_coverage_fixture(tmp, [row])
+            normalized = json.loads(normalized_path.read_text(encoding="utf-8"))
+            clearing = dict(row, record_id="wallet-1", source_system="printful")
+            normalized["records"]["clearing_transactions"] = [clearing]
+            normalized_path.write_text(json.dumps(normalized), encoding="utf-8")
+            allocations = json.loads(allocation_path.read_text(encoding="utf-8"))
+            allocations["normalized_bindings"][0]["sha256"] = hashlib.sha256(normalized_path.read_bytes()).hexdigest()
+            allocation_path.write_text(json.dumps(allocations), encoding="utf-8")
+            action = exact_settlement_action(row=row, normalized_path=normalized_path)
+            action["source_refs"][0]["record_ref"] = "wallet-1"
+            batch = bank_coverage_batch(period="2024-01", allocation_path=allocation_path, actions=[action])
+
+            findings = bookchecker.evaluate_bank_statement_completeness(
+                batch, action_path=tmp / "actions.yaml", cwd=tmp
+            )
+
+        self.assertTrue(any("masquerade" in item["summary"] for item in findings))
+
+    def test_checker_rejects_wrong_bank_account_for_physical_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            row = physical_bank_record(record_id="receipt-1", amount=20.0)
+            normalized_path, allocation_path = write_bank_coverage_fixture(tmp, [row])
+            action = exact_settlement_action(row=row, normalized_path=normalized_path)
+            action["payload"]["bank_account_id"] = "999"
+            batch = bank_coverage_batch(period="2024-01", allocation_path=allocation_path, actions=[action])
+
+            findings = bookchecker.evaluate_bank_statement_completeness(
+                batch,
+                action_path=tmp / "actions.yaml",
+                cwd=tmp,
+                posting_policy={"bank_accounts": {"EE123": {"EUR": "3"}}},
+            )
+
+        self.assertTrue(any("source account" in item["summary"] for item in findings))
+
+    def test_checker_requires_allocation_binding_when_normalized_period_has_bank_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            actions_dir = root / "artifacts" / "actions"
+            normalized_dir = root / "artifacts" / "normalized"
+            actions_dir.mkdir(parents=True)
+            normalized_dir.mkdir(parents=True)
+            normalized = base_normalized()
+            normalized["records"]["bank_transactions"] = [physical_bank_record(record_id="receipt-1", amount=20.0)]
+            (normalized_dir / "2024-01.json").write_text(json.dumps(normalized), encoding="utf-8")
+            batch = {"period": "2024-01", "reference_artifacts": [], "actions": [], "unresolved_dependencies": []}
+
+            findings = bookchecker.evaluate_bank_statement_completeness(
+                batch, action_path=actions_dir / "2024-01.yaml", cwd=root
+            )
+
+        self.assertTrue(any("bound bank allocation" in item["summary"] for item in findings))
+
+    def test_checker_rejects_allocation_bound_to_another_company(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            row = physical_bank_record(record_id="receipt-1", amount=20.0)
+            normalized_path, allocation_path = write_bank_coverage_fixture(tmp, [row])
+            allocations = json.loads(allocation_path.read_text(encoding="utf-8"))
+            allocations["company_slug"] = "another-company"
+            allocation_path.write_text(json.dumps(allocations), encoding="utf-8")
+            action = exact_settlement_action(row=row, normalized_path=normalized_path)
+            batch = bank_coverage_batch(period="2024-01", allocation_path=allocation_path, actions=[action])
+            batch["company_slug"] = "example"
+
+            findings = bookchecker.evaluate_bank_statement_completeness(
+                batch, action_path=tmp / "actions.yaml", cwd=tmp
+            )
+
+        self.assertTrue(any("company_slug" in item["summary"] for item in findings))
+
+    def test_approved_batch_rejects_medium_confidence_but_information_notes_do_not(self) -> None:
+        action = {"idempotency_key": "a", "confidence": "medium", "payload": {}, "review_notes": ["provenance"]}
+        findings = bookchecker.evaluate_account_vat(action=action, batch_approved=True)
+        self.assertTrue(any(item["severity"] == "error" and "medium" in item["summary"] for item in findings))
+
     def test_checker_blocks_vat_type_rate_mismatch(self) -> None:
         batch = allocated_action_fixture(line_rate=24, vat_type_id="25")
 
@@ -734,7 +1072,7 @@ class BookcheckerTests(unittest.TestCase):
 
         self.assertEqual(evaluation["result"], "pass")
         self.assertEqual(evaluation["error_count"], 0)
-        self.assertGreaterEqual(evaluation["warning_count"], 1)
+        self.assertEqual(evaluation["warning_count"], 0)
 
     def test_checker_fails_when_recon_is_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

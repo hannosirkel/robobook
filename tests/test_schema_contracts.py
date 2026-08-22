@@ -114,6 +114,12 @@ class SchemaContractTests(unittest.TestCase):
         artifact = bookchecker.load_yaml(ROOT / "templates/actions-period.template.yaml")
         self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=artifact)
 
+    def test_submission_log_schema_accepts_successful_action_file_sha(self) -> None:
+        artifact = json.loads((ROOT / "templates/submission-log.template.json").read_text(encoding="utf-8"))
+        artifact["mode"] = "write"
+        artifact["action_file_sha256"] = "a" * 64
+        self.assert_artifact_valid(schema_name="submission-log.schema.json", artifact=artifact)
+
     def test_posting_policy_template_matches_strict_schema(self) -> None:
         artifact = json.loads((ROOT / "templates/posting-policy.template.json").read_text(encoding="utf-8"))
         self.assert_artifact_valid(schema_name="posting-policy.schema.json", artifact=artifact)

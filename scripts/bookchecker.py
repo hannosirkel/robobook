@@ -14,9 +14,23 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
-from bank_allocations import BankAllocationError, bank_ledger_key, statement_identity
+from bank_allocations import (
+    BankAllocationError,
+    allocation_amounts,
+    bank_ledger_key,
+    load_bank_allocations,
+    period_allocations,
+    prove_exact_bank_allocation_coverage,
+    statement_identity,
+)
 from exchange_rates import ExchangeRateError, lookup_rate
-from posting_policy import PostingPolicyError, action_policy_errors, load_posting_policy, resolve_sales_vat_profile
+from posting_policy import (
+    PostingPolicyError,
+    action_policy_errors,
+    load_posting_policy,
+    resolve_bank_account,
+    resolve_sales_vat_profile,
+)
 from reference_artifacts import (
     ReferenceArtifactError,
     required_action_binding_kinds,
@@ -31,6 +45,7 @@ TOLERANCE = Decimal("0.01")
 SECTIONS = (
     "duplicate_risk",
     "source_reference_coverage",
+    "bank_statement_completeness",
     "arithmetic_consistency",
     "account_and_vat_review",
     "exchange_rate_review",
@@ -41,6 +56,7 @@ SECTIONS = (
 SECTION_TITLES = {
     "duplicate_risk": "Duplicate Risk",
     "source_reference_coverage": "Source Reference Coverage",
+    "bank_statement_completeness": "Bank Statement Completeness",
     "arithmetic_consistency": "Arithmetic Consistency",
     "account_and_vat_review": "Account And VAT Review",
     "exchange_rate_review": "Exchange Rate Review",
@@ -709,6 +725,7 @@ def evaluate_split_payment_groups(
 def evaluate_account_vat(
     *,
     action: dict[str, Any],
+    batch_approved: bool = False,
 ) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     payload = action.get("payload") or {}
@@ -728,8 +745,13 @@ def evaluate_account_vat(
         findings.append(
             make_finding(
                 section="account_and_vat_review",
-                severity="warn",
-                summary="Action confidence is medium; review the mapping hints before submit.",
+                severity="error" if batch_approved else "warn",
+                summary=(
+                    "Action confidence is medium and contains an unresolved accounting judgment; "
+                    "an approved batch must contain only high-confidence actions."
+                    if batch_approved
+                    else "Action confidence is medium; review the specific open accounting judgment before approval."
+                ),
                 action_id=action_label(action),
             )
         )
@@ -798,16 +820,6 @@ def evaluate_account_vat(
                     action_id=action_label(action),
                 )
             )
-        if line_role.endswith("shipping") and vat_amount_hint == 0:
-            findings.append(
-                make_finding(
-                    section="account_and_vat_review",
-                    severity="warn",
-                    summary="Shipping line has no VAT hint; shipping VAT treatment still needs manual review.",
-                    action_id=action_label(action),
-                )
-            )
-
     counterparty = payload.get("counterparty") or {}
     if draft_schema in {"invoice_summary_v1", "purchase_summary_v1", "purchase_credit_summary_v1", "cash_settlement_v1"} and counterparty.get("contact_id") in (None, ""):
         findings.append(
@@ -827,6 +839,371 @@ def evaluate_account_vat(
                 action_id=action_label(action),
             )
         )
+    return findings
+
+
+def _bank_allocation_binding(action_batch: dict[str, Any]) -> dict[str, Any] | None:
+    bindings = [
+        item
+        for item in action_batch.get("reference_artifacts") or []
+        if isinstance(item, dict) and str(item.get("kind") or "") == "bank_allocations"
+    ]
+    if len(bindings) != 1:
+        return None
+    return bindings[0]
+
+
+def _normalized_binding_paths(payload: dict[str, Any], *, cwd: Path) -> list[Path]:
+    paths: list[Path] = []
+    for binding in payload.get("normalized_bindings") or []:
+        if not isinstance(binding, dict):
+            continue
+        path = Path(str(binding.get("path") or ""))
+        paths.append(path if path.is_absolute() else cwd / path)
+    return paths
+
+
+def _physical_record_key(record: dict[str, Any]) -> tuple[str, str, str]:
+    iban, currency = bank_ledger_key(record)
+    return statement_identity(record), iban, currency
+
+
+def _settlement_signed_amount(action: dict[str, Any]) -> Decimal:
+    payload = action.get("payload") or {}
+    amount = decimal_value(payload.get("amount"))
+    document_type = str(payload.get("document_type") or "")
+    if document_type == "incoming":
+        return amount
+    if document_type == "payment":
+        return -amount
+    raise SimplbooksError("Physical cash action must be an incoming or payment settlement.")
+
+
+def _allocation_part_matches_action(
+    part: dict[str, Any],
+    *,
+    action: dict[str, Any],
+    signed_amount: Decimal,
+) -> bool:
+    payload = action.get("payload") or {}
+    disposition = str(part.get("disposition") or "")
+    document_type = str(payload.get("document_type") or "")
+    allowed = (
+        {"generated_invoice_receipt", "existing_invoice_receipt", "direct_sale_receipt"}
+        if document_type == "incoming"
+        else {"generated_purchase_payment", "existing_purchase_payment"}
+    )
+    if disposition not in allowed or decimal_value(part.get("amount")) != signed_amount:
+        return False
+    target = part.get("target") or {}
+    if disposition == "existing_invoice_receipt":
+        return str(payload.get("linked_invoice_id") or "") == str(target.get("simplbooks_id") or "")
+    if disposition == "existing_purchase_payment":
+        return str(payload.get("linked_purchase_id") or "") == str(target.get("simplbooks_id") or "")
+    if disposition == "generated_invoice_receipt":
+        target_keys = {
+            str(target.get(name) or "")
+            for name in ("action_key", "idempotency_key", "action_id")
+        } - {""}
+        return len(target_keys) == 1 and str(payload.get("linked_invoice_action") or "") in target_keys
+    if disposition == "generated_purchase_payment":
+        target_keys = {
+            str(target.get(name) or "")
+            for name in ("action_key", "idempotency_key", "action_id")
+        } - {""}
+        return len(target_keys) == 1 and str(payload.get("linked_purchase_action") or "") in target_keys
+    return bool(str(payload.get("linked_invoice_action") or ""))
+
+
+def evaluate_bank_statement_completeness(
+    action_batch: dict[str, Any],
+    *,
+    action_path: Path,
+    cwd: Path,
+    posting_policy: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Independently prove exact-once terminal coverage for this period's physical rows."""
+    findings: list[dict[str, Any]] = []
+    period = str(action_batch.get("period") or "")
+    physical_action_refs = [
+        ref
+        for action in action_batch.get("actions") or []
+        if isinstance(action, dict)
+        for ref in action.get("source_refs") or []
+        if isinstance(ref, dict) and ref.get("source_kind") == "physical_bank"
+    ]
+    manual_dependencies = [
+        item
+        for item in action_batch.get("unresolved_dependencies") or []
+        if isinstance(item, dict)
+        and str(item.get("kind") or "") == "manual_statement_import_financial_transaction"
+    ]
+    binding = _bank_allocation_binding(action_batch)
+    if binding is None:
+        inferred_normalized = (
+            action_path.parent.parent / "normalized" / f"{period}.json"
+            if action_path.parent.name == "actions"
+            else None
+        )
+        inferred_has_physical = False
+        if inferred_normalized is not None and inferred_normalized.exists():
+            inferred_payload = load_json(inferred_normalized)
+            inferred_has_physical = any(
+                isinstance(record, dict) and str(record.get("source_system") or "") == "bank"
+                for record in (inferred_payload.get("records") or {}).get("bank_transactions") or []
+            )
+        if physical_action_refs or manual_dependencies or inferred_has_physical:
+            findings.append(make_finding(
+                section="bank_statement_completeness",
+                severity="error",
+                summary="Physical bank coverage requires exactly one bound bank allocation artifact.",
+            ))
+        return findings
+
+    try:
+        allocation_path = verify_file_binding(binding, cwd=cwd)
+        raw_allocations = load_json(allocation_path)
+        normalized_paths = _normalized_binding_paths(raw_allocations, cwd=cwd)
+        allocation_payload = load_bank_allocations(
+            allocation_path,
+            normalized_year_paths=normalized_paths,
+        )
+        if str(allocation_payload.get("company_slug") or "") != str(
+            action_batch.get("company_slug") or ""
+        ):
+            raise BankAllocationError("Bank allocation company_slug does not match the action batch.")
+        if str(allocation_payload.get("year") or "") != period[:4]:
+            raise BankAllocationError("Bank allocation year does not match the action period.")
+        prove_exact_bank_allocation_coverage(
+            allocation_payload,
+            normalized_year_paths=normalized_paths,
+        )
+        allocations = period_allocations(allocation_payload, period)
+    except (BankAllocationError, ReferenceArtifactError, SimplbooksError, OSError) as exc:
+        return [make_finding(
+            section="bank_statement_completeness",
+            severity="error",
+            summary=f"Bank statement allocation proof is invalid or stale: {exc}",
+        )]
+
+    physical_records: dict[tuple[str, str, str], tuple[Path, dict[str, Any]]] = {}
+    record_indexes: dict[Path, dict[str, tuple[str, dict[str, Any]]]] = {}
+    for normalized_path in normalized_paths:
+        payload = load_json(normalized_path)
+        record_indexes[normalized_path.resolve()] = build_record_index(payload)
+        if str(payload.get("period") or "") != period:
+            continue
+        for record in (payload.get("records") or {}).get("bank_transactions") or []:
+            if not isinstance(record, dict) or str(record.get("source_system") or "") != "bank":
+                continue
+            try:
+                key = _physical_record_key(record)
+            except BankAllocationError as exc:
+                findings.append(make_finding(
+                    section="bank_statement_completeness", severity="error",
+                    summary=f"Physical bank row has invalid identity: {exc}",
+                    action_id=str(record.get("record_id") or "") or None,
+                ))
+                continue
+            physical_records[key] = (normalized_path.resolve(), record)
+
+    coverage: dict[tuple[str, str, str], list[tuple[str, Decimal]]] = defaultdict(list)
+    for action in action_batch.get("actions") or []:
+        if not isinstance(action, dict) or str((action.get("payload") or {}).get("draft_schema") or "") != "cash_settlement_v1":
+            continue
+        refs = [
+            ref for ref in action.get("source_refs") or []
+            if isinstance(ref, dict) and ref.get("source_kind") == "physical_bank"
+        ]
+        if len(refs) != 1:
+            findings.append(make_finding(
+                section="bank_statement_completeness", severity="error",
+                summary="Each physical cash settlement action must reference exactly one physical bank row.",
+                action_id=action_label(action),
+            ))
+            continue
+        ref = refs[0]
+        source_path = resolve_path(str(ref.get("path") or ""), cwd=cwd, action_path=action_path).resolve()
+        resolved = record_indexes.get(source_path, {}).get(str(ref.get("record_ref") or ""))
+        if resolved is None:
+            findings.append(make_finding(
+                section="bank_statement_completeness", severity="error",
+                summary="Physical settlement source reference is extra, stale, or cannot be resolved.",
+                action_id=action_label(action),
+            ))
+            continue
+        category, record = resolved
+        if category != "bank_transactions" or str(record.get("source_system") or "") != "bank":
+            findings.append(make_finding(
+                section="bank_statement_completeness", severity="error",
+                summary="A clearing record must not masquerade as a physical bank row.",
+                action_id=action_label(action),
+            ))
+            continue
+        try:
+            key = _physical_record_key(record)
+            signed_amount = _settlement_signed_amount(action)
+        except (BankAllocationError, SimplbooksError) as exc:
+            findings.append(make_finding(
+                section="bank_statement_completeness", severity="error", summary=str(exc),
+                action_id=action_label(action),
+            ))
+            continue
+        payload = action.get("payload") or {}
+        if str(payload.get("document_date") or "") != str(record.get("event_date") or ""):
+            findings.append(make_finding(
+                section="bank_statement_completeness", severity="error",
+                summary="Physical settlement statement date does not match the normalized bank row.",
+                action_id=action_label(action),
+            ))
+        if str(payload.get("currency") or "").upper() != key[2]:
+            findings.append(make_finding(
+                section="bank_statement_completeness", severity="error",
+                summary="Physical settlement currency does not match the normalized bank row.",
+                action_id=action_label(action),
+            ))
+        if posting_policy is not None:
+            try:
+                expected_bank_account_id = resolve_bank_account(
+                    posting_policy,
+                    customer_account=key[1],
+                    currency=key[2],
+                    allow_legacy_single_currency=False,
+                )
+            except PostingPolicyError as exc:
+                findings.append(make_finding(
+                    section="bank_statement_completeness", severity="error",
+                    summary=f"Physical settlement source account cannot be resolved exactly: {exc}",
+                    action_id=action_label(action),
+                ))
+            else:
+                if str(payload.get("bank_account_id") or "") != str(expected_bank_account_id):
+                    findings.append(make_finding(
+                        section="bank_statement_completeness", severity="error",
+                        summary="Physical settlement source account does not match the exact (IBAN, currency) policy mapping.",
+                        action_id=action_label(action),
+                    ))
+        allocation = allocations.get(key)
+        allocation_parts = (
+            [part for part in allocation.get("parts") or [] if isinstance(part, dict)]
+            if isinstance(allocation, dict) and str(allocation.get("disposition") or "") == "reviewed_split"
+            else [allocation] if isinstance(allocation, dict) else []
+        )
+        if not any(
+            _allocation_part_matches_action(part, action=action, signed_amount=signed_amount)
+            for part in allocation_parts
+        ):
+            findings.append(make_finding(
+                section="bank_statement_completeness", severity="error",
+                summary="Physical settlement disposition, signed amount, or reviewed target does not match its bank allocation.",
+                action_id=action_label(action),
+            ))
+        coverage[key].append((action_label(action), signed_amount))
+
+    payload_cache: dict[Path, dict[str, Any]] = {}
+    index_cache: dict[Path, dict[str, tuple[str, dict[str, Any]]]] = {}
+    for dependency in manual_dependencies:
+        proof = dependency.get("statement_import_proof") or {}
+        valid = (
+            dependency.get("blocking") is False
+            and proof.get("status") == "verified"
+            and not manual_financial_dependency_errors(dependency)
+            and not manual_financial_source_errors(
+                dependency,
+                action_path=action_path,
+                cwd=cwd,
+                payload_cache=payload_cache,
+                index_cache=index_cache,
+            )
+        )
+        if not valid:
+            continue
+        try:
+            key = (
+                str(dependency.get("statement_id") or ""),
+                re.sub(r"\s+", "", str(dependency.get("iban") or "")).upper(),
+                str(dependency.get("currency") or "").upper(),
+            )
+            allocation = allocations.get(key)
+            expected_split_parts = [
+                {
+                    "signed_amount": decimal_number(decimal_value(part.get("amount"))),
+                    "disposition": str(part.get("disposition") or ""),
+                    "target": part.get("target") or {},
+                }
+                for part in (allocation or {}).get("parts") or []
+                if isinstance(part, dict)
+            ]
+            manual_matches_allocation = (
+                isinstance(allocation, dict)
+                and str(dependency.get("disposition") or "") == str(allocation.get("disposition") or "")
+                and (dependency.get("target") or {}) == (allocation.get("target") or {})
+                and (dependency.get("split_parts") or []) == expected_split_parts
+            )
+            if not manual_matches_allocation:
+                findings.append(make_finding(
+                    section="bank_statement_completeness", severity="error",
+                    summary="verified manual coverage does not match the reviewed allocation disposition, target, or split parts.",
+                    action_id=str(dependency.get("record_id") or "") or None,
+                ))
+                continue
+            coverage[key].append(
+                (
+                    str(dependency.get("record_id") or "manual dependency"),
+                    decimal_value(dependency.get("physical_signed_amount")),
+                )
+            )
+        except SimplbooksError:
+            continue
+
+    for key, (_source_path, record) in physical_records.items():
+        items = coverage.get(key, [])
+        allocation = allocations.get(key)
+        if allocation is None:
+            findings.append(make_finding(
+                section="bank_statement_completeness", severity="error",
+                summary="Physical bank row has no current-period reviewed allocation.",
+                action_id=str(record.get("record_id") or "") or None,
+            ))
+            continue
+        manual_required = str(allocation.get("disposition") or "") in {"bank_fee_payment", "clearing_transfer"}
+        if str(allocation.get("disposition") or "") == "reviewed_split":
+            manual_required = any(
+                str(part.get("disposition") or "") in {"bank_fee_payment", "clearing_transfer"}
+                for part in allocation.get("parts") or [] if isinstance(part, dict)
+            )
+        expected_count = 1 if manual_required else len(allocation_amounts(allocation))
+        if not items:
+            findings.append(make_finding(
+                section="bank_statement_completeness", severity="error",
+                summary="uncovered physical bank row has no exact settlement action or verified manual import proof.",
+                action_id=str(record.get("record_id") or "") or None,
+            ))
+            continue
+        if len(items) != expected_count:
+            findings.append(make_finding(
+                section="bank_statement_completeness", severity="error",
+                summary=f"duplicate physical bank coverage: expected {expected_count} terminal coverage item(s), found {len(items)}.",
+                action_id=str(record.get("record_id") or "") or None,
+            ))
+        actual_amounts = sorted((amount for _label, amount in items))
+        expected_amounts = (
+            [decimal_value(record.get("gross_amount"))]
+            if manual_required
+            else sorted(allocation_amounts(allocation))
+        )
+        if actual_amounts != expected_amounts:
+            findings.append(make_finding(
+                section="bank_statement_completeness", severity="error",
+                summary="Physical settlement signed amount does not match its reviewed allocation.",
+                action_id=str(record.get("record_id") or "") or None,
+            ))
+
+    for key in sorted(set(coverage) - set(physical_records)):
+        findings.append(make_finding(
+            section="bank_statement_completeness", severity="error",
+            summary=f"Extra physical bank coverage does not belong to period {period}: {key}.",
+        ))
     return findings
 
 
@@ -1594,6 +1971,14 @@ def evaluate_action_batch(
     resolved_sources_by_action: dict[str, list[dict[str, Any]]] = {}
 
     findings.extend(evaluate_duplicates(action_batch))
+    findings.extend(
+        evaluate_bank_statement_completeness(
+            action_batch,
+            action_path=action_path,
+            cwd=cwd,
+            posting_policy=posting_policy,
+        )
+    )
     findings.extend(evaluate_exchange_rates(action_batch, exchange_rate_cache=exchange_rate_cache))
     findings.extend(
         evaluate_unresolved_dependencies(
@@ -1664,7 +2049,12 @@ def evaluate_action_batch(
                 split_payment_action_ids=split_payment_action_ids,
             )
         )
-        findings.extend(evaluate_account_vat(action=action))
+        findings.extend(
+            evaluate_account_vat(
+                action=action,
+                batch_approved=str(action_batch.get("approval_status") or "") in {"approved", "submitted"},
+            )
+        )
         findings.extend(
             evaluate_historical_outliers(
                 action=action,

@@ -26,6 +26,9 @@ Write mode currently requires all of the following:
 - the check report `Batch ID` matches the current action batch
 - the check report `Action file SHA256` matches the current action file contents
 - explicit `--confirm-write`
+- exact-once physical bank coverage recomputed from the bound allocation and normalized files
+- a successful immutable write for the immediately preceding configured action period, except for the first configured period
+- no mismatch with a successful current-period submission log's stored action-file SHA
 
 Dry-run mode does not require the batch to be approved.
 
@@ -39,6 +42,7 @@ Dry-run mode does not require the batch to be approved.
   - `incomings/create`
   - `payments/create`
 - Already successful actions are skipped on rerun.
+- All dependency, manual-proof, physical-coverage, translation, and posting-policy checks run before the first API request.
 - Default behavior stops on the first hard failure.
 - `--continue-on-error` allows best-effort continuation.
 - Legacy `/save` draft endpoints are normalized to the matching `/create` request only for backward-compatible batch loading.
@@ -52,6 +56,7 @@ Dry-run mode does not require the batch to be approved.
 - an append-only `request_log`
 - a manual-only `rollback_plan`
 - summary counts for the current invocation
+- `action_file_sha256` after a fully successful live write; subsequent runs reject a changed YAML
 
 Each request-log entry includes:
 

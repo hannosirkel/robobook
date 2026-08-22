@@ -60,6 +60,18 @@ class ReferenceArtifactTests(unittest.TestCase):
         self.assertTrue(reference_artifacts.requires_bank_allocation_binding(physical_bank))
         self.assertIn("bank_allocations", reference_artifacts.required_action_binding_kinds(physical_bank))
 
+    def test_manual_statement_import_dependency_requires_bank_allocation_binding(self) -> None:
+        batch = {
+            "actions": [],
+            "unresolved_dependencies": [{
+                "kind": "manual_statement_import_financial_transaction",
+                "source_ref": {"source_kind": "physical_bank"},
+            }],
+        }
+
+        self.assertTrue(reference_artifacts.requires_bank_allocation_binding(batch))
+        self.assertIn("bank_allocations", reference_artifacts.required_action_binding_kinds(batch))
+
 
 if __name__ == "__main__":
     unittest.main()

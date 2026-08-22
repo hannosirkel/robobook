@@ -772,13 +772,48 @@ def record_count_note(records: list[dict[str, Any]]) -> str:
     return f"Built from {len(records)} normalized record(s)."
 
 
-def review_confidence(*, notes: list[str], required_ids: list[str | None]) -> str:
+def review_confidence(*, open_issues: list[str], required_ids: list[str | None]) -> str:
     missing_required = any(item in (None, "") for item in required_ids)
     if missing_required:
         return "low"
-    if notes:
+    if open_issues:
         return "medium"
     return "high"
+
+
+def unresolved_review_issues(notes: list[str]) -> list[str]:
+    """Separate actual accounting judgments from informational provenance."""
+    markers = (
+        "ambiguous entity mapping",
+        "pick the posting target manually",
+        "still needs review",
+        "no matching bank receipt",
+        "multiple warehouse ids",
+        "multiple customer country codes",
+        "forced despite",
+    )
+    return [note for note in notes if any(marker in normalize_text(note) for marker in markers)]
+
+
+def clean_resolved_review_notes(
+    notes: list[str],
+    *,
+    contact_resolved: bool,
+    vat_resolved: bool,
+) -> list[str]:
+    cleaned: list[str] = []
+    for note in notes:
+        normalized = normalize_text(note)
+        if contact_resolved and (
+            normalized.startswith("used ") and " contact mapping as a fallback " in normalized
+            or normalized.startswith("no contact/client mapping matched")
+            or normalized.startswith("ambiguous entity mapping candidates:")
+        ):
+            continue
+        if vat_resolved and "exact vat allocation between revenue and shipping still needs review" in normalized:
+            continue
+        cleaned.append(note)
+    return cleaned
 
 
 def policy_prefers_shipping_split(policy_text: str | None, shipping_total: Decimal) -> bool:
@@ -1487,7 +1522,7 @@ def build_sales_actions(
             if split_profiles:
                 payload["summary_scope"]["tax_profile"] = profile_name
             confidence = review_confidence(
-                notes=review_notes,
+                open_issues=unresolved_review_issues(review_notes),
                 required_ids=[profile_mapping_hints["revenue_account"][0]],
             )
             action = make_action(
@@ -1599,7 +1634,7 @@ def build_sales_actions(
             "line_items": lines,
         }
         confidence = review_confidence(
-            notes=review_notes,
+            open_issues=unresolved_review_issues(review_notes),
             required_ids=[refund_mapping_hints["revenue_account"][0]],
         )
         actions.append(
@@ -1724,7 +1759,10 @@ def build_fee_actions(
                 }
             ],
         }
-        confidence = review_confidence(notes=review_notes, required_ids=[processor_expense_account_id or fee_account_id, contact_id])
+        confidence = review_confidence(
+            open_issues=unresolved_review_issues(review_notes),
+            required_ids=[processor_expense_account_id or fee_account_id, contact_id],
+        )
         action = make_action(
             period=period,
             idempotency_key=idempotency_key,
@@ -1881,7 +1919,7 @@ def build_purchase_actions(
         }
         required_ids = [contact_id]
         required_ids.extend(line.get("suggested_expense_account_id") for line in lines)
-        confidence = review_confidence(notes=review_notes, required_ids=required_ids)
+        confidence = review_confidence(open_issues=unresolved_review_issues(review_notes), required_ids=required_ids)
         actions.append(
             make_action(
                 period=period,
@@ -1991,7 +2029,7 @@ def build_incoming_actions(
             "bank_receipt_total_hint": decimal_number(bank_total) if bank_records else None,
             "record_count": len(payout_records),
         }
-        confidence = review_confidence(notes=review_notes, required_ids=[bank_account_id])
+        confidence = review_confidence(open_issues=unresolved_review_issues(review_notes), required_ids=[bank_account_id])
         source_refs = source_refs_for_records(normalized_path_display, payout_records)
         source_refs.extend(source_refs_for_records(normalized_path_display, bank_records, note="Matching bank receipt evidence."))
         actions.append(
@@ -2155,7 +2193,7 @@ def build_payment_actions(
                 "linked_purchase_period": candidate["action_period"],
                 "record_count": len(bank_records),
             }
-            confidence = review_confidence(notes=review_notes, required_ids=[bank_account_id])
+            confidence = review_confidence(open_issues=unresolved_review_issues(review_notes), required_ids=[bank_account_id])
             depends_on = [candidate["action_id"]] if candidate["source"] == "current" else []
             actions.append(
                 make_action(
@@ -2826,7 +2864,10 @@ def build_exact_cash_actions(
                         for source_ref in source_refs_for_records(normalized_path_display, [record])
                     ] + supporting_refs,
                     reason=f"Create the exact {document_type} settlement for reviewed physical bank row {record_id}.",
-                    confidence=review_confidence(notes=notes_for_action, required_ids=[bank_account_id, str(contact_id or "")]),
+                    confidence=review_confidence(
+                        open_issues=unresolved_review_issues(notes_for_action),
+                        required_ids=[bank_account_id, str(contact_id or "")],
+                    ),
                     depends_on=depends_on,
                     expected_effect=f"Create one {document_type} settlement for physical bank row {record_id}.",
                     review_notes=notes_for_action,
@@ -2964,7 +3005,10 @@ def build_purchase_credit_actions(
                 payload=payload,
                 source_refs=source_refs_for_records(normalized_path_display, group_records),
                 reason=f"Preserve {group_label} refund evidence as a separate supplier credit.",
-                confidence=review_confidence(notes=review_notes, required_ids=[contact_id, account_id, vat_type_id]),
+                confidence=review_confidence(
+                    open_issues=unresolved_review_issues(review_notes),
+                    required_ids=[contact_id, account_id, vat_type_id],
+                ),
                 depends_on=[],
                 expected_effect=f"Create a supplier credit for {group_label} in Simplbooks.",
                 review_notes=review_notes,
@@ -3140,12 +3184,7 @@ def apply_posting_policy(
                     ) from exc
                 warehouse_id = line_values.get("warehouse_id")
                 line["warehouse_id_hint"] = str(warehouse_id) if warehouse_id not in (None, "") else None
-        review_notes = [
-            note
-            for note in action.get("review_notes") or []
-            if not str(note).startswith("Ambiguous entity mapping candidates:")
-        ]
-        action["review_notes"] = review_notes
+        review_notes = list(action.get("review_notes") or [])
         required_ids: list[str | None] = [str((payload.get("counterparty") or {}).get("contact_id") or "")]
         for line in payload.get("line_items") or []:
             if role == "sales":
@@ -3156,7 +3195,16 @@ def apply_posting_policy(
                 required_ids.extend(
                     [line.get("suggested_expense_account_id"), line.get("suggested_vat_type_id")]
                 )
-        action["confidence"] = review_confidence(notes=review_notes, required_ids=required_ids)
+        review_notes = clean_resolved_review_notes(
+            review_notes,
+            contact_resolved=bool(required_ids[0]),
+            vat_resolved=all(value not in (None, "") for value in required_ids[1:]),
+        )
+        action["review_notes"] = review_notes
+        action["confidence"] = review_confidence(
+            open_issues=unresolved_review_issues(review_notes),
+            required_ids=required_ids,
+        )
     return unresolved
 
 

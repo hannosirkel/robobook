@@ -327,6 +327,111 @@ class FakeClient:
 
 
 class BooksendTests(unittest.TestCase):
+    def test_write_rejects_when_previous_required_month_is_not_successful(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            actions_dir = root / "artifacts" / "actions"
+            submissions_dir = root / "artifacts" / "submissions"
+            actions_dir.mkdir(parents=True)
+            submissions_dir.mkdir(parents=True)
+            booksend.write_yaml(actions_dir / "2024-01.yaml", make_batch())
+            feb = make_batch()
+            feb.update({"period": "2024-02", "batch_id": "example-2024-02-draft"})
+            booksend.write_yaml(actions_dir / "2024-02.yaml", feb)
+
+            # The first configured period has no predecessor and remains eligible.
+            booksend.validate_predecessor_submission(
+                action_path=actions_dir / "2024-01.yaml", period="2024-01"
+            )
+            with self.assertRaisesRegex(SimplbooksError, "previous month"):
+                booksend.validate_predecessor_submission(
+                    action_path=actions_dir / "2024-02.yaml", period="2024-02"
+                )
+
+    def test_write_accepts_exact_successful_configured_predecessor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            actions_dir = root / "artifacts" / "actions"
+            submissions_dir = root / "artifacts" / "submissions"
+            actions_dir.mkdir(parents=True)
+            submissions_dir.mkdir(parents=True)
+            jan = make_batch(approval_status="submitted")
+            booksend.write_yaml(actions_dir / "2024-01.yaml", jan)
+            jan_sha = booksend.file_sha256(actions_dir / "2024-01.yaml")
+            booksend.write_json(submissions_dir / "2024-01.json", {
+                "schema_version": "1.0",
+                "company_slug": "example",
+                "period": "2024-01",
+                "generated_at": "2026-04-04T00:00:00Z",
+                "batch_id": jan["batch_id"],
+                "mode": "write",
+                "action_file_sha256": jan_sha,
+                "request_log": [],
+                "rollback_plan": {"supported": False, "notes": [], "reversal_candidates": []},
+                "summary": {"attempted_actions": 0, "successful_actions": 0, "failed_actions": 0, "stopped_on_failure": False},
+            })
+            feb = make_batch()
+            feb.update({"period": "2024-02", "batch_id": "example-2024-02-draft"})
+            booksend.write_yaml(actions_dir / "2024-02.yaml", feb)
+
+            booksend.validate_predecessor_submission(
+                action_path=actions_dir / "2024-02.yaml", period="2024-02"
+            )
+
+    def test_write_rejects_changed_yaml_after_successful_submission(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            action_path = root / "2024-01.yaml"
+            output_path = root / "2024-01.json"
+            batch = make_batch(approval_status="submitted")
+            booksend.write_yaml(action_path, batch)
+            original_sha = booksend.file_sha256(action_path)
+            booksend.write_json(output_path, {
+                "batch_id": batch["batch_id"],
+                "company_slug": "example",
+                "period": "2024-01",
+                "mode": "write",
+                "action_file_sha256": original_sha,
+                "request_log": [],
+            })
+            batch["source_summary"] = "mutated after successful write"
+            booksend.write_yaml(action_path, batch)
+
+            with self.assertRaisesRegex(SimplbooksError, "submitted batch is immutable"):
+                booksend.load_existing_submission(
+                    output_path=output_path,
+                    action_path=action_path,
+                    batch_id=batch["batch_id"],
+                    company_slug="example",
+                    period="2024-01",
+                )
+
+    def test_partial_failed_write_log_remains_resume_safe_before_submission_freeze(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            action_path = root / "2024-01.yaml"
+            output_path = root / "2024-01.json"
+            batch = make_batch(approval_status="approved")
+            booksend.write_yaml(action_path, batch)
+            booksend.write_json(output_path, {
+                "batch_id": batch["batch_id"],
+                "company_slug": "example",
+                "period": "2024-01",
+                "mode": "write",
+                "request_log": [{"mode": "write", "success": False}],
+                "summary": {"failed_actions": 1, "stopped_on_failure": True},
+            })
+
+            loaded = booksend.load_existing_submission(
+                output_path=output_path,
+                action_path=action_path,
+                batch_id=batch["batch_id"],
+                company_slug="example",
+                period="2024-01",
+            )
+
+        self.assertEqual(loaded["summary"]["failed_actions"], 1)
+
     def test_sender_preserves_reviewed_direct_sale_quantity(self) -> None:
         action = invoice_action(key="example-2024-01-direct-sale")
         action["payload"]["totals"].update({"gross_amount": 40.0, "vat_amount": 7.21, "shipping_amount": 0.0})
@@ -498,6 +603,24 @@ class BooksendTests(unittest.TestCase):
                         client=client,
                     )
                 self.assertEqual(client.calls, [])
+
+    def test_sender_prevalidates_bank_completeness_before_translation_or_client_call(self) -> None:
+        action = invoice_action()
+        action["source_refs"][0]["source_kind"] = "physical_bank"
+        client = FakeClient(responses=[{"_http_status": 201, "invoice_id": 501}])
+
+        with tempfile.TemporaryDirectory() as tmpdir, self.assertRaisesRegex(
+            SimplbooksError, "bank statement completeness"
+        ):
+            booksend.execute_batch(
+                action_batch=make_batch(actions=[action]),
+                mode="write",
+                client=client,
+                action_path=Path(tmpdir) / "actions.yaml",
+                cwd=Path(tmpdir),
+            )
+
+        self.assertEqual(client.calls, [])
 
     def test_sender_copies_reviewed_rate_and_translates_supplier_credit(self) -> None:
         translated = booksend.translate_action_for_api(purchase_credit_action(), lookup={})

@@ -13,7 +13,11 @@ from pathlib import Path
 from typing import Any
 
 from bookbuilder import write_yaml
-from bookchecker import load_yaml, manual_financial_dependency_errors
+from bookchecker import (
+    evaluate_bank_statement_completeness,
+    load_yaml,
+    manual_financial_dependency_errors,
+)
 from exchange_rates import ExchangeRateError, lookup_rate
 from posting_policy import PostingPolicyError, action_policy_errors, load_posting_policy
 from reference_artifacts import (
@@ -970,6 +974,7 @@ def build_rollback_plan(action_batch: dict[str, Any], ordered_actions: list[dict
 def load_existing_submission(
     *,
     output_path: Path,
+    action_path: Path,
     batch_id: str,
     company_slug: str,
     period: str,
@@ -1007,7 +1012,58 @@ def load_existing_submission(
                 normalized_log.append(entry)
         existing["request_log"] = normalized_log
 
+    successful_write_sha = str(existing.get("action_file_sha256") or "").strip()
+    current_batch_status = str(load_yaml(action_path).get("approval_status") or "")
+    freeze_required = existing.get("mode") == "write" and (
+        bool(successful_write_sha) or current_batch_status == "submitted"
+    )
+    if freeze_required:
+        if not successful_write_sha or successful_write_sha != file_sha256(action_path):
+            raise SimplbooksError(
+                "The submitted batch is immutable: its successful action-file SHA does not match "
+                f"the current YAML at {action_path}."
+            )
+
     return existing
+
+
+def validate_predecessor_submission(*, action_path: Path, period: str) -> None:
+    """Require the immediately preceding configured action batch to be immutable and successful."""
+    action_dir = action_path.parent
+    configured = sorted(
+        path.stem
+        for path in action_dir.glob("*.yaml")
+        if re.fullmatch(r"\d{4}-\d{2}", path.stem)
+    )
+    if period not in configured:
+        raise SimplbooksError(f"Current period {period} is absent from the configured action sequence.")
+    position = configured.index(period)
+    if position == 0:
+        return
+    predecessor = configured[position - 1]
+    predecessor_action_path = action_dir / f"{predecessor}.yaml"
+    submissions_dir = action_dir.parent / "submissions"
+    predecessor_submission_path = submissions_dir / f"{predecessor}.json"
+    if not predecessor_submission_path.exists():
+        raise SimplbooksError(
+            f"Write mode requires the previous month/configured period {predecessor} to have a successful submission."
+        )
+    predecessor_batch = load_yaml(predecessor_action_path)
+    predecessor_submission = load_json(predecessor_submission_path)
+    summary = predecessor_submission.get("summary") or {}
+    valid = (
+        str(predecessor_batch.get("approval_status") or "") == "submitted"
+        and predecessor_submission.get("mode") == "write"
+        and str(predecessor_submission.get("period") or "") == predecessor
+        and str(predecessor_submission.get("batch_id") or "") == str(predecessor_batch.get("batch_id") or "")
+        and str(predecessor_submission.get("action_file_sha256") or "") == file_sha256(predecessor_action_path)
+        and int(summary.get("failed_actions") or 0) == 0
+        and summary.get("stopped_on_failure") is False
+    )
+    if not valid:
+        raise SimplbooksError(
+            f"Write mode requires the previous month/configured period {predecessor} to be successfully submitted and immutable."
+        )
 
 
 def load_prior_action_lookup(
@@ -1108,7 +1164,25 @@ def execute_batch(
     reference_lookup: dict[str, dict[str, Any]] | None = None,
     exchange_rate_cache: dict[str, Any] | None = None,
     posting_policy: dict[str, Any] | None = None,
+    action_path: Path | None = None,
+    cwd: Path | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    if action_path is not None and cwd is not None:
+        coverage_errors = [
+            item
+            for item in evaluate_bank_statement_completeness(
+                action_batch,
+                action_path=action_path,
+                cwd=cwd,
+                posting_policy=posting_policy,
+            )
+            if item.get("severity") == "error"
+        ]
+        if coverage_errors:
+            raise SimplbooksError(
+                "Action batch bank statement completeness prevalidation failed before translation or API calls: "
+                + str(coverage_errors[0].get("summary") or "unknown coverage error")
+            )
     manual_dependencies = [
         dependency
         for dependency in action_batch.get("unresolved_dependencies") or []
@@ -1302,6 +1376,18 @@ def run_submission(
             period=period,
             company_id=resolved_company_id,
         )
+        validate_predecessor_submission(action_path=action_path, period=period)
+        coverage_findings = evaluate_bank_statement_completeness(
+            action_batch,
+            action_path=action_path,
+            cwd=cwd,
+        )
+        coverage_errors = [item for item in coverage_findings if item.get("severity") == "error"]
+        if coverage_errors:
+            raise SimplbooksError(
+                "Write mode bank statement completeness prevalidation failed before any API call: "
+                + str(coverage_errors[0].get("summary") or "unknown coverage error")
+            )
 
     company_slug = str(
         action_batch.get("company_slug")
@@ -1310,6 +1396,7 @@ def run_submission(
     )
     existing_submission = load_existing_submission(
         output_path=output_path,
+        action_path=action_path,
         batch_id=str(action_batch.get("batch_id") or ""),
         company_slug=company_slug,
         period=period,
@@ -1354,11 +1441,15 @@ def run_submission(
         reference_lookup=reference_lookup,
         exchange_rate_cache=exchange_rate_cache,
         posting_policy=posting_policy,
+        action_path=action_path,
+        cwd=cwd,
     )
     prior_request_count = len((existing_submission or {}).get("request_log") or [])
     current_request_log = submission["request_log"][prior_request_count:]
 
     write_yaml(action_path, updated_batch)
+    if mode == "write" and str(updated_batch.get("approval_status") or "") == "submitted":
+        submission["action_file_sha256"] = file_sha256(action_path)
     write_json(output_path, submission)
 
     company_name = resolve_company_name(company_dir=str(company_dir)) if company_dir is not None else None

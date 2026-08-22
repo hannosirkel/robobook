@@ -329,6 +329,35 @@ def purchase_summary_action(
 
 
 class BookbuilderTests(unittest.TestCase):
+    def test_review_confidence_uses_open_issues_not_informational_notes(self) -> None:
+        self.assertEqual(
+            bookbuilder.review_confidence(open_issues=[], required_ids=["42"]),
+            "high",
+        )
+        self.assertEqual(
+            bookbuilder.review_confidence(open_issues=["Exact unresolved judgment."], required_ids=["42"]),
+            "medium",
+        )
+        self.assertEqual(
+            bookbuilder.review_confidence(open_issues=[], required_ids=[None]),
+            "low",
+        )
+
+    def test_resolved_policy_removes_obsolete_contact_and_shipping_review_notes(self) -> None:
+        notes = [
+            "Used 'stripe' contact mapping as a fallback for 'paypal'.",
+            "No contact/client mapping matched 'paypal'.",
+            "Shipping is split into a dedicated draft line; exact VAT allocation between revenue and shipping still needs review.",
+            "Built from 2 normalized record(s).",
+        ]
+
+        cleaned = bookbuilder.clean_resolved_review_notes(
+            notes,
+            contact_resolved=True,
+            vat_resolved=True,
+        )
+
+        self.assertEqual(cleaned, ["Built from 2 normalized record(s)."])
     def test_direct_sales_group_one_monthly_invoice_and_keep_exact_receipts(self) -> None:
         normalized = base_normalized("2024-08")
         rows = [

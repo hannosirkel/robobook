@@ -94,10 +94,18 @@ def required_action_binding_kinds(action_batch: dict[str, Any]) -> set[str]:
 
 def requires_bank_allocation_binding(action_batch: dict[str, Any]) -> bool:
     """Report whether a write-capable batch contains physical bank settlement evidence."""
-    return any(
+    action_evidence = any(
         str(source_ref.get("source_kind") or "") == "physical_bank"
         for action in action_batch.get("actions") or []
         if isinstance(action, dict)
         for source_ref in action.get("source_refs") or []
         if isinstance(source_ref, dict)
     )
+    manual_evidence = any(
+        str(dependency.get("kind") or "") == "manual_statement_import_financial_transaction"
+        and isinstance(dependency.get("source_ref"), dict)
+        and str((dependency.get("source_ref") or {}).get("source_kind") or "") == "physical_bank"
+        for dependency in action_batch.get("unresolved_dependencies") or []
+        if isinstance(dependency, dict)
+    )
+    return action_evidence or manual_evidence

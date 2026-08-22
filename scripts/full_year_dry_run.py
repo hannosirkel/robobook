@@ -202,6 +202,7 @@ def summarize_bank_reconciliation_artifacts(
     company_dir: Path,
     year: int,
     expected_periods: list[str] | None = None,
+    period_states: dict[str, str] | None = None,
     cwd: Path | None = None,
 ) -> dict[str, int]:
     totals = {
@@ -211,18 +212,48 @@ def summarize_bank_reconciliation_artifacts(
         "clearing_movement_count": 0,
         "unresolved_clearing_count": 0,
     }
-    expected = expected_periods or periods_for_year(year)
+    expected = periods_for_year(year) if expected_periods is None else expected_periods
     root = cwd or Path.cwd()
     expected_company_slug = resolve_company_slug(company_dir=str(company_dir)) or company_dir.name
     recon_dir = company_dir / "artifacts" / "recon"
+    actions_dir = company_dir / "artifacts" / "actions"
     expected_normalized_dir = company_dir / "artifacts" / "normalized"
     expected_allocation_path = company_dir / "artifacts" / "bank" / f"{year}-allocations.json"
     for period in expected:
         if not period.startswith(f"{year}-"):
             raise SimplbooksError(f"Expected reconciliation period is outside {year}: {period}")
-        path = recon_dir / f"{period}.json"
-        if not path.exists():
-            raise SimplbooksError(f"Expected reconciliation artifact is missing: {path}")
+        action_path = actions_dir / f"{period}.yaml"
+        if not action_path.exists():
+            raise SimplbooksError(f"Expected action artifact is missing for reconciliation aggregation: {action_path}")
+        action_batch = load_yaml(action_path)
+        if (
+            str(action_batch.get("period") or "") != period
+            or str(action_batch.get("company_slug") or "") != expected_company_slug
+        ):
+            raise SimplbooksError(f"Action artifact identity mismatch for reconciliation period {period}.")
+        run_state = (period_states or {}).get(period)
+        if period_states is not None and run_state not in {"processed", "skipped_submitted"}:
+            raise SimplbooksError(f"Period {period} was not successfully processed or frozen during this run.")
+        if run_state == "skipped_submitted" or str(action_batch.get("approval_status") or "") == "submitted":
+            if submitted_month_state(company_dir=company_dir, period=period) != "submitted":
+                raise SimplbooksError(f"Frozen period {period} lacks a successful submitted identity.")
+
+        reconciliation_bindings = [
+            binding
+            for binding in action_batch.get("reference_artifacts") or []
+            if isinstance(binding, dict) and binding.get("kind") == "reconciliation"
+        ]
+        if len(reconciliation_bindings) != 1:
+            raise SimplbooksError(f"Action artifact {period} requires exactly one reconciliation binding.")
+        try:
+            path = verify_file_binding(reconciliation_bindings[0], cwd=root)
+        except ReferenceArtifactError as exc:
+            raise SimplbooksError(f"Action-bound reconciliation for {period} changed or is missing: {exc}") from exc
+        expected_recon_path = recon_dir / f"{period}.json"
+        if path.resolve() != expected_recon_path.resolve():
+            raise SimplbooksError(
+                f"Action-bound reconciliation for {period} does not resolve to the expected artifact."
+            )
         payload = json.loads(path.read_text(encoding="utf-8"))
         if str(payload.get("period") or "") != period:
             raise SimplbooksError(
@@ -274,7 +305,9 @@ def summarize_bank_reconciliation_artifacts(
     return totals
 
 
-def summarize_action_artifacts(*, company_dir: Path, year: int) -> dict[str, Any]:
+def summarize_action_artifacts(
+    *, company_dir: Path, year: int, periods: list[str] | None = None
+) -> dict[str, Any]:
     def load_action_yaml(path: Path) -> dict[str, Any]:
         text = path.read_text(encoding="utf-8")
         try:
@@ -351,7 +384,14 @@ def summarize_action_artifacts(*, company_dir: Path, year: int) -> dict[str, Any
             if not manual_inventory_action_loaded:
                 manual_inventory_status = "invalid"
             manual_inventory_error = str(exc)
-    for path in sorted(actions_dir.glob(f"{year}-??.yaml")) if actions_dir.exists() else []:
+    action_paths = (
+        [actions_dir / f"{period}.yaml" for period in periods]
+        if periods is not None
+        else (sorted(actions_dir.glob(f"{year}-??.yaml")) if actions_dir.exists() else [])
+    )
+    for path in action_paths:
+        if not path.exists():
+            raise SimplbooksError(f"Expected action artifact is missing from annual summary: {path}")
         batch = load_action_yaml(path)
         period = str(batch.get("period") or path.stem)
         suppressed_document_count += len(batch.get("already_present") or [])
@@ -405,7 +445,14 @@ def summarize_action_artifacts(*, company_dir: Path, year: int) -> dict[str, Any
                     canonical_source_reference_count += 1
 
     normalized_dir = company_dir / "artifacts" / "normalized"
-    for path in sorted(normalized_dir.glob(f"{year}-??.json")) if normalized_dir.exists() else []:
+    normalized_paths = (
+        [normalized_dir / f"{period}.json" for period in periods]
+        if periods is not None
+        else (sorted(normalized_dir.glob(f"{year}-??.json")) if normalized_dir.exists() else [])
+    )
+    for path in normalized_paths:
+        if not path.exists():
+            raise SimplbooksError(f"Expected normalized artifact is missing from annual summary: {path}")
         payload = json.loads(path.read_text(encoding="utf-8"))
         for source in payload.get("sources") or []:
             raw_source_reference_count += 1
@@ -541,6 +588,7 @@ def run_full_year_dry_run(
     bank_allocations = company_dir / "artifacts" / "bank" / f"{year}-allocations.json"
     months: list[dict[str, Any]] = []
     api_calls: list[dict[str, Any]] = []
+    successful_period_states: dict[str, str] = {}
     overall_success = True
 
     target_periods = periods_for_year(year)
@@ -548,6 +596,7 @@ def run_full_year_dry_run(
         submission_state = submitted_month_state(company_dir=company_dir, period=period)
         if submission_state == "submitted":
             months.append({"period": period, "ok": True, "status": "skipped_submitted", "steps": []})
+            successful_period_states[period] = "skipped_submitted"
             continue
         if submission_state == "partial_submission":
             raise SimplbooksError(
@@ -589,20 +638,33 @@ def run_full_year_dry_run(
                 overall_success = False
                 break
         months.append({"period": period, "ok": month_success, "status": "processed", "steps": step_results})
+        if month_success:
+            successful_period_states[period] = "processed"
         if not month_success and not continue_on_error:
             break
 
-    reference_summary = summarize_action_artifacts(company_dir=company_dir, year=year)
+    aggregated_periods = [period for period in target_periods if period in successful_period_states]
+    unprocessed_periods = [period for period in target_periods if period not in successful_period_states]
+    reference_summary = summarize_action_artifacts(
+        company_dir=company_dir,
+        year=year,
+        periods=aggregated_periods,
+    )
     bank_reconciliation_summary = summarize_bank_reconciliation_artifacts(
         company_dir=company_dir,
         year=year,
-        expected_periods=target_periods,
+        expected_periods=aggregated_periods,
+        period_states=successful_period_states,
         cwd=cwd,
     )
     policy_path = company_dir / "artifacts" / "posting_policy.json"
     posting_policy = json.loads(policy_path.read_text(encoding="utf-8")) if policy_path.exists() else {}
     expectations = ((posting_policy.get("year_expectations") or {}).get(str(year)) or {})
     acceptance_issues = reference_acceptance_issues(reference_summary, expectations=expectations)
+    if unprocessed_periods:
+        acceptance_issues.append(
+            "Periods not successfully processed or frozen: " + ", ".join(unprocessed_periods) + "."
+        )
     if len(months) != len(target_periods):
         acceptance_issues.append(f"Expected {len(target_periods)} processed months, found {len(months)}.")
     overall_success = overall_success and not acceptance_issues
@@ -617,6 +679,8 @@ def run_full_year_dry_run(
         "force_build": force_build,
         "continue_on_error": continue_on_error,
         "overall_success": overall_success,
+        "aggregated_periods": aggregated_periods,
+        "unprocessed_periods": unprocessed_periods,
         "reference_summary": reference_summary,
         "bank_reconciliation_summary": bank_reconciliation_summary,
         "acceptance_issues": acceptance_issues,

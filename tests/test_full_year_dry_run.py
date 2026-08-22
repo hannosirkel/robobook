@@ -81,6 +81,30 @@ def write_bound_recon(company_dir: Path, period: str, *, cwd: Path) -> None:
     }), encoding="utf-8")
 
 
+def write_action_bound_to_recon(
+    company_dir: Path,
+    period: str,
+    *,
+    cwd: Path,
+    approval_status: str = "draft",
+    bound_recon_path: Path | None = None,
+) -> Path:
+    action_path = company_dir / "artifacts" / "actions" / f"{period}.yaml"
+    recon_path = bound_recon_path or company_dir / "artifacts" / "recon" / f"{period}.json"
+    action_path.parent.mkdir(parents=True, exist_ok=True)
+    action_path.write_text(json.dumps({
+        "batch_id": f"example-{period}",
+        "company_slug": "example",
+        "period": period,
+        "approval_status": approval_status,
+        "reference_artifacts": [
+            reference_artifacts.bind_file(recon_path, kind="reconciliation", cwd=cwd),
+        ],
+        "actions": [],
+    }), encoding="utf-8")
+    return action_path
+
+
 class FullYearDryRunTests(unittest.TestCase):
     def test_reference_summary_blocks_required_manual_inventory_action(self) -> None:
         action = {
@@ -229,6 +253,8 @@ class FullYearDryRunTests(unittest.TestCase):
             called_scripts.append(script)
             if script == "bookrecon.py":
                 write_bound_recon(company_dir, cmd[cmd.index("--period") + 1], cwd=cwd)
+            if script == "bookbuilder.py":
+                write_action_bound_to_recon(company_dir, cmd[cmd.index("--period") + 1], cwd=cwd)
             payload = {"result": "pass"} if script == "bookchecker.py" else {"ok": True}
             return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
 
@@ -410,6 +436,7 @@ class FullYearDryRunTests(unittest.TestCase):
                     "notes": ["Wording and punctuation are deliberately unrelated!"],
                 }],
             }), encoding="utf-8")
+            write_action_bound_to_recon(company_dir, "2024-01", cwd=root)
 
             summary = full_year_dry_run.summarize_bank_reconciliation_artifacts(
                 company_dir=company_dir, year=2024, expected_periods=["2024-01"], cwd=root
@@ -432,6 +459,7 @@ class FullYearDryRunTests(unittest.TestCase):
                 "company_slug": "example", "period": "2024-02",
                 "reference_artifacts": [], "bank_coverage": {},
             }), encoding="utf-8")
+            write_action_bound_to_recon(company_dir, "2024-01", cwd=Path(tmp))
 
             with self.assertRaisesRegex(full_year_dry_run.SimplbooksError, "period mismatch"):
                 full_year_dry_run.summarize_bank_reconciliation_artifacts(
@@ -451,6 +479,7 @@ class FullYearDryRunTests(unittest.TestCase):
             root = Path(tmp)
             company_dir = root / "companies" / "example"
             write_bound_recon(company_dir, "2024-01", cwd=root)
+            write_action_bound_to_recon(company_dir, "2024-01", cwd=root)
             recon_path = company_dir / "artifacts" / "recon" / "2024-01.json"
             payload = json.loads(recon_path.read_text(encoding="utf-8"))
             payload["bank_coverage"].update({
@@ -462,12 +491,57 @@ class FullYearDryRunTests(unittest.TestCase):
                 "unresolved_clearing_record_ids": [],
             })
             recon_path.write_text(json.dumps(payload), encoding="utf-8")
+            write_action_bound_to_recon(company_dir, "2024-01", cwd=root)
 
             with self.assertRaisesRegex(full_year_dry_run.SimplbooksError, "partition"):
                 full_year_dry_run.summarize_bank_reconciliation_artifacts(
                     company_dir=company_dir, year=2024,
                     expected_periods=["2024-01"], cwd=root,
                 )
+
+    def test_full_year_summary_rejects_reconciliation_edited_after_action_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            company_dir = root / "companies" / "example"
+            write_bound_recon(company_dir, "2024-01", cwd=root)
+            write_action_bound_to_recon(company_dir, "2024-01", cwd=root)
+            recon_path = company_dir / "artifacts" / "recon" / "2024-01.json"
+            payload = json.loads(recon_path.read_text(encoding="utf-8"))
+            payload["bank_coverage"]["physical_bank_row_count"] = 99
+            recon_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaisesRegex(full_year_dry_run.SimplbooksError, "reconciliation.*changed|SHA"):
+                full_year_dry_run.summarize_bank_reconciliation_artifacts(
+                    company_dir=company_dir, year=2024,
+                    expected_periods=["2024-01"], cwd=root,
+                )
+
+    def test_full_year_summary_rejects_wrong_action_reconciliation_path_or_sha(self) -> None:
+        for defect in ("path", "sha"):
+            with self.subTest(defect=defect), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                company_dir = root / "companies" / "example"
+                write_bound_recon(company_dir, "2024-01", cwd=root)
+                if defect == "path":
+                    wrong_path = company_dir / "artifacts" / "recon" / "wrong.json"
+                    wrong_path.write_text(
+                        (company_dir / "artifacts" / "recon" / "2024-01.json").read_text(encoding="utf-8"),
+                        encoding="utf-8",
+                    )
+                    action_path = write_action_bound_to_recon(
+                        company_dir, "2024-01", cwd=root, bound_recon_path=wrong_path
+                    )
+                else:
+                    action_path = write_action_bound_to_recon(company_dir, "2024-01", cwd=root)
+                    action = json.loads(action_path.read_text(encoding="utf-8"))
+                    action["reference_artifacts"][0]["sha256"] = "0" * 64
+                    action_path.write_text(json.dumps(action), encoding="utf-8")
+
+                with self.assertRaisesRegex(full_year_dry_run.SimplbooksError, "reconciliation"):
+                    full_year_dry_run.summarize_bank_reconciliation_artifacts(
+                        company_dir=company_dir, year=2024,
+                        expected_periods=["2024-01"], cwd=root,
+                    )
 
     def test_full_year_summary_rejects_changed_bound_normalized_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -491,11 +565,12 @@ class FullYearDryRunTests(unittest.TestCase):
                 "bank_coverage": {
                     "physical_bank_row_count": 1, "allocated_row_count": 1,
                     "unallocated_row_count": 0, "clearing_movement_count": 0,
-                    "unresolved_clearing_count": 0,
+                    "resolved_clearing_count": 0, "unresolved_clearing_count": 0,
                     "clearing_movement_record_ids": [], "resolved_clearing_record_ids": [],
                     "unresolved_clearing_record_ids": [],
                 },
             }), encoding="utf-8")
+            write_action_bound_to_recon(company_dir, "2024-01", cwd=root)
             normalized_path.write_text('{"period":"2024-01","changed":true}', encoding="utf-8")
 
             with self.assertRaisesRegex(full_year_dry_run.SimplbooksError, "changed"):
@@ -512,18 +587,16 @@ class FullYearDryRunTests(unittest.TestCase):
             submission_dir = company_dir / "artifacts" / "submissions"
             action_dir.mkdir(parents=True)
             submission_dir.mkdir(parents=True)
-            action_path = action_dir / "2024-03.yaml"
-            action_path.write_text(json.dumps({
-                "batch_id": "example-2024-03", "company_slug": "example",
-                "period": "2024-03", "approval_status": "submitted", "actions": [],
-            }), encoding="utf-8")
+            write_bound_recon(company_dir, "2024-03", cwd=ROOT)
+            action_path = write_action_bound_to_recon(
+                company_dir, "2024-03", cwd=ROOT, approval_status="submitted"
+            )
             (submission_dir / "2024-03.json").write_text(json.dumps({
                 "batch_id": "example-2024-03", "company_slug": "example", "period": "2024-03",
                 "mode": "write", "action_file_sha256": hashlib.sha256(action_path.read_bytes()).hexdigest(),
                 "summary": {"failed_actions": 0, "stopped_on_failure": False},
                 "request_log": [],
             }), encoding="utf-8")
-            write_bound_recon(company_dir, "2024-03", cwd=ROOT)
 
             def fake_run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
                 called_scripts.append(Path(cmd[1]).name)
@@ -810,6 +883,8 @@ class FullYearDryRunTests(unittest.TestCase):
             period = cmd[cmd.index("--period") + 1]
             if script == "bookrecon.py":
                 write_bound_recon(company_dir, period, cwd=cwd)
+            if script == "bookbuilder.py":
+                write_action_bound_to_recon(company_dir, period, cwd=cwd)
             payload = {"step": script}
             if script == "bookchecker.py":
                 payload["result"] = "pass"
@@ -897,6 +972,73 @@ class FullYearDryRunTests(unittest.TestCase):
 
         self.assertFalse(summary["overall_success"])
         self.assertNotIn("booksend.py", called_scripts)
+
+    def test_full_year_runner_returns_summary_when_january_fails_before_two_month_run_finishes(self) -> None:
+        def fake_run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+            period = cmd[cmd.index("--period") + 1]
+            return SimpleNamespace(returncode=1, stdout="", stderr=f"failed {period}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            company_dir = Path(tmp) / "companies" / "example"
+            original_run = full_year_dry_run.subprocess.run
+            original_periods = full_year_dry_run.periods_for_year
+            original_resolve = full_year_dry_run.resolve_company_name
+            try:
+                full_year_dry_run.subprocess.run = fake_run
+                full_year_dry_run.periods_for_year = lambda _year: ["2024-01", "2024-02"]
+                full_year_dry_run.resolve_company_name = lambda company_dir: "Example Company OU"
+                summary = full_year_dry_run.run_full_year_dry_run(
+                    company_dir=company_dir, year=2024, source_dir=None,
+                    python_executable="python3", continue_on_error=False,
+                    force_build=False, cwd=Path(tmp),
+                )
+            finally:
+                full_year_dry_run.subprocess.run = original_run
+                full_year_dry_run.periods_for_year = original_periods
+                full_year_dry_run.resolve_company_name = original_resolve
+
+        self.assertFalse(summary["overall_success"])
+        self.assertEqual(summary["aggregated_periods"], [])
+        self.assertEqual(summary["unprocessed_periods"], ["2024-01", "2024-02"])
+        self.assertEqual(summary["bank_reconciliation_summary"]["physical_bank_row_count"], 0)
+        self.assertTrue(any("2024-01" in issue and "2024-02" in issue for issue in summary["acceptance_issues"]))
+
+    def test_full_year_runner_does_not_fall_back_to_stale_artifacts_for_failed_period(self) -> None:
+        def fake_run(_cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(returncode=1, stdout="", stderr="failed before generation")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            company_dir = root / "companies" / "example"
+            write_bound_recon(company_dir, "2024-01", cwd=root)
+            recon_path = company_dir / "artifacts" / "recon" / "2024-01.json"
+            stale = json.loads(recon_path.read_text(encoding="utf-8"))
+            stale["bank_coverage"].update({
+                "physical_bank_row_count": 77,
+                "allocated_row_count": 77,
+            })
+            recon_path.write_text(json.dumps(stale), encoding="utf-8")
+            write_action_bound_to_recon(company_dir, "2024-01", cwd=root)
+            original_run = full_year_dry_run.subprocess.run
+            original_periods = full_year_dry_run.periods_for_year
+            original_resolve = full_year_dry_run.resolve_company_name
+            try:
+                full_year_dry_run.subprocess.run = fake_run
+                full_year_dry_run.periods_for_year = lambda _year: ["2024-01"]
+                full_year_dry_run.resolve_company_name = lambda company_dir: "Example Company OU"
+                summary = full_year_dry_run.run_full_year_dry_run(
+                    company_dir=company_dir, year=2024, source_dir=None,
+                    python_executable="python3", continue_on_error=False,
+                    force_build=False, cwd=root,
+                )
+            finally:
+                full_year_dry_run.subprocess.run = original_run
+                full_year_dry_run.periods_for_year = original_periods
+                full_year_dry_run.resolve_company_name = original_resolve
+
+        self.assertFalse(summary["overall_success"])
+        self.assertEqual(summary["aggregated_periods"], [])
+        self.assertEqual(summary["bank_reconciliation_summary"]["physical_bank_row_count"], 0)
 
     def test_main_writes_summary_to_default_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

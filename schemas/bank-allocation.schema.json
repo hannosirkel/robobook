@@ -210,12 +210,12 @@
     "statementImportProof": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["status", "required_evidence", "simplbooks_transaction_id", "evidence_ref"],
+      "required": ["status", "required_evidence", "simplbooks_transaction_id", "evidence_binding"],
       "properties": {
         "status": {"const": "verified"},
         "required_evidence": {"const": "live_discovery_or_audit"},
         "simplbooks_transaction_id": {"type": "string", "minLength": 1},
-        "evidence_ref": {"type": "string", "minLength": 1}
+        "evidence_binding": {"$ref": "#/$defs/binding"}
       }
     }
   }

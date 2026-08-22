@@ -11,6 +11,12 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
+from statement_import_evidence import (
+    StatementImportEvidenceError,
+    evidence_identity_errors,
+    load_bound_evidence,
+)
+
 
 DISPOSITIONS = {
     "generated_invoice_receipt",
@@ -261,12 +267,7 @@ def _validate_shape(payload: dict[str, Any]) -> list[dict[str, Any]]:
             raise BankAllocationError("Bank allocation target must be a non-empty object.")
         proof = allocation["target"].get("statement_import_proof")
         if proof is not None:
-            required_proof = {
-                "status",
-                "required_evidence",
-                "simplbooks_transaction_id",
-                "evidence_ref",
-            }
+            required_proof = {"status", "required_evidence", "simplbooks_transaction_id", "evidence_binding"}
             if not isinstance(proof, dict) or set(proof) != required_proof:
                 raise BankAllocationError(
                     "statement_import_proof must be a complete reviewed proof object."
@@ -275,7 +276,7 @@ def _validate_shape(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 proof.get("status") != "verified"
                 or proof.get("required_evidence") != "live_discovery_or_audit"
                 or not _text(proof.get("simplbooks_transaction_id"))
-                or not _text(proof.get("evidence_ref"))
+                or not isinstance(proof.get("evidence_binding"), dict)
             ):
                 raise BankAllocationError("statement_import_proof is not verified and complete.")
         review = allocation.get("review")
@@ -320,6 +321,41 @@ def load_bank_allocations(path: Path, *, normalized_year_paths: list[Path]) -> d
     _validate_against_normalized(
         allocations, _bank_records(normalized_year_paths, year=payload["year"]), year=payload["year"]
     )
+    indexed_records = _bank_records(normalized_year_paths, year=payload["year"])
+    normalized_by_record_id: dict[str, Path] = {}
+    for normalized_path in normalized_year_paths:
+        for record in ((_load_json(normalized_path).get("records") or {}).get("bank_transactions") or []):
+            if isinstance(record, dict) and _text(record.get("source_system")) == "bank":
+                normalized_by_record_id[_text(record.get("record_id"))] = normalized_path
+    for allocation in allocations:
+        proof = (allocation.get("target") or {}).get("statement_import_proof")
+        if proof is None:
+            continue
+        try:
+            evidence = load_bound_evidence(proof["evidence_binding"], cwd=Path.cwd())
+        except StatementImportEvidenceError as exc:
+            raise BankAllocationError(str(exc)) from exc
+        dependency = {
+            "statement_id": allocation.get("statement_id"), "record_id": allocation.get("record_id"),
+            "date": str(allocation.get("period")) + "-01", "iban": allocation.get("iban"),
+            "currency": allocation.get("currency"), "physical_signed_amount": allocation.get("amount"),
+        }
+        record = indexed_records[allocation_key(allocation)]
+        dependency["date"] = record.get("event_date")
+        errors = evidence_identity_errors(
+            evidence, dependency=dependency, expected_company_id=None,
+            expected_transaction_id=_text(proof.get("simplbooks_transaction_id")),
+        )
+        normalized_path = normalized_by_record_id.get(_text(allocation.get("record_id")))
+        source_identity = evidence.get("source_identity") or {}
+        if normalized_path is None or Path(_text(source_identity.get("path"))).resolve() != normalized_path.resolve():
+            errors.append("Statement-import evidence normalized source path does not match reviewed record.")
+        elif _text(source_identity.get("sha256")) != _hash(normalized_path):
+            errors.append("Statement-import evidence normalized source SHA does not match reviewed record.")
+        if _text(evidence.get("company_slug")) != _text(payload.get("company_slug")):
+            errors.append("Statement-import evidence company_slug does not match bank allocations.")
+        if errors:
+            raise BankAllocationError(errors[0])
     return payload
 
 

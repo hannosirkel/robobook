@@ -385,6 +385,12 @@ def translate_invoice_payload(
     tasks = []
     for index, line in enumerate(payload.get("line_items") or [], start=1):
         gross_amount = abs(decimal_value(line.get("gross_amount")))
+        if line.get("article_id_hint") not in (None, ""):
+            proof_errors = inventory_quantity_proof_errors(line)
+            if proof_errors:
+                raise SimplbooksError(
+                    f"{action_id(action)} line {index} inventory quantity proof is invalid: {proof_errors[0]}"
+                )
         quantity = abs(decimal_value(line.get("quantity") if line.get("quantity") not in (None, "") else 1))
         if quantity <= 0:
             raise SimplbooksError(f"{action_id(action)} line {index} quantity must be positive.")
@@ -469,6 +475,48 @@ def translate_invoice_payload(
             "Tasks": tasks,
         },
     }
+
+
+def inventory_quantity_proof_errors(line: dict[str, Any]) -> list[str]:
+    proof = line.get("inventory_quantity_proof")
+    if not isinstance(proof, dict) or set(proof) != {"status", "quantity", "contributors"}:
+        return ["exact proof object is required"]
+    if proof.get("status") != "exact":
+        return ["status must be exact"]
+    try:
+        line_quantity = decimal_value(line.get("quantity"))
+        proof_quantity = decimal_value(proof.get("quantity"))
+    except SimplbooksError as exc:
+        return [str(exc)]
+    if line_quantity <= 0 or proof_quantity != line_quantity:
+        return ["positive line quantity must equal proof quantity"]
+    contributors = proof.get("contributors")
+    if not isinstance(contributors, list) or not contributors:
+        return ["contributors are required"]
+    total = Decimal("0")
+    seen: set[str] = set()
+    for contributor in contributors:
+        if not isinstance(contributor, dict) or set(contributor) != {
+            "record_id", "quantity", "quantity_source", "record_sha256"
+        }:
+            return ["contributor shape is invalid"]
+        record_id = str(contributor.get("record_id") or "").strip()
+        if not record_id:
+            return ["contributor record_id is required"]
+        if record_id in seen:
+            return ["contributor record IDs must be unique"]
+        seen.add(record_id)
+        if contributor.get("quantity_source") not in {"normalized_record", "reviewed_allocation_target"}:
+            return ["contributor quantity_source is invalid"]
+        if not re.fullmatch(r"[a-f0-9]{64}", str(contributor.get("record_sha256") or "")):
+            return ["contributor record SHA-256 is invalid"]
+        amount = decimal_value(contributor.get("quantity"))
+        if amount <= 0:
+            return ["contributor quantity must be positive"]
+        total += amount
+    if total != line_quantity:
+        return ["contributor quantities do not equal line quantity"]
+    return []
 
 
 def reviewed_currency_rate(payload: dict[str, Any], *, base_currency: str = "EUR") -> float:
@@ -1190,6 +1238,7 @@ def execute_batch(
     posting_policy: dict[str, Any] | None = None,
     action_path: Path | None = None,
     cwd: Path | None = None,
+    expected_company_id: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if action_path is not None and cwd is not None:
         coverage_errors = [
@@ -1214,7 +1263,10 @@ def execute_batch(
         and str(dependency.get("kind") or "") == "manual_statement_import_financial_transaction"
     ]
     for dependency in manual_dependencies:
-        dependency_errors = manual_financial_dependency_errors(dependency)
+        dependency_errors = manual_financial_dependency_errors(
+            dependency, cwd=cwd, expected_company_id=expected_company_id,
+            require_typed_context=True,
+        )
         if dependency_errors:
             raise SimplbooksError(
                 "Action batch contains an invalid manual statement-import financial dependency "
@@ -1496,6 +1548,7 @@ def run_submission(
         posting_policy=posting_policy,
         action_path=action_path,
         cwd=cwd,
+        expected_company_id=resolved_company_id if mode == "write" else None,
     )
     prior_request_count = len((existing_submission or {}).get("request_log") or [])
     current_request_log = submission["request_log"][prior_request_count:]

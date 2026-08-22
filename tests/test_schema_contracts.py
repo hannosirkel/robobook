@@ -120,6 +120,12 @@ class SchemaContractTests(unittest.TestCase):
         artifact["action_file_sha256"] = "a" * 64
         self.assert_artifact_valid(schema_name="submission-log.schema.json", artifact=artifact)
 
+    def test_statement_import_evidence_template_matches_strict_schema(self) -> None:
+        artifact = json.loads(
+            (ROOT / "templates/statement-import-evidence.template.json").read_text(encoding="utf-8")
+        )
+        self.assert_artifact_valid(schema_name="statement-import-evidence.schema.json", artifact=artifact)
+
     def test_posting_policy_template_matches_strict_schema(self) -> None:
         artifact = json.loads((ROOT / "templates/posting-policy.template.json").read_text(encoding="utf-8"))
         self.assert_artifact_valid(schema_name="posting-policy.schema.json", artifact=artifact)
@@ -490,9 +496,18 @@ class SchemaContractTests(unittest.TestCase):
             "status": "verified",
             "required_evidence": "live_discovery_or_audit",
             "simplbooks_transaction_id": "txn-501",
-            "evidence_ref": "audit/2024-01#txn-501",
+            "evidence_binding": {"path": "evidence.json", "sha256": "a" * 64},
         }
         self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=batch)
+
+    def test_action_batch_schema_rejects_inventory_article_without_quantity_proof(self) -> None:
+        artifact = bookchecker.load_yaml(ROOT / "templates/actions-period.template.yaml")
+        artifact["actions"][0]["payload"] = {
+            "line_items": [{"article_id_hint": "3", "gross_amount": 20.0}]
+        }
+
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=artifact)
 
     def test_action_batch_schema_restricts_top_level_manual_financial_dispositions(self) -> None:
         dependency = {
@@ -513,7 +528,8 @@ class SchemaContractTests(unittest.TestCase):
             "split_proof": None,
             "statement_import_proof": {
                 "status": "verified", "required_evidence": "live_discovery_or_audit",
-                "simplbooks_transaction_id": "txn-501", "evidence_ref": "audit/2024-01#txn-501",
+                "simplbooks_transaction_id": "txn-501",
+                "evidence_binding": {"path": "evidence.json", "sha256": "a" * 64},
             },
         }
         batch = {

@@ -94,6 +94,87 @@ def bind_discoveries(action_path: Path, discovery_paths: list[Path]) -> None:
 
 
 class LiveMonthRunTests(unittest.TestCase):
+    def test_discovery_evidence_must_match_refreshed_cash_index(self) -> None:
+        evidence = {
+            "evidence_kind": "simplbooks_discovery", "company_id": "123",
+            "simplbooks_transaction_id": "txn-1", "transaction_date": "2024-03-15",
+            "currency": "EUR", "signed_amount": -7.0,
+        }
+        overview = {"document_index": [{
+            "document_type": "payment", "simplbooks_id": "txn-1",
+            "document_date": "2024-03-15", "currency": "EUR", "gross_amount": 8.0,
+        }]}
+
+        with self.assertRaisesRegex(live_month_run.SimplbooksError, "economics"):
+            live_month_run._validate_refreshed_cash_evidence(
+                evidence=evidence, discovery_payloads=[overview], expected_company_id="123"
+            )
+
+    def test_refreshed_discovery_evidence_failure_stops_before_builder(self) -> None:
+        calls: list[list[str]] = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            company_dir = root / "companies" / "example"
+            allocation = {
+                "statement_id": "archive:fee-1", "record_id": "fee-1", "iban": "EE123",
+                "period": "2024-03", "disposition": "bank_fee_payment", "amount": -7.0,
+                "currency": "EUR", "target": {"financial_transaction_kind": "bank-fee"},
+                "review": {"status": "approved", "rationale": "Reviewed bank fee."},
+            }
+            write_live_context(company_dir, allocations=[allocation])
+            company_dir.mkdir(parents=True, exist_ok=True)
+            (company_dir / "METADATA.md").write_text(
+                "Company name: Example\nCompany slug: example\nSimplbooks company ID: 123\n",
+                encoding="utf-8",
+            )
+            normalized = company_dir / "artifacts" / "normalized" / "2024-03.json"
+            snapshot = root / "discovery-snapshot.json"
+            snapshot.write_text("{}\n", encoding="utf-8")
+            evidence = {
+                "schema_version": "1.0", "company_slug": "example", "company_id": "123",
+                "period": "2024-03", "statement_id": "archive:fee-1", "record_id": "fee-1",
+                "transaction_date": "2024-03-15", "iban": "EE123", "currency": "EUR",
+                "signed_amount": -7.0, "simplbooks_transaction_id": "txn-1",
+                "evidence_kind": "simplbooks_discovery", "captured_at": "2026-08-22T00:00:00Z",
+                "source_identity": {
+                    "path": str(normalized), "sha256": hashlib.sha256(normalized.read_bytes()).hexdigest(),
+                    "record_ref": "fee-1",
+                },
+                "evidence_source": {
+                    "path": str(snapshot), "sha256": hashlib.sha256(snapshot.read_bytes()).hexdigest(),
+                    "record_ref": "txn-1",
+                },
+            }
+            evidence_path = root / "evidence.json"
+            evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+            allocation_path = company_dir / "artifacts" / "bank" / "2024-allocations.json"
+            allocation_payload = json.loads(allocation_path.read_text(encoding="utf-8"))
+            allocation_payload["allocations"][0]["target"]["statement_import_proof"] = {
+                "status": "verified", "required_evidence": "live_discovery_or_audit",
+                "simplbooks_transaction_id": "txn-1",
+                "evidence_binding": {
+                    "path": str(evidence_path),
+                    "sha256": hashlib.sha256(evidence_path.read_bytes()).hexdigest(),
+                },
+            }
+            allocation_path.write_text(json.dumps(allocation_payload), encoding="utf-8")
+
+            def fake_run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+                calls.append(cmd)
+                output = Path(cmd[cmd.index("--output") + 1])
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text(json.dumps({"year": 2024, "document_index": []}), encoding="utf-8")
+                return SimpleNamespace(returncode=0, stdout=json.dumps({"year": 2024}), stderr="")
+
+            with self.assertRaisesRegex(live_month_run.SimplbooksError, "does not contain exactly one"):
+                live_month_run.run_live_month(
+                    company_dir=company_dir, period="2024-03", python_executable="python3",
+                    cwd=ROOT, confirm_write=True, run_command=fake_run,
+                    approval_checkpoint=lambda _path: None,
+                )
+
+        self.assertEqual([Path(cmd[1]).name for cmd in calls], ["examine_simplbooks_year.py"])
+
     def test_pending_manual_proof_stops_before_discovery(self) -> None:
         calls: list[list[str]] = []
         with tempfile.TemporaryDirectory() as tmp:
@@ -124,7 +205,7 @@ class LiveMonthRunTests(unittest.TestCase):
                     "status": "verified",
                     "required_evidence": "live_discovery_or_audit",
                     "simplbooks_transaction_id": "txn-1",
-                    "evidence_ref": "audit#txn-1",
+                    "evidence_binding": {"path": "evidence.json", "sha256": "a" * 64},
                 },
             },
             {"kind": "informational_note", "blocking": False, "reason": "Reviewed context."},

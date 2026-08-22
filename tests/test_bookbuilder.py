@@ -510,7 +510,7 @@ class BookbuilderTests(unittest.TestCase):
             "status": "verified",
             "required_evidence": "live_discovery_or_audit",
             "simplbooks_transaction_id": "txn-501",
-            "evidence_ref": "audit/2024-08#txn-501",
+            "evidence_binding": {"path": "evidence.json", "sha256": "a" * 64},
         }
         allocations = {(allocation["statement_id"], allocation["iban"], allocation["currency"]): allocation}
 
@@ -1391,6 +1391,59 @@ class BookbuilderTests(unittest.TestCase):
 
         self.assertEqual(line["quantity"], 2.0)
         self.assertEqual(line["article_id_hint"], "3")
+        self.assertEqual(line["inventory_quantity_proof"]["quantity"], 2.0)
+
+    def test_inventory_article_is_blocked_for_mixed_known_and_missing_quantity(self) -> None:
+        normalized = base_normalized()
+        known = record(record_id="woo:known", source_system="woo", channel="woo",
+                       event_type="woo_daily_sales", gross_amount=30.0, description="Known")
+        known["quantity"] = 1
+        missing = record(record_id="woo:missing", source_system="woo", channel="woo",
+                         event_type="woo_daily_sales", gross_amount=30.0, description="Missing")
+        normalized["records"]["sales"] = [known, missing]
+        policy = policy_with_mixed_22_percent_profile()
+        policy["mappings"]["woo-non-taxable"]["article_id"] = "3"
+
+        batch = build_batch_with_policy(normalized, policy)
+        line = find_action(batch, "create_invoice_summary")["payload"]["line_items"][0]
+
+        self.assertIsNone(line["article_id_hint"])
+        self.assertTrue(any(item.get("kind") == "inventory_quantity" for item in batch["unresolved_dependencies"]))
+
+    def test_quartermaster_exact_goods_quantity_is_proven_and_shipping_is_not_inventory(self) -> None:
+        normalized = base_normalized()
+        sale = record(
+            record_id="quartermaster:sale:exact", source_system="quartermaster",
+            channel="quartermaster", event_type="quartermaster_sales_report",
+            gross_amount=120.0, description="Two Lunar Base plus shipping",
+        )
+        sale.update({"quantity": 2, "shipping_amount": 20.0})
+        normalized["records"]["sales"] = [sale]
+        policy = policy_with_mixed_22_percent_profile()
+        policy["contacts"]["sales"]["quartermaster"] = "77"
+        policy["mappings"]["quartermaster-non-taxable"] = {
+            "income_account_id": "109", "shipping_income_account_id": "255",
+            "vat_type_id": "12", "shipping_vat_type_id": "13",
+            "warehouse_id": "6", "article_id": "3",
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            batch = bookbuilder.build_action_batch(
+                normalized_payload=normalized, recon_payload=base_recon(),
+                normalized_path=root / "normalized.json", recon_path=root / "recon.json",
+                repo_root=root, posting_policy=policy,
+                policy_text="Shipping revenue separate.",
+            )
+        lines = find_action(batch, "create_invoice_summary")["payload"]["line_items"]
+        goods = next(line for line in lines if line["line_role"] == "sales_revenue")
+        shipping = next(line for line in lines if line["line_role"] == "sales_shipping")
+
+        self.assertEqual(goods["article_id_hint"], "3")
+        self.assertEqual(goods["quantity"], 2.0)
+        self.assertEqual(goods["inventory_quantity_proof"]["contributors"][0]["record_id"], sale["record_id"])
+        self.assertIsNone(shipping["article_id_hint"])
+        self.assertNotIn("inventory_quantity_proof", shipping)
 
     def test_builder_rejects_bank_row_without_source_account_under_policy(self) -> None:
         normalized = base_normalized()

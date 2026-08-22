@@ -243,7 +243,10 @@ def build_clean_artifacts(tmp: Path, *, recon_approve: bool = True, force: bool 
 def manual_financial_dependency(*, blocking: bool = False, status: str = "verified") -> dict:
     proof = {"status": status, "required_evidence": "live_discovery_or_audit"}
     if status == "verified":
-        proof.update({"simplbooks_transaction_id": "txn-501", "evidence_ref": "audit/2024-01#txn-501"})
+        proof.update({
+            "simplbooks_transaction_id": "txn-501",
+            "evidence_binding": {"path": "evidence.json", "sha256": "a" * 64},
+        })
     return {
         "kind": "manual_statement_import_financial_transaction",
         "blocking": blocking,
@@ -352,6 +355,49 @@ def bank_coverage_batch(*, period: str, allocation_path: Path, actions: list[dic
 
 
 class BookcheckerTests(unittest.TestCase):
+    def test_inventory_quantity_checker_rejects_tampered_normalized_contributor(self) -> None:
+        record = {"record_id": "woo:sale:1", "quantity": 2, "gross_amount": 40.0}
+        action = {"idempotency_key": "example-2024-01-inventory", "payload": {"line_items": [{
+            "line_role": "sales_revenue", "article_id_hint": "3", "quantity": 2,
+            "inventory_quantity_proof": {
+                "status": "exact", "quantity": 2,
+                "contributors": [{
+                    "record_id": "woo:sale:1", "quantity": 2,
+                    "quantity_source": "normalized_record", "record_sha256": "0" * 64,
+                }],
+            },
+        }]}}
+
+        findings = bookchecker.evaluate_inventory_quantities(
+            action=action,
+            resolved_sources=[{"record_ref": "woo:sale:1", "record": record}],
+            reviewed_allocations={},
+        )
+
+        self.assertTrue(any("SHA-256" in item["summary"] for item in findings))
+
+    def test_inventory_quantity_checker_uses_builder_canonical_unicode_hash(self) -> None:
+        record = {"record_id": "woo:sale:unicode", "quantity": 1, "description": "Lunar mäng"}
+        action = {"idempotency_key": "example-2024-01-unicode", "payload": {"line_items": [{
+            "line_role": "sales_revenue", "article_id_hint": "3", "quantity": 1,
+            "inventory_quantity_proof": {
+                "status": "exact", "quantity": 1,
+                "contributors": [{
+                    "record_id": record["record_id"], "quantity": 1,
+                    "quantity_source": "normalized_record",
+                    "record_sha256": bookbuilder.canonical_record_sha256(record),
+                }],
+            },
+        }]}}
+
+        findings = bookchecker.evaluate_inventory_quantities(
+            action=action,
+            resolved_sources=[{"record_ref": record["record_id"], "record": record}],
+            reviewed_allocations={},
+        )
+
+        self.assertEqual(findings, [])
+
     def test_explicit_bank_allocation_must_match_bound_artifact_path(self) -> None:
         batch = {
             "reference_artifacts": [{

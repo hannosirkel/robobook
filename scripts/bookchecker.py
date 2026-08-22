@@ -37,6 +37,11 @@ from reference_artifacts import (
     verify_file_binding,
 )
 from simplbooks_api import SimplbooksError, resolve_company_id, resolve_company_name
+from statement_import_evidence import (
+    StatementImportEvidenceError,
+    evidence_identity_errors,
+    load_bound_evidence,
+)
 
 
 TOLERANCE = Decimal("0.01")
@@ -1618,7 +1623,124 @@ def evaluate_exchange_rates(
     return findings
 
 
-def manual_financial_dependency_errors(dependency: dict[str, Any]) -> list[str]:
+def _canonical_record_sha256(record: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(record, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def evaluate_inventory_quantities(
+    *, action: dict[str, Any], resolved_sources: list[dict[str, Any]],
+    reviewed_allocations: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Independently prove each article line's quantity against immutable contributors."""
+    findings: list[dict[str, Any]] = []
+    records = {
+        str(item.get("record_ref") or ""): item.get("record")
+        for item in resolved_sources
+        if isinstance(item.get("record"), dict) and str(item.get("record_ref") or "")
+    }
+    for line in action_line_items(action):
+        if line.get("article_id_hint") in (None, ""):
+            continue
+        proof = line.get("inventory_quantity_proof")
+        problems: list[str] = []
+        if not isinstance(proof, dict) or set(proof) != {"status", "quantity", "contributors"}:
+            problems.append("Inventory article line requires an exact quantity proof object.")
+            contributors: list[Any] = []
+        else:
+            contributors = proof.get("contributors") if isinstance(proof.get("contributors"), list) else []
+            try:
+                line_quantity = decimal_value(line.get("quantity"))
+                proof_quantity = decimal_value(proof.get("quantity"))
+            except SimplbooksError:
+                line_quantity = proof_quantity = Decimal("0")
+            if proof.get("status") != "exact" or line_quantity <= 0 or proof_quantity != line_quantity:
+                problems.append("Inventory article line and proof require the same exact positive quantity.")
+            if not contributors:
+                problems.append("Inventory quantity proof requires contributors.")
+        seen: set[str] = set()
+        contributor_total = Decimal("0")
+        for contributor in contributors:
+            if not isinstance(contributor, dict) or set(contributor) != {
+                "record_id", "quantity", "quantity_source", "record_sha256"
+            }:
+                problems.append("Inventory quantity contributor shape is invalid.")
+                continue
+            record_id = str(contributor.get("record_id") or "")
+            if not record_id or record_id in seen:
+                problems.append("Inventory quantity contributors require unique record IDs.")
+                continue
+            seen.add(record_id)
+            try:
+                quantity = decimal_value(contributor.get("quantity"))
+            except SimplbooksError:
+                quantity = Decimal("0")
+            if quantity <= 0:
+                problems.append("Inventory quantity contributor must be positive.")
+                continue
+            contributor_total += quantity
+            record = records.get(record_id)
+            if not isinstance(record, dict):
+                problems.append(f"Inventory quantity contributor {record_id} is not an action source.")
+                continue
+            if _canonical_record_sha256(record) != str(contributor.get("record_sha256") or ""):
+                problems.append(f"Inventory quantity contributor {record_id} SHA-256 does not match its source record.")
+            source = contributor.get("quantity_source")
+            if source == "normalized_record":
+                try:
+                    source_quantity = decimal_value(record.get("quantity"))
+                except SimplbooksError:
+                    source_quantity = Decimal("0")
+                if source_quantity <= 0 or source_quantity != quantity:
+                    problems.append(f"Inventory quantity contributor {record_id} does not match normalized quantity.")
+            elif source == "reviewed_allocation_target":
+                allocation = reviewed_allocations.get(record_id)
+                target = allocation.get("target") if isinstance(allocation, dict) else None
+                try:
+                    allocated_quantity = decimal_value((target or {}).get("quantity"))
+                except SimplbooksError:
+                    allocated_quantity = Decimal("0")
+                if not isinstance(target, dict) or allocated_quantity <= 0 or allocated_quantity != quantity:
+                    problems.append(f"Inventory quantity contributor {record_id} does not match reviewed allocation target.")
+            else:
+                problems.append(f"Inventory quantity contributor {record_id} has unsupported quantity source.")
+        try:
+            if contributors and contributor_total != decimal_value(line.get("quantity")):
+                problems.append("Inventory contributor quantities do not reconcile to the article line.")
+        except SimplbooksError:
+            pass
+        for problem in problems:
+            findings.append(make_finding(
+                section="account_and_vat_review", severity="error", summary=problem,
+                action_id=action_label(action),
+            ))
+    return findings
+
+
+def load_reviewed_allocation_index(
+    action_batch: dict[str, Any], *, cwd: Path,
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    binding = _bank_allocation_binding(action_batch)
+    if binding is None:
+        return {}, []
+    try:
+        allocation_path = verify_file_binding(binding, cwd=cwd)
+        raw = load_json(allocation_path)
+        normalized_paths = _normalized_binding_paths(raw, cwd=cwd)
+        payload = load_bank_allocations(allocation_path, normalized_year_paths=normalized_paths)
+        return period_allocations(payload, str(action_batch.get("period") or "")), []
+    except (BankAllocationError, ReferenceArtifactError, SimplbooksError, OSError, json.JSONDecodeError) as exc:
+        return {}, [make_finding(
+            section="account_and_vat_review", severity="error",
+            summary=f"Inventory allocation proof cannot be loaded: {exc}",
+        )]
+
+
+def manual_financial_dependency_errors(
+    dependency: dict[str, Any], *, cwd: Path | None = None,
+    expected_company_id: str | None = None, require_typed_context: bool = False,
+) -> list[str]:
     errors: list[str] = []
     allowed_top_level_dispositions = {
         "bank_fee_payment",
@@ -1690,9 +1812,10 @@ def manual_financial_dependency_errors(dependency: dict[str, Any]) -> list[str]:
         errors.append("Manual financial dependency requires a statement import proof contract.")
     elif proof.get("status") == "verified" and (
         not str(proof.get("simplbooks_transaction_id") or "").strip()
-        or not str(proof.get("evidence_ref") or "").strip()
+        or not isinstance(proof.get("evidence_binding"), dict)
+        or set(proof.get("evidence_binding") or {}) != {"path", "sha256"}
     ):
-        errors.append("Verified statement import proof requires a SimplBooks transaction ID and evidence ref.")
+        errors.append("Verified statement import proof requires a SimplBooks transaction ID and evidence binding.")
     elif proof.get("status") == "pending" and dependency.get("blocking") is not True:
         errors.append("Pending statement import proof must remain blocking.")
     elif dependency.get("blocking") is False and proof.get("status") != "verified":
@@ -1769,6 +1892,19 @@ def manual_financial_dependency_errors(dependency: dict[str, Any]) -> list[str]:
         and physical_amount >= 0
     ):
         errors.append(f"Manual financial dependency {disposition} amount must be negative.")
+    if isinstance(proof, dict) and proof.get("status") == "verified" and not errors:
+        if cwd is None and require_typed_context:
+            errors.append("Verified statement import proof requires typed evidence validation context.")
+        elif cwd is not None:
+            try:
+                evidence = load_bound_evidence(proof.get("evidence_binding"), cwd=cwd)
+            except StatementImportEvidenceError as exc:
+                errors.append(str(exc))
+            else:
+                errors.extend(evidence_identity_errors(
+                    evidence, dependency=dependency, expected_company_id=expected_company_id,
+                    expected_transaction_id=str(proof.get("simplbooks_transaction_id") or ""),
+                ))
     return errors
 
 
@@ -1836,11 +1972,15 @@ def evaluate_unresolved_dependencies(
     cwd: Path | None = None,
     payload_cache: dict[Path, dict[str, Any]] | None = None,
     index_cache: dict[Path, dict[str, tuple[str, dict[str, Any]]]] | None = None,
+    expected_company_id: str | None = None,
 ) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     for dependency in action_batch.get("unresolved_dependencies") or []:
         if str(dependency.get("kind") or "") == "manual_statement_import_financial_transaction":
-            dependency_errors = manual_financial_dependency_errors(dependency)
+            dependency_errors = manual_financial_dependency_errors(
+                dependency, cwd=cwd, expected_company_id=expected_company_id,
+                require_typed_context=True,
+            )
             if action_path is not None and cwd is not None:
                 dependency_errors.extend(
                     manual_financial_source_errors(
@@ -2313,6 +2453,7 @@ def evaluate_action_batch(
             cwd=cwd,
             payload_cache=payload_cache,
             index_cache=index_cache,
+            expected_company_id=expected_company_id,
         )
     )
     findings.extend(evaluate_posting_policy(action_batch, posting_policy))
@@ -2351,6 +2492,8 @@ def evaluate_action_batch(
         )
         resolved_sources_by_action[action_label(action)] = resolved_sources
         findings.extend(source_findings)
+    reviewed_allocations, allocation_findings = load_reviewed_allocation_index(action_batch, cwd=cwd)
+    findings.extend(allocation_findings)
     split_payment_action_ids, split_payment_findings = evaluate_split_payment_groups(
         action_batch=action_batch,
         resolved_sources_by_action=resolved_sources_by_action,
@@ -2375,6 +2518,13 @@ def evaluate_action_batch(
                 resolved_sources=resolved_sources,
                 split_payment_action_ids=split_payment_action_ids,
                 physical_expected_amount=assigned_cash_amounts.get(action_label(action)),
+            )
+        )
+        findings.extend(
+            evaluate_inventory_quantities(
+                action=action,
+                resolved_sources=resolved_sources,
+                reviewed_allocations=reviewed_allocations,
             )
         )
         findings.extend(

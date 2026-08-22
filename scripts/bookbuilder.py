@@ -156,6 +156,31 @@ def decimal_number(value: Decimal | None) -> float | None:
     return float(value)
 
 
+def canonical_record_sha256(record: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(record, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def normalized_inventory_quantity_proof(records: list[dict[str, Any]]) -> dict[str, Any] | None:
+    contributors: list[dict[str, Any]] = []
+    total = Decimal("0")
+    for record in records:
+        quantity = decimal_value(record.get("quantity") or 0)
+        if quantity <= 0:
+            return None
+        total += quantity
+        contributors.append({
+            "record_id": str(record.get("record_id") or ""),
+            "quantity": decimal_number(quantity),
+            "quantity_source": "normalized_record",
+            "record_sha256": canonical_record_sha256(record),
+        })
+    if not contributors or total <= 0:
+        return None
+    return {"status": "exact", "quantity": decimal_number(total), "contributors": contributors}
+
+
 def normalize_ascii(value: str) -> str:
     normalized = unicodedata.normalize("NFKD", value)
     return normalized.encode("ascii", "ignore").decode("ascii")
@@ -1317,6 +1342,7 @@ def build_sales_lines(
         total_vat = sum_abs_amount(records, "vat_amount")
         revenue_gross = total_gross - total_shipping
         shipping_vat_type_id = shipping_standard_vat_id if total_vat != 0 else shipping_zero_vat_id
+        inventory_proof = normalized_inventory_quantity_proof(records)
         lines.append(
             {
                 "line_role": f"{direction}_revenue",
@@ -1328,6 +1354,7 @@ def build_sales_lines(
                 "suggested_vat_type_id": standard_vat_id if total_vat != 0 else zero_vat_id,
                 "warehouse_id_hint": maybe_single_warehouse(records) or default_warehouse_id,
                 "quantity": decimal_number(sum((decimal_value(record.get("quantity") or 0) for record in records), Decimal("0"))) or None,
+                "inventory_quantity_proof": inventory_proof,
                 "record_count": len(records),
             }
         )
@@ -1353,6 +1380,7 @@ def build_sales_lines(
             gross_amount = sum_abs_amount(profile_records, "gross_amount")
             vat_amount = sum_abs_amount(profile_records, "vat_amount")
             shipping_amount = sum_abs_amount(profile_records, "shipping_amount")
+            inventory_proof = normalized_inventory_quantity_proof(profile_records)
             lines.append(
                 {
                     "line_role": f"{direction}_revenue",
@@ -1364,6 +1392,7 @@ def build_sales_lines(
                     "suggested_vat_type_id": standard_vat_id if profile_name == "taxable" else zero_vat_id,
                     "warehouse_id_hint": maybe_single_warehouse(profile_records) or default_warehouse_id,
                     "quantity": decimal_number(sum((decimal_value(record.get("quantity") or 0) for record in profile_records), Decimal("0"))) or None,
+                    "inventory_quantity_proof": inventory_proof,
                     "record_count": len(profile_records),
                 }
             )
@@ -2584,6 +2613,16 @@ def build_direct_sale_actions(
                     "suggested_vat_type_id": vat_type_id,
                     "warehouse_id_hint": warehouse_id,
                     "article_id_hint": article_id,
+                    "inventory_quantity_proof": {
+                        "status": "exact",
+                        "quantity": decimal_number(entry["quantity"]),
+                        "contributors": [{
+                            "record_id": str(entry["record"].get("record_id") or ""),
+                            "quantity": decimal_number(entry["quantity"]),
+                            "quantity_source": "reviewed_allocation_target",
+                            "record_sha256": canonical_record_sha256(entry["record"]),
+                        }],
+                    },
                     "record_count": 1,
                     "vat_profile_name": vat_profile_name,
                     "vat_profile_rate": vat_rate,
@@ -3234,9 +3273,27 @@ def apply_posting_policy(
                 else:
                     line["warehouse_id_hint"] = None
                 if not is_shipping and family_values.get("article_id") not in (None, ""):
-                    line["article_id_hint"] = resolve_mapping(
-                        posting_policy, family=family, field_name="article_id"
-                    )
+                    proof = line.get("inventory_quantity_proof")
+                    exact_quantity = decimal_value(line.get("quantity"))
+                    proof_quantity = decimal_value(proof.get("quantity")) if isinstance(proof, dict) else Decimal("0")
+                    contributors = proof.get("contributors") if isinstance(proof, dict) else None
+                    if (
+                        isinstance(proof, dict) and proof.get("status") == "exact"
+                        and exact_quantity > 0 and proof_quantity == exact_quantity
+                        and isinstance(contributors, list) and contributors
+                    ):
+                        line["article_id_hint"] = resolve_mapping(
+                            posting_policy, family=family, field_name="article_id"
+                        )
+                    else:
+                        line["article_id_hint"] = None
+                        unresolved.append({
+                            "action_id": action.get("idempotency_key"),
+                            "kind": "inventory_quantity",
+                            "blocking": True,
+                            "reason": "Inventory article requires exact positive reviewed quantity for every contributing goods source.",
+                            "line_role": line_role,
+                        })
                 else:
                     line["article_id_hint"] = None
                 allocation_component = str(line.get("vat_allocation_component") or "")

@@ -159,6 +159,8 @@ class BankAllocationTests(unittest.TestCase):
             item["target"]["statement_import_proof"] = {
                 "status": "verified",
                 "required_evidence": "live_discovery_or_audit",
+                "simplbooks_transaction_id": "txn-501",
+                "evidence_binding": {"path": str(root / "missing.json"), "sha256": "0" * 64},
             }
             payload = {
                 "schema_version": "1.0",
@@ -173,7 +175,7 @@ class BankAllocationTests(unittest.TestCase):
             allocation_path = root / "allocations.json"
             allocation_path.write_text(json.dumps(payload), encoding="utf-8")
 
-            with self.assertRaisesRegex(bank_allocations.BankAllocationError, "statement_import_proof"):
+            with self.assertRaisesRegex(bank_allocations.BankAllocationError, "does not exist"):
                 bank_allocations.load_bank_allocations(
                     allocation_path, normalized_year_paths=[normalized_path]
                 )

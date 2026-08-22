@@ -366,7 +366,10 @@ def write_full_prevalidation_fixture(
 def manual_financial_dependency(*, status: str = "pending", blocking: bool = True) -> dict:
     proof = {"status": status, "required_evidence": "live_discovery_or_audit"}
     if status == "verified":
-        proof.update({"simplbooks_transaction_id": "txn-501", "evidence_ref": "audit/2024-01#txn-501"})
+        proof.update({
+            "simplbooks_transaction_id": "txn-501",
+            "evidence_binding": {"path": "evidence.json", "sha256": "a" * 64},
+        })
     return {
         "kind": "manual_statement_import_financial_transaction",
         "blocking": blocking,
@@ -388,6 +391,35 @@ def manual_financial_dependency(*, status: str = "pending", blocking: bool = Tru
         "split_parts": [],
         "split_proof": None,
         "statement_import_proof": proof,
+    }
+
+
+def bind_statement_import_evidence(root: Path, dependency: dict) -> None:
+    normalized = root / "normalized.json"
+    audit_export = root / "audit-export.json"
+    normalized.write_text("{}\n", encoding="utf-8")
+    audit_export.write_text("{}\n", encoding="utf-8")
+    evidence = {
+        "schema_version": "1.0", "company_slug": "example", "company_id": "123",
+        "period": "2024-01", "statement_id": dependency["statement_id"],
+        "record_id": dependency["record_id"], "transaction_date": dependency["date"],
+        "iban": dependency["iban"], "currency": dependency["currency"],
+        "signed_amount": dependency["physical_signed_amount"],
+        "simplbooks_transaction_id": "txn-501", "evidence_kind": "simplbooks_ui_export",
+        "captured_at": "2026-08-22T00:00:00Z",
+        "source_identity": {
+            "path": str(normalized), "sha256": booksend.file_sha256(normalized),
+            "record_ref": dependency["record_id"],
+        },
+        "evidence_source": {
+            "path": str(audit_export), "sha256": booksend.file_sha256(audit_export),
+            "record_ref": "txn-501",
+        },
+    }
+    evidence_path = root / "evidence.json"
+    evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+    dependency["statement_import_proof"]["evidence_binding"] = {
+        "path": str(evidence_path), "sha256": booksend.file_sha256(evidence_path),
     }
 
 
@@ -599,6 +631,13 @@ class BooksendTests(unittest.TestCase):
             "suggested_vat_type_id": "22",
             "warehouse_id_hint": "6",
             "article_id_hint": "3",
+            "inventory_quantity_proof": {
+                "status": "exact", "quantity": 2,
+                "contributors": [{
+                    "record_id": "source:sale:1", "quantity": 2,
+                    "quantity_source": "normalized_record", "record_sha256": "a" * 64,
+                }],
+            },
         }]
 
         translated = booksend.translate_action_for_api(action, lookup={})
@@ -607,6 +646,32 @@ class BooksendTests(unittest.TestCase):
         self.assertEqual(row["amount"], 2.0)
         self.assertEqual(row["price_per_unit"], 20.0)
         self.assertEqual(row["article_id"], 3)
+
+    def test_sender_rejects_article_line_without_exact_quantity_proof(self) -> None:
+        action = invoice_action(key="example-2024-01-inventory")
+        line = action["payload"]["line_items"][0]
+        line["article_id_hint"] = "3"
+        line.pop("quantity", None)
+
+        with self.assertRaisesRegex(SimplbooksError, "inventory quantity proof"):
+            booksend.translate_action_for_api(action, lookup={})
+
+    def test_sender_rejects_duplicate_inventory_quantity_contributors(self) -> None:
+        action = invoice_action(key="example-2024-01-inventory-duplicate")
+        line = action["payload"]["line_items"][0]
+        line.update({
+            "article_id_hint": "3", "quantity": 2,
+            "inventory_quantity_proof": {
+                "status": "exact", "quantity": 2,
+                "contributors": [
+                    {"record_id": "woo:1", "quantity": 1, "quantity_source": "normalized_record", "record_sha256": "a" * 64},
+                    {"record_id": "woo:1", "quantity": 1, "quantity_source": "normalized_record", "record_sha256": "a" * 64},
+                ],
+            },
+        })
+
+        with self.assertRaisesRegex(SimplbooksError, "unique"):
+            booksend.translate_action_for_api(action, lookup={})
 
     def test_sender_rejects_manual_financial_dependency_before_any_translation_or_call(self) -> None:
         dependency = manual_financial_dependency(blocking=False)
@@ -623,26 +688,52 @@ class BooksendTests(unittest.TestCase):
 
     def test_sender_allows_verified_nonblocking_manual_dependency_and_translates_remaining_actions(self) -> None:
         client = FakeClient(responses=[])
-
-        _batch, submission = booksend.execute_batch(
-            action_batch=make_batch(
-                actions=[invoice_action()],
-                unresolved_dependencies=[manual_financial_dependency(status="verified", blocking=False)],
-            ),
-            mode="dry-run",
-            client=client,
-        )
+        dependency = manual_financial_dependency(status="verified", blocking=False)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            bind_statement_import_evidence(tmp, dependency)
+            _batch, submission = booksend.execute_batch(
+                action_batch=make_batch(actions=[invoice_action()], unresolved_dependencies=[dependency]),
+                mode="dry-run", client=client, cwd=tmp,
+            )
 
         self.assertEqual(submission["summary"]["attempted_actions"], 1)
         self.assertEqual(len(submission["request_log"]), 1)
         self.assertEqual(client.calls, [])
 
+    def test_sender_rejects_typed_evidence_economic_mismatch_before_client(self) -> None:
+        dependency = manual_financial_dependency(status="verified", blocking=False)
+        client = FakeClient(responses=[{"_http_status": 201, "invoice_id": 501}])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            bind_statement_import_evidence(tmp, dependency)
+            dependency["physical_signed_amount"] = -8.0
+            with self.assertRaisesRegex(SimplbooksError, "signed amount"):
+                booksend.execute_batch(
+                    action_batch=make_batch(actions=[invoice_action()], unresolved_dependencies=[dependency]),
+                    mode="write", client=client, cwd=tmp,
+                )
+        self.assertEqual(client.calls, [])
+
+    def test_sender_rejects_typed_evidence_company_mismatch_before_client(self) -> None:
+        dependency = manual_financial_dependency(status="verified", blocking=False)
+        client = FakeClient(responses=[{"_http_status": 201, "invoice_id": 501}])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            bind_statement_import_evidence(tmp, dependency)
+            with self.assertRaisesRegex(SimplbooksError, "company ID"):
+                booksend.execute_batch(
+                    action_batch=make_batch(actions=[invoice_action()], unresolved_dependencies=[dependency]),
+                    mode="write", client=client, cwd=tmp, expected_company_id="wrong-company",
+                )
+        self.assertEqual(client.calls, [])
+
     def test_sender_rejects_incomplete_verified_manual_dependency_before_any_call(self) -> None:
         dependency = manual_financial_dependency(status="verified", blocking=False)
-        dependency["statement_import_proof"].pop("evidence_ref")
+        dependency["statement_import_proof"].pop("evidence_binding")
         client = FakeClient(responses=[{"_http_status": 201, "invoice_id": 501}])
 
-        with self.assertRaisesRegex(SimplbooksError, "evidence ref"):
+        with self.assertRaisesRegex(SimplbooksError, "evidence binding"):
             booksend.execute_batch(
                 action_batch=make_batch(actions=[invoice_action()], unresolved_dependencies=[dependency]),
                 mode="write",

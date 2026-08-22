@@ -7,6 +7,7 @@ import json
 import re
 import subprocess
 import sys
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable
 
@@ -15,6 +16,8 @@ from bank_allocations import BankAllocationError, load_bank_allocations, period_
 from full_year_dry_run import parse_json_output, submitted_month_state
 from reference_artifacts import ReferenceArtifactError, verify_file_binding
 from simplbooks_api import SimplbooksError
+from simplbooks_api import resolve_company_id
+from statement_import_evidence import StatementImportEvidenceError, load_bound_evidence
 
 
 CommandRunner = Callable[..., Any]
@@ -156,6 +159,73 @@ def _load_live_allocations(*, company_dir: Path, period: str) -> list[dict[str, 
     return selected
 
 
+def _validate_refreshed_cash_evidence(
+    *, evidence: dict[str, Any], discovery_payloads: list[dict[str, Any]],
+    expected_company_id: str,
+) -> None:
+    if str(evidence.get("company_id") or "") != str(expected_company_id):
+        raise SimplbooksError("Statement-import evidence company identity does not match live company metadata.")
+    if evidence.get("evidence_kind") != "simplbooks_discovery":
+        return
+    transaction_id = str(evidence.get("simplbooks_transaction_id") or "")
+    candidates = [
+        item
+        for overview in discovery_payloads
+        for item in overview.get("document_index") or []
+        if isinstance(item, dict)
+        and item.get("document_type") in {"incoming", "payment"}
+        and str(item.get("simplbooks_id") or "") == transaction_id
+    ]
+    if len(candidates) != 1:
+        raise SimplbooksError(
+            "Fresh SimplBooks discovery does not contain exactly one cash transaction for "
+            f"statement-import evidence ID {transaction_id}."
+        )
+    item = candidates[0]
+    try:
+        discovered = Decimal(str(item.get("gross_amount")))
+        expected = Decimal(str(evidence.get("signed_amount")))
+    except (InvalidOperation, ValueError) as exc:
+        raise SimplbooksError("Fresh cash discovery/evidence amount is invalid.") from exc
+    if item.get("document_type") == "payment":
+        discovered = -abs(discovered)
+    if (
+        str(item.get("document_date") or "") != str(evidence.get("transaction_date") or "")
+        or str(item.get("currency") or "") != str(evidence.get("currency") or "")
+        or discovered != expected
+    ):
+        raise SimplbooksError("Fresh SimplBooks cash transaction economics do not match typed statement-import evidence.")
+
+
+def _validate_live_statement_evidence(
+    *, allocations: list[dict[str, Any]], discovery_paths: list[Path],
+    company_dir: Path, cwd: Path,
+) -> None:
+    proofs = [
+        target.get("statement_import_proof")
+        for allocation in allocations
+        for target in _allocation_targets(allocation)
+        if isinstance(target.get("statement_import_proof"), dict)
+        and target.get("statement_import_proof", {}).get("status") == "verified"
+    ]
+    if not proofs:
+        return
+    try:
+        company_id = resolve_company_id(None, company_dir=str(company_dir))
+        discovery_payloads = [json.loads(path.read_text(encoding="utf-8")) for path in discovery_paths]
+    except (OSError, json.JSONDecodeError, SimplbooksError) as exc:
+        raise SimplbooksError(f"Cannot validate refreshed statement-import evidence: {exc}") from exc
+    for proof in proofs:
+        try:
+            evidence = load_bound_evidence(proof.get("evidence_binding"), cwd=cwd)
+        except StatementImportEvidenceError as exc:
+            raise SimplbooksError(f"Statement-import evidence binding is invalid: {exc}") from exc
+        _validate_refreshed_cash_evidence(
+            evidence=evidence, discovery_payloads=discovery_payloads,
+            expected_company_id=company_id,
+        )
+
+
 def _interactive_approval_checkpoint(action_path: Path) -> None:
     input(
         f"Review {action_path}, change only approval_status from draft to approved, "
@@ -244,6 +314,11 @@ def run_live_month(
         ]
         commands.append(discovery_command)
         _run_step(command=discovery_command, cwd=cwd, runner=runner, label=f"Discovery refresh {discovery_year}")
+
+    _validate_live_statement_evidence(
+        allocations=live_allocations, discovery_paths=discovery_paths,
+        company_dir=company_dir, cwd=cwd,
+    )
 
     builder_command = [
         python_executable, "scripts/bookbuilder.py", "--company-dir", str(company_dir),

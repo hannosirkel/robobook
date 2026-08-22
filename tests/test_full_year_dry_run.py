@@ -1,4 +1,4 @@
-from __future__ import annotations
+from __future__ import annotations  # noqa: I001
 
 import json
 import hashlib
@@ -12,7 +12,7 @@ from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-import full_year_dry_run  # noqa: E402
+import full_year_dry_run  # noqa: E402, I001
 import bookprep  # noqa: E402
 
 

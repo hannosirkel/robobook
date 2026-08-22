@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-from __future__ import annotations
+from __future__ import annotations  # noqa: EXE001, I001
 
 import argparse
 import hashlib
@@ -101,7 +101,7 @@ def normalize_text(value: Any) -> str:
 
 def decimal_value(value: Any) -> Decimal:
     if value in (None, ""):
-        return Decimal("0")
+        return Decimal("0")  # noqa: FURB157
     try:
         return Decimal(str(value))
     except InvalidOperation as exc:
@@ -114,10 +114,10 @@ def decimal_number(value: Decimal | None) -> float | None:
     return float(value)
 
 
-def decimal_text(value: Decimal | int | float | str) -> str:
+def decimal_text(value: Decimal | int | float | str) -> str:  # noqa: PYI041
     normalized = decimal_value(value).normalize()
     if normalized == normalized.to_integral():
-        return format(normalized.quantize(Decimal("1")), "f")
+        return format(normalized.quantize(Decimal("1")), "f")  # noqa: FURB157
     return format(normalized, "f")
 
 
@@ -433,14 +433,14 @@ def collect_live_state(client: SimplbooksClient, *, scope: AuditScope) -> dict[s
 
 
 def sum_amount(records: list[dict[str, Any]], field: str) -> Decimal:
-    total = Decimal("0")
+    total = Decimal("0")  # noqa: FURB157
     for record in records:
         total += decimal_value(record.get(field))
     return total
 
 
 def sum_abs_amount(records: list[dict[str, Any]], field: str) -> Decimal:
-    total = Decimal("0")
+    total = Decimal("0")  # noqa: FURB157
     for record in records:
         total += abs(decimal_value(record.get(field)))
     return total
@@ -467,8 +467,8 @@ def record_quantity(record: dict[str, Any]) -> Decimal:
             try:
                 return decimal_value(candidate)
             except SimplbooksError:
-                return Decimal("0")
-    return Decimal("0")
+                return Decimal("0")  # noqa: FURB157
+    return Decimal("0")  # noqa: FURB157
 
 
 def record_haystack(record: dict[str, Any]) -> str:
@@ -661,7 +661,7 @@ def build_source_snapshot(payloads: list[dict[str, Any]], *, policy_text: str | 
         "fulfillment_partners": fulfillment_partners,
         "inventory_expected": inventory_expected,
         "warehouse_ids": source_warehouse_ids,
-        "inventory_quantity_total": sum((abs(record_quantity(record)) for record in records["inventory_movements"]), Decimal("0")),
+        "inventory_quantity_total": sum((abs(record_quantity(record)) for record in records["inventory_movements"]), Decimal("0")),  # noqa: FURB157
         "invoice_record_count": len(effective_sales) + len(effective_refunds),
         "purchase_record_count": len(records["purchase_expenses"]) + sum(len(source_records) for _, source_records, _ in fee_groups),
         "payout_record_count": len(records["payouts"]),
@@ -683,7 +683,7 @@ def document_total(document: dict[str, Any], *keys: str) -> Decimal:
     for key in keys:
         if document.get(key) not in (None, ""):
             return decimal_value(document.get(key))
-    return Decimal("0")
+    return Decimal("0")  # noqa: FURB157
 
 
 def nonempty_ids(rows: list[dict[str, Any]], key: str) -> list[str]:
@@ -1072,7 +1072,7 @@ def sample_document_records(live: dict[str, Any], scope: AuditScope) -> list[dic
         decorated = []
         for document in documents:
             identifier = str(document.get("id") or document.get("number") or json.dumps(document, sort_keys=True))
-            stable_hash = hashlib.sha256(f"{scope.label}:{doc_type}:{identifier}".encode("utf-8")).hexdigest()
+            stable_hash = hashlib.sha256(f"{scope.label}:{doc_type}:{identifier}".encode("utf-8")).hexdigest()  # noqa: UP012
             decorated.append((stable_hash, document))
         decorated.sort(key=lambda item: item[0])
         chosen = decorated[0][1]

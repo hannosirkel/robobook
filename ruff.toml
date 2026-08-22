@@ -1,0 +1,16 @@
+# Lint settings for the `ruff check` gate. See
+# https://github.com/hannosirkel/architecture/blob/main/standards/languages/python.md
+#
+# Two settings, each for a reason. Everything else is ruff's default.
+
+# The Validate workflow installs Python 3.13. Left unset, ruff assumes 3.10 and
+# offers modernisation advice for a version this repository never runs.
+target-version = "py313"
+
+[lint]
+# Every test module puts `sys.path` manipulation above its imports of the
+# `scripts/` modules and already carries a `# noqa: E402` directive on each one.
+# E402 is not in ruff's default selection, so without this those 25 directives
+# are dead and ruff reports each as RUF100 unused-noqa. Enabling the rule honours
+# the directives the repository already wrote.
+extend-select = ["E402"]

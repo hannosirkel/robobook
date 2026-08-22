@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-from __future__ import annotations
+from __future__ import annotations  # noqa: EXE001, I001
 
 import re
 import unicodedata
 from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation
-from typing import Any, Iterable, Literal
+from typing import Any, Iterable, Literal  # noqa: UP035
 
 
 MatchStatus = Literal["exact", "ambiguous", "none"]

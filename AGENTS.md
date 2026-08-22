@@ -59,6 +59,12 @@ python3 -m venv .venv
 Run the tests before every handoff. The rest of the command catalogue is in
 [`docs/current/repository-layout.md`](docs/current/repository-layout.md).
 
+`ruff check .` also gates a merge. It blocks on new work only: this repository's
+existing findings are baselined as `# noqa:` directives in the files themselves.
+**Never change a line of logic to satisfy the linter**, and never widen a
+directive to cover something your own change introduced. See
+[`docs/current/repository-layout.md`](docs/current/repository-layout.md).
+
 ## This repository is public, and it must stay publishable
 
 - **No real company details, no real name, no customer data, no credential.**

@@ -1,4 +1,4 @@
-from __future__ import annotations
+from __future__ import annotations  # noqa: I001
 
 import json
 import hashlib
@@ -725,7 +725,7 @@ class BookprepTests(unittest.TestCase):
                     period_end=period_end,
                     base_currency="EUR",
                 )
-            except Exception as exc:  # the unsupported format is the failing behavior under test
+            except Exception as exc:  # the unsupported format is the failing behavior under test  # noqa: BLE001
                 self.fail(f"Stripe payouts history format was not parsed: {exc}")
 
             self.assertEqual(source.parser_name, "parse_stripe_payouts_csv")
@@ -765,7 +765,7 @@ class BookprepTests(unittest.TestCase):
                     period_end=period_end,
                     base_currency="EUR",
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 self.fail(f"Stripe payout statuses were not handled conservatively: {exc}")
 
             self.assertFalse(records["payouts"])
@@ -1102,7 +1102,7 @@ class BookprepTests(unittest.TestCase):
             root = Path(tmp)
             source = pdf_source(root, "stripe-fee.pdf", source_system="stripe")
             pages = [
-                "Tax Invoice\n"
+                "Tax Invoice\n"  # noqa: ISC004
                 "Invoice Number\nCWZ5RHUU-2023-01\n"
                 "Invoice Date\nFeb 1, 2023\n"
                 "Service Month\nJan 2023\n"
@@ -1133,7 +1133,7 @@ class BookprepTests(unittest.TestCase):
             root = Path(tmp)
             source = pdf_source(root, "qm_sales_10.pdf", source_system="quartermaster")
             pages = [
-                "Sales Report\n"
+                "Sales Report\n"  # noqa: ISC004
                 "Date\n10/31/2024\n"
                 "S.R. No.\n1174\n"
                 "Vendor\nPlepic Games LLC\n"
@@ -1174,7 +1174,7 @@ class BookprepTests(unittest.TestCase):
             root = Path(tmp)
             source = pdf_source(root, "qm_sales_01.pdf", source_system="quartermaster")
             pages = [
-                "Sales Report\n"
+                "Sales Report\n"  # noqa: ISC004
                 "Date\n1/31/2025\n"
                 "S.R. No.\n1504\n"
                 "Vendor\nPlepic Games LLC\n"
@@ -1230,7 +1230,7 @@ class BookprepTests(unittest.TestCase):
             root = Path(tmp)
             source = pdf_source(root, "qm_sales_07.pdf", source_system="quartermaster")
             pages = [
-                "Sales Report\nDate\n8/31/2025\nS.R. No.\n2385\n"
+                "Sales Report\nDate\n8/31/2025\nS.R. No.\n2385\n"  # noqa: ISC004
                 "Vendor\nPlepic Games LLC\nQuartermaster Direct\n"
                 "This represents your Sales Report for August 2025. NOTE: No sales for this pay period.\n"
                 "Lunar Base - Sold Copies\n0 5.00 0.00\n"
@@ -1252,7 +1252,7 @@ class BookprepTests(unittest.TestCase):
             root = Path(tmp)
             source = pdf_source(root, "2024.10.01_Quartermaster.pdf", source_system="quartermaster")
             pages = [
-                "INVOICE\n"
+                "INVOICE\n"  # noqa: ISC004
                 "Quartermaster Logistics LLC\n"
                 "Invoice Date\n"
                 "10/01/2024\n"
@@ -1300,7 +1300,7 @@ class BookprepTests(unittest.TestCase):
             root = Path(tmp)
             source = pdf_source(root, "2024.04.20_DPD.pdf", source_system="document")
             pages = [
-                "DPD EESTI AS\n"
+                "DPD EESTI AS\n"  # noqa: ISC004
                 "Plepic Games OÜ Arve number 40534576\n"
                 "Arve kuupäev 20.04.2024\n"
                 "Maksetähtaeg 20.04.2024\n"
@@ -1330,7 +1330,7 @@ class BookprepTests(unittest.TestCase):
             root = Path(tmp)
             source = pdf_source(root, "2024.10.15_Omniva.pdf", source_system="document")
             pages = [
-                "Arve\n"
+                "Arve\n"  # noqa: ISC004
                 "A000048795\n"
                 "Arve kuupäev\n"
                 "15.10.2024\n"
@@ -1367,7 +1367,7 @@ class BookprepTests(unittest.TestCase):
             root = Path(tmp)
             source = pdf_source(root, "2024.08.28_Balti_Logistika.pdf", source_system="document")
             pages = [
-                "ARVE 127434\n"
+                "ARVE 127434\n"  # noqa: ISC004
                 "Arve kuupäev: 28.08.2024\n"
                 "BALTI LOGISTIKA AS\n"
                 "Euroopa Keskpanga valuutakursid: 852.0 EUR 9.24 EUR 861.24 EUR\n"
@@ -1394,7 +1394,7 @@ class BookprepTests(unittest.TestCase):
             root = Path(tmp)
             source = pdf_source(root, "2025.10.30_JaJaa.pdf", source_system="document")
             pages = [
-                "Kuupäev:\nTingimused:\nTähtaeg:\n5 päeva\n04.11.2025\n"
+                "Kuupäev:\nTingimused:\nTähtaeg:\n5 päeva\n04.11.2025\n"  # noqa: ISC004
                 "Jajaa OÜ\nTatari 8/Sakala 22\n"
                 "11,30 20 Värviprint A4 300g 105\n"
                 "Plepic Games OÜ\nMaksja:\nJajaa OÜ\n30.10.2025\n"
@@ -1465,7 +1465,7 @@ class BookprepTests(unittest.TestCase):
             root = Path(tmp)
             source = pdf_source(root, "printful-report.pdf", source_system="printful")
             pages = [
-                "VAT report\n"
+                "VAT report\n"  # noqa: ISC004
                 "Invoice date: 2023-02-10\n"
                 "Invoice: #LV90011218978-EE102137075-EUR-202301\n"
                 "Invoice period: Jan 1, 2023 - Jan 31, 2023\n"
@@ -1642,7 +1642,7 @@ class BookprepTests(unittest.TestCase):
             source = pdf_source(root, "printful-report.pdf", source_system="printful")
             source.canonical = True
             pages = [
-                "VAT report\n"
+                "VAT report\n"  # noqa: ISC004
                 "Invoice date: 2023-02-10\n"
                 "Invoice: #LV90011218978-EE102137075-EUR-202301\n"
                 "Invoice period: Jan 1, 2023 - Jan 31, 2023\n"
@@ -1701,7 +1701,7 @@ class BookprepTests(unittest.TestCase):
             assert source is not None
             source.canonical = True
             pages = [
-                "VAT report\n"
+                "VAT report\n"  # noqa: ISC004
                 "Invoice date: 2023-09-10\n"
                 "Invoice: #LV90011218978-EE102137075-EUR-202308\n"
                 "Invoice period: Aug 1, 2023 - Aug 31, 2023\n"
@@ -1750,7 +1750,7 @@ class BookprepTests(unittest.TestCase):
             previous_source.canonical = True
             current_source.canonical = True
             pages = [
-                "VAT report\n"
+                "VAT report\n"  # noqa: ISC004
                 "Please find invoice details in the invoice attachment.\n"
                 "Invoice #85131636\n"
                 "Printful Inc.\n"
@@ -1777,7 +1777,7 @@ class BookprepTests(unittest.TestCase):
             root = Path(tmp)
             source = pdf_source(root, "simplbooks.pdf", source_system="document")
             pages = [
-                "Arve nr EE23111186\n"
+                "Arve nr EE23111186\n"  # noqa: ISC004
                 "Kuupäev 18.11.2023\n"
                 "Toode/Teenus Hind Kogus Summa KM Kokku\n"
                 "SimplBooks raamatupidamistarkvara teenustasu\n"
@@ -1808,7 +1808,7 @@ class BookprepTests(unittest.TestCase):
             root = Path(tmp)
             source = pdf_source(root, "2024.11.28_Simplbooks.pdf", source_system="document")
             pages = [
-                "Arve nr EE24111268\n"
+                "Arve nr EE24111268\n"  # noqa: ISC004
                 "Kuupäev 18.11.2024\n"
                 "KLIENT\n"
                 "Plepic Games OÜ\n"

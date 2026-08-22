@@ -11,15 +11,19 @@ permissions:
 
 jobs:
   validate:
+    name: Validate
     runs-on: ubuntu-24.04
     steps:
       - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        # actions/setup-python v7.0.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: '3.13'
 
@@ -28,6 +32,15 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip
           python -m pip install --requirement requirements.txt
+          python -m pip install --requirement requirements-dev.txt
+
+      - name: Lint
+        # Gates on new work only. Today's findings are recorded as `# noqa:`
+        # directives in the files themselves, so a later run reports only what
+        # a change introduced. See standards/languages/python.md.
+        run: |
+          set -euo pipefail
+          ruff check .
 
       - name: Run tests
         run: |
@@ -48,3 +61,50 @@ jobs:
           echo "${GITLEAKS_SHA256}  ${archive}" | sha256sum --check --strict
           tar -xzf "$archive" gitleaks
           ./gitleaks git --redact --verbose
+
+  documentation:
+    name: Documentation
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Check layout
+        # DavidAnson/markdownlint-cli2-action v24.2.0
+        uses: DavidAnson/markdownlint-cli2-action@21c1be1b93ad9ed58fa840aacc3f279cde2a72ff
+        with:
+          globs: '**/*.md'
+
+      - name: Check links
+        # lycheeverse/lychee-action v2.9.0
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8
+        with:
+          args: --no-progress --config lychee.toml .
+          fail: true
+
+  workflows:
+    name: Workflow lint
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        # actions/setup-python v7.0.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.13'
+
+      - name: Lint the workflows
+        # A workflow is the shortest path from a pull request to a token, and
+        # agents edit workflows constantly. See standards/security.md.
+        run: |
+          set -euo pipefail
+          python -m pip install 'zizmor==1.29.0'
+          zizmor --persona=regular .github/workflows/

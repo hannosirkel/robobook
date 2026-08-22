@@ -10,7 +10,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-import bookchecker  # noqa: E402
+import bookchecker  # noqa: E402, I001
 import bookbuilder  # noqa: E402
 import examine_simplbooks_year  # noqa: E402
 

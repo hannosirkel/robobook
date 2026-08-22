@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-from __future__ import annotations
+from __future__ import annotations  # noqa: EXE001, I001
 
 import argparse
 import copy
@@ -133,7 +133,7 @@ def load_optional_text(path: Path | None) -> str | None:
 
 def decimal_value(value: Any) -> Decimal:
     if value in (None, ""):
-        return Decimal("0")
+        return Decimal("0")  # noqa: FURB157
     try:
         return Decimal(str(value))
     except InvalidOperation as exc:
@@ -735,14 +735,14 @@ def summarize_warehouses(records: list[dict[str, Any]]) -> list[str]:
 
 
 def sum_amount(records: list[dict[str, Any]], field: str) -> Decimal:
-    total = Decimal("0")
+    total = Decimal("0")  # noqa: FURB157
     for record in records:
         total += decimal_value(record.get(field))
     return total
 
 
 def sum_abs_amount(records: list[dict[str, Any]], field: str) -> Decimal:
-    total = Decimal("0")
+    total = Decimal("0")  # noqa: FURB157
     for record in records:
         total += abs(decimal_value(record.get(field)))
     return total
@@ -972,7 +972,7 @@ def matched_purchase_candidates_for_total(
     if len(ordered) > 16:
         return []
 
-    remaining_totals = [Decimal("0")] * (len(ordered) + 1)
+    remaining_totals = [Decimal("0")] * (len(ordered) + 1)  # noqa: FURB157
     for index in range(len(ordered) - 1, -1, -1):
         remaining_totals[index] = remaining_totals[index + 1] + ordered[index]["gross_amount"]
 
@@ -1006,7 +1006,7 @@ def matched_purchase_candidates_for_total(
         chosen.pop()
         search(index + 1, chosen, running_total)
 
-    search(0, [], Decimal("0"))
+    search(0, [], Decimal("0"))  # noqa: FURB157
     if best_match is None:
         return []
     return best_match[1]
@@ -2582,7 +2582,7 @@ def build_action_batch(
         mapping_hints=mapping_hints,
         forced_note=forced_note,
     )
-    purchase_actions, purchase_action_ids = build_purchase_actions(
+    purchase_actions, purchase_action_ids = build_purchase_actions(  # noqa: RUF059
         company_slug=company_slug,
         period=period,
         period_end=period_end,

@@ -1,4 +1,4 @@
-from __future__ import annotations
+from __future__ import annotations  # noqa: I001
 
 import copy
 import sys
@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-import bookaudit  # noqa: E402
+import bookaudit  # noqa: E402, I001
 
 
 RECORD_CATEGORIES = (
@@ -388,7 +388,7 @@ class BookauditTests(unittest.TestCase):
         snapshot = bookaudit.build_source_snapshot([normalized], policy_text=None)
 
         self.assertEqual(snapshot["purchase_total"], Decimal("7.9"))
-        self.assertEqual(snapshot["input_vat_total"], Decimal("0"))
+        self.assertEqual(snapshot["input_vat_total"], Decimal("0"))  # noqa: FURB157
 
 
 if __name__ == "__main__":

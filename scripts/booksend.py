@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-from __future__ import annotations
+from __future__ import annotations  # noqa: EXE001, I001
 
 import argparse
 import copy
@@ -67,7 +67,7 @@ def file_sha256(path: Path) -> str:
 
 def decimal_value(value: Any) -> Decimal:
     if value in (None, ""):
-        return Decimal("0")
+        return Decimal("0")  # noqa: FURB157
     try:
         return Decimal(str(value))
     except InvalidOperation as exc:
@@ -241,12 +241,12 @@ def api_id(value: Any, *, field_name: str, optional: bool = False) -> int | None
 
 
 def rounded_rate(gross_amount: Decimal, vat_amount: Decimal | None) -> float | None:
-    if vat_amount in (None, Decimal("0")):
-        return 0.0 if vat_amount == Decimal("0") else None
+    if vat_amount in (None, Decimal("0")):  # noqa: FURB157
+        return 0.0 if vat_amount == Decimal("0") else None  # noqa: FURB157
     taxable_base = gross_amount - vat_amount
     if taxable_base <= 0:
         return None
-    return float((vat_amount / taxable_base * Decimal("100")).quantize(Decimal("0.01")))
+    return float((vat_amount / taxable_base * Decimal("100")).quantize(Decimal("0.01")))  # noqa: FURB157
 
 
 def reviewed_allocated_rate(
@@ -320,7 +320,7 @@ def reviewed_allocated_rate(
         or str(item_profile.get(vat_type_field) or "") != str(line.get("suggested_vat_type_id") or "")
     ):
         raise SimplbooksError("Woo VAT API line VAT profile provenance does not match the reviewed line.")
-    expected_vat = (gross_amount * rate / (Decimal("100") + rate)).quantize(
+    expected_vat = (gross_amount * rate / (Decimal("100") + rate)).quantize(  # noqa: FURB157
         Decimal("0.01"), rounding=ROUND_HALF_UP
     )
     if vat_amount != expected_vat:
@@ -816,7 +816,7 @@ def response_is_success(http_status: int, response_body: dict[str, Any]) -> bool
     status_text = str(response_body.get("status") or response_body.get("result") or "").strip().lower()
     if status_text in {"error", "errors", "fail", "failed"}:
         return False
-    if response_body.get("errors") or response_body.get("error"):
+    if response_body.get("errors") or response_body.get("error"):  # noqa: SIM103
         return False
     return True
 

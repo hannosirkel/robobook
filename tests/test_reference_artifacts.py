@@ -1,9 +1,9 @@
-from __future__ import annotations
+from __future__ import annotations  # noqa: I001
 
 import sys
 import tempfile
 import unittest
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta  # noqa: F401
 from pathlib import Path
 
 

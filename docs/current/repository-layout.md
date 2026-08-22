@@ -77,6 +77,30 @@ With `--company-dir`, `bookbuilder` looks for:
 A missing explicit contact stays a blocking dependency. Master-data creation
 belongs in a separately approved draft, never implicit.
 
+## The lint gate and its baseline
+
+```bash
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/ruff check .
+```
+
+`requirements-dev.txt` pins the tooling the Validate workflow needs and the
+application does not. `ruff check .` runs there and blocks a merge.
+
+The gate blocks on new work only. The 173 findings this repository already had
+are recorded as 157 `# noqa:` directives in the files themselves, so a later run
+reports only what a change introduced. `ruff check --ignore-noqa .` still reports
+all of them, which is the proof that the linter is live rather than switched off.
+
+Those directives are baselined pre-existing findings, not fixes. **No line of
+logic was changed to satisfy the linter, and none should be.** Do not widen a
+directive to cover something your own change introduced. Working the backlog down
+is ordinary follow-up work; it belongs in its own commit, never mixed into a
+change that touches money.
+
+`ruff.toml` carries two settings, each with its reason written beside it, and
+takes ruff's defaults for everything else.
+
 ## Script policy
 
 A script under `scripts/` is reusable across companies, Python, deterministic

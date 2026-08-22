@@ -1,4 +1,4 @@
-from __future__ import annotations
+from __future__ import annotations  # noqa: I001
 
 import tempfile
 import hashlib
@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-import bookbuilder  # noqa: E402
+import bookbuilder  # noqa: E402, I001
 import bookchecker  # noqa: E402
 import woo_tax  # noqa: E402
 
@@ -685,7 +685,7 @@ class BookbuilderTests(unittest.TestCase):
         normalized = base_normalized()
         recon = base_recon(approve=False)
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp:  # noqa: SIM117
             with self.assertRaises(bookbuilder.SimplbooksError):
                 bookbuilder.build_action_batch(
                     normalized_payload=normalized,

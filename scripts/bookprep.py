@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-from __future__ import annotations
+from __future__ import annotations  # noqa: EXE001, I001
 
 import argparse
 import csv
@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable  # noqa: UP035
 from xml.etree import ElementTree
 
 from simplbooks_api import (
@@ -276,10 +276,10 @@ def is_ignored_work_file(path: Path) -> bool:
 
 def parse_decimal(value: Any) -> Decimal:
     if value in (None, ""):
-        return Decimal("0")
+        return Decimal("0")  # noqa: FURB157
     text = str(value).strip().replace("\ufeff", "").replace("\u00a0", "").replace(" ", "")
     if not text:
-        return Decimal("0")
+        return Decimal("0")  # noqa: FURB157
     if "," in text and "." in text:
         if text.rfind(",") > text.rfind("."):
             text = text.replace(".", "").replace(",", ".")
@@ -308,7 +308,7 @@ def parse_date_value(value: str) -> date:
         "%B %d, %Y",
     ):
         try:
-            return datetime.strptime(text, fmt).date()
+            return datetime.strptime(text, fmt).date()  # noqa: DTZ007
         except ValueError:
             continue
     raise SimplbooksError(f"Unsupported date format: {value!r}")
@@ -395,7 +395,7 @@ def parse_currency_amount(value: str) -> Decimal:
 def parse_money_cell(value: str | None, *, default_currency: str | None = None) -> tuple[Decimal, str]:
     text = str(value or "").strip().replace("\ufeff", "").replace("\u00a0", "")
     if not text or text == "-":
-        return Decimal("0"), (default_currency or "")
+        return Decimal("0"), (default_currency or "")  # noqa: FURB157
 
     normalized = normalize_ascii(text).upper()
     currency = default_currency or ""
@@ -455,7 +455,7 @@ def detect_parser(path: Path, source_type: str, source_system: str, header_names
         return "parse_stripe_payouts_csv"
     if source_type == "csv" and source_system == "stripe":
         return "parse_stripe_balance_csv"
-    if source_type == "csv" and source_system == "quartermaster":
+    if source_type == "csv" and source_system == "quartermaster":  # noqa: SIM102
         if headers >= ROW_EVENT_HEADERS["quartermaster_orders_csv"]:
             return "parse_quartermaster_orders_csv"
     if source_type == "csv" and source_system == "printful":
@@ -495,7 +495,7 @@ def infer_pdf_coverage(text: str, source_system: str) -> tuple[date, date] | Non
     if not match:
         return None
     try:
-        report_date = datetime.strptime(match.group(1), "%m/%d/%Y").date()
+        report_date = datetime.strptime(match.group(1), "%m/%d/%Y").date()  # noqa: DTZ007
     except ValueError:
         return None
     return report_date, report_date
@@ -701,7 +701,7 @@ def parse_purchase_note_amounts(note_text: str) -> dict[str, Any] | None:
         return None
 
     gross_amount: Decimal | None = None
-    vat_amount = Decimal("0")
+    vat_amount = Decimal("0")  # noqa: FURB157
     reverse_charge = "reverse-charg" in lower
 
     explicit_total = re.search(r"=\s*([0-9]+(?:[.,][0-9]+)?)\s*€", normalized)
@@ -714,7 +714,7 @@ def parse_purchase_note_amounts(note_text: str) -> dict[str, Any] | None:
         if gross_amount is None and len(amounts) >= 2:
             gross_amount = amounts[0] + vat_amount
     elif "vat 0%" in lower or reverse_charge:
-        vat_amount = Decimal("0")
+        vat_amount = Decimal("0")  # noqa: FURB157
 
     if gross_amount is None:
         if vat_amount != 0 and len(amounts) >= 2:
@@ -846,9 +846,9 @@ def make_record(
     currency: str,
     gross_amount: Decimal,
     net_amount: Decimal,
-    vat_amount: Decimal = Decimal("0"),
-    fee_amount: Decimal = Decimal("0"),
-    shipping_amount: Decimal = Decimal("0"),
+    vat_amount: Decimal = Decimal("0"),  # noqa: FURB157
+    fee_amount: Decimal = Decimal("0"),  # noqa: FURB157
+    shipping_amount: Decimal = Decimal("0"),  # noqa: FURB157
     settlement_date: date | None = None,
     external_ref: str | None = None,
     quantity: Decimal | None = None,
@@ -1094,8 +1094,8 @@ def parse_woo_order_summary_csv(
             event_date=event_date,
             description=f"Woo order-summary evidence {order_id}",
             currency=base_currency,
-            gross_amount=Decimal("0"),
-            net_amount=Decimal("0"),
+            gross_amount=Decimal("0"),  # noqa: FURB157
+            net_amount=Decimal("0"),  # noqa: FURB157
             external_ref=order_id,
             channel="woo",
             attributes={
@@ -1196,8 +1196,8 @@ def parse_woo_tax_summary_csv(
             event_date=source.covered_until,
             description=f"Woo annual tax summary {tax_code}",
             currency=base_currency,
-            gross_amount=Decimal("0"),
-            net_amount=Decimal("0"),
+            gross_amount=Decimal("0"),  # noqa: FURB157
+            net_amount=Decimal("0"),  # noqa: FURB157
             vat_amount=total,
             external_ref=tax_code,
             channel="woo",
@@ -1671,7 +1671,7 @@ def parse_stripe_balance_csv(
                 "customer_name": row.get("customer_name (metadata)"),
             }
 
-            tax_amount = abs(parse_decimal(row.get("tax_amount (metadata)"))) / Decimal("100")
+            tax_amount = abs(parse_decimal(row.get("tax_amount (metadata)"))) / Decimal("100")  # noqa: FURB157
             if charge_in_period and amount != 0:
                 seen_dates.append(event_date)
                 category_name, record = make_record(
@@ -1707,10 +1707,10 @@ def parse_stripe_balance_csv(
                         suggested_follow_up="Export Stripe charges with the Refunded date (UTC) column populated.",
                     )
                 )
-            elif refunded and refunded_date is not None:
+            elif refunded and refunded_date is not None:  # noqa: SIM102
                 if refund_in_period:
                     seen_dates.append(refunded_date)
-                    refund_tax = Decimal("0")
+                    refund_tax = Decimal("0")  # noqa: FURB157
                     if amount != 0:
                         refund_tax = (tax_amount * refunded / abs(amount)).quantize(
                             Decimal("0.01"), rounding=ROUND_HALF_UP
@@ -1869,7 +1869,7 @@ def parse_quartermaster_date_value(value: str) -> date:
         "%m/%d/%Y %H:%M",
     ):
         try:
-            return datetime.strptime(text, fmt).date()
+            return datetime.strptime(text, fmt).date()  # noqa: DTZ007
         except ValueError:
             continue
     raise SimplbooksError(f"Unsupported Quartermaster date format: {value!r}")
@@ -1913,8 +1913,8 @@ def parse_quartermaster_orders_csv(
             settlement_date=shipped_date,
             description=f"Quartermaster order history {description_ref}",
             currency=base_currency,
-            gross_amount=Decimal("0"),
-            net_amount=Decimal("0"),
+            gross_amount=Decimal("0"),  # noqa: FURB157
+            net_amount=Decimal("0"),  # noqa: FURB157
             external_ref=reference_id or qml_order_id or None,
             channel="quartermaster",
             attributes={
@@ -2022,7 +2022,7 @@ def parse_printful_orders_csv(
         if event_date < period_start or event_date > period_end:
             continue
 
-        total_amount, total_currency = parse_money_cell(row.get("Total"), default_currency=base_currency)
+        total_amount, total_currency = parse_money_cell(row.get("Total"), default_currency=base_currency)  # noqa: RUF059
         currency = total_currency or base_currency
 
         components: dict[str, Decimal] = {}
@@ -2050,7 +2050,7 @@ def parse_printful_orders_csv(
                 "payment_instruments": set(),
                 "shipping_origins": set(),
                 "shipping_destinations": set(),
-                "components": {column: Decimal("0") for column in component_columns},
+                "components": {column: Decimal("0") for column in component_columns},  # noqa: FURB157
             },
         )
         if group["currency"] != currency:
@@ -2183,7 +2183,7 @@ def parse_printful_wallet_csv(
     for line_no, row in enumerate(rows, start=2):
         date_text = row.get("Date", "")
         normalized_date = normalize_ascii(date_text).lower()
-        if normalized_date.startswith("total deposits to wallet") or normalized_date.startswith("total withdrawals from wallet"):
+        if normalized_date.startswith("total deposits to wallet") or normalized_date.startswith("total withdrawals from wallet"):  # noqa: PIE810
             continue
 
         event_date = parse_date_value(date_text)
@@ -2461,7 +2461,7 @@ def parse_month_label_period(value: str) -> tuple[date, date]:
     text = re.sub(r"\s+", " ", value.strip())
     for fmt in ("%b %Y", "%B %Y"):
         try:
-            parsed = datetime.strptime(text, fmt).date()
+            parsed = datetime.strptime(text, fmt).date()  # noqa: DTZ007
             return date(parsed.year, parsed.month, 1), month_end(parsed.year, parsed.month)
         except ValueError:
             continue
@@ -2787,9 +2787,9 @@ def parse_quartermaster_pdf(
         if report_date < period_start or report_date > period_end:
             return result, []
 
-        sold_quantity = sum((parse_decimal(match[0]) for match in sold_matches), Decimal("0"))
-        sold_amount = sum((parse_decimal(match[2]) for match in sold_matches), Decimal("0"))
-        sold_rate = sold_amount / sold_quantity if sold_quantity else Decimal("0")
+        sold_quantity = sum((parse_decimal(match[0]) for match in sold_matches), Decimal("0"))  # noqa: FURB157
+        sold_amount = sum((parse_decimal(match[2]) for match in sold_matches), Decimal("0"))  # noqa: FURB157
+        sold_rate = sold_amount / sold_quantity if sold_quantity else Decimal("0")  # noqa: FURB157
         fee_quantity = parse_decimal(fee_match.group(1))
         fee_rate = abs(parse_decimal(fee_match.group(2)))
         fee_amount = abs(parse_decimal(fee_match.group(3)))
@@ -2985,7 +2985,7 @@ def parse_printful_pdf(
             summary_text = full_text.split("Please find invoice details", 1)[0]
             grand_totals = [parse_currency_amount(value) for value in re.findall(r"Grand total\s+€([0-9.,]+)", summary_text)]
             if grand_totals:
-                total_amount = sum(grand_totals, Decimal("0"))
+                total_amount = sum(grand_totals, Decimal("0"))  # noqa: FURB157
                 report_invoice_date = parse_date_value(report_invoice_date_text)
                 category, record = make_record(
                     source=source,
@@ -3050,7 +3050,7 @@ def parse_printful_pdf(
             continue
 
         net_amount = total_amount
-        vat_amount = Decimal("0")
+        vat_amount = Decimal("0")  # noqa: FURB157
         if detail_match:
             net_amount = parse_currency_amount(detail_match.group(1))
             vat_amount = parse_currency_amount(detail_match.group(2))
@@ -3221,14 +3221,14 @@ def parse_purchase_invoice_pdf(
             r"VAT \([0-9.%]+\):\s*€\s*([0-9.,]+)",
             r"KM \d+%\s+([0-9.,]+)",
         ],
-    ) or Decimal("0")
-    if vat_amount == Decimal("0") and balance_summary_match:
+    ) or Decimal("0")  # noqa: FURB157
+    if vat_amount == Decimal("0") and balance_summary_match:  # noqa: FURB157
         vat_amount = parse_currency_amount(balance_summary_match.group(2))
-    if vat_amount == Decimal("0") and omniva_summary_match:
+    if vat_amount == Decimal("0") and omniva_summary_match:  # noqa: FURB157
         vat_amount = parse_currency_amount(omniva_summary_match.group(2))
-    if vat_amount == Decimal("0") and dpd_summary_match:
+    if vat_amount == Decimal("0") and dpd_summary_match:  # noqa: FURB157
         vat_amount = parse_currency_amount(dpd_summary_match.group(2))
-    if vat_amount == Decimal("0") and jajaa_summary_match:
+    if vat_amount == Decimal("0") and jajaa_summary_match:  # noqa: FURB157
         vat_amount = parse_currency_amount(jajaa_summary_match.group(2))
 
     net_amount = first_decimal_match(

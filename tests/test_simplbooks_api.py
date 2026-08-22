@@ -1,4 +1,4 @@
-from __future__ import annotations
+from __future__ import annotations  # noqa: I001
 
 import io
 import json
@@ -21,7 +21,7 @@ class FakeResponse:
         self.status = status
         self.body = body
 
-    def __enter__(self) -> "FakeResponse":
+    def __enter__(self) -> "FakeResponse":  # noqa: PYI034, UP037
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -82,7 +82,7 @@ class SimplbooksApiTests(unittest.TestCase):
                 rate_limit_per_minute=1_000_000,
             )
 
-            with mock.patch.object(
+            with mock.patch.object(  # noqa: SIM117
                 simplbooks_api.request,
                 "urlopen",
                 side_effect=error.URLError("offline"),

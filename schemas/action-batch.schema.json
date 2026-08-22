@@ -522,7 +522,12 @@
                 "properties": {
                   "line_items": {
                     "items": {
-                      "if": {"required": ["article_id_hint"]},
+                      "if": {
+                        "properties": {
+                          "article_id_hint": {"type": "string", "minLength": 1}
+                        },
+                        "required": ["article_id_hint"]
+                      },
                       "then": {
                         "properties": {
                           "line_role": {"pattern": "^refund_(revenue|product)"},

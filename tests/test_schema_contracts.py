@@ -555,6 +555,50 @@ class SchemaContractTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=artifact)
 
+    def test_action_batch_schema_allows_credit_refund_shipping_with_null_article(self) -> None:
+        artifact = bookchecker.load_yaml(ROOT / "templates/actions-period.template.yaml")
+        action = artifact["actions"][0]
+        action["action_type"] = "create_credit_invoice_summary"
+        action["payload"] = {"document_type": "credit_note", "line_items": [{
+            "line_role": "refund_shipping", "article_id_hint": None, "gross_amount": 5,
+        }]}
+
+        self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=artifact)
+
+    def test_action_batch_schema_allows_credit_refund_line_without_article(self) -> None:
+        artifact = bookchecker.load_yaml(ROOT / "templates/actions-period.template.yaml")
+        action = artifact["actions"][0]
+        action["action_type"] = "create_credit_invoice_summary"
+        action["payload"] = {"document_type": "credit_note", "line_items": [{
+            "line_role": "refund_revenue", "gross_amount": 20,
+        }]}
+
+        self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=artifact)
+
+    def test_action_batch_schema_rejects_credit_inventory_with_non_refund_role(self) -> None:
+        artifact = bookchecker.load_yaml(ROOT / "templates/actions-period.template.yaml")
+        proof = bookbuilder.inventory_proof_envelope(
+            scope={
+                "kind": "normalized_sales_group", "period": "2024-01",
+                "record_category": "refunds", "group_label": "woo",
+                "currency": "EUR", "tax_profile": "non_taxable",
+            },
+            quantity=bookbuilder.Decimal("1"),
+            contributors=[{
+                "record_id": "woo:refund:1", "quantity": 1,
+                "quantity_source": "normalized_record", "record_sha256": "a" * 64,
+            }],
+        )
+        action = artifact["actions"][0]
+        action["action_type"] = "create_credit_invoice_summary"
+        action["payload"] = {"document_type": "credit_note", "line_items": [{
+            "line_role": "sales_revenue", "article_id_hint": "3", "quantity": 1,
+            "inventory_quantity_proof": proof,
+        }]}
+
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=artifact)
+
     def test_statement_import_evidence_template_uses_immutable_discovery_snapshot(self) -> None:
         artifact = json.loads(
             (ROOT / "templates/statement-import-evidence.template.json").read_text(encoding="utf-8")

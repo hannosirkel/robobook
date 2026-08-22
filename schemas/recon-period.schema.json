@@ -10,6 +10,8 @@
     "period",
     "generated_at",
     "approve_for_build",
+    "bank_coverage",
+    "reference_artifacts",
     "checks",
     "exceptions"
   ],
@@ -43,6 +45,57 @@
       "type": "integer",
       "minimum": 0
     },
+    "bank_coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "coverage_ready",
+        "clearing_ready",
+        "clearing_movement_count",
+        "resolved_clearing_count",
+        "unresolved_clearing_count",
+        "clearing_movement_record_ids",
+        "resolved_clearing_record_ids",
+        "unresolved_clearing_record_ids",
+        "physical_bank_row_count",
+        "allocated_row_count",
+        "unallocated_row_count",
+        "credit_total",
+        "debit_total",
+        "net_movement",
+        "ledgers"
+      ],
+      "properties": {
+        "coverage_ready": {"type": "boolean"},
+        "clearing_ready": {"type": "boolean"},
+        "clearing_movement_count": {"type": "integer", "minimum": 0},
+        "resolved_clearing_count": {"type": "integer", "minimum": 0},
+        "unresolved_clearing_count": {"type": "integer", "minimum": 0},
+        "clearing_movement_record_ids": {
+          "type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}
+        },
+        "resolved_clearing_record_ids": {
+          "type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}
+        },
+        "unresolved_clearing_record_ids": {
+          "type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}
+        },
+        "physical_bank_row_count": {"type": "integer", "minimum": 0},
+        "allocated_row_count": {"type": "integer", "minimum": 0},
+        "unallocated_row_count": {"type": "integer", "minimum": 0},
+        "credit_total": {"type": "number"},
+        "debit_total": {"type": "number"},
+        "net_movement": {"type": "number"},
+        "ledgers": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/bank_ledger"}
+        }
+      }
+    },
+    "reference_artifacts": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/reference_binding"}
+    },
     "checks": {
       "type": "array",
       "items": {
@@ -63,6 +116,59 @@
     }
   },
   "$defs": {
+    "reference_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path", "sha256"],
+      "properties": {
+        "kind": {"type": "string", "enum": ["normalized_period", "bank_allocations"]},
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+      }
+    },
+    "bank_ledger": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "iban",
+        "currency",
+        "physical_bank_row_count",
+        "allocated_row_count",
+        "unallocated_row_count",
+        "credit_total",
+        "debit_total",
+        "net_movement",
+        "camt_opening_balance",
+        "computed_closing_balance",
+        "camt_closing_balance"
+      ],
+      "properties": {
+        "iban": {"type": "string", "minLength": 1},
+        "currency": {"type": "string", "pattern": "^[A-Z]{3}$"},
+        "physical_bank_row_count": {"type": "integer", "minimum": 0},
+        "allocated_row_count": {"type": "integer", "minimum": 0},
+        "unallocated_row_count": {"type": "integer", "minimum": 0},
+        "credit_total": {"type": "number"},
+        "debit_total": {"type": "number"},
+        "net_movement": {"type": "number"},
+        "camt_opening_balance": {"type": ["number", "null"]},
+        "computed_closing_balance": {"type": ["number", "null"]},
+        "camt_closing_balance": {"type": ["number", "null"]},
+        "camt_evidence_scopes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["statement_from", "statement_to", "balance_type"],
+            "properties": {
+              "statement_from": {"type": "string", "format": "date"},
+              "statement_to": {"type": "string", "format": "date"},
+              "balance_type": {"type": "string", "minLength": 1}
+            }
+          }
+        }
+      }
+    },
     "artifact_ref": {
       "type": "object",
       "additionalProperties": false,

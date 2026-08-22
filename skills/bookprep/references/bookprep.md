@@ -79,8 +79,9 @@ system exports.
   - emits `purchase_expenses` only for positive in-period net charges
   - warns and skips refund-overage groups that would become negative purchase-expense rows
 - `Wallet.csv`
-  - maps `Deposit to wallet` to negative `bank_transactions`
-  - maps `Withdrawal from wallet` to positive `bank_transactions`
+  - maps `Deposit to wallet` to negative `clearing_transactions`
+  - maps `Withdrawal from wallet` to positive `clearing_transactions`
+  - marks both rows with `clearing_provider: printful` and `clearing_account: printful_wallet`; it never creates a physical-bank row
 - `Other.csv`
   - parses category-based monthly service charges into `purchase_expenses`
 - `Services.csv`
@@ -94,7 +95,9 @@ system exports.
 
 ### CAMT XML
 
-- parses `<Ntry>` entries into `bank_transactions`
+- parses `<Ntry>` entries into `bank_transactions` only when CAMT is the canonical bank source
+- parses `<Bal>` entries into `bank_balances`, keyed by IBAN, currency, balance type, and date
+- when a paired CSV is canonical, retains CAMT balances and cross-checks available `AcctSvcrRef` values without duplicating CSV transaction rows
 - uses `BookgDt` and `CdtDbtInd`
 
 ### PDF Invoices

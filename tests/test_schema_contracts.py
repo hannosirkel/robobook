@@ -28,6 +28,16 @@ def validate(instance: Any, schema: dict[str, Any], *, root_schema: dict[str, An
     if "$ref" in schema:
         validate(instance, resolve_ref(root_schema, schema["$ref"]), root_schema=root_schema, path=path)
         return
+    for subschema in schema.get("allOf", []):
+        validate(instance, subschema, root_schema=root_schema, path=path)
+    if "if" in schema:
+        try:
+            validate(instance, schema["if"], root_schema=root_schema, path=path)
+        except AssertionError:
+            pass
+        else:
+            if "then" in schema:
+                validate(instance, schema["then"], root_schema=root_schema, path=path)
     if "const" in schema:
         assert instance == schema["const"], f"{path}: expected const {schema['const']!r}"
     if "enum" in schema:
@@ -56,6 +66,8 @@ def validate(instance: Any, schema: dict[str, Any], *, root_schema: dict[str, An
             assert len(instance) <= schema["maxLength"], f"{path}: string is too long"
     if isinstance(instance, (int, float)) and not isinstance(instance, bool) and "minimum" in schema:
         assert instance >= schema["minimum"], f"{path}: below minimum"
+    if isinstance(instance, (int, float)) and not isinstance(instance, bool) and "maximum" in schema:
+        assert instance <= schema["maximum"], f"{path}: above maximum"
 
     if isinstance(instance, list):
         if "minItems" in schema:
@@ -63,8 +75,19 @@ def validate(instance: Any, schema: dict[str, Any], *, root_schema: dict[str, An
         if "items" in schema:
             for index, item in enumerate(instance):
                 validate(item, schema["items"], root_schema=root_schema, path=f"{path}[{index}]")
+        if "contains" in schema:
+            matching_items = 0
+            for index, item in enumerate(instance):
+                try:
+                    validate(item, schema["contains"], root_schema=root_schema, path=f"{path}[{index}]")
+                except AssertionError:
+                    continue
+                matching_items += 1
+            assert matching_items >= schema.get("minContains", 1), f"{path}: contains match count is too small"
 
     if isinstance(instance, dict):
+        if "minProperties" in schema:
+            assert len(instance) >= schema["minProperties"], f"{path}: too few properties"
         for required in schema.get("required", []):
             assert required in instance, f"{path}: missing required property {required!r}"
         if "propertyNames" in schema:
@@ -91,9 +114,63 @@ class SchemaContractTests(unittest.TestCase):
         artifact = bookchecker.load_yaml(ROOT / "templates/actions-period.template.yaml")
         self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=artifact)
 
+    def test_submission_log_schema_accepts_successful_action_file_sha(self) -> None:
+        artifact = json.loads((ROOT / "templates/submission-log.template.json").read_text(encoding="utf-8"))
+        artifact["mode"] = "write"
+        artifact["action_file_sha256"] = "a" * 64
+        self.assert_artifact_valid(schema_name="submission-log.schema.json", artifact=artifact)
+
+    def test_statement_import_evidence_template_matches_strict_schema(self) -> None:
+        artifact = json.loads(
+            (ROOT / "templates/statement-import-evidence.template.json").read_text(encoding="utf-8")
+        )
+        self.assert_artifact_valid(schema_name="statement-import-evidence.schema.json", artifact=artifact)
+
     def test_posting_policy_template_matches_strict_schema(self) -> None:
         artifact = json.loads((ROOT / "templates/posting-policy.template.json").read_text(encoding="utf-8"))
         self.assert_artifact_valid(schema_name="posting-policy.schema.json", artifact=artifact)
+
+    def test_posting_policy_schema_accepts_currency_qualified_bank_account(self) -> None:
+        artifact = json.loads((ROOT / "templates/posting-policy.template.json").read_text(encoding="utf-8"))
+        artifact["bank_accounts"] = {"EE123": {"EUR": "3", "USD": "4"}}
+
+        self.assert_artifact_valid(schema_name="posting-policy.schema.json", artifact=artifact)
+
+    def test_normalized_period_template_includes_cash_ledger_categories(self) -> None:
+        artifact = json.loads((ROOT / "templates/normalized-period.template.json").read_text(encoding="utf-8"))
+        self.assert_artifact_valid(schema_name="normalized-period.schema.json", artifact=artifact)
+        self.assertEqual(artifact["records"]["clearing_transactions"], [])
+        self.assertEqual(artifact["records"]["bank_balances"], [])
+
+    def test_recon_period_template_exposes_report_only_bank_write_readiness(self) -> None:
+        artifact = json.loads((ROOT / "templates/recon-period.template.json").read_text(encoding="utf-8"))
+
+        self.assert_artifact_valid(schema_name="recon-period.schema.json", artifact=artifact)
+        self.assertFalse(artifact["bank_coverage"]["coverage_ready"])
+        self.assertFalse(artifact["bank_coverage"]["clearing_ready"])
+
+    def test_recon_period_schema_accepts_deferred_camt_evidence_scope(self) -> None:
+        artifact = json.loads((ROOT / "templates/recon-period.template.json").read_text(encoding="utf-8"))
+        artifact["bank_coverage"]["ledgers"] = [{
+            "iban": "EE123",
+            "currency": "EUR",
+            "physical_bank_row_count": 0,
+            "allocated_row_count": 0,
+            "unallocated_row_count": 0,
+            "credit_total": 0,
+            "debit_total": 0,
+            "net_movement": 0,
+            "camt_opening_balance": None,
+            "computed_closing_balance": None,
+            "camt_closing_balance": None,
+            "camt_evidence_scopes": [{
+                "statement_from": "2024-01-01",
+                "statement_to": "2024-12-31",
+                "balance_type": "OPBD",
+            }],
+        }]
+
+        self.assert_artifact_valid(schema_name="recon-period.schema.json", artifact=artifact)
 
     def test_year_overview_template_matches_strict_schema(self) -> None:
         artifact = json.loads((ROOT / "templates/year-overview.template.json").read_text(encoding="utf-8"))
@@ -118,6 +195,180 @@ class SchemaContractTests(unittest.TestCase):
                 with self.assertRaises(AssertionError):
                     self.assert_artifact_valid(schema_name="woo-tax-allocation.schema.json", artifact=mutated)
 
+    def test_bank_allocation_schema_accepts_exact_reviewed_disposition(self) -> None:
+        artifact = bank_allocation_payload(
+            allocations=[
+                {
+                    "statement_id": "archive:2024010212345678",
+                    "record_id": "bank-source:bank:2",
+                    "iban": "EE123",
+                    "period": "2024-01",
+                    "disposition": "existing_invoice_receipt",
+                    "amount": 330.0,
+                    "currency": "EUR",
+                    "target": {"simplbooks_id": "119", "document_type": "invoice"},
+                    "review": {"status": "approved", "rationale": "Exact invoice number and amount."},
+                }
+            ]
+        )
+        self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=artifact)
+
+    def test_bank_allocation_schema_rejects_ignore(self) -> None:
+        artifact = bank_allocation_payload(allocations=[bank_allocation(disposition="ignore")])
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=artifact)
+
+    def test_bank_allocation_schema_requires_iban(self) -> None:
+        artifact = bank_allocation_payload(allocations=[bank_allocation()])
+        del artifact["allocations"][0]["iban"]
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=artifact)
+
+    def test_bank_allocation_schema_rejects_empty_bindings_and_target(self) -> None:
+        empty_bindings = bank_allocation_payload(allocations=[])
+        empty_bindings["normalized_bindings"] = []
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=empty_bindings)
+
+        empty_target = bank_allocation_payload(allocations=[bank_allocation(target={})])
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=empty_target)
+
+    def test_bank_allocation_schema_rejects_malformed_statement_import_proof(self) -> None:
+        reviewed = bank_allocation(target={
+            "financial_transaction_kind": "bank-fee",
+            "statement_import_proof": "verified",
+        })
+        artifact = bank_allocation_payload(allocations=[reviewed])
+
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=artifact)
+
+    def test_bank_allocation_schema_requires_a_four_digit_year(self) -> None:
+        for year in (1000, 9999):
+            with self.subTest(year=year):
+                artifact = bank_allocation_payload(allocations=[])
+                artifact["year"] = year
+                self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=artifact)
+        for year in (999, 10000):
+            with self.subTest(year=year):
+                artifact = bank_allocation_payload(allocations=[])
+                artifact["year"] = year
+                with self.assertRaises(AssertionError):
+                    self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=artifact)
+
+    def test_bank_allocation_schema_rejects_malformed_clearing_and_fx_proof(self) -> None:
+        target = {
+            "document_type": "financial_transaction",
+            "transaction_family": "failed_transfer_and_return",
+            "clearing_record_ids": ["clearing:1"],
+        }
+        missing_proof = bank_allocation_payload(allocations=[
+            bank_allocation(disposition="clearing_transfer", amount=-13.27, target=target)
+        ])
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=missing_proof)
+
+        target.update({
+            "bridge_record_ids": ["clearing:1"], "bridge_direction": "opposite_physical",
+            "clearing_evidence": [{
+                "record_id": "clearing:1", "period": "2024-01", "currency": "USD", "amount": 14.94,
+                "provider": "processor", "account": "wallet", "source_system": "processor",
+            }],
+            "clearing_totals": {"USD": 14.94}, "clearing_relation": "reviewed_group",
+            "bridge_amount": -13.27,
+            "fx_proof": {
+                "equation": "absolute_clearing_times_rate_plus_fee_equals_physical",
+                "physical_record_id": "bank-source:bank:2", "physical_currency": "EUR", "physical_amount": -13.27,
+                "clearing_currency": "USD", "clearing_amount": 14.94, "rate": "bad", "fee_amount": 0,
+                "rate_evidence": {"path": "source.csv", "sha256": "a" * 64},
+            },
+        })
+        malformed_fx = bank_allocation_payload(allocations=[
+            bank_allocation(disposition="clearing_transfer", amount=-13.27, target=target)
+        ])
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=malformed_fx)
+
+    def test_bank_allocation_schema_types_foreign_currency_pilot(self) -> None:
+        target = {
+            "document_type": "purchase", "action_key": "purchase",
+            "foreign_currency_pilot_required": True,
+        }
+        malformed = bank_allocation_payload(allocations=[
+            bank_allocation(disposition="generated_purchase_payment", amount=-30.20, target=target)
+        ])
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=malformed)
+
+    def test_bank_allocation_schema_requires_complete_proof_for_clearing_transfer(self) -> None:
+        incomplete = bank_allocation_payload(allocations=[
+            bank_allocation(
+                disposition="clearing_transfer",
+                target={"document_type": "financial_transaction", "transaction_family": "internal_transfer"},
+            )
+        ])
+
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=incomplete)
+
+        malformed_equation = bank_allocation_payload(allocations=[bank_allocation(
+            disposition="clearing_transfer",
+            amount=-13.27,
+            target={
+                "document_type": "financial_transaction", "transaction_family": "internal_transfer",
+                "clearing_record_ids": ["wallet:deposit", "wallet:conversion"],
+                "bridge_record_ids": ["wallet:deposit"], "bridge_direction": "opposite_physical",
+                "clearing_evidence": [
+                    {"record_id": "wallet:deposit", "period": "2024-01", "currency": "EUR", "amount": 13.27,
+                     "provider": "wallet", "account": "wallet", "source_system": "wallet"},
+                    {"record_id": "wallet:conversion", "period": "2024-01", "currency": "EUR", "amount": -13.27,
+                     "provider": "wallet", "account": "wallet", "source_system": "wallet"},
+                ],
+                "clearing_totals": {"EUR": 0.0}, "clearing_relation": "reviewed_group", "bridge_amount": -13.27,
+                "clearing_equations": [{
+                    "equation": "signed_sum_equals_zero", "role": "balance_pair",
+                    "record_ids": ["wallet:deposit", "wallet:conversion"],
+                }],
+            },
+        )])
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=malformed_equation)
+
+    def test_bank_allocation_schema_requires_proof_on_clearing_transfer_split_part(self) -> None:
+        malformed = bank_allocation_payload(allocations=[bank_allocation(
+            disposition="reviewed_split",
+            amount=-13.27,
+            target={"document_type": "financial_transaction", "transaction_family": "reviewed_group"},
+            parts=[{
+                "amount": -13.27,
+                "disposition": "clearing_transfer",
+                "target": {"document_type": "financial_transaction", "transaction_family": "internal_transfer"},
+            }],
+        )])
+
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=malformed)
+
+    def test_bank_allocation_schema_rejects_non_object_target_on_clearing_transfer_split_part(self) -> None:
+        malformed = bank_allocation_payload(allocations=[bank_allocation(
+            disposition="reviewed_split",
+            amount=-13.27,
+            target={"document_type": "financial_transaction", "transaction_family": "reviewed_group"},
+            parts=[{
+                "amount": -13.27,
+                "disposition": "clearing_transfer",
+                "target": "not-an-object",
+            }],
+        )])
+
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=malformed)
+
+    def test_bank_allocation_template_matches_strict_schema(self) -> None:
+        artifact = json.loads((ROOT / "templates/bank-allocation.template.json").read_text(encoding="utf-8"))
+        self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=artifact)
+
     def test_manual_inventory_action_template_matches_strict_schema(self) -> None:
         artifact = json.loads((ROOT / "templates/manual-inventory-action.template.json").read_text(encoding="utf-8"))
         self.assert_artifact_valid(schema_name="manual-inventory-action.schema.json", artifact=artifact)
@@ -130,7 +381,7 @@ class SchemaContractTests(unittest.TestCase):
 
     def test_generated_action_batch_matches_strict_schema(self) -> None:
         categories = (
-            "sales", "refunds", "fees", "payouts", "bank_transactions", "purchase_expenses",
+            "sales", "refunds", "fees", "payouts", "bank_transactions", "clearing_transactions", "bank_balances", "purchase_expenses",
             "purchase_credits", "inventory_movements", "manual_adjustments", "other",
         )
         normalized = {
@@ -159,7 +410,262 @@ class SchemaContractTests(unittest.TestCase):
         batch["reference_artifacts"] = [
             {"kind": "posting_policy", "path": "policy.json", "sha256": "0" * 64},
             {"kind": "discovery_overview", "path": "overview.json", "sha256": "1" * 64},
+            {"kind": "normalized_period", "path": "normalized.json", "sha256": "2" * 64},
+            {"kind": "reconciliation", "path": "recon.json", "sha256": "3" * 64},
         ]
+        self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=batch)
+
+    def test_action_batch_schema_allows_bank_allocation_reference(self) -> None:
+        batch = {
+            "schema_version": "1.0",
+            "company_slug": "example",
+            "period": "2024-01",
+            "generated_at": "2024-01-01T00:00:00Z",
+            "batch_id": "example-2024-01",
+            "approval_status": "draft",
+            "already_present": [],
+            "unresolved_dependencies": [],
+            "reference_artifacts": [
+                {"kind": "posting_policy", "path": "policy.json", "sha256": "0" * 64},
+                {"kind": "discovery_overview", "path": "overview.json", "sha256": "1" * 64},
+                {"kind": "bank_allocations", "path": "allocations.json", "sha256": "2" * 64},
+                {"kind": "normalized_period", "path": "normalized.json", "sha256": "3" * 64},
+                {"kind": "reconciliation", "path": "recon.json", "sha256": "4" * 64},
+            ],
+            "actions": [],
+        }
+        self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=batch)
+
+    def test_action_batch_schema_rejects_manual_financial_dependency_without_statement_binding(self) -> None:
+        batch = {
+            "schema_version": "1.0",
+            "company_slug": "example",
+            "period": "2024-01",
+            "generated_at": "2024-01-01T00:00:00Z",
+            "batch_id": "example-2024-01",
+            "approval_status": "draft",
+            "already_present": [],
+            "unresolved_dependencies": [{
+                "kind": "manual_statement_import_financial_transaction",
+                "blocking": True,
+                "reason": "Statement import required.",
+            }],
+            "reference_artifacts": [
+                {"kind": "posting_policy", "path": "policy.json", "sha256": "0" * 64},
+                {"kind": "discovery_overview", "path": "overview.json", "sha256": "1" * 64},
+            ],
+            "actions": [],
+        }
+
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=batch)
+
+    def test_action_batch_schema_rejects_pending_manual_dependency_marked_nonblocking(self) -> None:
+        dependency = {
+            "kind": "manual_statement_import_financial_transaction",
+            "blocking": False,
+            "reason": "Statement import required.",
+            "disposition": "bank_fee_payment",
+            "statement_id": "archive:fee-1",
+            "record_id": "fee-1",
+            "date": "2024-01-15",
+            "iban": "EE123",
+            "currency": "EUR",
+            "physical_signed_amount": -7.0,
+            "source_ref": {"path": "normalized.json", "record_ref": "fee-1", "source_kind": "physical_bank"},
+            "reviewed_rationale": "Reviewed fee.",
+            "target": {"financial_transaction_kind": "bank-fee"},
+            "split_parts": [],
+            "split_proof": None,
+            "statement_import_proof": {"status": "pending", "required_evidence": "live_discovery_or_audit"},
+        }
+        batch = {
+            "schema_version": "1.0", "company_slug": "example", "period": "2024-01",
+            "generated_at": "2024-01-01T00:00:00Z", "batch_id": "example-2024-01",
+            "approval_status": "draft", "already_present": [], "unresolved_dependencies": [dependency],
+            "reference_artifacts": [
+                {"kind": "posting_policy", "path": "policy.json", "sha256": "0" * 64},
+                {"kind": "discovery_overview", "path": "overview.json", "sha256": "1" * 64},
+            ], "actions": [],
+        }
+
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=batch)
+
+        dependency["statement_import_proof"] = {
+            "status": "verified",
+            "required_evidence": "live_discovery_or_audit",
+            "simplbooks_transaction_id": "txn-501",
+            "evidence_binding": {"path": "evidence.json", "sha256": "a" * 64},
+        }
+        self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=batch)
+
+    def test_action_batch_schema_rejects_inventory_article_without_quantity_proof(self) -> None:
+        artifact = bookchecker.load_yaml(ROOT / "templates/actions-period.template.yaml")
+        artifact["actions"][0]["payload"] = {
+            "line_items": [{"article_id_hint": "3", "gross_amount": 20.0}]
+        }
+
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=artifact)
+
+    def test_action_batch_schema_types_inventory_scope_and_complete_set_binding(self) -> None:
+        artifact = bookchecker.load_yaml(ROOT / "templates/actions-period.template.yaml")
+        proof = bookbuilder.inventory_proof_envelope(
+            scope={
+                "kind": "normalized_sales_group", "period": "2024-01",
+                "record_category": "sales", "group_label": "woo",
+                "currency": "EUR", "tax_profile": "non_taxable",
+            },
+            quantity=bookbuilder.Decimal("1"),
+            contributors=[{
+                "record_id": "woo:1", "quantity": 1,
+                "quantity_source": "normalized_record", "record_sha256": "a" * 64,
+            }],
+        )
+        artifact["actions"][0]["payload"] = {"line_items": [{
+            "article_id_hint": "3", "quantity": 1, "inventory_quantity_proof": proof,
+        }]}
+        self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=artifact)
+        proof.pop("scope_sha256")
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=artifact)
+
+    def test_action_batch_schema_rejects_credit_note_inventory_with_sales_scope(self) -> None:
+        artifact = bookchecker.load_yaml(ROOT / "templates/actions-period.template.yaml")
+        proof = bookbuilder.inventory_proof_envelope(
+            scope={
+                "kind": "normalized_sales_group", "period": "2024-01",
+                "record_category": "sales", "group_label": "woo",
+                "currency": "EUR", "tax_profile": "non_taxable",
+            },
+            quantity=bookbuilder.Decimal("1"),
+            contributors=[{
+                "record_id": "woo:1", "quantity": 1,
+                "quantity_source": "normalized_record", "record_sha256": "a" * 64,
+            }],
+        )
+        action = artifact["actions"][0]
+        action["action_type"] = "create_credit_invoice_summary"
+        action["payload"] = {"document_type": "credit_note", "line_items": [{
+            "line_role": "refund_revenue", "article_id_hint": "3", "quantity": 1,
+            "inventory_quantity_proof": proof,
+        }]}
+
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=artifact)
+
+    def test_action_batch_schema_allows_credit_refund_shipping_with_null_article(self) -> None:
+        artifact = bookchecker.load_yaml(ROOT / "templates/actions-period.template.yaml")
+        action = artifact["actions"][0]
+        action["action_type"] = "create_credit_invoice_summary"
+        action["payload"] = {"document_type": "credit_note", "line_items": [{
+            "line_role": "refund_shipping", "article_id_hint": None, "gross_amount": 5,
+        }]}
+
+        self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=artifact)
+
+    def test_action_batch_schema_allows_credit_refund_line_without_article(self) -> None:
+        artifact = bookchecker.load_yaml(ROOT / "templates/actions-period.template.yaml")
+        action = artifact["actions"][0]
+        action["action_type"] = "create_credit_invoice_summary"
+        action["payload"] = {"document_type": "credit_note", "line_items": [{
+            "line_role": "refund_revenue", "gross_amount": 20,
+        }]}
+
+        self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=artifact)
+
+    def test_action_batch_schema_rejects_credit_inventory_with_non_refund_role(self) -> None:
+        artifact = bookchecker.load_yaml(ROOT / "templates/actions-period.template.yaml")
+        proof = bookbuilder.inventory_proof_envelope(
+            scope={
+                "kind": "normalized_sales_group", "period": "2024-01",
+                "record_category": "refunds", "group_label": "woo",
+                "currency": "EUR", "tax_profile": "non_taxable",
+            },
+            quantity=bookbuilder.Decimal("1"),
+            contributors=[{
+                "record_id": "woo:refund:1", "quantity": 1,
+                "quantity_source": "normalized_record", "record_sha256": "a" * 64,
+            }],
+        )
+        action = artifact["actions"][0]
+        action["action_type"] = "create_credit_invoice_summary"
+        action["payload"] = {"document_type": "credit_note", "line_items": [{
+            "line_role": "sales_revenue", "article_id_hint": "3", "quantity": 1,
+            "inventory_quantity_proof": proof,
+        }]}
+
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=artifact)
+
+    def test_statement_import_evidence_template_uses_immutable_discovery_snapshot(self) -> None:
+        artifact = json.loads(
+            (ROOT / "templates/statement-import-evidence.template.json").read_text(encoding="utf-8")
+        )
+
+        path = artifact["evidence_source"]["path"]
+        self.assertIn("snapshots", path)
+        self.assertNotEqual(path, "companies/example/artifacts/discovery/2024-overview.json")
+
+    def test_action_batch_schema_restricts_top_level_manual_financial_dispositions(self) -> None:
+        dependency = {
+            "kind": "manual_statement_import_financial_transaction",
+            "blocking": False,
+            "reason": "Statement import completed.",
+            "disposition": "bank_fee_payment",
+            "statement_id": "archive:fee-1",
+            "record_id": "fee-1",
+            "date": "2024-01-15",
+            "iban": "EE123",
+            "currency": "EUR",
+            "physical_signed_amount": -7.0,
+            "source_ref": {"path": "normalized.json", "record_ref": "fee-1", "source_kind": "physical_bank"},
+            "reviewed_rationale": "Reviewed fee.",
+            "target": {"financial_transaction_kind": "bank-fee"},
+            "split_parts": [],
+            "split_proof": None,
+            "statement_import_proof": {
+                "status": "verified", "required_evidence": "live_discovery_or_audit",
+                "simplbooks_transaction_id": "txn-501",
+                "evidence_binding": {"path": "evidence.json", "sha256": "a" * 64},
+            },
+        }
+        batch = {
+            "schema_version": "1.0", "company_slug": "example", "period": "2024-01",
+            "generated_at": "2024-01-01T00:00:00Z", "batch_id": "example-2024-01",
+            "approval_status": "draft", "already_present": [], "unresolved_dependencies": [dependency],
+            "reference_artifacts": [
+                {"kind": "posting_policy", "path": "policy.json", "sha256": "0" * 64},
+                {"kind": "discovery_overview", "path": "overview.json", "sha256": "1" * 64},
+            ], "actions": [],
+        }
+
+        dependency["disposition"] = "expense_reimbursement_payment"
+        self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=batch)
+
+        for disposition in ("existing_invoice_receipt", "generated_purchase_payment"):
+            with self.subTest(disposition=disposition):
+                dependency["disposition"] = disposition
+                with self.assertRaises(AssertionError):
+                    self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=batch)
+
+        dependency.update({
+            "disposition": "reviewed_split",
+            "physical_signed_amount": 10.0,
+            "split_parts": [
+                {"signed_amount": 20.0, "disposition": "existing_invoice_receipt", "target": {"simplbooks_id": "119"}},
+                {"signed_amount": -10.0, "disposition": "generated_purchase_payment", "target": {"action_key": "purchase-1"}},
+            ],
+            "split_proof": {"signed_parts_total": 10.0, "physical_signed_amount": 10.0, "equation": "20.00 + -10.00 = 10.00"},
+        })
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=batch)
+
+        dependency["split_parts"][1].update({
+            "disposition": "bank_fee_payment",
+            "target": {"financial_transaction_kind": "fee"},
+        })
         self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=batch)
 
     def test_generated_year_overview_matches_strict_schema(self) -> None:
@@ -178,3 +684,34 @@ class SchemaContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def bank_allocation_payload(*, allocations: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "schema_version": "1.0",
+        "company_slug": "example",
+        "year": 2024,
+        "normalized_bindings": [
+            {
+                "path": "companies/example/artifacts/normalized/2024-01.json",
+                "sha256": "a" * 64,
+            }
+        ],
+        "allocations": allocations,
+    }
+
+
+def bank_allocation(**overrides: Any) -> dict[str, Any]:
+    allocation = {
+        "statement_id": "archive:2024010212345678",
+        "record_id": "bank-source:bank:2",
+        "iban": "EE123",
+        "period": "2024-01",
+        "disposition": "existing_invoice_receipt",
+        "amount": 330.0,
+        "currency": "EUR",
+        "target": {"simplbooks_id": "119", "document_type": "invoice"},
+        "review": {"status": "approved", "rationale": "Exact invoice number and amount."},
+    }
+    allocation.update(overrides)
+    return allocation

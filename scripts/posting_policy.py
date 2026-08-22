@@ -110,7 +110,16 @@ def validate_posting_policy(payload: dict[str, Any]) -> None:
     for source_account, account_id in payload["bank_accounts"].items():
         if not str(source_account).strip():
             raise PostingPolicyError("Posting policy bank account keys cannot be empty.")
-        normalize_id(account_id, field_name=f"bank_accounts[{source_account!r}]")
+        if isinstance(account_id, dict):
+            if not account_id:
+                raise PostingPolicyError(f"bank_accounts[{source_account!r}] requires at least one currency mapping.")
+            for currency, currency_account_id in account_id.items():
+                normalized_currency = str(currency or "").strip()
+                if not re.fullmatch(r"[A-Z]{3}", normalized_currency):
+                    raise PostingPolicyError(f"bank_accounts[{source_account!r}] has invalid currency {currency!r}.")
+                normalize_id(currency_account_id, field_name=f"bank_accounts[{source_account!r}][{currency!r}]")
+        else:
+            normalize_id(account_id, field_name=f"bank_accounts[{source_account!r}]")
 
     contacts = payload["contacts"]
     for role, mappings in contacts.items():
@@ -145,7 +154,13 @@ def load_posting_policy(path: Path) -> dict[str, Any]:
     return payload
 
 
-def resolve_bank_account(policy: dict[str, Any], *, customer_account: str) -> str:
+def resolve_bank_account(
+    policy: dict[str, Any],
+    *,
+    customer_account: str,
+    currency: str | None = None,
+    allow_legacy_single_currency: bool = False,
+) -> str:
     source_account = re.sub(r"\s+", "", str(customer_account or "")).upper()
     mappings = policy.get("bank_accounts") or {}
     normalized_mappings = {
@@ -154,7 +169,25 @@ def resolve_bank_account(policy: dict[str, Any], *, customer_account: str) -> st
     }
     if source_account not in normalized_mappings:
         raise PostingPolicyError(f"No exact bank-account mapping exists for source account {customer_account!r}.")
-    return normalize_id(normalized_mappings[source_account], field_name=f"bank_accounts[{customer_account!r}]")
+    account_mapping = normalized_mappings[source_account]
+    if isinstance(account_mapping, dict):
+        normalized_currency = str(currency or "").strip().upper()
+        if not re.fullmatch(r"[A-Z]{3}", normalized_currency):
+            raise PostingPolicyError(f"Bank-account mapping for {customer_account!r} requires a three-letter currency.")
+        currency_mappings = {str(key).strip().upper(): value for key, value in account_mapping.items()}
+        if normalized_currency not in currency_mappings:
+            raise PostingPolicyError(
+                f"No exact bank-account mapping exists for source account {customer_account!r} and currency {normalized_currency}."
+            )
+        return normalize_id(
+            currency_mappings[normalized_currency],
+            field_name=f"bank_accounts[{customer_account!r}][{normalized_currency!r}]",
+        )
+    if currency is not None and not allow_legacy_single_currency:
+        raise PostingPolicyError(
+            f"Bank-account mapping for {customer_account!r} must specify currency {str(currency).upper()!r}."
+        )
+    return normalize_id(account_mapping, field_name=f"bank_accounts[{customer_account!r}]")
 
 
 def resolve_contact(policy: dict[str, Any], *, role: str, label: str) -> str:
@@ -180,6 +213,23 @@ def resolve_supplier_alias(policy: dict[str, Any], value: str) -> str:
     return aliases.get(supplier, supplier)
 
 
+def configured_bank_account_ids(policy: dict[str, Any]) -> set[str]:
+    """Flatten legacy and `(IBAN, currency)` mappings to their allowed SimplBooks IDs."""
+    resolved: set[str] = set()
+    for source_account, value in (policy.get("bank_accounts") or {}).items():
+        if isinstance(value, dict):
+            for currency, account_id in value.items():
+                resolved.add(
+                    normalize_id(
+                        account_id,
+                        field_name=f"bank_accounts[{source_account!r}][{currency!r}]",
+                    )
+                )
+        else:
+            resolved.add(normalize_id(value, field_name=f"bank_accounts[{source_account!r}]"))
+    return resolved
+
+
 def action_policy_errors(action: dict[str, Any], policy: dict[str, Any]) -> list[str]:
     """Independently compare every submit-capable ID in an action with explicit policy."""
     payload = action.get("payload") or {}
@@ -187,6 +237,15 @@ def action_policy_errors(action: dict[str, Any], policy: dict[str, Any]) -> list
     if action_type in {"create_invoice_summary", "create_credit_invoice_summary"}:
         role = "sales"
         label = str((payload.get("summary_scope") or {}).get("channel_or_source") or "")
+    elif action_type == "create_incoming_summary" and str(payload.get("settlement_family") or "") == "direct-sale":
+        role = "sales"
+        label = str(payload.get("counterparty_hint") or "")
+    elif action_type == "create_incoming_summary" and (
+        payload.get("linked_invoice_id") not in (None, "")
+        or payload.get("linked_invoice_action") not in (None, "")
+    ):
+        role = "sales"
+        label = str(payload.get("counterparty_hint") or "")
     elif action_type == "create_incoming_summary" or (
         action_type == "create_purchase_summary" and slugify(str(payload.get("vendor_hint") or "")) in {"paypal", "stripe"}
     ):
@@ -209,16 +268,18 @@ def action_policy_errors(action: dict[str, Any], policy: dict[str, Any]) -> list
             errors.append(f"Contact ID {actual_contact!r} does not match policy ID {expected_contact!r} for {role}/{label}.")
 
     if action_type in {"create_incoming_summary", "create_payment_summary"}:
-        allowed = {normalize_id(value, field_name="bank_accounts") for value in (policy.get("bank_accounts") or {}).values()}
+        allowed = configured_bank_account_ids(policy)
         if str(payload.get("bank_account_id") or "") not in allowed:
             errors.append("Cash action bank_account_id is not one of the explicit posting-policy accounts.")
 
     family = ""
     if role == "sales":
-        tax_profile = str((payload.get("summary_scope") or {}).get("tax_profile") or "")
-        if not tax_profile:
-            tax_profile = "taxable" if float((payload.get("totals") or {}).get("vat_amount") or 0) else "non-taxable"
-        family = f"{slugify(label)}-{slugify(tax_profile)}"
+        if action_type in {"create_invoice_summary", "create_credit_invoice_summary"}:
+            explicit_family = str((payload.get("summary_scope") or {}).get("posting_family") or "")
+            tax_profile = str((payload.get("summary_scope") or {}).get("tax_profile") or "")
+            if not tax_profile:
+                tax_profile = "taxable" if float((payload.get("totals") or {}).get("vat_amount") or 0) else "non-taxable"
+            family = slugify(explicit_family) or f"{slugify(label)}-{slugify(tax_profile)}"
     elif action_type == "create_purchase_summary" and role == "processors":
         family = f"fees-{slugify(label)}"
     elif action_type in {"create_purchase_summary", "create_purchase_credit_summary"}:
@@ -265,4 +326,12 @@ def action_policy_errors(action: dict[str, Any], policy: dict[str, Any]) -> list
         actual_warehouse = line.get("warehouse_id_hint")
         if str(actual_warehouse or "") != str(expected_warehouse or ""):
             errors.append(f"Line warehouse does not match policy family {family!r}.")
+        expected_article = (
+            None if role == "sales" and line_role.endswith("_shipping")
+            else family_values.get("article_id") if role == "sales"
+            else line_values.get("article_id")
+        )
+        actual_article = line.get("article_id_hint")
+        if str(actual_article or "") != str(expected_article or ""):
+            errors.append(f"Line article does not match policy family {family!r}.")
     return errors

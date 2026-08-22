@@ -57,12 +57,23 @@ Implemented deterministic checks:
 - missing account, VAT, and bank mapping hints
 - recon gate alignment
 - policy-driven historical outlier warnings
+- manual statement-import proof state, signed disposition direction, and independent identity/economic
+  comparison with the referenced normalized physical bank row
+- manual dependency top-level disposition scope, including the requirement that `reviewed_split`
+  contains at least one bank-fee or clearing-transfer part
+- independent exact-once physical-bank coverage against the bound annual allocation and normalized files
+- bijective reviewed-split assignment by signed amount, disposition, and exact target; each cash action is checked against its assigned part
+- direct-sale receipt linkage to the generated invoice action, physical source-row line, and reviewed grouping/target fields
+- exact statement date, signed amount, currency, and `(IBAN, currency)` bank-account mapping for every cash settlement
+- verified non-blocking statement-import dependencies as terminal coverage, without allowing pending proof to pass
+- manual-financial allocations as atomic rows: exactly one verified manual coverage item and no API cash action
+- generated settlement targets resolved to the correct current invoice/purchase action and dependency, or to SHA-bound successful historical action and inserted-ID proof
 
 ## Guardrails
 
 - `bookchecker` is a pre-submit gate and should run before `booksend`.
 - A blocked recon month should fail the checker.
-- Do not treat low-confidence draft actions as submit-ready.
+- Do not approve low- or medium-confidence actions; informational provenance notes do not lower confidence.
 - Keep the report with the action batch so reruns remain auditable.
 - Fail company batches whose normalized evidence still points to disposable `temp/` source paths.
 

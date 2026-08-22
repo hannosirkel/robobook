@@ -9,10 +9,17 @@
     "company_slug": {"type": "string", "pattern": "^[a-z0-9-]+$"},
     "bank_accounts": {
       "type": "object",
-      "additionalProperties": {"type": "string", "pattern": "^[0-9]+$"}
+      "additionalProperties": {
+        "type": ["string", "object"],
+        "pattern": "^[0-9]+$",
+        "minProperties": 1,
+        "propertyNames": {"pattern": "^[A-Z]{3}$"},
+        "additionalProperties": {"type": "string", "pattern": "^[0-9]+$"}
+      }
     },
     "contacts": {
       "type": "object",
+      "description": "Role-based generic contact labels, including sales/direct-sale when direct bank sales are approved.",
       "additionalProperties": {
         "type": "object",
         "additionalProperties": {"type": "string", "pattern": "^[0-9]+$"}
@@ -20,6 +27,7 @@
     },
     "mappings": {
       "type": "object",
+      "description": "Generic posting-family keys such as direct-sale-taxable; company-specific IDs belong in values, not family names.",
       "additionalProperties": {
         "$ref": "#/$defs/posting_family"
       }
@@ -65,6 +73,7 @@
     },
     "posting_family": {
       "type": "object",
+      "description": "Reusable revenue or expense mapping for one reviewed posting family.",
       "additionalProperties": false,
       "properties": {
         "income_account_id": {"$ref": "#/$defs/id"},
@@ -73,6 +82,7 @@
         "vat_type_id": {"$ref": "#/$defs/id"},
         "shipping_vat_type_id": {"$ref": "#/$defs/id"},
         "warehouse_id": {"$ref": "#/$defs/id"},
+        "article_id": {"$ref": "#/$defs/id"},
         "lines": {
           "type": "object",
           "additionalProperties": {"$ref": "#/$defs/line_mapping"}

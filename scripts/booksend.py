@@ -578,6 +578,10 @@ def translate_cash_settlement_payload(
             ),
             None,
         )
+        if linked_invoice_id and invoice_dependency:
+            raise SimplbooksError(
+                f"{action_id(action)} cannot carry both linked_invoice_id and generated invoice dependency."
+            )
         translated = {
             "Incoming": compact_dict(
                 {
@@ -621,6 +625,10 @@ def translate_cash_settlement_payload(
             )
         if not linked_purchase_action:
             linked_purchase_action = next((str(dep) for dep in action.get("depends_on") or []), "")
+        if linked_purchase_id and linked_purchase_action:
+            raise SimplbooksError(
+                f"{action_id(action)} cannot carry both linked_purchase_id and generated purchase dependency."
+            )
         translated = {
             "Payment": compact_dict(
                 {
@@ -1073,9 +1081,10 @@ def verify_submission_reference_artifacts(
         try:
             bound_path = verify_file_binding(binding, cwd=cwd)
             if kind == "discovery_overview":
+                overview = load_json(bound_path)
                 validate_discovery(
-                    load_json(bound_path),
-                    year=int(period[:4]),
+                    overview,
+                    year=int(overview.get("year") or 0),
                     company_id=company_id,
                 )
         except ReferenceArtifactError as exc:

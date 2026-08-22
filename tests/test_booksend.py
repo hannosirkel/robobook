@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import copy
+import json
 import sys
 import tempfile
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 
 
@@ -11,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import booksend  # noqa: E402
+import reference_artifacts  # noqa: E402
 from simplbooks_api import SimplbooksError  # noqa: E402
 
 
@@ -250,12 +253,14 @@ def payment_action(
 
 def existing_invoice_incoming() -> dict:
     action = incoming_action(depends_on=[])
+    action["depends_on"] = []
     action["payload"]["linked_invoice_id"] = "119"
     return action
 
 
 def existing_purchase_payment() -> dict:
     action = payment_action(depends_on=[])
+    action["depends_on"] = []
     action["payload"].pop("linked_purchase_action")
     action["payload"]["linked_purchase_id"] = "88"
     return action
@@ -288,6 +293,43 @@ class FakeClient:
 
 
 class BooksendTests(unittest.TestCase):
+    def test_sender_rejects_existing_invoice_id_with_generated_invoice_dependency(self) -> None:
+        action = existing_invoice_incoming()
+        action["depends_on"] = ["example-2024-01-sales-paypal"]
+
+        with self.assertRaisesRegex(SimplbooksError, "both linked_invoice_id and generated invoice dependency"):
+            booksend.translate_cash_settlement_payload(
+                action,
+                lookup={"example-2024-01-sales-paypal": invoice_action()},
+            )
+
+    def test_sender_accepts_bound_prior_year_discovery_overview(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            discovery_path = root / "2023-overview.json"
+            discovery_path.write_text(
+                json.dumps({
+                    "year": 2023,
+                    "company_id": "CID",
+                    "retrieved_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                }),
+                encoding="utf-8",
+            )
+            policy_path = root / "posting-policy.json"
+            policy_path.write_text("{}", encoding="utf-8")
+            batch = make_batch(actions=[invoice_action()])
+            batch["reference_artifacts"] = [
+                reference_artifacts.bind_file(policy_path, kind="posting_policy", cwd=root),
+                reference_artifacts.bind_file(discovery_path, kind="discovery_overview", cwd=root),
+            ]
+
+            booksend.verify_submission_reference_artifacts(
+                batch,
+                cwd=root,
+                period="2024-01",
+                company_id="CID",
+            )
+
     def test_translate_incoming_accepts_existing_invoice_id(self) -> None:
         translated = booksend.translate_cash_settlement_payload(existing_invoice_incoming(), lookup={})
 

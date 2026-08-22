@@ -2320,11 +2320,13 @@ def build_exact_cash_actions(
         bank_account_id = default_bank_account_id
         notes = list(bank_account_notes)
         if posting_policy is not None:
-            source_account = str((record.get("attributes") or {}).get("customer_account") or "").strip()
-            if not source_account:
-                raise SimplbooksError(f"Physical bank settlement {record_id} lacks source bank account.")
             try:
-                bank_account_id = resolve_bank_account(posting_policy, customer_account=source_account)
+                bank_account_id = resolve_bank_account(
+                    posting_policy,
+                    customer_account=key[1],
+                    currency=currency,
+                    allow_legacy_single_currency=len({record_currency(item, base_currency) for item in records.get("bank_transactions", []) if str(item.get("source_system") or "") == "bank"}) == 1,
+                )
             except PostingPolicyError as exc:
                 raise SimplbooksError(str(exc)) from exc
             notes = ["Applied exact source-bank-account mapping from the physical bank row."]
@@ -2332,8 +2334,13 @@ def build_exact_cash_actions(
         for part, part_number in _allocation_parts(allocation):
             disposition = str(part.get("disposition") or "")
             target = part.get("target") or {}
+            part_amount = decimal_value(part.get("amount") if part_number is not None else allocation.get("amount"))
             if not isinstance(target, dict):
                 raise SimplbooksError(f"Settlement target for {record_id} must be an object.")
+            if disposition in {"generated_invoice_receipt", "existing_invoice_receipt", "direct_sale_receipt"} and part_amount <= 0:
+                raise SimplbooksError(f"Receipt settlement allocation for {record_id} must be positive.")
+            if disposition in {"generated_purchase_payment", "existing_purchase_payment", "bank_fee_payment"} and part_amount >= 0:
+                raise SimplbooksError(f"Payment settlement allocation for {record_id} must be negative.")
             if disposition in {"clearing_transfer", "direct_sale_receipt", "bank_fee_payment"}:
                 # These require their dedicated document builders; never manufacture a substitute here.
                 continue
@@ -2347,11 +2354,20 @@ def build_exact_cash_actions(
                 raise SimplbooksError(f"Settlement target for {record_id} must be a {target_kind}.")
 
             target_is_existing = disposition.startswith("existing_")
+            target_has_existing_id = bool(str(target.get("simplbooks_id") or "").strip())
+            target_has_generated_action = any(
+                bool(str(target.get(field) or "").strip())
+                for field in ("action_key", "idempotency_key", "action_id")
+            )
+            if target_has_existing_id and target_has_generated_action:
+                raise SimplbooksError(f"Settlement target for {record_id} cannot carry both existing and generated target fields.")
             target_field = f"linked_{target_kind}_id" if target_is_existing else f"linked_{target_kind}_action"
             target_value = _existing_target_id(target) if target_is_existing else _generated_target_action_key(target)
             depends_on: list[str] = []
             supporting_refs: list[dict[str, Any]] = []
-            if target_is_existing and discovery_overviews:
+            if target_is_existing:
+                if not discovery_overviews:
+                    raise SimplbooksError(f"Existing settlement target {target_value!r} requires a bound discovery overview.")
                 discovered = [
                     item
                     for overview in discovery_overviews
@@ -2401,7 +2417,6 @@ def build_exact_cash_actions(
                 notes_for_action.append(forced_note)
             notes_for_action.append(str((allocation.get("review") or {}).get("rationale") or "Reviewed bank allocation."))
 
-            part_amount = decimal_value(part.get("amount") if part_number is not None else allocation.get("amount"))
             payload = {
                 "draft_schema": "cash_settlement_v1",
                 "document_type": document_type,
@@ -2413,7 +2428,7 @@ def build_exact_cash_actions(
                 },
                 "counterparty_hint": str(target.get("counterparty_hint") or record_group_label(record, default="bank settlement")),
                 "bank_account_id": bank_account_id,
-                "amount": decimal_number(abs(part_amount)),
+                "amount": decimal_number(part_amount if document_type == "incoming" else -part_amount),
                 target_field: target_value,
                 "record_count": 1,
             }
@@ -2424,7 +2439,10 @@ def build_exact_cash_actions(
                     action_type=action_type,
                     endpoint=endpoint,
                     payload=payload,
-                    source_refs=source_refs_for_records(normalized_path_display, [record]) + supporting_refs,
+                    source_refs=[
+                        {**source_ref, "source_kind": "physical_bank"}
+                        for source_ref in source_refs_for_records(normalized_path_display, [record])
+                    ] + supporting_refs,
                     reason=f"Create the exact {document_type} settlement for reviewed physical bank row {record_id}.",
                     confidence=review_confidence(notes=notes_for_action, required_ids=[bank_account_id, str(contact_id or "")]),
                     depends_on=depends_on,
@@ -2804,23 +2822,24 @@ def build_action_batch(
             for record in records["bank_transactions"]
             if slugify(str(record.get("source_system") or "")) == "bank"
         ]
-        missing_source_accounts = [
-            str(record.get("record_id") or "<unknown>")
-            for record in source_bank_records
-            if not str((record.get("attributes") or {}).get("customer_account") or "").strip()
-        ]
-        if missing_source_accounts:
-            raise SimplbooksError(
-                f"Posting policy found bank row(s) missing source bank account: {', '.join(missing_source_accounts[:3])}."
-            )
-        source_accounts = {
-            re.sub(r"\s+", "", str((record.get("attributes") or {}).get("customer_account") or "")).upper()
-            for record in source_bank_records
-        }
-        source_accounts.discard("")
+        source_accounts: list[tuple[str, str]] = []
+        for record in source_bank_records:
+            try:
+                iban, currency = bank_ledger_key(record)
+            except BankAllocationError as exc:
+                raise SimplbooksError(
+                    f"Posting policy found bank row(s) missing source bank account: {record.get('record_id') or '<unknown>'}."
+                ) from exc
+            source_accounts.append((iban, currency))
+        currencies = {currency for _iban, currency in source_accounts}
         try:
-            for source_account in source_accounts:
-                resolve_bank_account(posting_policy, customer_account=source_account)
+            for source_account, currency in source_accounts:
+                resolve_bank_account(
+                    posting_policy,
+                    customer_account=source_account,
+                    currency=currency,
+                    allow_legacy_single_currency=len(currencies) == 1,
+                )
         except PostingPolicyError as exc:
             raise SimplbooksError(str(exc)) from exc
         bank_account_notes = ["Applied exact source-bank-account mapping from the physical bank row."]

@@ -141,7 +141,7 @@ def existing_invoice_allocation(*, record_id: str, invoice_id: str) -> dict:
     }
 
 
-def build_with(*, bank: dict, allocation: dict) -> dict:
+def build_with(*, bank: dict, allocation: dict, **overrides: object) -> dict:
     normalized = base_normalized(bank["event_date"][:7])
     normalized["records"]["bank_transactions"] = [bank]
     allocation = dict(allocation, period=normalized["period"], amount=bank["gross_amount"])
@@ -157,6 +157,7 @@ def build_with(*, bank: dict, allocation: dict) -> dict:
             bank_allocations={
                 (allocation["statement_id"], allocation["iban"], allocation["currency"]): allocation,
             },
+            **overrides,
         )
 
 
@@ -267,10 +268,48 @@ def purchase_summary_action(
 
 
 class BookbuilderTests(unittest.TestCase):
+    def test_existing_cash_target_requires_discovery_proof(self) -> None:
+        with self.assertRaisesRegex(bookbuilder.SimplbooksError, "discovery overview"):
+            build_with(
+                bank=bank_row(record_id="receipt", amount=330.0, event_date="2024-01-08"),
+                allocation=existing_invoice_allocation(record_id="receipt", invoice_id="119"),
+            )
+
+    def test_existing_cash_target_rejects_generated_target_field(self) -> None:
+        allocation = existing_invoice_allocation(record_id="receipt", invoice_id="119")
+        allocation["target"]["action_key"] = "example-2024-01-sales-direct"
+        with self.assertRaisesRegex(bookbuilder.SimplbooksError, "both existing and generated"):
+            build_with(
+                bank=bank_row(record_id="receipt", amount=330.0, event_date="2024-01-08"),
+                allocation=allocation,
+                discovery_overviews=[{"document_index": [{"simplbooks_id": "119", "document_type": "invoice"}]}],
+            )
+
+    def test_exact_cash_actions_reject_disposition_with_wrong_sign(self) -> None:
+        receipt = existing_invoice_allocation(record_id="receipt", invoice_id="119")
+        receipt["amount"] = -20.0
+        with self.assertRaisesRegex(bookbuilder.SimplbooksError, "positive"):
+            build_with(
+                bank=bank_row(record_id="receipt", amount=-20.0, event_date="2024-01-08"),
+                allocation=receipt,
+                discovery_overviews=[{"document_index": [{"simplbooks_id": "119", "document_type": "invoice"}]}],
+            )
+
+        payment = existing_invoice_allocation(record_id="payment", invoice_id="88")
+        payment.update({"disposition": "existing_purchase_payment", "amount": 20.0})
+        payment["target"] = {"simplbooks_id": "88", "document_type": "purchase"}
+        with self.assertRaisesRegex(bookbuilder.SimplbooksError, "negative"):
+            build_with(
+                bank=bank_row(record_id="payment", amount=20.0, event_date="2024-01-08"),
+                allocation=payment,
+                discovery_overviews=[{"document_index": [{"simplbooks_id": "88", "document_type": "purchase"}]}],
+            )
+
     def test_existing_manual_invoice_receipt_uses_statement_date_and_id(self) -> None:
         batch = build_with(
             bank=bank_row(record_id="receipt", amount=330.0, event_date="2024-01-08"),
             allocation=existing_invoice_allocation(record_id="receipt", invoice_id="119"),
+            discovery_overviews=[{"document_index": [{"simplbooks_id": "119", "document_type": "invoice"}]}],
         )
 
         action = find_action(batch, "create_incoming_summary")
@@ -333,14 +372,14 @@ class BookbuilderTests(unittest.TestCase):
             bank_row(record_id="receipt-one", amount=20.0, event_date="2024-01-08"),
             bank_row(record_id="receipt-two", amount=20.0, event_date="2024-01-09"),
         ]
-        rows[0]["attributes"]["customer_account"] = "EE111"
-        rows[1]["attributes"]["customer_account"] = "EE222"
+        rows[0]["attributes"]["iban"] = "EE111"
+        rows[1]["attributes"]["iban"] = "EE222"
         normalized["records"]["bank_transactions"] = rows
         allocations = {
-            (f"archive:{row['record_id']}", "EE123", "EUR"): {
+            (f"archive:{row['record_id']}", row["attributes"]["iban"], "EUR"): {
                 "statement_id": f"archive:{row['record_id']}",
                 "record_id": row["record_id"],
-                "iban": "EE123",
+                "iban": row["attributes"]["iban"],
                 "period": "2024-01",
                 "disposition": "existing_invoice_receipt",
                 "amount": 20.0,
@@ -352,7 +391,7 @@ class BookbuilderTests(unittest.TestCase):
         }
         policy = {
             "schema_version": "1.0", "company_slug": "example",
-            "bank_accounts": {"EE111": "3", "EE222": "4"},
+            "bank_accounts": {"EE111": {"EUR": "3"}, "EE222": {"EUR": "4"}},
             "contacts": {}, "mappings": {}, "supplier_aliases": {},
         }
         with tempfile.TemporaryDirectory() as tmp:
@@ -365,12 +404,71 @@ class BookbuilderTests(unittest.TestCase):
                 repo_root=root,
                 posting_policy=policy,
                 bank_allocations=allocations,
+                discovery_overviews=[{"document_index": [{"simplbooks_id": "119", "document_type": "invoice"}]}],
             )
 
         self.assertEqual(
             [action["payload"]["bank_account_id"] for action in actions_of_type(batch, "create_incoming_summary")],
             ["3", "4"],
         )
+
+    def test_exact_cash_actions_map_same_iban_by_currency(self) -> None:
+        normalized = base_normalized("2024-01")
+        rows = [
+            bank_row(record_id="receipt-eur", amount=20.0, event_date="2024-01-08"),
+            bank_row(record_id="receipt-usd", amount=20.0, event_date="2024-01-09"),
+        ]
+        rows[1]["currency"] = "USD"
+        normalized["records"]["bank_transactions"] = rows
+        allocations = {}
+        for row in rows:
+            currency = row["currency"]
+            allocations[(f"archive:{row['record_id']}", "EE123", currency)] = {
+                "statement_id": f"archive:{row['record_id']}", "record_id": row["record_id"],
+                "iban": "EE123", "period": "2024-01", "disposition": "existing_invoice_receipt",
+                "amount": 20.0, "currency": currency,
+                "target": {"simplbooks_id": "119", "document_type": "invoice"},
+                "review": {"status": "approved", "rationale": "Exact invoice match."},
+            }
+        policy = {
+            "schema_version": "1.0", "company_slug": "example",
+            "bank_accounts": {"EE123": {"EUR": "3", "USD": "4"}},
+            "contacts": {}, "mappings": {}, "supplier_aliases": {},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            batch = bookbuilder.build_action_batch(
+                normalized_payload=normalized, recon_payload=base_recon("2024-01"),
+                normalized_path=root / "normalized.json", recon_path=root / "recon.json", repo_root=root,
+                posting_policy=policy, bank_allocations=allocations,
+                discovery_overviews=[{"document_index": [{"simplbooks_id": "119", "document_type": "invoice"}]}],
+            )
+        self.assertEqual(
+            [action["payload"]["bank_account_id"] for action in actions_of_type(batch, "create_incoming_summary")],
+            ["3", "4"],
+        )
+
+    def test_exact_cash_actions_block_missing_currency_specific_bank_mapping(self) -> None:
+        normalized = base_normalized("2024-01")
+        row = bank_row(record_id="receipt-usd", amount=20.0, event_date="2024-01-09")
+        row["currency"] = "USD"
+        normalized["records"]["bank_transactions"] = [row]
+        allocation = existing_invoice_allocation(record_id="receipt-usd", invoice_id="119")
+        allocation.update({"amount": 20.0, "currency": "USD"})
+        policy = {
+            "schema_version": "1.0", "company_slug": "example",
+            "bank_accounts": {"EE123": {"EUR": "3"}},
+            "contacts": {}, "mappings": {}, "supplier_aliases": {},
+        }
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(bookbuilder.SimplbooksError, "USD"):
+            root = Path(tmp)
+            bookbuilder.build_action_batch(
+                normalized_payload=normalized, recon_payload=base_recon("2024-01"),
+                normalized_path=root / "normalized.json", recon_path=root / "recon.json", repo_root=root,
+                posting_policy=policy,
+                bank_allocations={("archive:receipt-usd", "EE123", "USD"): allocation},
+                discovery_overviews=[{"document_index": [{"simplbooks_id": "119", "document_type": "invoice"}]}],
+            )
 
     def test_processor_classifier_ignores_refs_nested_in_woo_vat_evidence(self) -> None:
         woo_sale = record(

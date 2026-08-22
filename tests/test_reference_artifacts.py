@@ -37,8 +37,8 @@ class ReferenceArtifactTests(unittest.TestCase):
             with self.assertRaises(reference_artifacts.ReferenceArtifactError):
                 reference_artifacts.verify_file_binding(binding, cwd=Path(tmp))
 
-    def test_physical_bank_source_reference_requires_bank_allocation_binding(self) -> None:
-        batch = {
+    def test_physical_bank_source_metadata_requires_bank_allocation_binding(self) -> None:
+        false_positive = {
             "actions": [
                 {
                     "source_refs": [
@@ -47,8 +47,18 @@ class ReferenceArtifactTests(unittest.TestCase):
                 }
             ]
         }
-        self.assertTrue(reference_artifacts.requires_bank_allocation_binding(batch))
-        self.assertIn("bank_allocations", reference_artifacts.required_action_binding_kinds(batch))
+        physical_bank = {
+            "actions": [
+                {
+                    "source_refs": [
+                        {"path": "normalized.json", "record_ref": "receipt-1", "source_kind": "physical_bank"}
+                    ]
+                }
+            ]
+        }
+        self.assertFalse(reference_artifacts.requires_bank_allocation_binding(false_positive))
+        self.assertTrue(reference_artifacts.requires_bank_allocation_binding(physical_bank))
+        self.assertIn("bank_allocations", reference_artifacts.required_action_binding_kinds(physical_bank))
 
 
 if __name__ == "__main__":

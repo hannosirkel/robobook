@@ -63,6 +63,40 @@ class PostingPolicyTests(unittest.TestCase):
         with self.assertRaises(posting_policy.PostingPolicyError):
             posting_policy.resolve_bank_account(policy, customer_account="UNKNOWN")
 
+    def test_bank_account_resolution_requires_exact_currency_mapping(self) -> None:
+        policy = {"bank_accounts": {"EE-LHV": {"EUR": "3", "USD": "4"}}}
+
+        self.assertEqual(
+            posting_policy.resolve_bank_account(policy, customer_account="ee-lhv", currency="eur"),
+            "3",
+        )
+        self.assertEqual(
+            posting_policy.resolve_bank_account(policy, customer_account="EE-LHV", currency="USD"),
+            "4",
+        )
+        with self.assertRaisesRegex(posting_policy.PostingPolicyError, "GBP"):
+            posting_policy.resolve_bank_account(policy, customer_account="EE-LHV", currency="GBP")
+
+        legacy = {"bank_accounts": {"EE-LHV": "3"}}
+        with self.assertRaisesRegex(posting_policy.PostingPolicyError, "specify currency 'USD'"):
+            posting_policy.resolve_bank_account(legacy, customer_account="EE-LHV", currency="USD")
+        self.assertEqual(
+            posting_policy.resolve_bank_account(
+                legacy,
+                customer_account="EE-LHV",
+                currency="USD",
+                allow_legacy_single_currency=True,
+            ),
+            "3",
+        )
+
+    def test_policy_rejects_non_uppercase_currency_bank_mapping(self) -> None:
+        policy = posting_policy_fixture_with_profiles()
+        policy["bank_accounts"] = {"EE-LHV": {"usd": "4"}}
+
+        with self.assertRaisesRegex(posting_policy.PostingPolicyError, "invalid currency"):
+            posting_policy.validate_posting_policy(policy)
+
     def test_woo_uses_eraisik_and_paypal_never_falls_back_to_stripe(self) -> None:
         policy = {
             "contacts": {

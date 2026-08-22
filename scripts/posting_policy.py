@@ -110,7 +110,16 @@ def validate_posting_policy(payload: dict[str, Any]) -> None:
     for source_account, account_id in payload["bank_accounts"].items():
         if not str(source_account).strip():
             raise PostingPolicyError("Posting policy bank account keys cannot be empty.")
-        normalize_id(account_id, field_name=f"bank_accounts[{source_account!r}]")
+        if isinstance(account_id, dict):
+            if not account_id:
+                raise PostingPolicyError(f"bank_accounts[{source_account!r}] requires at least one currency mapping.")
+            for currency, currency_account_id in account_id.items():
+                normalized_currency = str(currency or "").strip()
+                if not re.fullmatch(r"[A-Z]{3}", normalized_currency):
+                    raise PostingPolicyError(f"bank_accounts[{source_account!r}] has invalid currency {currency!r}.")
+                normalize_id(currency_account_id, field_name=f"bank_accounts[{source_account!r}][{currency!r}]")
+        else:
+            normalize_id(account_id, field_name=f"bank_accounts[{source_account!r}]")
 
     contacts = payload["contacts"]
     for role, mappings in contacts.items():
@@ -145,7 +154,13 @@ def load_posting_policy(path: Path) -> dict[str, Any]:
     return payload
 
 
-def resolve_bank_account(policy: dict[str, Any], *, customer_account: str) -> str:
+def resolve_bank_account(
+    policy: dict[str, Any],
+    *,
+    customer_account: str,
+    currency: str | None = None,
+    allow_legacy_single_currency: bool = False,
+) -> str:
     source_account = re.sub(r"\s+", "", str(customer_account or "")).upper()
     mappings = policy.get("bank_accounts") or {}
     normalized_mappings = {
@@ -154,7 +169,25 @@ def resolve_bank_account(policy: dict[str, Any], *, customer_account: str) -> st
     }
     if source_account not in normalized_mappings:
         raise PostingPolicyError(f"No exact bank-account mapping exists for source account {customer_account!r}.")
-    return normalize_id(normalized_mappings[source_account], field_name=f"bank_accounts[{customer_account!r}]")
+    account_mapping = normalized_mappings[source_account]
+    if isinstance(account_mapping, dict):
+        normalized_currency = str(currency or "").strip().upper()
+        if not re.fullmatch(r"[A-Z]{3}", normalized_currency):
+            raise PostingPolicyError(f"Bank-account mapping for {customer_account!r} requires a three-letter currency.")
+        currency_mappings = {str(key).strip().upper(): value for key, value in account_mapping.items()}
+        if normalized_currency not in currency_mappings:
+            raise PostingPolicyError(
+                f"No exact bank-account mapping exists for source account {customer_account!r} and currency {normalized_currency}."
+            )
+        return normalize_id(
+            currency_mappings[normalized_currency],
+            field_name=f"bank_accounts[{customer_account!r}][{normalized_currency!r}]",
+        )
+    if currency is not None and not allow_legacy_single_currency:
+        raise PostingPolicyError(
+            f"Bank-account mapping for {customer_account!r} must specify currency {str(currency).upper()!r}."
+        )
+    return normalize_id(account_mapping, field_name=f"bank_accounts[{customer_account!r}]")
 
 
 def resolve_contact(policy: dict[str, Any], *, role: str, label: str) -> str:

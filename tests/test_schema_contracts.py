@@ -99,6 +99,12 @@ class SchemaContractTests(unittest.TestCase):
         artifact = json.loads((ROOT / "templates/posting-policy.template.json").read_text(encoding="utf-8"))
         self.assert_artifact_valid(schema_name="posting-policy.schema.json", artifact=artifact)
 
+    def test_posting_policy_schema_accepts_currency_qualified_bank_account(self) -> None:
+        artifact = json.loads((ROOT / "templates/posting-policy.template.json").read_text(encoding="utf-8"))
+        artifact["bank_accounts"] = {"EE123": {"EUR": "3", "USD": "4"}}
+
+        self.assert_artifact_valid(schema_name="posting-policy.schema.json", artifact=artifact)
+
     def test_normalized_period_template_includes_cash_ledger_categories(self) -> None:
         artifact = json.loads((ROOT / "templates/normalized-period.template.json").read_text(encoding="utf-8"))
         self.assert_artifact_valid(schema_name="normalized-period.schema.json", artifact=artifact)

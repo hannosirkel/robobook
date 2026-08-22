@@ -95,16 +95,9 @@ def required_action_binding_kinds(action_batch: dict[str, Any]) -> set[str]:
 def requires_bank_allocation_binding(action_batch: dict[str, Any]) -> bool:
     """Report whether a write-capable batch contains physical bank settlement evidence."""
     return any(
-        _is_physical_bank_source_ref(source_ref)
+        str(source_ref.get("source_kind") or "") == "physical_bank"
         for action in action_batch.get("actions") or []
         if isinstance(action, dict)
         for source_ref in action.get("source_refs") or []
         if isinstance(source_ref, dict)
     )
-
-
-def _is_physical_bank_source_ref(source_ref: dict[str, Any]) -> bool:
-    """Recognize normalized physical-bank locators without treating clearing rows as bank rows."""
-    record_ref = str(source_ref.get("record_ref") or "")
-    tokens = {part.strip().lower() for part in record_ref.split(":") if part.strip()}
-    return "bank" in tokens or "camt" in tokens

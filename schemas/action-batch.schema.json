@@ -120,6 +120,10 @@
             "string",
             "null"
           ]
+        },
+        "source_kind": {
+          "type": "string",
+          "enum": ["physical_bank"]
         }
       }
     },

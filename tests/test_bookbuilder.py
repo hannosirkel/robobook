@@ -566,6 +566,24 @@ class BookbuilderTests(unittest.TestCase):
         with self.assertRaisesRegex(bookbuilder.SimplbooksError, "bank_fee_payment.*negative"):
             build_with(bank=row, allocation=allocation)
 
+    def test_foreign_currency_purchase_payment_adds_blocking_first_live_pilot(self) -> None:
+        row = bank_row(record_id="wise-usd-purchase", amount=-30.2, event_date="2024-11-01")
+        allocation = manual_allocation(row=row, disposition="generated_purchase_payment")
+        allocation["target"] = {
+            "document_type": "purchase", "action_key": "prior-usd-purchase",
+            "target_currency": "USD", "foreign_currency_pilot_required": True,
+            "pilot_requirements": ["applied_ecb_rate", "linked_purchase_balance", "realized_fx_and_fee_treatment"],
+        }
+
+        dependencies = bookbuilder.build_foreign_currency_payment_pilot_dependencies(
+            records={"bank_transactions": [row]},
+            allocations={(allocation["statement_id"], allocation["iban"], allocation["currency"]): allocation},
+        )
+
+        self.assertEqual(len(dependencies), 1)
+        self.assertTrue(dependencies[0]["blocking"])
+        self.assertEqual(dependencies[0]["target_currency"], "USD")
+
     def test_netted_foreign_receipt_rejects_reversed_split_signs(self) -> None:
         row = bank_row(record_id="foreign-reversed", amount=-723.32, event_date="2024-08-30")
         row["currency"] = "USD"
@@ -744,6 +762,28 @@ class BookbuilderTests(unittest.TestCase):
         )
         self.assertEqual(unresolved, [])
         self.assertEqual(actions[0]["payload"]["counterparty"]["contact_id"], "37")
+
+    def test_generated_payment_rejects_contact_conflicting_with_linked_purchase(self) -> None:
+        row = bank_row(record_id="dpd-conflict", amount=-43.4, event_date="2025-09-12")
+        allocation = manual_allocation(row=row, disposition="generated_purchase_payment")
+        allocation["target"] = {
+            "document_type": "purchase", "action_key": "example-2025-09-purchase-dpd",
+            "contact_id": "99", "counterparty_hint": "other-vendor",
+        }
+        target_action = purchase_summary_action(
+            period="2025-09", key="example-2025-09-purchase-dpd",
+            vendor_hint="dpd", amount=43.4, contact_id="37",
+        )
+
+        with self.assertRaisesRegex(bookbuilder.SimplbooksError, "conflicts with linked generated target"):
+            bookbuilder.build_exact_cash_actions(
+                company_slug="example", period="2025-09", normalized_path_display="normalized.json",
+                records={"bank_transactions": [row]}, base_currency="EUR",
+                default_bank_account_id="3", bank_account_notes=[], entity_map=None,
+                posting_policy=None,
+                allocations={(allocation["statement_id"], allocation["iban"], allocation["currency"]): allocation},
+                current_actions=[target_action], historical_actions={}, discovery_overviews=[], forced_note=None,
+            )
 
     def test_exact_cash_actions_map_each_physical_bank_account(self) -> None:
         normalized = base_normalized("2024-01")

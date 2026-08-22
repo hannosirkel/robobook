@@ -409,6 +409,7 @@ class BookreconTests(unittest.TestCase):
                 attributes={"clearing_provider": "printful", "clearing_account": "printful_wallet"},
             )
         ]
+        normalized["records"]["clearing_transactions"][0]["event_date"] = "2024-02-29"
 
         with tempfile.TemporaryDirectory() as tmp:
             document = bookrecon.build_recon_document(
@@ -440,6 +441,7 @@ class BookreconTests(unittest.TestCase):
                 attributes={"clearing_provider": "printful", "clearing_account": "printful_wallet"},
             )
         ]
+        normalized["records"]["clearing_transactions"][0]["event_date"] = "2024-02-29"
         march_allocation = allocation(
             statement_id="archive:march1",
             record_id="march1",
@@ -450,6 +452,14 @@ class BookreconTests(unittest.TestCase):
                 "document_type": "purchase",
                 "action_key": "example-2024-02-purchase-printful",
                 "clearing_record_ids": ["printful:wallet:feb29"],
+                "clearing_evidence": [{
+                    "record_id": "printful:wallet:feb29", "period": "2024-02",
+                    "currency": "EUR", "amount": -7.9,
+                    "provider": "printful", "account": "printful_wallet",
+                }],
+                "clearing_totals": {"EUR": -7.9},
+                "clearing_relation": "exact_amount",
+                "bridge_amount": -7.9,
             },
         )
 
@@ -466,6 +476,46 @@ class BookreconTests(unittest.TestCase):
 
         self.assertEqual(document["bank_coverage"]["resolved_clearing_record_ids"], ["printful:wallet:feb29"])
         self.assertEqual(document["bank_coverage"]["unresolved_clearing_count"], 0)
+
+    def test_arbitrary_or_economically_wrong_clearing_hint_does_not_resolve_movement(self) -> None:
+        normalized = base_normalized(period="2024-02")
+        movement = record(
+            record_id="printful:wallet:feb29", source_system="printful",
+            event_type="printful_wallet_deposit", gross_amount=-7.9,
+            attributes={"clearing_provider": "printful", "clearing_account": "printful_wallet"},
+        )
+        movement["event_date"] = "2024-02-29"
+        normalized["records"]["clearing_transactions"] = [movement]
+        reviewed = allocation(
+            statement_id="archive:march1", record_id="march1", amount=-7.9,
+            period="2024-03", disposition="generated_purchase_payment",
+            target={"document_type": "purchase", "action_key": "purchase", "note": "printful:wallet:feb29"},
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            arbitrary = bookrecon.build_recon_document(
+                normalized_payload=normalized, normalized_path=Path(tmp) / "2024-02.json",
+                repo_root=Path(tmp), amount_threshold=bookrecon.Decimal("0.5"),
+                quantity_threshold=bookrecon.Decimal("1"), clearing_allocations={"a": reviewed},
+            )
+            reviewed["target"].update({
+                "clearing_record_ids": ["printful:wallet:feb29"],
+                "clearing_evidence": [{
+                    "record_id": "printful:wallet:feb29", "period": "2024-03",
+                    "currency": "EUR", "amount": -7.9,
+                    "provider": "printful", "account": "printful_wallet",
+                }],
+                "clearing_totals": {"EUR": -7.9}, "clearing_relation": "exact_amount",
+                "bridge_amount": -7.9,
+            })
+            wrong_period = bookrecon.build_recon_document(
+                normalized_payload=normalized, normalized_path=Path(tmp) / "2024-02.json",
+                repo_root=Path(tmp), amount_threshold=bookrecon.Decimal("0.5"),
+                quantity_threshold=bookrecon.Decimal("1"), clearing_allocations={"a": reviewed},
+            )
+
+        self.assertEqual(arbitrary["bank_coverage"]["unresolved_clearing_count"], 1)
+        self.assertEqual(wrong_period["bank_coverage"]["unresolved_clearing_count"], 1)
     def test_processor_classifier_ignores_refs_nested_in_woo_vat_evidence(self) -> None:
         woo_sale = record(
             record_id="woo:1",
@@ -602,12 +652,29 @@ class BookreconTests(unittest.TestCase):
         bank = bank_row(record_id="paypal-return", amount=13.27)
         bank["description"] = "PAYPAL *PAYPAL returned card transfer"
         normalized["records"]["bank_transactions"].append(bank)
+        clearing = record(
+            record_id="paypal:clearing:return", source_system="paypal",
+            event_type="paypal_payment_reversal", gross_amount=13.27,
+            attributes={"clearing_provider": "paypal", "clearing_account": "paypal_wallet"},
+        )
+        normalized["records"]["clearing_transactions"].append(clearing)
         reviewed = allocation(
             statement_id="archive:paypal-return",
             record_id="paypal-return",
             amount=13.27,
             disposition="clearing_transfer",
-            target={"document_type": "financial_transaction", "transaction_family": "failed_payment_return"},
+            target={
+                "document_type": "financial_transaction",
+                "transaction_family": "failed_payment_transfer_and_return",
+                "clearing_record_ids": ["paypal:clearing:return"],
+                "clearing_evidence": [{
+                    "record_id": "paypal:clearing:return", "period": "2024-01",
+                    "currency": "EUR", "amount": 13.27,
+                    "provider": "paypal", "account": "paypal_wallet",
+                }],
+                "clearing_totals": {"EUR": 13.27},
+                "clearing_relation": "exact_amount", "bridge_amount": 13.27,
+            },
         )
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -621,6 +688,26 @@ class BookreconTests(unittest.TestCase):
             )
 
         self.assertFalse(any(item["exception_id"] == "bookrecon:missing-processor-evidence:paypal" for item in document["exceptions"]))
+
+    def test_arbitrary_reviewed_clearing_transfer_does_not_exempt_missing_processor_evidence(self) -> None:
+        normalized = base_normalized()
+        bank = bank_row(record_id="paypal-return", amount=13.27)
+        bank["description"] = "PAYPAL transfer"
+        normalized["records"]["bank_transactions"].append(bank)
+        reviewed = allocation(
+            statement_id="archive:paypal-return", record_id="paypal-return", amount=13.27,
+            disposition="clearing_transfer",
+            target={"document_type": "financial_transaction", "transaction_family": "arbitrary"},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            document = bookrecon.build_recon_document(
+                normalized_payload=normalized, normalized_path=Path(tmp) / "2024-01.json",
+                repo_root=Path(tmp), amount_threshold=bookrecon.Decimal("0.5"),
+                quantity_threshold=bookrecon.Decimal("1"),
+                bank_allocations={"archive:paypal-return": reviewed},
+            )
+
+        self.assertTrue(any(item["exception_id"] == "bookrecon:missing-processor-evidence:paypal" for item in document["exceptions"]))
 
     def test_processor_payouts_vs_bank_receipts_passes(self) -> None:
         normalized = base_normalized()

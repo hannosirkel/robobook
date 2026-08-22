@@ -529,6 +529,41 @@ class BookcheckerTests(unittest.TestCase):
         self.assertFalse(any("generated target" in item["summary"].lower() for item in valid_findings))
         self.assertTrue(any("generated target" in item["summary"].lower() for item in invalid_findings))
 
+    def test_generated_settlement_contact_must_match_linked_document(self) -> None:
+        target = {
+            "idempotency_key": "generated-purchase", "action_type": "create_purchase_summary",
+            "payload": {
+                "draft_schema": "purchase_summary_v1", "vendor_hint": "dpd",
+                "counterparty": {"contact_id": "37", "display_name_hint": "DPD"},
+            },
+        }
+        settlement = {
+            "payload": {"counterparty": {"contact_id": "99"}, "counterparty_hint": "other"},
+            "depends_on": ["generated-purchase"],
+        }
+        part = {
+            "disposition": "generated_purchase_payment",
+            "target": {"document_type": "purchase", "action_key": "generated-purchase"},
+        }
+
+        errors = bookchecker._generated_target_errors(
+            part=part, settlement=settlement,
+            current_actions={"generated-purchase": target}, historical_actions={},
+        )
+
+        self.assertTrue(any("contact" in item.lower() for item in errors))
+        self.assertTrue(any("label" in item.lower() for item in errors))
+
+    def test_existing_target_external_number_is_supporting_identity(self) -> None:
+        row = physical_bank_record(record_id="invoice-receipt", amount=20.0)
+        action = exact_settlement_action(row=row, normalized_path=Path("normalized.json"))
+        part = {
+            "disposition": "existing_invoice_receipt", "amount": 20.0,
+            "target": {"document_type": "invoice", "simplbooks_id": "119", "external_number": "INV-119"},
+        }
+
+        self.assertTrue(bookchecker._allocation_part_matches_action(part, action=action, signed_amount=bookchecker.Decimal("20")))
+
     def test_checker_errors_when_action_batch_omits_one_bank_row(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -1476,6 +1511,18 @@ class BookcheckerTests(unittest.TestCase):
 
         self.assertEqual(evaluation["result"], "fail")
         self.assertTrue(any("idempotency_key" in item["summary"] for item in evaluation["findings"]))
+
+    def test_distinct_physical_cash_rows_with_identical_payload_are_not_duplicates(self) -> None:
+        first = {
+            "idempotency_key": "incoming-one", "method": "POST", "endpoint": "incomings/create",
+            "payload": {"draft_schema": "cash_settlement_v1", "amount": 20.0},
+            "source_refs": [{"path": "normalized.json", "record_ref": "bank:one", "source_kind": "physical_bank"}],
+        }
+        second = copy.deepcopy(first)
+        second["idempotency_key"] = "incoming-two"
+        second["source_refs"][0]["record_ref"] = "bank:two"
+
+        self.assertEqual(bookchecker.evaluate_duplicates({"actions": [first, second]}), [])
 
     def test_checker_detects_arithmetic_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

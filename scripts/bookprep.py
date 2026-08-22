@@ -1321,16 +1321,34 @@ def load_bound_woo_tax_allocation(
     return allocation
 
 
-def paypal_category(row: dict[str, str], gross_amount: Decimal) -> str:
+def paypal_category(
+    row: dict[str, str],
+    gross_amount: Decimal,
+    *,
+    funded_payment_ids: set[str] | None = None,
+) -> str:
     type_value = row.get("Type", "").strip().lower()
-    if type_value in {
-        "general card withdrawal",
-        "general card deposit",
-        "general currency conversion",
-        "general payment",
-        "payment reversal",
-    }:
-        return "clearing_transactions"
+    balance_impact = row.get("Balance Impact", "").strip().lower()
+    transaction_id = row.get("Transaction ID", "").strip()
+    reference_id = row.get("Reference Txn ID", "").strip()
+    funded_payment_ids = funded_payment_ids or set()
+    if type_value == "general card withdrawal":
+        return "clearing_transactions" if gross_amount < 0 and balance_impact == "debit" and reference_id else "ambiguous"
+    if type_value == "general card deposit":
+        return "clearing_transactions" if gross_amount > 0 and balance_impact == "credit" and reference_id else "ambiguous"
+    if type_value == "general currency conversion":
+        sign_matches = (gross_amount < 0 and balance_impact == "debit") or (gross_amount > 0 and balance_impact == "credit")
+        return "clearing_transactions" if sign_matches and reference_id else "ambiguous"
+    if type_value == "general payment":
+        if gross_amount > 0 and balance_impact == "credit":
+            return "sales"
+        if gross_amount < 0 and balance_impact == "debit" and transaction_id in funded_payment_ids:
+            return "clearing_transactions"
+        return "ambiguous"
+    if type_value == "payment reversal":
+        if gross_amount > 0 and balance_impact == "credit" and reference_id in funded_payment_ids:
+            return "clearing_transactions"
+        return "refunds"
     if "withdrawal" in type_value or "payout" in type_value:
         return "payouts"
     if "deposit" in type_value or "currency conversion" in type_value:
@@ -1355,6 +1373,13 @@ def parse_paypal_csv(
     result = parser_result()
     exceptions: list[dict[str, Any]] = []
     seen_dates: list[date] = []
+    funded_payment_ids = {
+        str(row.get("Reference Txn ID") or "").strip()
+        for row in rows
+        if str(row.get("Type") or "").strip().lower()
+        in {"general card withdrawal", "general card deposit", "general currency conversion"}
+        and str(row.get("Reference Txn ID") or "").strip()
+    }
 
     for line_no, row in enumerate(rows, start=2):
         event_date = parse_date_value(row["Date"])
@@ -1381,7 +1406,19 @@ def parse_paypal_csv(
         net = parse_decimal(row.get("Net"))
         shipping = abs(parse_decimal(row.get("Shipping and Handling Amount")))
         sales_tax = abs(parse_decimal(row.get("Sales Tax")))
-        category = paypal_category(row, gross)
+        category = paypal_category(row, gross, funded_payment_ids=funded_payment_ids)
+        if category == "ambiguous":
+            exceptions.append(
+                make_exception(
+                    source=source,
+                    exception_id=f"{source.source_id}:paypal-routing:{line_no}",
+                    severity="error",
+                    reason="Ambiguous PayPal general movement lacks an exact signed balance-impact and reference bridge.",
+                    blocking=True,
+                    row_ref=f"csv:{line_no}",
+                )
+            )
+            continue
         if category == "payouts":
             gross = abs(gross)
             net = abs(net)
@@ -1396,6 +1433,7 @@ def parse_paypal_csv(
             "from_email": row.get("From Email Address"),
             "to_email": row.get("To Email Address"),
             "quantity": row.get("Quantity"),
+            "reference_transaction_id": row.get("Reference Txn ID"),
         }
         if category == "clearing_transactions":
             attributes.update({
@@ -3405,12 +3443,15 @@ def parse_purchase_note_markdown(
     net_amount = parse_decimal(context.get("net_amount"))
     vat_amount = parse_decimal(context.get("vat_amount"))
     target_source_id = str(context.get("target_source_id") or "")
+    payer_match = re.search(r"\bpaid\s+by\s+(.+)$", label, flags=re.IGNORECASE)
+    expense_report_payee = payer_match.group(1).strip() if payer_match else None
+    category_name = "manual_adjustments" if expense_report_payee else "purchase_expenses"
 
     category, record = make_record(
         source=source,
-        category="purchase_expenses",
-        record_id=f"{source.source_id}:purchase:{slugify(target_source_id or vendor_name)}",
-        event_type="purchase_note_markdown",
+        category=category_name,
+        record_id=f"{source.source_id}:{'expense-report' if expense_report_payee else 'purchase'}:{slugify(target_source_id or vendor_name)}",
+        event_type="expense_report_evidence" if expense_report_payee else "purchase_note_markdown",
         event_date=event_date,
         description=note_body or f"{vendor_name} manual purchase note",
         currency=base_currency,
@@ -3426,6 +3467,7 @@ def parse_purchase_note_markdown(
             "reverse_charge": bool(context.get("reverse_charge")),
             "target_source_id": target_source_id or None,
             "target_path": context.get("target_path"),
+            "expense_report_payee": expense_report_payee,
         },
     )
     result[category].append(record)

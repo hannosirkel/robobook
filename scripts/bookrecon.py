@@ -5,7 +5,7 @@ import argparse
 import json
 import re
 from calendar import monthrange
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -344,6 +344,7 @@ def missing_processor_evidence_exceptions(
     normalized_path_display: str,
     records: dict[str, list[dict[str, Any]]],
     bank_allocations: dict[Any, dict[str, Any]] | None = None,
+    annual_clearing_records: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     exceptions: list[dict[str, Any]] = []
     processor_records: dict[str, list[dict[str, Any]]] = {name: [] for name in PROCESSOR_KEYWORDS}
@@ -354,11 +355,31 @@ def missing_processor_evidence_exceptions(
                 processor_records[processor].append(record)
 
     for processor in sorted(PROCESSOR_KEYWORDS):
+        clearing_index = annual_clearing_records or {
+            str(record.get("record_id") or ""): record
+            for record in records.get("clearing_transactions", [])
+            if str(record.get("record_id") or "")
+        }
+        supported_families = {
+            "processor_payout_transfer",
+            "failed_payment_transfer_and_return",
+            "failed_quartermaster_payment_and_return",
+            "paypal_funded_quartermaster_payment",
+            "internal_transfer",
+        }
         reviewed_transfer_record_ids = {
             str(item.get("record_id") or "")
             for item in (bank_allocations or {}).values()
             if str(item.get("disposition") or "") == "clearing_transfer"
             and str((item.get("review") or {}).get("status") or "") == "approved"
+            and str((item.get("target") or {}).get("document_type") or "") == "financial_transaction"
+            and str((item.get("target") or {}).get("transaction_family") or "") in supported_families
+            and bool(_validated_clearing_allocation_references({"candidate": item}, clearing_index))
+            and all(
+                str(((clearing_index.get(str(ref)) or {}).get("attributes") or {}).get("clearing_provider") or "").lower()
+                == processor
+                for ref in (item.get("target") or {}).get("clearing_record_ids") or []
+            )
         }
         bank_records = [
             record
@@ -649,14 +670,77 @@ def build_physical_bank_coverage_check(
     )
 
 
-def _reference_values(value: Any) -> set[str]:
-    if isinstance(value, str):
-        return {value.strip()} if value.strip() else set()
-    if isinstance(value, list):
-        return set().union(*(_reference_values(item) for item in value)) if value else set()
-    if isinstance(value, dict):
-        return set().union(*(_reference_values(item) for item in value.values())) if value else set()
-    return set()
+def _validated_clearing_allocation_references(
+    allocations: dict[Any, dict[str, Any]],
+    clearing_records: dict[str, dict[str, Any]],
+) -> set[str]:
+    """Resolve only explicit, economically bound clearing bridge evidence."""
+    resolved: set[str] = set()
+    claimed: set[str] = set()
+    for allocation in allocations.values():
+        target = allocation.get("target") or {}
+        refs = target.get("clearing_record_ids")
+        evidence = target.get("clearing_evidence")
+        totals = target.get("clearing_totals")
+        relation = str(target.get("clearing_relation") or "")
+        if not isinstance(refs, list) or not refs or len(refs) != len(set(refs)):
+            continue
+        if not isinstance(evidence, list) or not isinstance(totals, dict):
+            continue
+        evidence_by_id = {
+            str(item.get("record_id") or ""): item
+            for item in evidence
+            if isinstance(item, dict) and str(item.get("record_id") or "")
+        }
+        if set(refs) != set(evidence_by_id) or set(refs) & claimed:
+            continue
+        computed_totals: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
+        valid = True
+        for ref in refs:
+            record = clearing_records.get(str(ref))
+            item = evidence_by_id.get(str(ref))
+            if record is None or item is None:
+                valid = False
+                break
+            attributes = record.get("attributes") or {}
+            actual = {
+                "period": str(record.get("event_date") or "")[:7],
+                "currency": record_currency(record),
+                "amount": decimal_value(record.get("gross_amount")),
+                "provider": str(attributes.get("clearing_provider") or "").strip().lower(),
+                "account": str(attributes.get("clearing_account") or "").strip(),
+            }
+            if (
+                str(item.get("period") or "") != actual["period"]
+                or str(item.get("currency") or "").upper() != actual["currency"]
+                or decimal_value(item.get("amount")) != actual["amount"]
+                or str(item.get("provider") or "").strip().lower() != actual["provider"]
+                or str(item.get("account") or "").strip() != actual["account"]
+                or not actual["provider"]
+                or not actual["account"]
+            ):
+                valid = False
+                break
+            computed_totals[actual["currency"]] += actual["amount"]
+        expected_totals = {str(key).upper(): decimal_value(value) for key, value in totals.items()}
+        if not valid or dict(computed_totals) != expected_totals:
+            continue
+        if decimal_value(target.get("bridge_amount")) != decimal_value(allocation.get("amount")):
+            continue
+        if relation == "exact_amount":
+            if len(refs) != 1:
+                continue
+            record = clearing_records[str(refs[0])]
+            if (
+                record_currency(record) != str(allocation.get("currency") or "").upper()
+                or decimal_value(record.get("gross_amount")) != decimal_value(allocation.get("amount"))
+            ):
+                continue
+        elif relation != "reviewed_group":
+            continue
+        claimed.update(refs)
+        resolved.update(refs)
+    return resolved
 
 
 def _clearing_balance_value(records: list[dict[str, Any]], names: tuple[str, ...]) -> tuple[Decimal | None, bool]:
@@ -674,6 +758,7 @@ def build_clearing_continuity_checks(
     normalized_path_display: str,
     records: dict[str, list[dict[str, Any]]],
     allocations: dict[str, dict[str, Any]],
+    annual_clearing_records: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], bool, dict[str, Any]]:
     """Check provider/account/currency clearing evidence, retaining Phase-A report-only status."""
     grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
@@ -683,14 +768,20 @@ def build_clearing_continuity_checks(
         account = str(attributes.get("clearing_account") or "").strip() or "unidentified"
         grouped.setdefault((provider, account, record_currency(record)), []).append(record)
 
-    allocation_references = set().union(*(_reference_values(allocation.get("target")) for allocation in allocations.values())) if allocations else set()
+    clearing_record_index = annual_clearing_records or {
+        str(record.get("record_id") or ""): record
+        for record in records.get("clearing_transactions", [])
+        if str(record.get("record_id") or "")
+    }
+    allocation_references = _validated_clearing_allocation_references(allocations, clearing_record_index)
     bridge_references: set[str] = set()
     for category, category_records in records.items():
         if category == "clearing_transactions":
             continue
         for record in category_records:
-            bridge_references.update(_reference_values((record.get("attributes") or {}).get("clearing_record_ids")))
-            bridge_references.update(_reference_values((record.get("attributes") or {}).get("clearing_reference")))
+            explicit_refs = (record.get("attributes") or {}).get("clearing_record_ids")
+            if isinstance(explicit_refs, list):
+                bridge_references.update(str(item) for item in explicit_refs if str(item) in clearing_record_index)
 
     results: dict[tuple[str, str, str], tuple[list[dict[str, Any]], list[str]]] = {}
     for (provider, account, currency), group_records in grouped.items():
@@ -1272,6 +1363,7 @@ def build_recon_document(
     previous_path: Path | None = None,
     bank_allocations: dict[str, dict[str, Any]] | None = None,
     clearing_allocations: dict[str, dict[str, Any]] | None = None,
+    annual_clearing_records: dict[str, dict[str, Any]] | None = None,
     bank_allocation_errors: list[str] | None = None,
     bank_allocations_path: Path | None = None,
 ) -> dict[str, Any]:
@@ -1289,6 +1381,7 @@ def build_recon_document(
             normalized_path_display=normalized_path_display,
             records=records,
             bank_allocations=bank_allocations,
+            annual_clearing_records=annual_clearing_records,
         )
     )
 
@@ -1304,6 +1397,7 @@ def build_recon_document(
         normalized_path_display=normalized_path_display,
         records=records,
         allocations=clearing_allocations if clearing_allocations is not None else (bank_allocations or {}),
+        annual_clearing_records=annual_clearing_records,
     )
     bank_coverage["clearing_ready"] = clearing_ready
     bank_coverage.update(clearing_coverage)
@@ -1595,6 +1689,14 @@ def main() -> int:
         for key, item in annual_bank_allocations.items()
         if str(item.get("period") or "") == args.period
     }
+    annual_clearing_records: dict[str, dict[str, Any]] = {}
+    for annual_path in normalized_year_paths(normalized_path, period=args.period):
+        annual_payload = load_json(annual_path)
+        if str(annual_payload.get("company_slug") or "") != str(normalized_payload.get("company_slug") or ""):
+            continue
+        for item in (annual_payload.get("records") or {}).get("clearing_transactions") or []:
+            if isinstance(item, dict) and str(item.get("record_id") or ""):
+                annual_clearing_records[str(item["record_id"])] = item
 
     repo_root = Path.cwd()
     document = build_recon_document(
@@ -1611,6 +1713,7 @@ def main() -> int:
         previous_path=previous_path if previous_payload is not None else None,
         bank_allocations=period_bank_allocations,
         clearing_allocations=annual_bank_allocations,
+        annual_clearing_records=annual_clearing_records,
         bank_allocation_errors=bank_allocation_errors,
         bank_allocations_path=bank_allocations_path,
     )

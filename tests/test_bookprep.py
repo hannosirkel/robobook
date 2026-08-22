@@ -868,11 +868,11 @@ class BookprepTests(unittest.TestCase):
             root = Path(tmp)
             csv_path = root / "paypal_2025_report.CSV"
             csv_path.write_text(
-                "Date,Name,Type,Status,Currency,Gross,Fee,Net,Transaction ID,Balance Impact\n"
-                "09/10/2025,,General Card Withdrawal,Completed,EUR,-13.27,0.00,-13.27,TX1,Debit\n"
-                "09/10/2025,,General Card Deposit,Completed,EUR,13.42,0.00,13.42,TX2,Credit\n"
-                "09/10/2025,,General Currency Conversion,Completed,USD,-14.94,0.00,-14.94,TX3,Debit\n"
-                "09/10/2025,Quartermaster Logistics LLC,General Payment,Completed,USD,-14.94,0.00,-14.94,TX4,Debit\n",
+                "Date,Name,Type,Status,Currency,Gross,Fee,Net,Transaction ID,Reference Txn ID,Balance Impact\n"
+                "09/10/2025,,General Card Withdrawal,Completed,EUR,-13.27,0.00,-13.27,TX1,TX4,Debit\n"
+                "09/10/2025,,General Card Deposit,Completed,EUR,13.42,0.00,13.42,TX2,TX4,Credit\n"
+                "09/10/2025,,General Currency Conversion,Completed,USD,-14.94,0.00,-14.94,TX3,TX4,Debit\n"
+                "09/10/2025,Quartermaster Logistics LLC,General Payment,Completed,USD,-14.94,0.00,-14.94,TX4,,Debit\n",
                 encoding="utf-8",
             )
             period_start, period_end = bookprep.parse_period("2025-10")
@@ -903,6 +903,52 @@ class BookprepTests(unittest.TestCase):
             )
             self.assertFalse(records["sales"])
             self.assertFalse(records["refunds"])
+
+    def test_paypal_general_customer_receipt_and_refund_reversal_stay_processor_activity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "paypal_2025_report.CSV"
+            csv_path.write_text(
+                "Date,Name,Type,Status,Currency,Gross,Fee,Net,Transaction ID,Reference Txn ID,Balance Impact\n"
+                "09/10/2025,Buyer,General Payment,Completed,EUR,20.00,-1.00,19.00,SALE1,,Credit\n"
+                "10/10/2025,Buyer,Payment Reversal,Completed,EUR,-20.00,0.00,-20.00,REV1,SALE1,Debit\n",
+                encoding="utf-8",
+            )
+            period_start, period_end = bookprep.parse_period("2025-10")
+            source = bookprep.inspect_source_file(
+                path=csv_path, root_dir=root, period_start=period_start, period_end=period_end
+            )
+            assert source is not None
+
+            records, exceptions = bookprep.parse_paypal_csv(
+                source, period_start=period_start, period_end=period_end, base_currency="EUR"
+            )
+
+        self.assertFalse(exceptions)
+        self.assertEqual([item["external_ref"] for item in records["sales"]], ["SALE1"])
+        self.assertEqual([item["external_ref"] for item in records["refunds"]], ["REV1"])
+        self.assertFalse(records["clearing_transactions"])
+
+    def test_ambiguous_outgoing_paypal_general_payment_is_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "paypal_2025_report.CSV"
+            csv_path.write_text(
+                "Date,Name,Type,Status,Currency,Gross,Fee,Net,Transaction ID,Reference Txn ID,Balance Impact\n"
+                "09/10/2025,Unknown,General Payment,Completed,USD,-14.94,0.00,-14.94,PAY1,,Debit\n",
+                encoding="utf-8",
+            )
+            period_start, period_end = bookprep.parse_period("2025-10")
+            source = bookprep.inspect_source_file(
+                path=csv_path, root_dir=root, period_start=period_start, period_end=period_end
+            )
+            assert source is not None
+            records, exceptions = bookprep.parse_paypal_csv(
+                source, period_start=period_start, period_end=period_end, base_currency="EUR"
+            )
+
+        self.assertFalse(records["clearing_transactions"])
+        self.assertTrue(any(item["blocking"] and "ambiguous" in item["reason"].lower() for item in exceptions))
 
     def test_inspect_source_file_infers_quartermaster_sales_month_from_parent_year(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1694,7 +1740,7 @@ class BookprepTests(unittest.TestCase):
             self.assertEqual(expense["net_amount"], 11.3)
             self.assertEqual(expense["vat_amount"], 2.71)
 
-    def test_ostuarved_readme_note_becomes_canonical_purchase_evidence(self) -> None:
+    def test_employee_paid_ostuarved_note_becomes_expense_report_evidence_not_supplier_payable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             ostuarved = root / "Ostuarved"
@@ -1728,12 +1774,14 @@ class BookprepTests(unittest.TestCase):
             )
 
             self.assertFalse([item for item in exceptions if item.get("blocking")])
-            self.assertEqual(len(records["purchase_expenses"]), 1)
-            expense = records["purchase_expenses"][0]
+            self.assertFalse(records["purchase_expenses"])
+            self.assertEqual(len(records["manual_adjustments"]), 1)
+            expense = records["manual_adjustments"][0]
             self.assertEqual(expense["gross_amount"], 82.1)
             self.assertEqual(expense["vat_amount"], 0.0)
             self.assertEqual(expense["attributes"]["vendor_name"], "Omniva")
             self.assertTrue(expense["attributes"]["manual_note"])
+            self.assertEqual(expense["attributes"]["expense_report_payee"], "Hanno")
 
     def test_parse_printful_pdf_creates_monthly_summary_and_storage_invoice(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

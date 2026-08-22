@@ -486,6 +486,14 @@ def evaluate_duplicates(action_batch: dict[str, Any]) -> list[dict[str, Any]]:
                 "method": action.get("method"),
                 "endpoint": action.get("endpoint"),
                 "payload": action.get("payload"),
+                "physical_bank_identity": sorted(
+                    (
+                        str(ref.get("path") or ""),
+                        str(ref.get("record_ref") or ""),
+                    )
+                    for ref in action.get("source_refs") or []
+                    if isinstance(ref, dict) and ref.get("source_kind") == "physical_bank"
+                ) or None,
             },
             sort_keys=True,
         )
@@ -916,7 +924,12 @@ def _allocation_part_matches_action(
     )
     if target.get("document_type") not in (None, "", expected_target_document_type):
         return False
-    allowed_common_target_fields = {"document_type", "contact_id", "counterparty_hint"}
+    allowed_common_target_fields = {
+        "document_type", "contact_id", "counterparty_hint", "external_number",
+        "clearing_record_ids", "clearing_evidence", "clearing_totals",
+        "clearing_relation", "bridge_amount",
+        "target_currency", "foreign_currency_pilot_required", "pilot_requirements",
+    }
     if target.get("contact_id") not in (None, "") and str(
         (payload.get("counterparty") or {}).get("contact_id") or ""
     ) != str(target.get("contact_id")):
@@ -1099,6 +1112,7 @@ def _generated_target_errors(
             errors.append(f"Generated target {target_key!r} is not the required {target_kind} action/schema type.")
         if list(settlement.get("depends_on") or []).count(target_key) != 1:
             errors.append(f"Current-batch generated target {target_key!r} must appear exactly once in depends_on.")
+        errors.extend(_generated_settlement_contact_errors(target, settlement, current, target_key))
         return errors
     historical = historical_actions.get(target_key)
     if historical is None:
@@ -1113,7 +1127,38 @@ def _generated_target_errors(
         return [f"Historical generated target {target_key!r} lacks successful inserted-ID proof."]
     if endpoint != expected_endpoint:
         return [f"Historical generated target {target_key!r} has the wrong successful object endpoint proof."]
-    return []
+    return _generated_settlement_contact_errors(target, settlement, historical_action, target_key)
+
+
+def _generated_settlement_contact_errors(
+    reviewed_target: dict[str, Any],
+    settlement: dict[str, Any],
+    document_action: dict[str, Any],
+    target_key: str,
+) -> list[str]:
+    settlement_payload = settlement.get("payload") or {}
+    document_payload = document_action.get("payload") or {}
+    document_counterparty = document_payload.get("counterparty") or {}
+    expected_contact = str(document_counterparty.get("contact_id") or "")
+    expected_label = str(
+        document_payload.get("vendor_hint")
+        or (document_payload.get("summary_scope") or {}).get("channel_or_source")
+        or document_counterparty.get("display_name_hint")
+        or ""
+    )
+    errors: list[str] = []
+    actual_contact = str((settlement_payload.get("counterparty") or {}).get("contact_id") or "")
+    actual_label = str(settlement_payload.get("counterparty_hint") or "")
+    if expected_contact and actual_contact != expected_contact:
+        errors.append(f"Settlement contact does not match linked generated target {target_key!r}.")
+    if expected_label and normalize_text(actual_label) != normalize_text(expected_label):
+        errors.append(f"Settlement counterparty label does not match linked generated target {target_key!r}.")
+    if str(reviewed_target.get("contact_id") or "") not in {"", expected_contact}:
+        errors.append(f"Reviewed allocation contact conflicts with linked generated target {target_key!r}.")
+    reviewed_label = str(reviewed_target.get("counterparty_hint") or "")
+    if reviewed_label and expected_label and normalize_text(reviewed_label) != normalize_text(expected_label):
+        errors.append(f"Reviewed allocation label conflicts with linked generated target {target_key!r}.")
+    return errors
 
 
 def evaluate_bank_statement_completeness(

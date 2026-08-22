@@ -39,6 +39,26 @@ def posting_policy_fixture_with_profiles() -> dict:
 
 
 class PostingPolicyTests(unittest.TestCase):
+    def test_linked_invoice_receipt_uses_sales_contact_role(self) -> None:
+        policy = {
+            "bank_accounts": {"EE123": {"EUR": "3"}},
+            "contacts": {"sales": {"brain-games": "31"}, "processors": {}, "suppliers": {}},
+            "mappings": {},
+        }
+        action = {
+            "action_type": "create_incoming_summary",
+            "payload": {
+                "draft_schema": "cash_settlement_v1",
+                "document_type": "incoming",
+                "linked_invoice_id": "58",
+                "counterparty_hint": "brain-games",
+                "counterparty": {"contact_id": "31"},
+                "bank_account_id": "3",
+            },
+        }
+
+        self.assertEqual(posting_policy.action_policy_errors(action, policy), [])
+
     def test_resolve_sales_vat_profile_changes_on_effective_date(self) -> None:
         policy = posting_policy_fixture_with_profiles()
 

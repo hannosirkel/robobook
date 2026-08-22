@@ -2388,6 +2388,30 @@ def build_manual_financial_dependencies(
     return dependencies
 
 
+def build_foreign_currency_payment_pilot_dependencies(
+    *,
+    records: dict[str, list[dict[str, Any]]],
+    allocations: dict[tuple[str, str, str], dict[str, Any]],
+) -> list[dict[str, Any]]:
+    dependencies: list[dict[str, Any]] = []
+    for record, allocation in _approved_bank_allocations(records=records, allocations=allocations):
+        target = allocation.get("target") or {}
+        if not target.get("foreign_currency_pilot_required"):
+            continue
+        dependencies.append({
+            "kind": "foreign_currency_payment_pilot",
+            "blocking": True,
+            "reason": (
+                "First live base-currency payment against a foreign-currency purchase requires verified "
+                "applied ECB rate, linked purchase balance, and realized FX/fee treatment."
+            ),
+            "record_id": str(record.get("record_id") or ""),
+            "target_currency": str(target.get("target_currency") or ""),
+            "required_evidence": list(target.get("pilot_requirements") or []),
+        })
+    return dependencies
+
+
 def build_direct_sale_actions(
     *,
     company_slug: str,
@@ -2833,6 +2857,17 @@ def build_exact_cash_actions(
                     or (target_counterparty.get("display_name_hint") if isinstance(target_counterparty, dict) else "")
                     or ""
                 ).strip()
+
+                reviewed_contact_id = str(target.get("contact_id") or "").strip()
+                if reviewed_contact_id and reviewed_contact_id != str(generated_target_contact_id or ""):
+                    raise SimplbooksError(
+                        f"Settlement contact {reviewed_contact_id!r} conflicts with linked generated target {target_value!r}."
+                    )
+                reviewed_hint = str(target.get("counterparty_hint") or "").strip()
+                if reviewed_hint and slugify(reviewed_hint) != slugify(generated_target_label):
+                    raise SimplbooksError(
+                        f"Settlement counterparty hint {reviewed_hint!r} conflicts with linked generated target {target_value!r}."
+                    )
 
             contact_id = target.get("contact_id")
             if contact_id in (None, "") and generated_target_contact_id not in (None, ""):
@@ -3393,6 +3428,12 @@ def build_action_batch(
     unresolved_dependencies.extend(
         build_manual_financial_dependencies(
             normalized_path_display=normalized_path_display,
+            records=records,
+            allocations=bank_allocations or {},
+        )
+    )
+    unresolved_dependencies.extend(
+        build_foreign_currency_payment_pilot_dependencies(
             records=records,
             allocations=bank_allocations or {},
         )

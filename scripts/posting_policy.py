@@ -240,6 +240,12 @@ def action_policy_errors(action: dict[str, Any], policy: dict[str, Any]) -> list
     elif action_type == "create_incoming_summary" and str(payload.get("settlement_family") or "") == "direct-sale":
         role = "sales"
         label = str(payload.get("counterparty_hint") or "")
+    elif action_type == "create_incoming_summary" and (
+        payload.get("linked_invoice_id") not in (None, "")
+        or payload.get("linked_invoice_action") not in (None, "")
+    ):
+        role = "sales"
+        label = str(payload.get("counterparty_hint") or "")
     elif action_type == "create_incoming_summary" or (
         action_type == "create_purchase_summary" and slugify(str(payload.get("vendor_hint") or "")) in {"paypal", "stripe"}
     ):

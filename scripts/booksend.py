@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from bookbuilder import write_yaml
-from bookchecker import load_yaml
+from bookchecker import load_yaml, manual_financial_dependency_errors
 from exchange_rates import ExchangeRateError, lookup_rate
 from posting_policy import PostingPolicyError, action_policy_errors, load_posting_policy
 from reference_artifacts import (
@@ -1115,10 +1115,19 @@ def execute_batch(
         if isinstance(dependency, dict)
         and str(dependency.get("kind") or "") == "manual_statement_import_financial_transaction"
     ]
-    if manual_dependencies:
-        raise SimplbooksError(
-            "Action batch contains a manual statement-import financial dependency; no API action is translated or sent until live discovery/audit proves the import."
-        )
+    for dependency in manual_dependencies:
+        dependency_errors = manual_financial_dependency_errors(dependency)
+        if dependency_errors:
+            raise SimplbooksError(
+                "Action batch contains an invalid manual statement-import financial dependency "
+                f"{dependency.get('record_id') or '<unknown>'}: {dependency_errors[0]}"
+            )
+        proof = dependency.get("statement_import_proof") or {}
+        if dependency.get("blocking") is not False or proof.get("status") != "verified":
+            raise SimplbooksError(
+                "Action batch contains a pending manual statement-import financial dependency; "
+                "no API action is translated or sent until live discovery/audit proves the import."
+            )
     ordered_actions = stable_execution_order(list(action_batch.get("actions") or []))
     lookup = dict(reference_lookup or {})
     lookup.update(action_lookup(ordered_actions))

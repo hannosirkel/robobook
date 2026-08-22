@@ -2214,6 +2214,22 @@ def _allocation_parts(allocation: dict[str, Any]) -> list[tuple[dict[str, Any], 
 
 
 MANUAL_FINANCIAL_DISPOSITIONS = frozenset({"bank_fee_payment", "clearing_transfer"})
+POSITIVE_BANK_DISPOSITIONS = frozenset(
+    {"generated_invoice_receipt", "existing_invoice_receipt", "direct_sale_receipt"}
+)
+NEGATIVE_BANK_DISPOSITIONS = frozenset(
+    {"generated_purchase_payment", "existing_purchase_payment", "bank_fee_payment"}
+)
+
+
+def _validate_reviewed_disposition_signs(allocation: dict[str, Any]) -> None:
+    for part, _part_number in _allocation_parts(allocation):
+        disposition = str(part.get("disposition") or "")
+        amount = decimal_value(part.get("amount"))
+        if disposition in POSITIVE_BANK_DISPOSITIONS and amount <= 0:
+            raise SimplbooksError(f"Reviewed {disposition} amount must be positive.")
+        if disposition in NEGATIVE_BANK_DISPOSITIONS and amount >= 0:
+            raise SimplbooksError(f"Reviewed {disposition} amount must be negative.")
 
 
 def _requires_manual_financial_transaction(allocation: dict[str, Any]) -> bool:
@@ -2235,6 +2251,8 @@ def _approved_bank_allocations(
         validate_reviewed_amounts(list(allocations.values()))
     except BankAllocationError as exc:
         raise SimplbooksError(str(exc)) from exc
+    for allocation in allocations.values():
+        _validate_reviewed_disposition_signs(allocation)
     for record in records.get("bank_transactions", []):
         if str(record.get("source_system") or "") != "bank":
             continue
@@ -2311,6 +2329,7 @@ def build_manual_financial_dependencies(
                     f"Physical bank row {record_id} requires full SimplBooks statement import and live proof; "
                     "no public financial-transaction API endpoint is confirmed."
                 ),
+                "disposition": str(allocation.get("disposition") or ""),
                 "statement_id": statement_id,
                 "record_id": record_id,
                 "date": str(record.get("event_date") or ""),

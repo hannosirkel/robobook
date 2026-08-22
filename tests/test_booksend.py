@@ -286,6 +286,34 @@ def make_batch(
     }
 
 
+def manual_financial_dependency(*, status: str = "pending", blocking: bool = True) -> dict:
+    proof = {"status": status, "required_evidence": "live_discovery_or_audit"}
+    if status == "verified":
+        proof.update({"simplbooks_transaction_id": "txn-501", "evidence_ref": "audit/2024-01#txn-501"})
+    return {
+        "kind": "manual_statement_import_financial_transaction",
+        "blocking": blocking,
+        "reason": "Statement import required.",
+        "disposition": "bank_fee_payment",
+        "statement_id": "archive:fee-1",
+        "record_id": "fee-1",
+        "date": "2024-01-15",
+        "iban": "EE123",
+        "currency": "EUR",
+        "physical_signed_amount": -7.0,
+        "source_ref": {
+            "path": "companies/example/artifacts/normalized/2024-01.json",
+            "record_ref": "fee-1",
+            "source_kind": "physical_bank",
+        },
+        "reviewed_rationale": "Reviewed fee.",
+        "target": {"financial_transaction_kind": "bank-fee"},
+        "split_parts": [],
+        "split_proof": None,
+        "statement_import_proof": proof,
+    }
+
+
 class FakeClient:
     def __init__(self, responses: list[dict]) -> None:
         self.responses = list(responses)
@@ -320,28 +348,40 @@ class BooksendTests(unittest.TestCase):
         self.assertEqual(row["price_per_unit"], 20.0)
 
     def test_sender_rejects_manual_financial_dependency_before_any_translation_or_call(self) -> None:
-        dependency = {
-            "kind": "manual_statement_import_financial_transaction",
-            "blocking": True,
-            "statement_id": "archive:fee-1",
-            "record_id": "fee-1",
-            "date": "2024-01-15",
-            "iban": "EE123",
-            "currency": "EUR",
-            "physical_signed_amount": -7.0,
-            "source_ref": {
-                "path": "companies/example/artifacts/normalized/2024-01.json",
-                "record_ref": "fee-1",
-                "source_kind": "physical_bank",
-            },
-            "reviewed_rationale": "Reviewed fee.",
-            "split_parts": [],
-            "split_proof": None,
-            "statement_import_proof": {"status": "pending", "required_evidence": "live_discovery_or_audit"},
-        }
+        dependency = manual_financial_dependency(blocking=False)
         client = FakeClient(responses=[{"_http_status": 201, "invoice_id": 501}])
 
         with self.assertRaisesRegex(SimplbooksError, "manual statement-import"):
+            booksend.execute_batch(
+                action_batch=make_batch(actions=[invoice_action()], unresolved_dependencies=[dependency]),
+                mode="write",
+                client=client,
+            )
+
+        self.assertEqual(client.calls, [])
+
+    def test_sender_allows_verified_nonblocking_manual_dependency_and_translates_remaining_actions(self) -> None:
+        client = FakeClient(responses=[])
+
+        _batch, submission = booksend.execute_batch(
+            action_batch=make_batch(
+                actions=[invoice_action()],
+                unresolved_dependencies=[manual_financial_dependency(status="verified", blocking=False)],
+            ),
+            mode="dry-run",
+            client=client,
+        )
+
+        self.assertEqual(submission["summary"]["attempted_actions"], 1)
+        self.assertEqual(len(submission["request_log"]), 1)
+        self.assertEqual(client.calls, [])
+
+    def test_sender_rejects_incomplete_verified_manual_dependency_before_any_call(self) -> None:
+        dependency = manual_financial_dependency(status="verified", blocking=False)
+        dependency["statement_import_proof"].pop("evidence_ref")
+        client = FakeClient(responses=[{"_http_status": 201, "invoice_id": 501}])
+
+        with self.assertRaisesRegex(SimplbooksError, "evidence ref"):
             booksend.execute_batch(
                 action_batch=make_batch(actions=[invoice_action()], unresolved_dependencies=[dependency]),
                 mode="write",

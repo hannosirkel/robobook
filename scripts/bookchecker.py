@@ -14,6 +14,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
+from bank_allocations import BankAllocationError, bank_ledger_key, statement_identity
 from exchange_rates import ExchangeRateError, lookup_rate
 from posting_policy import PostingPolicyError, action_policy_errors, load_posting_policy, resolve_sales_vat_profile
 from reference_artifacts import (
@@ -920,10 +921,31 @@ def evaluate_exchange_rates(
 
 def manual_financial_dependency_errors(dependency: dict[str, Any]) -> list[str]:
     errors: list[str] = []
-    required_text = ("statement_id", "record_id", "date", "iban", "currency", "reviewed_rationale")
+    allowed_dispositions = {
+        "generated_invoice_receipt",
+        "existing_invoice_receipt",
+        "generated_purchase_payment",
+        "existing_purchase_payment",
+        "direct_sale_receipt",
+        "bank_fee_payment",
+        "clearing_transfer",
+        "reviewed_split",
+    }
+    required_text = (
+        "reason",
+        "disposition",
+        "statement_id",
+        "record_id",
+        "date",
+        "iban",
+        "currency",
+        "reviewed_rationale",
+    )
     for field in required_text:
         if not str(dependency.get(field) or "").strip():
             errors.append(f"Manual financial dependency requires {field}.")
+    if str(dependency.get("disposition") or "") not in allowed_dispositions:
+        errors.append("Manual financial dependency disposition is invalid.")
     try:
         date.fromisoformat(str(dependency.get("date") or ""))
     except ValueError:
@@ -931,6 +953,8 @@ def manual_financial_dependency_errors(dependency: dict[str, Any]) -> list[str]:
     if not re.fullmatch(r"[A-Z]{3}", str(dependency.get("currency") or "")):
         errors.append("Manual financial dependency currency must be an uppercase ISO code.")
     try:
+        if dependency.get("physical_signed_amount") in (None, ""):
+            raise ValueError
         physical_amount = decimal_value(dependency.get("physical_signed_amount"))
         if not physical_amount.is_finite() or physical_amount.quantize(Decimal("0.01")) != physical_amount:
             raise ValueError
@@ -946,6 +970,11 @@ def manual_financial_dependency_errors(dependency: dict[str, Any]) -> list[str]:
     ):
         errors.append("Manual financial dependency requires an exact physical-bank statement ref binding.")
 
+    if not isinstance(dependency.get("target"), dict):
+        errors.append("Manual financial dependency target must be an object.")
+    if not isinstance(dependency.get("blocking"), bool):
+        errors.append("Manual financial dependency blocking flag must be boolean.")
+
     proof = dependency.get("statement_import_proof")
     if not isinstance(proof, dict) or proof.get("status") not in {"pending", "verified"} or (
         proof.get("required_evidence") != "live_discovery_or_audit"
@@ -956,38 +985,156 @@ def manual_financial_dependency_errors(dependency: dict[str, Any]) -> list[str]:
         or not str(proof.get("evidence_ref") or "").strip()
     ):
         errors.append("Verified statement import proof requires a SimplBooks transaction ID and evidence ref.")
+    elif proof.get("status") == "pending" and dependency.get("blocking") is not True:
+        errors.append("Pending statement import proof must remain blocking.")
+    elif dependency.get("blocking") is False and proof.get("status") != "verified":
+        errors.append("Only verified statement import proof may be non-blocking.")
 
     split_parts = dependency.get("split_parts")
     split_proof = dependency.get("split_proof")
     if not isinstance(split_parts, list):
         errors.append("Manual financial dependency split_parts must be a list.")
     elif split_parts:
+        if str(dependency.get("disposition") or "") != "reviewed_split":
+            errors.append("Manual financial dependency with split parts must use reviewed_split disposition.")
         signed_total = Decimal("0")
+        signed_part_amounts: list[Decimal] = []
         for part in split_parts:
             if not isinstance(part, dict) or not str(part.get("disposition") or "") or not isinstance(part.get("target"), dict):
                 errors.append("Manual financial dependency split parts require disposition and target.")
                 continue
             try:
-                signed_total += decimal_value(part.get("signed_amount"))
-            except SimplbooksError:
+                if part.get("signed_amount") in (None, ""):
+                    raise ValueError
+                part_amount = decimal_value(part.get("signed_amount"))
+                signed_total += part_amount
+                signed_part_amounts.append(part_amount)
+            except (SimplbooksError, ValueError):
                 errors.append("Manual financial dependency split part requires an exact signed amount.")
+                continue
+            disposition = str(part.get("disposition") or "")
+            if disposition in {"generated_invoice_receipt", "existing_invoice_receipt", "direct_sale_receipt"} and part_amount <= 0:
+                errors.append(f"Manual financial dependency {disposition} split part must be positive.")
+            if disposition in {"generated_purchase_payment", "existing_purchase_payment", "bank_fee_payment"} and part_amount >= 0:
+                errors.append(f"Manual financial dependency {disposition} split part must be negative.")
         if signed_total != physical_amount:
             errors.append("Manual financial dependency split parts do not sum to the physical signed amount.")
-        if not isinstance(split_proof, dict) or (
-            decimal_value((split_proof or {}).get("signed_parts_total")) != signed_total
-            or decimal_value((split_proof or {}).get("physical_signed_amount")) != physical_amount
-        ):
+        try:
+            split_proof_valid = (
+                isinstance(split_proof, dict)
+                and split_proof.get("signed_parts_total") not in (None, "")
+                and split_proof.get("physical_signed_amount") not in (None, "")
+                and bool(str(split_proof.get("equation") or "").strip())
+                and decimal_value(split_proof.get("signed_parts_total")) == signed_total
+                and decimal_value(split_proof.get("physical_signed_amount")) == physical_amount
+                and str(split_proof.get("equation") or "")
+                == " + ".join(f"{amount:.2f}" for amount in signed_part_amounts) + f" = {physical_amount:.2f}"
+            )
+        except SimplbooksError:
+            split_proof_valid = False
+        if not split_proof_valid:
             errors.append("Manual financial dependency split proof does not prove the signed arithmetic.")
     elif split_proof is not None:
         errors.append("Manual financial dependency without split parts must not carry split proof.")
+
+    disposition = str(dependency.get("disposition") or "")
+    if not split_parts and disposition == "reviewed_split":
+        errors.append("Manual financial dependency reviewed_split disposition requires split parts.")
+    if (
+        not split_parts
+        and disposition in {"generated_invoice_receipt", "existing_invoice_receipt", "direct_sale_receipt"}
+        and physical_amount <= 0
+    ):
+        errors.append(f"Manual financial dependency {disposition} amount must be positive.")
+    if (
+        not split_parts
+        and disposition in {"generated_purchase_payment", "existing_purchase_payment", "bank_fee_payment"}
+        and physical_amount >= 0
+    ):
+        errors.append(f"Manual financial dependency {disposition} amount must be negative.")
     return errors
 
 
-def evaluate_unresolved_dependencies(action_batch: dict[str, Any]) -> list[dict[str, Any]]:
+def manual_financial_source_errors(
+    dependency: dict[str, Any],
+    *,
+    action_path: Path,
+    cwd: Path,
+    payload_cache: dict[Path, dict[str, Any]],
+    index_cache: dict[Path, dict[str, tuple[str, dict[str, Any]]]],
+) -> list[str]:
+    source_ref = dependency.get("source_ref")
+    if not isinstance(source_ref, dict):
+        return ["Manual financial dependency source ref cannot be resolved."]
+    path_text = str(source_ref.get("path") or "")
+    record_ref = str(source_ref.get("record_ref") or "")
+    if not path_text or not record_ref:
+        return ["Manual financial dependency record_id/source ref cannot be resolved."]
+    try:
+        source_path = resolve_path(path_text, cwd=cwd, action_path=action_path)
+        _payload, record_index = load_record_payload(
+            source_path,
+            cache=payload_cache,
+            index_cache=index_cache,
+        )
+    except (OSError, json.JSONDecodeError, SimplbooksError) as exc:
+        return [f"Manual financial dependency source ref cannot be resolved: {exc}"]
+    resolved = (record_index or {}).get(record_ref)
+    if resolved is None:
+        return ["Manual financial dependency record_id/source ref does not resolve to a normalized record."]
+    category, record = resolved
+    errors: list[str] = []
+    if category != "bank_transactions" or str(record.get("source_system") or "") != "bank":
+        errors.append("Manual financial dependency source ref is not a normalized physical bank record.")
+        return errors
+    if str(record.get("record_id") or "") != str(dependency.get("record_id") or ""):
+        errors.append("Manual financial dependency record_id does not match the normalized physical bank record.")
+    try:
+        normalized_statement_id = statement_identity(record)
+        normalized_iban, normalized_currency = bank_ledger_key(record)
+    except BankAllocationError as exc:
+        return [f"Manual financial dependency physical bank identity is invalid: {exc}"]
+    if normalized_statement_id != str(dependency.get("statement_id") or ""):
+        errors.append("Manual financial dependency statement_id does not match the normalized physical bank record.")
+    if str(record.get("event_date") or "") != str(dependency.get("date") or ""):
+        errors.append("Manual financial dependency date does not match the normalized physical bank record.")
+    try:
+        dependency_amount = decimal_value(dependency.get("physical_signed_amount"))
+        record_amount = decimal_value(record.get("gross_amount"))
+        if dependency_amount != record_amount:
+            errors.append("Manual financial dependency signed amount does not match the normalized physical bank record.")
+    except SimplbooksError as exc:
+        errors.append(f"Manual financial dependency signed amount cannot be compared: {exc}")
+    if normalized_iban != str(dependency.get("iban") or ""):
+        errors.append("Manual financial dependency IBAN does not match the normalized physical bank record.")
+    if normalized_currency != str(dependency.get("currency") or ""):
+        errors.append("Manual financial dependency currency does not match the normalized physical bank record.")
+    return errors
+
+
+def evaluate_unresolved_dependencies(
+    action_batch: dict[str, Any],
+    *,
+    action_path: Path | None = None,
+    cwd: Path | None = None,
+    payload_cache: dict[Path, dict[str, Any]] | None = None,
+    index_cache: dict[Path, dict[str, tuple[str, dict[str, Any]]]] | None = None,
+) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     for dependency in action_batch.get("unresolved_dependencies") or []:
         if str(dependency.get("kind") or "") == "manual_statement_import_financial_transaction":
-            for error in manual_financial_dependency_errors(dependency):
+            dependency_errors = manual_financial_dependency_errors(dependency)
+            if action_path is not None and cwd is not None:
+                dependency_errors.extend(
+                    manual_financial_source_errors(
+                        dependency,
+                        action_path=action_path,
+                        cwd=cwd,
+                        payload_cache=payload_cache if payload_cache is not None else {},
+                        index_cache=index_cache if index_cache is not None else {},
+                    )
+                )
+            for error in dependency_errors:
                 findings.append(
                     make_finding(
                         section="account_and_vat_review",
@@ -1432,7 +1579,15 @@ def evaluate_action_batch(
 
     findings.extend(evaluate_duplicates(action_batch))
     findings.extend(evaluate_exchange_rates(action_batch, exchange_rate_cache=exchange_rate_cache))
-    findings.extend(evaluate_unresolved_dependencies(action_batch))
+    findings.extend(
+        evaluate_unresolved_dependencies(
+            action_batch,
+            action_path=action_path,
+            cwd=cwd,
+            payload_cache=payload_cache,
+            index_cache=index_cache,
+        )
+    )
     findings.extend(evaluate_posting_policy(action_batch, posting_policy))
     findings.extend(evaluate_vat_profiles(action_batch.get("actions") or [], posting_policy))
     findings.extend(

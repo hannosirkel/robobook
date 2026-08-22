@@ -49,6 +49,8 @@ mapping choices explicit inside the draft payload:
 - `unresolved_dependencies`
   - one exact blocking manual statement-import financial transaction per bank-fee or clearing row
   - one atomic dependency containing every signed split part when any part needs manual financial handling
+  - pending proof remains blocking; later verified proof retains the SimplBooks transaction ID and
+    discovery/audit evidence reference before it can become non-blocking
 
 Each payload currently carries a `draft_schema` marker such as `invoice_summary_v1`,
 `purchase_summary_v1`, or `cash_settlement_v1`.

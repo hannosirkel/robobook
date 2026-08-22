@@ -317,6 +317,46 @@ class SchemaContractTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=batch)
 
+    def test_action_batch_schema_rejects_pending_manual_dependency_marked_nonblocking(self) -> None:
+        dependency = {
+            "kind": "manual_statement_import_financial_transaction",
+            "blocking": False,
+            "reason": "Statement import required.",
+            "disposition": "bank_fee_payment",
+            "statement_id": "archive:fee-1",
+            "record_id": "fee-1",
+            "date": "2024-01-15",
+            "iban": "EE123",
+            "currency": "EUR",
+            "physical_signed_amount": -7.0,
+            "source_ref": {"path": "normalized.json", "record_ref": "fee-1", "source_kind": "physical_bank"},
+            "reviewed_rationale": "Reviewed fee.",
+            "target": {"financial_transaction_kind": "bank-fee"},
+            "split_parts": [],
+            "split_proof": None,
+            "statement_import_proof": {"status": "pending", "required_evidence": "live_discovery_or_audit"},
+        }
+        batch = {
+            "schema_version": "1.0", "company_slug": "example", "period": "2024-01",
+            "generated_at": "2024-01-01T00:00:00Z", "batch_id": "example-2024-01",
+            "approval_status": "draft", "already_present": [], "unresolved_dependencies": [dependency],
+            "reference_artifacts": [
+                {"kind": "posting_policy", "path": "policy.json", "sha256": "0" * 64},
+                {"kind": "discovery_overview", "path": "overview.json", "sha256": "1" * 64},
+            ], "actions": [],
+        }
+
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=batch)
+
+        dependency["statement_import_proof"] = {
+            "status": "verified",
+            "required_evidence": "live_discovery_or_audit",
+            "simplbooks_transaction_id": "txn-501",
+            "evidence_ref": "audit/2024-01#txn-501",
+        }
+        self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=batch)
+
     def test_generated_year_overview_matches_strict_schema(self) -> None:
         class EmptyClient:
             company_id = "CID"

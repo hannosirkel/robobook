@@ -530,6 +530,25 @@ class BookbuilderTests(unittest.TestCase):
         with self.assertRaisesRegex(bookbuilder.SimplbooksError, "split.*sum"):
             build_with(bank=row, allocation=allocation)
 
+    def test_manual_bank_fee_rejects_positive_physical_amount(self) -> None:
+        row = bank_row(record_id="positive-fee", amount=7.0, event_date="2024-08-30")
+        allocation = manual_allocation(row=row, disposition="bank_fee_payment")
+
+        with self.assertRaisesRegex(bookbuilder.SimplbooksError, "bank_fee_payment.*negative"):
+            build_with(bank=row, allocation=allocation)
+
+    def test_netted_foreign_receipt_rejects_reversed_split_signs(self) -> None:
+        row = bank_row(record_id="foreign-reversed", amount=-723.32, event_date="2024-08-30")
+        row["currency"] = "USD"
+        allocation = manual_allocation(row=row, disposition="reviewed_split")
+        allocation["parts"] = [
+            {"amount": -738.32, "disposition": "existing_invoice_receipt", "target": {"simplbooks_id": "119"}},
+            {"amount": 15.0, "disposition": "bank_fee_payment", "target": {"financial_transaction_kind": "fee"}},
+        ]
+
+        with self.assertRaisesRegex(bookbuilder.SimplbooksError, "existing_invoice_receipt.*positive"):
+            build_with(bank=row, allocation=allocation)
+
     def test_existing_cash_target_requires_discovery_proof(self) -> None:
         with self.assertRaisesRegex(bookbuilder.SimplbooksError, "discovery overview"):
             build_with(

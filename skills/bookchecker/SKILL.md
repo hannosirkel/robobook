@@ -57,6 +57,8 @@ Implemented deterministic checks:
 - missing account, VAT, and bank mapping hints
 - recon gate alignment
 - policy-driven historical outlier warnings
+- manual statement-import proof state, signed disposition direction, and independent identity/economic
+  comparison with the referenced normalized physical bank row
 
 ## Guardrails
 

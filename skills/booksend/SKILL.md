@@ -71,9 +71,10 @@ Implemented write targets:
 - Master-data creation endpoints stay blocked unless separately approved.
 - Reject foreign-currency actions without a positive reviewed rate.
 - Reject supplier credits with non-positive draft magnitudes or inventory/article links; those need original stock-batch handling.
-- Reject a batch containing manual statement-import financial dependencies before translating any
-  API action; those dependencies are completed through full SimplBooks statement import and proved
-  later by live discovery or audit.
+- Reject pending, blocking, or invalid manual statement-import financial dependencies before
+  translating any API action. A complete verified proof may become non-blocking only when it retains
+  the SimplBooks transaction ID and audit/discovery evidence reference; the remaining API actions may
+  then proceed.
 
 ## References
 

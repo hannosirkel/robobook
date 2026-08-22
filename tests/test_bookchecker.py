@@ -238,6 +238,30 @@ def build_clean_artifacts(tmp: Path, *, recon_approve: bool = True, force: bool 
     return normalized_path, recon_path, action_path
 
 
+def manual_financial_dependency(*, blocking: bool = False, status: str = "verified") -> dict:
+    proof = {"status": status, "required_evidence": "live_discovery_or_audit"}
+    if status == "verified":
+        proof.update({"simplbooks_transaction_id": "txn-501", "evidence_ref": "audit/2024-01#txn-501"})
+    return {
+        "kind": "manual_statement_import_financial_transaction",
+        "blocking": blocking,
+        "reason": "Statement import required.",
+        "disposition": "bank_fee_payment",
+        "statement_id": "archive:fee-1",
+        "record_id": "bank:fee:1",
+        "date": "2024-01-15",
+        "iban": "EE123",
+        "currency": "EUR",
+        "physical_signed_amount": -7.0,
+        "source_ref": {"path": "normalized.json", "record_ref": "bank:fee:1", "source_kind": "physical_bank"},
+        "reviewed_rationale": "Reviewed bank fee.",
+        "target": {"financial_transaction_kind": "bank-fee"},
+        "split_parts": [],
+        "split_proof": None,
+        "statement_import_proof": proof,
+    }
+
+
 class BookcheckerTests(unittest.TestCase):
     def test_checker_blocks_vat_type_rate_mismatch(self) -> None:
         batch = allocated_action_fixture(line_rate=24, vat_type_id="25")
@@ -468,6 +492,81 @@ class BookcheckerTests(unittest.TestCase):
         findings = bookchecker.evaluate_unresolved_dependencies({"unresolved_dependencies": [dependency]})
 
         self.assertTrue(any("split" in item["summary"].lower() for item in findings))
+
+    def test_checker_treats_pending_manual_proof_as_blocking_even_when_flag_is_false(self) -> None:
+        dependency = manual_financial_dependency(blocking=False, status="pending")
+
+        findings = bookchecker.evaluate_unresolved_dependencies({"unresolved_dependencies": [dependency]})
+
+        self.assertTrue(any("pending" in item["summary"].lower() for item in findings))
+
+    def test_checker_independently_rejects_reversed_manual_split_signs(self) -> None:
+        dependency = manual_financial_dependency(blocking=True, status="pending")
+        dependency.update({
+            "disposition": "reviewed_split",
+            "currency": "USD",
+            "physical_signed_amount": -723.32,
+            "split_parts": [
+                {"signed_amount": -738.32, "disposition": "existing_invoice_receipt", "target": {"simplbooks_id": "119"}},
+                {"signed_amount": 15.0, "disposition": "bank_fee_payment", "target": {"financial_transaction_kind": "fee"}},
+            ],
+            "split_proof": {"signed_parts_total": -723.32, "physical_signed_amount": -723.32, "equation": "-738.32 + 15.00 = -723.32"},
+        })
+
+        findings = bookchecker.evaluate_unresolved_dependencies({"unresolved_dependencies": [dependency]})
+        summaries = " ".join(item["summary"] for item in findings)
+
+        self.assertIn("existing_invoice_receipt", summaries)
+        self.assertIn("bank_fee_payment", summaries)
+
+    def test_checker_independently_rejects_positive_manual_bank_fee(self) -> None:
+        dependency = manual_financial_dependency(blocking=True, status="pending")
+        dependency["physical_signed_amount"] = 7.0
+
+        findings = bookchecker.evaluate_unresolved_dependencies({"unresolved_dependencies": [dependency]})
+
+        self.assertTrue(any("bank_fee_payment" in item["summary"] and "negative" in item["summary"] for item in findings))
+
+    def test_checker_resolves_manual_dependency_against_physical_bank_record(self) -> None:
+        mutations = {
+            "statement_id": lambda dep: dep.update(statement_id="archive:forged"),
+            "record_id": lambda dep: (dep.update(record_id="bank:forged"), dep["source_ref"].update(record_ref="bank:forged")),
+            "date": lambda dep: dep.update(date="2024-01-16"),
+            "physical_signed_amount": lambda dep: dep.update(physical_signed_amount=-8.0),
+            "iban": lambda dep: dep.update(iban="EE999"),
+            "currency": lambda dep: dep.update(currency="USD"),
+        }
+        for field, mutate in mutations.items():
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                normalized = base_normalized()
+                fee = record(record_id="bank:fee:1", source_system="bank", event_type="bank_debit", gross_amount=-7.0)
+                fee["attributes"] = {"iban": "EE123", "archive_id": "fee-1"}
+                normalized["records"]["bank_transactions"] = [fee]
+                (root / "normalized.json").write_text(json.dumps(normalized), encoding="utf-8")
+                recon = base_recon()
+                recon_path = root / "recon.json"
+                recon_path.write_text(json.dumps(recon), encoding="utf-8")
+                dependency = manual_financial_dependency()
+                mutate(dependency)
+
+                report = bookchecker.evaluate_action_batch(
+                    action_batch={
+                        "period": "2024-01",
+                        "recon_ref": "recon.json",
+                        "unresolved_dependencies": [dependency],
+                        "reference_artifacts": [],
+                        "actions": [],
+                    },
+                    action_path=root / "actions.yaml",
+                    recon_payload=recon,
+                    recon_path=recon_path,
+                    policy_text=None,
+                    cwd=root,
+                )
+
+                self.assertEqual(report["result"], "fail")
+                self.assertTrue(any(field.replace("physical_signed_amount", "signed amount") in item["summary"].lower() for item in report["findings"]))
 
     def test_checker_requires_file_bindings_for_allocated_woo_tax_actions(self) -> None:
         action = allocated_action_fixture(line_rate=24, vat_type_id="34")["actions"][0]

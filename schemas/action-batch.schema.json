@@ -168,6 +168,7 @@
         "kind",
         "blocking",
         "reason",
+        "disposition",
         "statement_id",
         "record_id",
         "date",
@@ -185,13 +186,31 @@
         "kind": {"const": "manual_statement_import_financial_transaction"},
         "blocking": {"type": "boolean"},
         "reason": {"type": "string", "minLength": 1},
+        "disposition": {
+          "type": "string",
+          "enum": [
+            "generated_invoice_receipt",
+            "existing_invoice_receipt",
+            "generated_purchase_payment",
+            "existing_purchase_payment",
+            "direct_sale_receipt",
+            "bank_fee_payment",
+            "clearing_transfer",
+            "reviewed_split"
+          ]
+        },
         "statement_id": {"type": "string", "minLength": 1},
         "record_id": {"type": "string", "minLength": 1},
         "date": {"type": "string", "format": "date"},
         "iban": {"type": "string", "minLength": 1},
         "currency": {"type": "string", "pattern": "^[A-Z]{3}$"},
         "physical_signed_amount": {"type": "number"},
-        "source_ref": {"$ref": "#/$defs/source_ref"},
+        "source_ref": {
+          "allOf": [
+            {"$ref": "#/$defs/source_ref"},
+            {"required": ["record_ref", "source_kind"]}
+          ]
+        },
         "reviewed_rationale": {"type": "string", "minLength": 1},
         "target": {"type": "object"},
         "split_parts": {
@@ -224,7 +243,35 @@
             "evidence_ref": {"type": "string", "minLength": 1}
           }
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "statement_import_proof": {
+                "properties": {"status": {"const": "pending"}},
+                "required": ["status"]
+              }
+            },
+            "required": ["statement_import_proof"]
+          },
+          "then": {"properties": {"blocking": {"const": true}}}
+        },
+        {
+          "if": {
+            "properties": {"blocking": {"const": false}},
+            "required": ["blocking"]
+          },
+          "then": {
+            "properties": {
+              "statement_import_proof": {
+                "properties": {"status": {"const": "verified"}},
+                "required": ["status", "simplbooks_transaction_id", "evidence_ref"]
+              }
+            }
+          }
+        }
+      ]
     },
     "action": {
       "type": "object",

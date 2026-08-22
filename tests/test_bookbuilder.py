@@ -676,6 +676,51 @@ class BookbuilderTests(unittest.TestCase):
             {"example-2024-08-sales-direct"},
         )
 
+    def test_generated_purchase_payment_inherits_target_purchase_contact(self) -> None:
+        row = bank_row(record_id="dpd-payment", amount=-43.4, event_date="2025-09-12")
+        allocation = manual_allocation(row=row, disposition="generated_purchase_payment")
+        allocation["target"] = {
+            "document_type": "purchase",
+            "action_key": "example-2025-09-purchase-dpd",
+        }
+        target_action = purchase_summary_action(
+            period="2025-09",
+            key="example-2025-09-purchase-dpd",
+            vendor_hint="dpd",
+            amount=43.4,
+            contact_id="37",
+        )
+
+        actions = bookbuilder.build_exact_cash_actions(
+            company_slug="example",
+            period="2025-09",
+            normalized_path_display="normalized.json",
+            records={"bank_transactions": [row]},
+            base_currency="EUR",
+            default_bank_account_id="3",
+            bank_account_notes=[],
+            entity_map=None,
+            posting_policy=None,
+            allocations={(allocation["statement_id"], allocation["iban"], allocation["currency"]): allocation},
+            current_actions=[target_action],
+            historical_actions={},
+            discovery_overviews=[],
+            forced_note=None,
+        )
+
+        self.assertEqual(actions[0]["payload"]["counterparty"]["contact_id"], "37")
+        self.assertEqual(actions[0]["payload"]["counterparty_hint"], "dpd")
+        self.assertFalse(any("No contact/client mapping matched" in note for note in actions[0]["review_notes"]))
+        unresolved = bookbuilder.apply_posting_policy(
+            actions,
+            posting_policy={
+                "contacts": {"sales": {}, "processors": {}, "suppliers": {"dpd": "37"}},
+                "mappings": {},
+            },
+        )
+        self.assertEqual(unresolved, [])
+        self.assertEqual(actions[0]["payload"]["counterparty"]["contact_id"], "37")
+
     def test_exact_cash_actions_map_each_physical_bank_account(self) -> None:
         normalized = base_normalized("2024-01")
         rows = [

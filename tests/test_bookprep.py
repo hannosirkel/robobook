@@ -863,7 +863,7 @@ class BookprepTests(unittest.TestCase):
             self.assertEqual(records["sales"][0]["fee_amount"], 1.57)
             self.assertEqual(records["payouts"][0]["gross_amount"], 34.25)
 
-    def test_parse_paypal_csv_keeps_card_funding_and_conversions_out_of_payouts(self) -> None:
+    def test_parse_paypal_csv_routes_card_funding_conversions_and_supplier_payment_to_clearing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             csv_path = root / "paypal_2025_report.CSV"
@@ -887,9 +887,20 @@ class BookprepTests(unittest.TestCase):
             )
 
             self.assertFalse(exceptions)
-            self.assertEqual(len(records["payouts"]), 1)
-            self.assertEqual(records["payouts"][0]["external_ref"], "TX1")
-            self.assertEqual(len(records["other"]), 3)
+            self.assertFalse(records["payouts"])
+            self.assertFalse(records["other"])
+            self.assertEqual(len(records["clearing_transactions"]), 4)
+            self.assertEqual(
+                [record["external_ref"] for record in records["clearing_transactions"]],
+                ["TX1", "TX2", "TX3", "TX4"],
+            )
+            self.assertTrue(
+                all(
+                    record["attributes"]["clearing_provider"] == "paypal"
+                    and record["attributes"]["clearing_account"] == "paypal_wallet"
+                    for record in records["clearing_transactions"]
+                )
+            )
             self.assertFalse(records["sales"])
             self.assertFalse(records["refunds"])
 

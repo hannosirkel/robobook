@@ -1323,9 +1323,17 @@ def load_bound_woo_tax_allocation(
 
 def paypal_category(row: dict[str, str], gross_amount: Decimal) -> str:
     type_value = row.get("Type", "").strip().lower()
+    if type_value in {
+        "general card withdrawal",
+        "general card deposit",
+        "general currency conversion",
+        "general payment",
+        "payment reversal",
+    }:
+        return "clearing_transactions"
     if "withdrawal" in type_value or "payout" in type_value:
         return "payouts"
-    if "deposit" in type_value or "currency conversion" in type_value or type_value in {"general payment", "payment reversal"}:
+    if "deposit" in type_value or "currency conversion" in type_value:
         return "other"
     if "transfer" in type_value:
         return "payouts"
@@ -1380,6 +1388,21 @@ def parse_paypal_csv(
         type_slug = slugify(row.get("Type", "paypal-event")).replace("-", "_")
         currency = row.get("Currency", "").strip().upper() or base_currency
 
+        attributes = {
+            "status": status,
+            "item_title": row.get("Item Title"),
+            "item_id": row.get("Item ID"),
+            "balance_impact": row.get("Balance Impact"),
+            "from_email": row.get("From Email Address"),
+            "to_email": row.get("To Email Address"),
+            "quantity": row.get("Quantity"),
+        }
+        if category == "clearing_transactions":
+            attributes.update({
+                "clearing_provider": "paypal",
+                "clearing_account": "paypal_wallet",
+            })
+
         category_name, record = make_record(
             source=source,
             category=category,
@@ -1397,15 +1420,7 @@ def parse_paypal_csv(
             external_ref=row.get("Transaction ID") or None,
             channel="paypal",
             country_code=(row.get("Country Code") or "").strip().upper() or None,
-            attributes={
-                "status": status,
-                "item_title": row.get("Item Title"),
-                "item_id": row.get("Item ID"),
-                "balance_impact": row.get("Balance Impact"),
-                "from_email": row.get("From Email Address"),
-                "to_email": row.get("To Email Address"),
-                "quantity": row.get("Quantity"),
-            },
+            attributes=attributes,
             row_ref=f"csv:{line_no}",
         )
         result[category_name].append(record)

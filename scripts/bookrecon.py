@@ -343,6 +343,7 @@ def missing_processor_evidence_exceptions(
     *,
     normalized_path_display: str,
     records: dict[str, list[dict[str, Any]]],
+    bank_allocations: dict[Any, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     exceptions: list[dict[str, Any]] = []
     processor_records: dict[str, list[dict[str, Any]]] = {name: [] for name in PROCESSOR_KEYWORDS}
@@ -353,10 +354,17 @@ def missing_processor_evidence_exceptions(
                 processor_records[processor].append(record)
 
     for processor in sorted(PROCESSOR_KEYWORDS):
+        reviewed_transfer_record_ids = {
+            str(item.get("record_id") or "")
+            for item in (bank_allocations or {}).values()
+            if str(item.get("disposition") or "") == "clearing_transfer"
+            and str((item.get("review") or {}).get("status") or "") == "approved"
+        }
         bank_records = [
             record
             for record in records.get("bank_transactions", [])
             if infer_processor(record) == processor and decimal_value(record.get("gross_amount")) > 0
+            and str(record.get("record_id") or "") not in reviewed_transfer_record_ids
         ]
         if not bank_records or processor_records[processor]:
             continue
@@ -1263,6 +1271,7 @@ def build_recon_document(
     previous_payload: dict[str, Any] | None = None,
     previous_path: Path | None = None,
     bank_allocations: dict[str, dict[str, Any]] | None = None,
+    clearing_allocations: dict[str, dict[str, Any]] | None = None,
     bank_allocation_errors: list[str] | None = None,
     bank_allocations_path: Path | None = None,
 ) -> dict[str, Any]:
@@ -1279,6 +1288,7 @@ def build_recon_document(
         missing_processor_evidence_exceptions(
             normalized_path_display=normalized_path_display,
             records=records,
+            bank_allocations=bank_allocations,
         )
     )
 
@@ -1293,7 +1303,7 @@ def build_recon_document(
     clearing_checks, clearing_ready, clearing_coverage = build_clearing_continuity_checks(
         normalized_path_display=normalized_path_display,
         records=records,
-        allocations=bank_allocations or {},
+        allocations=clearing_allocations if clearing_allocations is not None else (bank_allocations or {}),
     )
     bank_coverage["clearing_ready"] = clearing_ready
     bank_coverage.update(clearing_coverage)
@@ -1461,6 +1471,25 @@ def load_period_bank_allocations(
         return {}, [f"Reviewed bank allocation artifact is not usable: {exc}"]
 
 
+def load_annual_bank_allocations(
+    *,
+    allocation_path: Path | None,
+    normalized_path: Path,
+    period: str,
+) -> tuple[dict[tuple[str, str, str], dict[str, Any]], list[str]]:
+    """Load all reviewed annual allocations for cross-period clearing bridges."""
+    if allocation_path is None or not allocation_path.exists():
+        return {}, ["Reviewed bank allocation artifact was not available for this period."]
+    try:
+        payload = load_bank_allocations(
+            allocation_path,
+            normalized_year_paths=normalized_year_paths(normalized_path, period=period),
+        )
+        return {allocation_key(item): item for item in payload.get("allocations") or []}, []
+    except BankAllocationError as exc:
+        return {}, [f"Reviewed bank allocation artifact is not usable: {exc}"]
+
+
 def resolve_previous_normalized_path(
     *,
     company_dir: Path | None,
@@ -1556,11 +1585,16 @@ def main() -> int:
     policy_memo_text = load_optional_text(policy_memo_path)
     entity_map = load_optional_json(entity_map_path)
     previous_payload = load_optional_json(previous_path)
-    period_bank_allocations, bank_allocation_errors = load_period_bank_allocations(
+    annual_bank_allocations, bank_allocation_errors = load_annual_bank_allocations(
         allocation_path=bank_allocations_path,
         normalized_path=normalized_path,
         period=args.period,
     )
+    period_bank_allocations = {
+        key: item
+        for key, item in annual_bank_allocations.items()
+        if str(item.get("period") or "") == args.period
+    }
 
     repo_root = Path.cwd()
     document = build_recon_document(
@@ -1576,6 +1610,7 @@ def main() -> int:
         previous_payload=previous_payload,
         previous_path=previous_path if previous_payload is not None else None,
         bank_allocations=period_bank_allocations,
+        clearing_allocations=annual_bank_allocations,
         bank_allocation_errors=bank_allocation_errors,
         bank_allocations_path=bank_allocations_path,
     )

@@ -2785,6 +2785,8 @@ def build_exact_cash_actions(
             target_value = _existing_target_id(target) if target_is_existing else _generated_target_action_key(target)
             depends_on: list[str] = []
             supporting_refs: list[dict[str, Any]] = []
+            generated_target_contact_id: Any = None
+            generated_target_label = ""
             if target_is_existing:
                 if not discovery_overviews:
                     raise SimplbooksError(f"Existing settlement target {target_value!r} requires a bound discovery overview.")
@@ -2821,8 +2823,21 @@ def build_exact_cash_actions(
                     for source_ref in target_action.get("source_refs") or []
                     if isinstance(source_ref, dict)
                 ]
+                target_counterparty = (target_action.get("payload") or {}).get("counterparty") or {}
+                if isinstance(target_counterparty, dict):
+                    generated_target_contact_id = target_counterparty.get("contact_id")
+                target_payload = target_action.get("payload") or {}
+                generated_target_label = str(
+                    target_payload.get("vendor_hint")
+                    or (target_payload.get("summary_scope") or {}).get("channel_or_source")
+                    or (target_counterparty.get("display_name_hint") if isinstance(target_counterparty, dict) else "")
+                    or ""
+                ).strip()
 
             contact_id = target.get("contact_id")
+            if contact_id in (None, "") and generated_target_contact_id not in (None, ""):
+                contact_id = generated_target_contact_id
+                notes.append("Inherited the exact contact from the linked generated target action.")
             if contact_id in (None, ""):
                 group_label = record_group_label(record, default="bank settlement")
                 contact_id, contact_notes = preferred_contact_id(
@@ -2837,6 +2852,12 @@ def build_exact_cash_actions(
                 notes_for_action.append(forced_note)
             notes_for_action.append(str((allocation.get("review") or {}).get("rationale") or "Reviewed bank allocation."))
 
+            counterparty_hint = str(
+                target.get("counterparty_hint")
+                or generated_target_label
+                or record_group_label(record, default="bank settlement")
+            )
+
             payload = {
                 "draft_schema": "cash_settlement_v1",
                 "document_type": document_type,
@@ -2844,9 +2865,9 @@ def build_exact_cash_actions(
                 "currency": currency,
                 "counterparty": {
                     "contact_id": str(contact_id) if contact_id not in (None, "") else None,
-                    "display_name_hint": str(target.get("counterparty_hint") or record_group_label(record, default="bank settlement")),
+                    "display_name_hint": counterparty_hint,
                 },
-                "counterparty_hint": str(target.get("counterparty_hint") or record_group_label(record, default="bank settlement")),
+                "counterparty_hint": counterparty_hint,
                 "bank_account_id": bank_account_id,
                 "amount": decimal_number(part_amount if document_type == "incoming" else -part_amount),
                 target_field: target_value,

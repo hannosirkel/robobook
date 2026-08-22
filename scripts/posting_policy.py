@@ -326,4 +326,12 @@ def action_policy_errors(action: dict[str, Any], policy: dict[str, Any]) -> list
         actual_warehouse = line.get("warehouse_id_hint")
         if str(actual_warehouse or "") != str(expected_warehouse or ""):
             errors.append(f"Line warehouse does not match policy family {family!r}.")
+        expected_article = (
+            None if role == "sales" and line_role.endswith("_shipping")
+            else family_values.get("article_id") if role == "sales"
+            else line_values.get("article_id")
+        )
+        actual_article = line.get("article_id_hint")
+        if str(actual_article or "") != str(expected_article or ""):
+            errors.append(f"Line article does not match policy family {family!r}.")
     return errors

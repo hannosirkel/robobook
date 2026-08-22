@@ -15,6 +15,40 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import live_month_run  # noqa: E402
 
 
+def write_live_context(company_dir: Path, *, period: str = "2024-03", allocations: list[dict] | None = None) -> None:
+    year = int(period[:4])
+    normalized_dir = company_dir / "artifacts" / "normalized"
+    normalized_dir.mkdir(parents=True, exist_ok=True)
+    normalized_paths = []
+    for month in range(1, 13):
+        path = normalized_dir / f"{year}-{month:02d}.json"
+        month_period = f"{year}-{month:02d}"
+        rows = []
+        for item in allocations or []:
+            if item["period"] != month_period:
+                continue
+            statement_id = str(item["statement_id"])
+            rows.append({
+                "record_id": item["record_id"], "source_system": "bank",
+                "event_date": f"{month_period}-15", "currency": item["currency"],
+                "gross_amount": item["amount"], "description": "Reviewed row",
+                "external_ref": statement_id.removeprefix("archive:"),
+                "attributes": {"customer_account": item["iban"]},
+            })
+        path.write_text(json.dumps({"period": month_period, "records": {"bank_transactions": rows}}), encoding="utf-8")
+        normalized_paths.append(path)
+    allocation_path = company_dir / "artifacts" / "bank" / f"{year}-allocations.json"
+    allocation_path.parent.mkdir(parents=True, exist_ok=True)
+    allocation_path.write_text(json.dumps({
+        "schema_version": "1.0", "company_slug": "example", "year": year,
+        "normalized_bindings": [
+            {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+            for path in normalized_paths
+        ],
+        "allocations": allocations or [],
+    }), encoding="utf-8")
+
+
 def write_action(path: Path, *, status: str = "draft", period: str = "2024-03") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({
@@ -50,7 +84,160 @@ def bind_discovery(action_path: Path, discovery_path: Path) -> None:
     action_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
 
 
+def bind_discoveries(action_path: Path, discovery_paths: list[Path]) -> None:
+    payload = json.loads(action_path.read_text(encoding="utf-8"))
+    payload["reference_artifacts"] = [{
+        "kind": "discovery_overview", "path": str(path),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    } for path in discovery_paths]
+    action_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+
 class LiveMonthRunTests(unittest.TestCase):
+    def test_pending_manual_proof_stops_before_discovery(self) -> None:
+        calls: list[list[str]] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            company_dir = Path(tmp) / "companies" / "example"
+            allocation = {
+                "statement_id": "archive:fee-1", "record_id": "fee-1", "iban": "EE123",
+                "period": "2024-03", "disposition": "bank_fee_payment", "amount": -7.0,
+                "currency": "EUR", "target": {"financial_transaction_kind": "bank-fee"},
+                "review": {"status": "approved", "rationale": "Reviewed bank fee."},
+            }
+            write_live_context(company_dir, allocations=[allocation])
+
+            with self.assertRaisesRegex(live_month_run.SimplbooksError, "before live discovery/build"):
+                live_month_run.run_live_month(
+                    company_dir=company_dir, period="2024-03", python_executable="python3",
+                    cwd=ROOT, confirm_write=True,
+                    run_command=lambda cmd, **kwargs: calls.append(cmd),
+                    approval_checkpoint=lambda _path: None,
+                )
+
+        self.assertEqual(calls, [])
+    def test_dependency_resolution_accepts_verified_manual_and_nonblocking_information(self) -> None:
+        batch = {"unresolved_dependencies": [
+            {
+                "kind": "manual_statement_import_financial_transaction",
+                "blocking": False,
+                "statement_import_proof": {
+                    "status": "verified",
+                    "required_evidence": "live_discovery_or_audit",
+                    "simplbooks_transaction_id": "txn-1",
+                    "evidence_ref": "audit#txn-1",
+                },
+            },
+            {"kind": "informational_note", "blocking": False, "reason": "Reviewed context."},
+        ]}
+
+        self.assertTrue(live_month_run._dependencies_are_resolved(batch))
+
+    def test_required_discovery_years_include_existing_and_generated_target_years(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            company_dir = Path(tmp) / "companies" / "example"
+            discovery = company_dir / "artifacts" / "discovery" / "2023-overview.json"
+            discovery.parent.mkdir(parents=True)
+            discovery.write_text(json.dumps({
+                "year": 2023,
+                "document_index": [{"simplbooks_id": "58", "document_type": "invoice"}],
+            }), encoding="utf-8")
+            allocations = [{
+                "target": {"simplbooks_id": "58", "document_type": "invoice"},
+            }, {
+                "target": {"action_key": "example-2024-12-purchase-abc"},
+            }]
+
+            self.assertEqual(
+                live_month_run._required_discovery_years(
+                    company_dir=company_dir, period="2025-01", allocations=allocations
+                ),
+                [2023, 2024, 2025],
+            )
+
+    def test_multiyear_discovery_failure_stops_before_builder(self) -> None:
+        calls: list[list[str]] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            company_dir = Path(tmp) / "companies" / "example"
+            allocation = {
+                "statement_id": "archive:receipt-1", "record_id": "receipt-1", "iban": "EE123",
+                "period": "2024-01", "disposition": "existing_invoice_receipt", "amount": 330.0,
+                "currency": "EUR", "target": {"simplbooks_id": "58", "document_type": "invoice"},
+                "review": {"status": "approved", "rationale": "Prior-year invoice receipt."},
+            }
+            write_live_context(company_dir, period="2024-01", allocations=[allocation])
+            old_discovery = company_dir / "artifacts" / "discovery" / "2023-overview.json"
+            old_discovery.parent.mkdir(parents=True)
+            old_discovery.write_text(json.dumps({
+                "year": 2023,
+                "document_index": [{"simplbooks_id": "58", "document_type": "invoice"}],
+            }), encoding="utf-8")
+
+            def fake_run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+                calls.append(cmd)
+                year = cmd[cmd.index("--year") + 1]
+                if year == "2024":
+                    return SimpleNamespace(returncode=1, stdout="", stderr="network unavailable")
+                return SimpleNamespace(returncode=0, stdout=json.dumps({"year": int(year)}), stderr="")
+
+            with self.assertRaisesRegex(live_month_run.SimplbooksError, "network unavailable"):
+                live_month_run.run_live_month(
+                    company_dir=company_dir, period="2024-01", python_executable="python3",
+                    cwd=ROOT, confirm_write=True, run_command=fake_run,
+                    approval_checkpoint=lambda _path: None,
+                )
+
+        self.assertEqual([Path(cmd[1]).name for cmd in calls], [
+            "examine_simplbooks_year.py", "examine_simplbooks_year.py",
+        ])
+        self.assertEqual([cmd[cmd.index("--year") + 1] for cmd in calls], ["2023", "2024"])
+
+    def test_multiyear_builder_receives_every_refreshed_discovery(self) -> None:
+        calls: list[list[str]] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            company_dir = Path(tmp) / "companies" / "example"
+            allocation = {
+                "statement_id": "archive:receipt-1", "record_id": "receipt-1", "iban": "EE123",
+                "period": "2024-01", "disposition": "existing_invoice_receipt", "amount": 330.0,
+                "currency": "EUR", "target": {"simplbooks_id": "58", "document_type": "invoice"},
+                "review": {"status": "approved", "rationale": "Prior-year invoice receipt."},
+            }
+            write_live_context(company_dir, period="2024-01", allocations=[allocation])
+            discovery_paths = [
+                company_dir / "artifacts" / "discovery" / f"{year}-overview.json"
+                for year in (2023, 2024)
+            ]
+            discovery_paths[0].parent.mkdir(parents=True)
+            discovery_paths[0].write_text(json.dumps({
+                "year": 2023,
+                "document_index": [{"simplbooks_id": "58", "document_type": "invoice"}],
+            }), encoding="utf-8")
+            action_path = company_dir / "artifacts" / "actions" / "2024-01.yaml"
+
+            def fake_run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+                calls.append(cmd)
+                script = Path(cmd[1]).name
+                if script == "examine_simplbooks_year.py":
+                    output = Path(cmd[cmd.index("--output") + 1])
+                    output.write_text(json.dumps({"year": int(cmd[cmd.index("--year") + 1])}), encoding="utf-8")
+                    result = {"year": int(cmd[cmd.index("--year") + 1])}
+                elif script == "bookbuilder.py":
+                    write_action(action_path, period="2024-01")
+                    bind_discoveries(action_path, discovery_paths)
+                    result = {"approval_status": "draft", "output": str(action_path)}
+                else:
+                    result = {"result": "pass", "error_count": 0, "warning_count": 1}
+                return SimpleNamespace(returncode=0, stdout=json.dumps(result), stderr="")
+
+            with self.assertRaisesRegex(live_month_run.SimplbooksError, "warning"):
+                live_month_run.run_live_month(
+                    company_dir=company_dir, period="2024-01", python_executable="python3",
+                    cwd=ROOT, confirm_write=True, run_command=fake_run,
+                    approval_checkpoint=lambda _path: None,
+                )
+
+        builder = next(cmd for cmd in calls if Path(cmd[1]).name == "bookbuilder.py")
+        bound = [builder[index + 1] for index, value in enumerate(builder) if value == "--discovery-overview"]
+        self.assertEqual(bound, list(map(str, discovery_paths)))
     def test_requires_explicit_confirmation_before_any_command(self) -> None:
         calls: list[list[str]] = []
         with tempfile.TemporaryDirectory() as tmp:
@@ -93,6 +280,7 @@ class LiveMonthRunTests(unittest.TestCase):
         calls: list[list[str]] = []
         with tempfile.TemporaryDirectory() as tmp:
             company_dir = Path(tmp) / "companies" / "example"
+            write_live_context(company_dir)
             action_path = company_dir / "artifacts" / "actions" / "2024-03.yaml"
             check_path = company_dir / "artifacts" / "actions" / "2024-03.check.md"
             discovery_path = company_dir / "artifacts" / "discovery" / "2024-overview.json"
@@ -138,6 +326,7 @@ class LiveMonthRunTests(unittest.TestCase):
     def test_refuses_non_approval_mutation_at_human_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             company_dir = Path(tmp) / "companies" / "example"
+            write_live_context(company_dir)
             action_path = company_dir / "artifacts" / "actions" / "2024-03.yaml"
             check_path = company_dir / "artifacts" / "actions" / "2024-03.check.md"
             discovery_path = company_dir / "artifacts" / "discovery" / "2024-overview.json"
@@ -191,6 +380,7 @@ class LiveMonthRunTests(unittest.TestCase):
         calls: list[list[str]] = []
         with tempfile.TemporaryDirectory() as tmp:
             company_dir = Path(tmp) / "companies" / "example"
+            write_live_context(company_dir)
             action_path = company_dir / "artifacts" / "actions" / "2024-03.yaml"
             discovery_path = company_dir / "artifacts" / "discovery" / "2024-overview.json"
 
@@ -222,6 +412,7 @@ class LiveMonthRunTests(unittest.TestCase):
         calls: list[list[str]] = []
         with tempfile.TemporaryDirectory() as tmp:
             company_dir = Path(tmp) / "companies" / "example"
+            write_live_context(company_dir)
             action_path = company_dir / "artifacts" / "actions" / "2024-03.yaml"
             discovery_path = company_dir / "artifacts" / "discovery" / "2024-overview.json"
             write_action(action_path)
@@ -262,6 +453,7 @@ class LiveMonthRunTests(unittest.TestCase):
         checkpoint_called = False
         with tempfile.TemporaryDirectory() as tmp:
             company_dir = Path(tmp) / "companies" / "example"
+            write_live_context(company_dir)
             action_path = company_dir / "artifacts" / "actions" / "2024-03.yaml"
             check_path = company_dir / "artifacts" / "actions" / "2024-03.check.md"
             discovery_path = company_dir / "artifacts" / "discovery" / "2024-overview.json"
@@ -296,6 +488,7 @@ class LiveMonthRunTests(unittest.TestCase):
     def test_rejects_builder_that_reports_a_different_output_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             company_dir = Path(tmp) / "companies" / "example"
+            write_live_context(company_dir)
             discovery_path = company_dir / "artifacts" / "discovery" / "2024-overview.json"
             action_path = company_dir / "artifacts" / "actions" / "2024-03.yaml"
 
@@ -323,6 +516,7 @@ class LiveMonthRunTests(unittest.TestCase):
     def test_rejects_noop_builder_that_leaves_stale_discovery_binding(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             company_dir = Path(tmp) / "companies" / "example"
+            write_live_context(company_dir)
             discovery_path = company_dir / "artifacts" / "discovery" / "2024-overview.json"
             action_path = company_dir / "artifacts" / "actions" / "2024-03.yaml"
             discovery_path.parent.mkdir(parents=True)

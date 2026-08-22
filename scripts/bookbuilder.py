@@ -1327,6 +1327,7 @@ def build_sales_lines(
                 "suggested_income_account_id": revenue_account_id,
                 "suggested_vat_type_id": standard_vat_id if total_vat != 0 else zero_vat_id,
                 "warehouse_id_hint": maybe_single_warehouse(records) or default_warehouse_id,
+                "quantity": decimal_number(sum((decimal_value(record.get("quantity") or 0) for record in records), Decimal("0"))) or None,
                 "record_count": len(records),
             }
         )
@@ -1362,6 +1363,7 @@ def build_sales_lines(
                     "suggested_income_account_id": revenue_account_id,
                     "suggested_vat_type_id": standard_vat_id if profile_name == "taxable" else zero_vat_id,
                     "warehouse_id_hint": maybe_single_warehouse(profile_records) or default_warehouse_id,
+                    "quantity": decimal_number(sum((decimal_value(record.get("quantity") or 0) for record in profile_records), Decimal("0"))) or None,
                     "record_count": len(profile_records),
                 }
             )
@@ -2357,12 +2359,21 @@ def build_manual_financial_dependencies(
                 + f" = {physical_amount:.2f}",
             }
         rationale = str((allocation.get("review") or {}).get("rationale") or "").strip()
+        reviewed_proof = copy.deepcopy((allocation.get("target") or {}).get("statement_import_proof"))
+        statement_import_proof = reviewed_proof or {
+            "status": "pending",
+            "required_evidence": "live_discovery_or_audit",
+        }
+        proof_verified = (
+            isinstance(statement_import_proof, dict)
+            and statement_import_proof.get("status") == "verified"
+        )
         source_ref = source_refs_for_records(normalized_path_display, [record], note=rationale)[0]
         source_ref["source_kind"] = "physical_bank"
         dependencies.append(
             {
                 "kind": "manual_statement_import_financial_transaction",
-                "blocking": True,
+                "blocking": not proof_verified,
                 "reason": (
                     f"Physical bank row {record_id} requires full SimplBooks statement import and live proof; "
                     "no public financial-transaction API endpoint is confirmed."
@@ -2379,10 +2390,7 @@ def build_manual_financial_dependencies(
                 "target": copy.deepcopy(allocation.get("target") or {}),
                 "split_parts": split_parts,
                 "split_proof": split_proof,
-                "statement_import_proof": {
-                    "status": "pending",
-                    "required_evidence": "live_discovery_or_audit",
-                },
+                "statement_import_proof": statement_import_proof,
             }
         )
     return dependencies
@@ -2485,12 +2493,21 @@ def build_direct_sale_actions(
         family_values = (posting_policy.get("mappings") or {}).get(family) or {}
         mapped_warehouse = family_values.get("warehouse_id")
         warehouse_id = str(mapped_warehouse) if mapped_warehouse not in (None, "") else None
+        mapped_article = family_values.get("article_id")
+        article_id = str(mapped_article) if mapped_article not in (None, "") else None
         if "warehouse_id" in target:
             reviewed_warehouse = target.get("warehouse_id")
             reviewed_warehouse = str(reviewed_warehouse) if reviewed_warehouse not in (None, "") else None
             if reviewed_warehouse != warehouse_id:
                 raise SimplbooksError(
                     f"Direct-sale target warehouse for {record_id} does not match posting family {family!r}."
+                )
+        if "article_id" in target:
+            reviewed_article = target.get("article_id")
+            reviewed_article = str(reviewed_article) if reviewed_article not in (None, "") else None
+            if reviewed_article != article_id:
+                raise SimplbooksError(
+                    f"Direct-sale target article for {record_id} does not match posting family {family!r}."
                 )
         for field, expected in (
             ("contact_id", contact_id),
@@ -2510,6 +2527,7 @@ def build_direct_sale_actions(
             mapped_vat_type_id,
             income_account_id,
             warehouse_id,
+            article_id,
         )
         grouped[group_key].append(
             {
@@ -2536,6 +2554,7 @@ def build_direct_sale_actions(
             vat_type_id,
             income_account_id,
             warehouse_id,
+            article_id,
         ) = group_key
         family = entries[0]["family"]
         contact_label = entries[0]["contact_label"]
@@ -2564,6 +2583,7 @@ def build_direct_sale_actions(
                     "suggested_income_account_id": income_account_id,
                     "suggested_vat_type_id": vat_type_id,
                     "warehouse_id_hint": warehouse_id,
+                    "article_id_hint": article_id,
                     "record_count": 1,
                     "vat_profile_name": vat_profile_name,
                     "vat_profile_rate": vat_rate,
@@ -3213,6 +3233,12 @@ def apply_posting_policy(
                     )
                 else:
                     line["warehouse_id_hint"] = None
+                if not is_shipping and family_values.get("article_id") not in (None, ""):
+                    line["article_id_hint"] = resolve_mapping(
+                        posting_policy, family=family, field_name="article_id"
+                    )
+                else:
+                    line["article_id_hint"] = None
                 allocation_component = str(line.get("vat_allocation_component") or "")
                 if allocation_component in {"goods", "shipping"}:
                     try:

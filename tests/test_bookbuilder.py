@@ -159,6 +159,7 @@ def direct_sale_allocation(*, row: dict, warehouse_id: str | None = "6") -> dict
             "quantity": 1,
             "gross_amount": row["gross_amount"],
             "warehouse_id": warehouse_id,
+            "article_id": "3",
         },
         "review": {"status": "approved", "rationale": "Reviewed direct bank sale."},
     }
@@ -175,6 +176,7 @@ def direct_sale_policy() -> dict:
                 "income_account_id": "107",
                 "vat_type_id": "25",
                 "warehouse_id": "6",
+                "article_id": "3",
             }
         },
         "sales_vat_profiles": [{
@@ -391,6 +393,7 @@ class BookbuilderTests(unittest.TestCase):
         self.assertEqual(invoice["payload"]["line_items"][0]["suggested_income_account_id"], "107")
         self.assertEqual(invoice["payload"]["line_items"][0]["suggested_vat_type_id"], "25")
         self.assertEqual(invoice["payload"]["line_items"][0]["warehouse_id_hint"], "6")
+        self.assertEqual(invoice["payload"]["line_items"][0]["article_id_hint"], "3")
         self.assertEqual({ref["record_ref"] for ref in invoice["source_refs"]}, {"direct-a", "direct-b"})
         self.assertEqual([item["payload"]["document_date"] for item in receipts], ["2024-08-27", "2024-08-30"])
         self.assertEqual([item["payload"]["amount"] for item in receipts], [20.0, 20.0])
@@ -428,6 +431,7 @@ class BookbuilderTests(unittest.TestCase):
                         "direct-sale-taxable-no-warehouse": {
                             "income_account_id": "107",
                             "vat_type_id": "25",
+                            "article_id": "3",
                         },
                     },
                 },
@@ -496,6 +500,37 @@ class BookbuilderTests(unittest.TestCase):
         self.assertEqual({item["physical_signed_amount"] for item in dependencies}, {-2.0, -7.0})
         self.assertTrue(all(item["source_ref"]["source_kind"] == "physical_bank" for item in dependencies))
         self.assertTrue(all(item["statement_import_proof"]["status"] == "pending" for item in dependencies))
+
+    def test_manual_dependency_propagates_reviewed_statement_import_proof(self) -> None:
+        normalized = base_normalized("2024-08")
+        row = bank_row(record_id="reviewed-fee", amount=-7.0, event_date="2024-08-30")
+        normalized["records"]["bank_transactions"] = [row]
+        allocation = manual_allocation(row=row, disposition="bank_fee_payment")
+        allocation["target"]["statement_import_proof"] = {
+            "status": "verified",
+            "required_evidence": "live_discovery_or_audit",
+            "simplbooks_transaction_id": "txn-501",
+            "evidence_ref": "audit/2024-08#txn-501",
+        }
+        allocations = {(allocation["statement_id"], allocation["iban"], allocation["currency"]): allocation}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            batch = bookbuilder.build_action_batch(
+                normalized_payload=normalized,
+                recon_payload=base_recon("2024-08"),
+                normalized_path=root / "normalized.json",
+                recon_path=root / "recon.json",
+                repo_root=root,
+                bank_allocations=allocations,
+            )
+
+        dependency = batch["unresolved_dependencies"][0]
+        self.assertFalse(dependency["blocking"])
+        self.assertEqual(
+            dependency["statement_import_proof"],
+            allocation["target"]["statement_import_proof"],
+        )
 
     def test_expense_reimbursement_payment_creates_atomic_manual_dependency(self) -> None:
         normalized = base_normalized("2024-08")
@@ -1337,6 +1372,25 @@ class BookbuilderTests(unittest.TestCase):
         self.assertEqual(sales["payload"]["line_items"][0]["warehouse_id_hint"], "6")
         self.assertNotEqual(sales["confidence"], "low")
         self.assertFalse(actions_of_type(batch, "create_incoming_summary"))
+
+    def test_inventory_sales_line_preserves_quantity_and_reviewed_article(self) -> None:
+        normalized = base_normalized()
+        sale = record(
+            record_id="woo:sale:inventory", source_system="woo", channel="woo",
+            event_type="woo_daily_sales", gross_amount=60.0, net_amount=60.0,
+            description="Two Lunar Base games",
+        )
+        sale["quantity"] = 2
+        normalized["records"]["sales"] = [sale]
+        policy = policy_with_mixed_22_percent_profile()
+        policy["mappings"]["woo-non-taxable"]["article_id"] = "3"
+
+        batch = build_batch_with_policy(normalized, policy)
+        invoice = find_action(batch, "create_invoice_summary")
+        line = invoice["payload"]["line_items"][0]
+
+        self.assertEqual(line["quantity"], 2.0)
+        self.assertEqual(line["article_id_hint"], "3")
 
     def test_builder_rejects_bank_row_without_source_account_under_policy(self) -> None:
         normalized = base_normalized()

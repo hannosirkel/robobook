@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import booksend
+from bank_allocations import BankAllocationError, load_bank_allocations, period_allocations
 from full_year_dry_run import parse_json_output, submitted_month_state
 from reference_artifacts import ReferenceArtifactError, verify_file_binding
 from simplbooks_api import SimplbooksError
@@ -62,15 +63,97 @@ def _dependencies_are_resolved(batch: dict[str, Any]) -> bool:
     for dependency in batch.get("unresolved_dependencies") or []:
         if not isinstance(dependency, dict):
             return False
-        proof = dependency.get("proof") or {}
-        if (
-            dependency.get("kind") != "manual_statement_import_financial_transaction"
-            or dependency.get("blocking") is not False
-            or not isinstance(proof, dict)
-            or proof.get("status") != "verified"
-        ):
+        if dependency.get("blocking") is True:
             return False
+        if dependency.get("kind") == "manual_statement_import_financial_transaction":
+            proof = dependency.get("statement_import_proof") or {}
+            if (
+                dependency.get("blocking") is not False
+                or not isinstance(proof, dict)
+                or proof.get("status") != "verified"
+            ):
+                return False
     return True
+
+
+def _allocation_targets(allocation: dict[str, Any]) -> list[dict[str, Any]]:
+    targets = []
+    target = allocation.get("target")
+    if isinstance(target, dict):
+        targets.append(target)
+    for part in allocation.get("parts") or []:
+        if isinstance(part, dict) and isinstance(part.get("target"), dict):
+            targets.append(part["target"])
+    return targets
+
+
+def _required_discovery_years(
+    *, company_dir: Path, period: str, allocations: list[dict[str, Any]]
+) -> list[int]:
+    years = {int(period[:4])}
+    existing_targets = {
+        (str(target.get("simplbooks_id")), str(target.get("document_type") or ""))
+        for allocation in allocations
+        for target in _allocation_targets(allocation)
+        if target.get("simplbooks_id") not in (None, "")
+    }
+    for allocation in allocations:
+        for target in _allocation_targets(allocation):
+            for value in target.values():
+                if isinstance(value, str):
+                    match = re.search(r"-(\d{4})-\d{2}-", value)
+                    if match:
+                        years.add(int(match.group(1)))
+    found_existing: set[tuple[str, str]] = set()
+    if existing_targets:
+        for path in sorted((company_dir / "artifacts" / "discovery").glob("[0-9][0-9][0-9][0-9]-overview.json")):
+            try:
+                overview = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            matching = {
+                (str(item.get("simplbooks_id") or ""), str(item.get("document_type") or ""))
+                for item in overview.get("document_index") or []
+                if isinstance(item, dict)
+            } & existing_targets
+            if matching:
+                years.add(int(path.name[:4]))
+                found_existing.update(matching)
+        missing = sorted(existing_targets - found_existing)
+        if missing:
+            raise SimplbooksError(
+                "Could not infer discovery year for existing SimplBooks target(s): "
+                + ", ".join(f"{kind}:{item_id}" for item_id, kind in missing)
+            )
+    return sorted(years)
+
+
+def _load_live_allocations(*, company_dir: Path, period: str) -> list[dict[str, Any]]:
+    year = period[:4]
+    normalized_paths = sorted((company_dir / "artifacts" / "normalized").glob(f"{year}-[0-1][0-9].json"))
+    allocation_path = company_dir / "artifacts" / "bank" / f"{year}-allocations.json"
+    try:
+        payload = load_bank_allocations(allocation_path, normalized_year_paths=normalized_paths)
+        selected = list(period_allocations(payload, period).values())
+    except BankAllocationError as exc:
+        raise SimplbooksError(f"Live bank allocation preflight failed: {exc}") from exc
+    for allocation in selected:
+        manual = str(allocation.get("disposition") or "") in {
+            "bank_fee_payment", "expense_reimbursement_payment", "clearing_transfer"
+        }
+        manual = manual or any(
+            str(part.get("disposition") or "") in {
+                "bank_fee_payment", "expense_reimbursement_payment", "clearing_transfer"
+            }
+            for part in allocation.get("parts") or [] if isinstance(part, dict)
+        )
+        if manual:
+            proof = (allocation.get("target") or {}).get("statement_import_proof")
+            if not isinstance(proof, dict) or proof.get("status") != "verified":
+                raise SimplbooksError(
+                    "Manual statement import and reviewed statement_import_proof must exist before live discovery/build."
+                )
+    return selected
 
 
 def _interactive_approval_checkpoint(action_path: Path) -> None:
@@ -81,7 +164,7 @@ def _interactive_approval_checkpoint(action_path: Path) -> None:
 
 
 def _verify_builder_output(
-    *, summary: dict[str, Any], action_path: Path, discovery_path: Path, cwd: Path
+    *, summary: dict[str, Any], action_path: Path, discovery_paths: list[Path], cwd: Path
 ) -> dict[str, Any]:
     if summary.get("approval_status") != "draft":
         raise SimplbooksError("Action builder must report approval_status draft for a live run.")
@@ -101,16 +184,16 @@ def _verify_builder_output(
         for item in batch.get("reference_artifacts") or []
         if isinstance(item, dict) and item.get("kind") == "discovery_overview"
     ]
-    matching = []
+    actual_paths = []
     for binding in discovery_bindings:
         try:
             bound_path = verify_file_binding(binding, cwd=cwd)
         except ReferenceArtifactError as exc:
             raise SimplbooksError(f"Fresh discovery binding is missing or changed: {exc}") from exc
-        if bound_path.resolve() == discovery_path.resolve():
-            matching.append(binding)
-    if len(matching) != 1:
-        raise SimplbooksError("Freshly rebuilt batch must bind the newly refreshed discovery artifact exactly once.")
+        actual_paths.append(bound_path.resolve())
+    expected_paths = [path.resolve() for path in discovery_paths]
+    if sorted(map(str, actual_paths)) != sorted(map(str, expected_paths)) or len(actual_paths) != len(set(actual_paths)):
+        raise SimplbooksError("Freshly rebuilt batch must bind every newly refreshed discovery artifact exactly once.")
     return batch
 
 
@@ -133,7 +216,6 @@ def run_live_month(
     checkpoint = approval_checkpoint or _interactive_approval_checkpoint
     action_path = company_dir / "artifacts" / "actions" / f"{period}.yaml"
     check_path = company_dir / "artifacts" / "actions" / f"{period}.check.md"
-    discovery_path = company_dir / "artifacts" / "discovery" / f"{period[:4]}-overview.json"
     allocation_path = company_dir / "artifacts" / "bank" / f"{period[:4]}-allocations.json"
 
     state = submitted_month_state(company_dir=company_dir, period=period)
@@ -144,29 +226,40 @@ def run_live_month(
     if action_path.exists():
         booksend.validate_predecessor_submission(action_path=action_path, period=period)
 
-    commands: list[list[str]] = []
-    discovery_command = [
-        python_executable, "scripts/examine_simplbooks_year.py",
-        "--company-dir", str(company_dir), "--year", period[:4],
-        "--output", str(discovery_path),
+    live_allocations = _load_live_allocations(company_dir=company_dir, period=period)
+    discovery_years = _required_discovery_years(
+        company_dir=company_dir, period=period, allocations=live_allocations
+    )
+    discovery_paths = [
+        company_dir / "artifacts" / "discovery" / f"{year}-overview.json"
+        for year in discovery_years
     ]
-    commands.append(discovery_command)
-    _run_step(command=discovery_command, cwd=cwd, runner=runner, label="Discovery refresh")
+
+    commands: list[list[str]] = []
+    for discovery_year, discovery_path in zip(discovery_years, discovery_paths):
+        discovery_command = [
+            python_executable, "scripts/examine_simplbooks_year.py",
+            "--company-dir", str(company_dir), "--year", str(discovery_year),
+            "--output", str(discovery_path),
+        ]
+        commands.append(discovery_command)
+        _run_step(command=discovery_command, cwd=cwd, runner=runner, label=f"Discovery refresh {discovery_year}")
 
     builder_command = [
         python_executable, "scripts/bookbuilder.py", "--company-dir", str(company_dir),
         "--period", period,
         "--posting-policy", str(company_dir / "artifacts" / "posting_policy.json"),
         "--exchange-rates", str(company_dir / "artifacts" / "reference" / f"ecb-rates-{period[:4]}.json"),
-        "--discovery-overview", str(discovery_path),
         "--bank-allocations", str(allocation_path),
     ]
+    for discovery_path in discovery_paths:
+        builder_command.extend(["--discovery-overview", str(discovery_path)])
     commands.append(builder_command)
     builder_summary = _run_step(command=builder_command, cwd=cwd, runner=runner, label="Action build")
     _verify_builder_output(
         summary=builder_summary,
         action_path=action_path,
-        discovery_path=discovery_path,
+        discovery_paths=discovery_paths,
         cwd=cwd,
     )
     booksend.validate_predecessor_submission(action_path=action_path, period=period)

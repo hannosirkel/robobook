@@ -149,6 +149,35 @@ class BankAllocationTests(unittest.TestCase):
 
         self.assertEqual(loaded["allocations"][0]["statement_id"], "archive:2024010212345678")
 
+    def test_loader_rejects_incomplete_reviewed_statement_import_proof(self) -> None:
+        record = bank_record()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            normalized_path = root / "2024-01.json"
+            normalized_path.write_text(json.dumps(normalized_payload(record)), encoding="utf-8")
+            item = allocation(statement_id="archive:2024010212345678", record_id=record["record_id"])
+            item["target"]["statement_import_proof"] = {
+                "status": "verified",
+                "required_evidence": "live_discovery_or_audit",
+            }
+            payload = {
+                "schema_version": "1.0",
+                "company_slug": "example",
+                "year": 2024,
+                "normalized_bindings": [{
+                    "path": str(normalized_path),
+                    "sha256": hashlib.sha256(normalized_path.read_bytes()).hexdigest(),
+                }],
+                "allocations": [item],
+            }
+            allocation_path = root / "allocations.json"
+            allocation_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaisesRegex(bank_allocations.BankAllocationError, "statement_import_proof"):
+                bank_allocations.load_bank_allocations(
+                    allocation_path, normalized_year_paths=[normalized_path]
+                )
+
     def test_same_archive_rows_in_distinct_currencies_load_and_prove_complete(self) -> None:
         eur = bank_record(record_id="bank-source:bank:eur", archive_id="transfer-1", amount=330.0)
         usd = bank_record(record_id="bank-source:bank:usd", archive_id="transfer-1", amount=-2.0)

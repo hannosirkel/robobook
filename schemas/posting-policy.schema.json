@@ -82,6 +82,7 @@
         "vat_type_id": {"$ref": "#/$defs/id"},
         "shipping_vat_type_id": {"$ref": "#/$defs/id"},
         "warehouse_id": {"$ref": "#/$defs/id"},
+        "article_id": {"$ref": "#/$defs/id"},
         "lines": {
           "type": "object",
           "additionalProperties": {"$ref": "#/$defs/line_mapping"}

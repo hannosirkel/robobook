@@ -598,6 +598,7 @@ class BooksendTests(unittest.TestCase):
             "suggested_income_account_id": "3000",
             "suggested_vat_type_id": "22",
             "warehouse_id_hint": "6",
+            "article_id_hint": "3",
         }]
 
         translated = booksend.translate_action_for_api(action, lookup={})
@@ -605,6 +606,7 @@ class BooksendTests(unittest.TestCase):
 
         self.assertEqual(row["amount"], 2.0)
         self.assertEqual(row["price_per_unit"], 20.0)
+        self.assertEqual(row["article_id"], 3)
 
     def test_sender_rejects_manual_financial_dependency_before_any_translation_or_call(self) -> None:
         dependency = manual_financial_dependency(blocking=False)

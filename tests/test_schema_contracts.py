@@ -228,6 +228,16 @@ class SchemaContractTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=empty_target)
 
+    def test_bank_allocation_schema_rejects_malformed_statement_import_proof(self) -> None:
+        reviewed = bank_allocation(target={
+            "financial_transaction_kind": "bank-fee",
+            "statement_import_proof": "verified",
+        })
+        artifact = bank_allocation_payload(allocations=[reviewed])
+
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=artifact)
+
     def test_bank_allocation_schema_requires_a_four_digit_year(self) -> None:
         for year in (1000, 9999):
             with self.subTest(year=year):

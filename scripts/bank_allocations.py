@@ -259,6 +259,25 @@ def _validate_shape(payload: dict[str, Any]) -> list[dict[str, Any]]:
         allocation_key(allocation)
         if not isinstance(allocation.get("target"), dict) or not allocation["target"]:
             raise BankAllocationError("Bank allocation target must be a non-empty object.")
+        proof = allocation["target"].get("statement_import_proof")
+        if proof is not None:
+            required_proof = {
+                "status",
+                "required_evidence",
+                "simplbooks_transaction_id",
+                "evidence_ref",
+            }
+            if not isinstance(proof, dict) or set(proof) != required_proof:
+                raise BankAllocationError(
+                    "statement_import_proof must be a complete reviewed proof object."
+                )
+            if (
+                proof.get("status") != "verified"
+                or proof.get("required_evidence") != "live_discovery_or_audit"
+                or not _text(proof.get("simplbooks_transaction_id"))
+                or not _text(proof.get("evidence_ref"))
+            ):
+                raise BankAllocationError("statement_import_proof is not verified and complete.")
         review = allocation.get("review")
         if not isinstance(review, dict) or set(review) != {"status", "rationale"}:
             raise BankAllocationError("Bank allocation review must contain only status and rationale.")

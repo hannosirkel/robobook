@@ -5,7 +5,9 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 import re
+import tempfile
 from calendar import month_name
 import unicodedata
 from calendar import monthrange
@@ -3968,9 +3970,11 @@ def build_normalized_document(
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    existing_text: str | None = None
     if path.exists() and "generated_at" in payload:
         try:
-            existing = json.loads(path.read_text(encoding="utf-8"))
+            existing_text = path.read_text(encoding="utf-8")
+            existing = json.loads(existing_text)
         except (OSError, json.JSONDecodeError):
             existing = None
         if isinstance(existing, dict) and "generated_at" in existing:
@@ -3978,7 +3982,34 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
             regenerated_content = {key: value for key, value in payload.items() if key != "generated_at"}
             if existing_content == regenerated_content:
                 payload = {**payload, "generated_at": existing["generated_at"]}
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    serialized = json.dumps(payload, indent=2, sort_keys=True)
+    if existing_text == serialized:
+        return
+
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def build_parser() -> argparse.ArgumentParser:

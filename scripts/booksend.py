@@ -406,6 +406,11 @@ def translate_invoice_payload(
                     field_name=f"{action_id(action)} line {index} warehouse_id",
                     optional=True,
                 ),
+                "article_id": api_id(
+                    line.get("article_id_hint"),
+                    field_name=f"{action_id(action)} line {index} article_id",
+                    optional=True,
+                ),
                 "name": str(line.get("description") or f"Line {index}"),
                 "unit": "summary",
                 "amount": decimal_number(quantity),

@@ -1017,6 +1017,7 @@ def _direct_sale_invoice_errors(
         ("VAT profile", scope.get("tax_profile"), target.get("vat_profile")),
         ("product description", line.get("description"), target.get("product_description") or target.get("description")),
         ("warehouse", line.get("warehouse_id_hint"), target.get("warehouse_id")),
+        ("article", line.get("article_id_hint"), target.get("article_id")),
     )
     for label, actual, expected in expected_values:
         if str(actual if actual is not None else "") != str(expected if expected is not None else ""):

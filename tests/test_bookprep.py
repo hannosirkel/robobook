@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 import sys
 import tempfile
 import unittest
@@ -88,10 +89,32 @@ class BookprepTests(unittest.TestCase):
             original_hash = hashlib.sha256(path.read_bytes()).hexdigest()
 
             regenerated = {**original, "generated_at": "2026-08-22T11:00:00Z"}
-            bookprep.write_json(path, regenerated)
+            with mock.patch.object(Path, "write_text", side_effect=AssertionError("unchanged output must not write")), \
+                    mock.patch("bookprep.os.replace") as replace:
+                bookprep.write_json(path, regenerated)
 
             self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), original_hash)
             self.assertEqual(json.loads(path.read_text())["generated_at"], original["generated_at"])
+            replace.assert_not_called()
+
+    def test_write_json_atomically_replaces_changed_normalized_content(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "normalized.json"
+            original = {"generated_at": "2026-08-22T10:00:00Z", "records": {"bank_transactions": []}}
+            changed = {"generated_at": "2026-08-22T11:00:00Z", "records": {"bank_transactions": [{"id": 1}]}}
+            bookprep.write_json(path, original)
+            old_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+
+            with mock.patch("bookprep.os.replace", wraps=os.replace) as replace:
+                bookprep.write_json(path, changed)
+
+            self.assertNotEqual(hashlib.sha256(path.read_bytes()).hexdigest(), old_sha)
+            self.assertEqual(json.loads(path.read_text()), changed)
+            replace.assert_called_once()
+            temporary, destination = map(Path, replace.call_args.args)
+            self.assertEqual(temporary.parent, path.parent)
+            self.assertEqual(destination, path)
+            self.assertFalse(temporary.exists())
 
     def test_parser_accepts_woo_tax_allocation_override(self) -> None:
         args = bookprep.build_parser().parse_args(

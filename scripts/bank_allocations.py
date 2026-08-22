@@ -19,6 +19,7 @@ DISPOSITIONS = {
     "existing_purchase_payment",
     "direct_sale_receipt",
     "bank_fee_payment",
+    "expense_reimbursement_payment",
     "clearing_transfer",
     "reviewed_split",
 }

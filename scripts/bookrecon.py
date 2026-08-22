@@ -746,12 +746,17 @@ def _validated_clearing_allocation_references(
                 valid = False
                 break
             attributes = record.get("attributes") or {}
+            provider = str(attributes.get("clearing_provider") or "").strip().lower()
+            account = str(attributes.get("clearing_account") or "").strip()
+            if not provider and str(record.get("event_type") or "").lower().endswith(("_payout", "_withdrawal")):
+                provider = str(record.get("channel") or record.get("source_system") or "").strip().lower()
+                account = f"{provider}_payout" if provider else ""
             actual = {
                 "period": str(record.get("event_date") or "")[:7],
                 "currency": record_currency(record),
                 "amount": decimal_value(record.get("gross_amount")),
-                "provider": str(attributes.get("clearing_provider") or "").strip().lower(),
-                "account": str(attributes.get("clearing_account") or "").strip(),
+                "provider": provider,
+                "account": account,
                 "source_system": str(record.get("source_system") or "").strip().lower(),
             }
             if (
@@ -785,6 +790,15 @@ def _validated_clearing_allocation_references(
         )
         physical_amount = decimal_value(allocation.get("amount"))
         bridge_currencies = {record_currency(record or {}) for record in bridge_records}
+        if relation == "exact_amount" and (len(normalized_refs) != 1 or len(normalized_bridge_refs) != 1):
+            continue
+        if not _clearing_equations_explain_claimed_records(
+            target,
+            clearing_records,
+            claimed_record_ids=set(normalized_refs),
+            bridge_record_ids=set(normalized_bridge_refs),
+        ):
+            continue
         if bridge_currencies != {physical_currency}:
             proof = target.get("fx_proof")
             if not isinstance(proof, dict) or repo_root is None:
@@ -820,10 +834,96 @@ def _validated_clearing_allocation_references(
         )
         if equation_delta.quantize(Decimal("0.01")) != Decimal("0.00"):
             continue
-        if relation == "exact_amount" and (len(normalized_refs) != 1 or len(normalized_bridge_refs) != 1):
-            continue
         resolved.update(refs)
     return resolved
+
+
+def _clearing_equations_explain_claimed_records(
+    target: dict[str, Any],
+    clearing_records: dict[str, dict[str, Any]],
+    *,
+    claimed_record_ids: set[str],
+    bridge_record_ids: set[str],
+) -> bool:
+    """Require every non-bridge clearing claim to participate in a checked economic equation."""
+    unexplained = claimed_record_ids - bridge_record_ids
+    equations = target.get("clearing_equations")
+    if not unexplained:
+        return equations in (None, [])
+    if not isinstance(equations, list) or not equations:
+        return False
+
+    covered: set[str] = set()
+    for equation in equations:
+        if not isinstance(equation, dict):
+            return False
+        record_ids = equation.get("record_ids")
+        if (
+            not isinstance(record_ids, list)
+            or not record_ids
+            or len(record_ids) != len(set(record_ids))
+            or not set(map(str, record_ids)).issubset(claimed_record_ids)
+        ):
+            return False
+        ids = [str(record_id) for record_id in record_ids]
+        records = [clearing_records.get(record_id) for record_id in ids]
+        if any(record is None for record in records):
+            return False
+        equation_type = str(equation.get("equation") or "")
+        role = str(equation.get("role") or "")
+        if equation_type == "signed_sum_equals_zero":
+            if role not in {"balance_pair", "settlement_pair", "return_pair"} or len(ids) < 2:
+                return False
+            reference_id = str(equation.get("reference_id") or "")
+            currencies = {record_currency(record or {}) for record in records}
+            total = sum((decimal_value((record or {}).get("gross_amount")) for record in records), Decimal("0"))
+            if (
+                not reference_id
+                or any(reference_id not in {
+                    str((record or {}).get("external_ref") or ""),
+                    str(((record or {}).get("attributes") or {}).get("reference_transaction_id") or ""),
+                } for record in records)
+                or len(currencies) != 1
+                or total.quantize(Decimal("0.01")) != Decimal("0.00")
+            ):
+                return False
+        elif equation_type == "absolute_source_times_rate_equals_destination":
+            if role != "currency_conversion" or len(ids) != 2:
+                return False
+            source_id = str(equation.get("source_record_id") or "")
+            destination_id = str(equation.get("destination_record_id") or "")
+            if {source_id, destination_id} != set(ids):
+                return False
+            source = clearing_records.get(source_id) or {}
+            destination = clearing_records.get(destination_id) or {}
+            rate = decimal_value(equation.get("rate"))
+            reference_id = str(equation.get("reference_id") or "")
+            source_reference = str((source.get("attributes") or {}).get("reference_transaction_id") or "")
+            destination_reference = str((destination.get("attributes") or {}).get("reference_transaction_id") or "")
+            if (
+                rate <= 0
+                or not reference_id
+                or source_reference != reference_id
+                or destination_reference != reference_id
+                or record_currency(source) == record_currency(destination)
+                or decimal_value(source.get("gross_amount")) * decimal_value(destination.get("gross_amount")) >= 0
+                or (abs(decimal_value(source.get("gross_amount"))) * rate).quantize(Decimal("0.01"))
+                != abs(decimal_value(destination.get("gross_amount"))).quantize(Decimal("0.01"))
+            ):
+                return False
+        elif equation_type == "single_record_equals_reviewed_fee":
+            if role != "fee_leg" or len(ids) != 1:
+                return False
+            record = records[0] or {}
+            if (
+                str(equation.get("currency") or "").upper() != record_currency(record)
+                or decimal_value(equation.get("reviewed_amount")) != decimal_value(record.get("gross_amount"))
+            ):
+                return False
+        else:
+            return False
+        covered.update(ids)
+    return unexplained.issubset(covered)
 
 
 def _clearing_balance_value(records: list[dict[str, Any]], names: tuple[str, ...]) -> tuple[Decimal | None, bool]:
@@ -1802,10 +1902,11 @@ def main() -> int:
         annual_payload = load_json(annual_path)
         if str(annual_payload.get("company_slug") or "") != str(normalized_payload.get("company_slug") or ""):
             continue
-        for item in (annual_payload.get("records") or {}).get("clearing_transactions") or []:
-            if isinstance(item, dict) and str(item.get("record_id") or ""):
-                annual_clearing_record_counts[str(item["record_id"])] += 1
-                annual_clearing_records[str(item["record_id"])] = item
+        for category in ("clearing_transactions", "payouts"):
+            for item in (annual_payload.get("records") or {}).get(category) or []:
+                if isinstance(item, dict) and str(item.get("record_id") or ""):
+                    annual_clearing_record_counts[str(item["record_id"])] += 1
+                    annual_clearing_records[str(item["record_id"])] = item
     duplicate_clearing_record_ids = {
         record_id for record_id, count in annual_clearing_record_counts.items() if count > 1
     }

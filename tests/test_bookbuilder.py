@@ -497,6 +497,32 @@ class BookbuilderTests(unittest.TestCase):
         self.assertTrue(all(item["source_ref"]["source_kind"] == "physical_bank" for item in dependencies))
         self.assertTrue(all(item["statement_import_proof"]["status"] == "pending" for item in dependencies))
 
+    def test_expense_reimbursement_payment_creates_atomic_manual_dependency(self) -> None:
+        normalized = base_normalized("2024-08")
+        row = bank_row(record_id="employee-reimbursement", amount=-50.30, event_date="2024-08-01")
+        normalized["records"]["bank_transactions"] = [row]
+        allocation = manual_allocation(
+            row=row,
+            disposition="expense_reimbursement_payment",
+            target={"document_type": "financial_transaction", "transaction_family": "expense_reimbursement"},
+        )
+        allocations = {(allocation["statement_id"], allocation["iban"], allocation["currency"]): allocation}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            batch = bookbuilder.build_action_batch(
+                normalized_payload=normalized,
+                recon_payload=base_recon("2024-08"),
+                normalized_path=root / "normalized.json",
+                recon_path=root / "recon.json",
+                repo_root=root,
+                bank_allocations=allocations,
+            )
+
+        self.assertEqual(batch["actions"], [])
+        self.assertEqual(len(batch["unresolved_dependencies"]), 1)
+        self.assertEqual(batch["unresolved_dependencies"][0]["disposition"], "expense_reimbursement_payment")
+
     def test_failed_payment_transfer_and_return_are_manual_and_zero_net(self) -> None:
         normalized = base_normalized("2024-09")
         rows = [

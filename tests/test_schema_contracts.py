@@ -285,6 +285,40 @@ class SchemaContractTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=malformed)
 
+    def test_bank_allocation_schema_requires_complete_proof_for_clearing_transfer(self) -> None:
+        incomplete = bank_allocation_payload(allocations=[
+            bank_allocation(
+                disposition="clearing_transfer",
+                target={"document_type": "financial_transaction", "transaction_family": "internal_transfer"},
+            )
+        ])
+
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=incomplete)
+
+        malformed_equation = bank_allocation_payload(allocations=[bank_allocation(
+            disposition="clearing_transfer",
+            amount=-13.27,
+            target={
+                "document_type": "financial_transaction", "transaction_family": "internal_transfer",
+                "clearing_record_ids": ["wallet:deposit", "wallet:conversion"],
+                "bridge_record_ids": ["wallet:deposit"], "bridge_direction": "opposite_physical",
+                "clearing_evidence": [
+                    {"record_id": "wallet:deposit", "period": "2024-01", "currency": "EUR", "amount": 13.27,
+                     "provider": "wallet", "account": "wallet", "source_system": "wallet"},
+                    {"record_id": "wallet:conversion", "period": "2024-01", "currency": "EUR", "amount": -13.27,
+                     "provider": "wallet", "account": "wallet", "source_system": "wallet"},
+                ],
+                "clearing_totals": {"EUR": 0.0}, "clearing_relation": "reviewed_group", "bridge_amount": -13.27,
+                "clearing_equations": [{
+                    "equation": "signed_sum_equals_zero", "role": "balance_pair",
+                    "record_ids": ["wallet:deposit", "wallet:conversion"],
+                }],
+            },
+        )])
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=malformed_equation)
+
     def test_bank_allocation_template_matches_strict_schema(self) -> None:
         artifact = json.loads((ROOT / "templates/bank-allocation.template.json").read_text(encoding="utf-8"))
         self.assert_artifact_valid(schema_name="bank-allocation.schema.json", artifact=artifact)
@@ -451,6 +485,9 @@ class SchemaContractTests(unittest.TestCase):
                 {"kind": "discovery_overview", "path": "overview.json", "sha256": "1" * 64},
             ], "actions": [],
         }
+
+        dependency["disposition"] = "expense_reimbursement_payment"
+        self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=batch)
 
         for disposition in ("existing_invoice_receipt", "generated_purchase_payment"):
             with self.subTest(disposition=disposition):

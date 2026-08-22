@@ -47,6 +47,7 @@
             "existing_purchase_payment",
             "direct_sale_receipt",
             "bank_fee_payment",
+            "expense_reimbursement_payment",
             "clearing_transfer",
             "reviewed_split"
           ]
@@ -72,7 +73,23 @@
             "rationale": {"type": "string", "minLength": 1}
           }
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {"required": ["disposition"], "properties": {"disposition": {"const": "clearing_transfer"}}},
+          "then": {
+            "properties": {
+              "target": {
+                "required": ["document_type", "transaction_family", "clearing_record_ids", "bridge_record_ids", "bridge_direction", "clearing_evidence", "clearing_totals", "clearing_relation", "bridge_amount"],
+                "properties": {
+                  "document_type": {"const": "financial_transaction"},
+                  "transaction_family": {"type": "string", "minLength": 1}
+                }
+              }
+            }
+          }
+        }
+      ]
     },
     "clearingEvidence": {
       "type": "object",
@@ -104,6 +121,36 @@
         "rate_evidence": {"$ref": "#/$defs/binding"}
       }
     },
+    "clearingEquation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["equation", "role", "record_ids"],
+      "properties": {
+        "equation": {"type": "string", "enum": ["signed_sum_equals_zero", "absolute_source_times_rate_equals_destination", "single_record_equals_reviewed_fee"]},
+        "role": {"type": "string", "enum": ["balance_pair", "settlement_pair", "return_pair", "currency_conversion", "fee_leg"]},
+        "record_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "source_record_id": {"type": "string", "minLength": 1},
+        "destination_record_id": {"type": "string", "minLength": 1},
+        "reference_id": {"type": "string", "minLength": 1},
+        "rate": {"type": "number", "minimum": 0.000000001},
+        "currency": {"type": "string", "pattern": "^[A-Z]{3}$"},
+        "reviewed_amount": {"type": "number"}
+      },
+      "allOf": [
+        {
+          "if": {"required": ["equation"], "properties": {"equation": {"const": "signed_sum_equals_zero"}}},
+          "then": {"required": ["reference_id"]}
+        },
+        {
+          "if": {"required": ["equation"], "properties": {"equation": {"const": "absolute_source_times_rate_equals_destination"}}},
+          "then": {"required": ["source_record_id", "destination_record_id", "reference_id", "rate"]}
+        },
+        {
+          "if": {"required": ["equation"], "properties": {"equation": {"const": "single_record_equals_reviewed_fee"}}},
+          "then": {"required": ["currency", "reviewed_amount"]}
+        }
+      ]
+    },
     "target": {
       "type": "object",
       "minProperties": 1,
@@ -116,6 +163,7 @@
         "clearing_totals": {"type": "object", "minProperties": 1, "additionalProperties": {"type": "number"}},
         "clearing_relation": {"type": "string", "enum": ["exact_amount", "reviewed_group"]},
         "bridge_amount": {"type": "number"},
+        "clearing_equations": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/clearingEquation"}},
         "fx_proof": {"$ref": "#/$defs/fxProof"},
         "foreign_currency_pilot_required": {"type": "boolean"},
         "target_currency": {"type": "string", "pattern": "^[A-Z]{3}$"},

@@ -1001,6 +1001,29 @@ class BookprepTests(unittest.TestCase):
         )
         self.assertFalse(any(item["blocking"] for item in exceptions))
 
+    def test_pending_customer_receipt_cannot_authorize_completed_refund_reversal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "paypal_2025_report.CSV"
+            csv_path.write_text(
+                "Date,Name,Type,Status,Currency,Gross,Fee,Net,Transaction ID,Reference Txn ID,Balance Impact\n"
+                "09/10/2025,Buyer,General Payment,Pending,EUR,20.00,0.00,20.00,SALE1,,Credit\n"
+                "10/10/2025,Buyer,Payment Reversal,Completed,EUR,-20.00,0.00,-20.00,REV1,SALE1,Debit\n",
+                encoding="utf-8",
+            )
+            period_start, period_end = bookprep.parse_period("2025-10")
+            source = bookprep.inspect_source_file(
+                path=csv_path, root_dir=root, period_start=period_start, period_end=period_end
+            )
+            assert source is not None
+
+            records, exceptions = bookprep.parse_paypal_csv(
+                source, period_start=period_start, period_end=period_end, base_currency="EUR"
+            )
+
+        self.assertFalse(records["refunds"])
+        self.assertTrue(any(item["blocking"] and "ambiguous" in item["reason"].lower() for item in exceptions))
+
     def test_ambiguous_outgoing_paypal_general_payment_is_blocking(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

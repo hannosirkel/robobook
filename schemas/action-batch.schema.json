@@ -157,6 +157,7 @@
             "existing_purchase_payment",
             "direct_sale_receipt",
             "bank_fee_payment",
+            "expense_reimbursement_payment",
             "clearing_transfer"
           ]
         },
@@ -192,6 +193,7 @@
           "type": "string",
           "enum": [
             "bank_fee_payment",
+            "expense_reimbursement_payment",
             "clearing_transfer",
             "reviewed_split"
           ]
@@ -279,7 +281,7 @@
                 "minItems": 1,
                 "contains": {
                   "properties": {
-                    "disposition": {"enum": ["bank_fee_payment", "clearing_transfer"]}
+                    "disposition": {"enum": ["bank_fee_payment", "expense_reimbursement_payment", "clearing_transfer"]}
                   },
                   "required": ["disposition"]
                 }

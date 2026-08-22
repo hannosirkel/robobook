@@ -556,6 +556,41 @@ class BookreconTests(unittest.TestCase):
 
         self.assertEqual(resolved, set())
 
+    def test_reviewed_group_rejects_unexplained_claim_outside_valid_bridge(self) -> None:
+        eur = record(
+            record_id="wallet:bridge", source_system="wallet", event_type="deposit",
+            gross_amount=13.27, attributes={"clearing_provider": "wallet", "clearing_account": "wallet"},
+        )
+        unrelated = record(
+            record_id="wallet:unrelated", source_system="wallet", event_type="conversion",
+            gross_amount=999.0, currency="USD",
+            attributes={"clearing_provider": "wallet", "clearing_account": "wallet"},
+        )
+        reviewed = allocation(
+            statement_id="archive:debit", record_id="bank:debit", amount=-13.27,
+            disposition="clearing_transfer",
+            target={
+                "document_type": "financial_transaction", "transaction_family": "internal_transfer",
+                "clearing_record_ids": ["wallet:bridge", "wallet:unrelated"],
+                "bridge_record_ids": ["wallet:bridge"], "bridge_direction": "opposite_physical",
+                "clearing_evidence": [
+                    {"record_id": "wallet:bridge", "period": "2024-01", "currency": "EUR",
+                     "amount": 13.27, "provider": "wallet", "account": "wallet", "source_system": "wallet"},
+                    {"record_id": "wallet:unrelated", "period": "2024-01", "currency": "USD",
+                     "amount": 999.0, "provider": "wallet", "account": "wallet", "source_system": "wallet"},
+                ],
+                "clearing_totals": {"EUR": 13.27, "USD": 999.0},
+                "clearing_relation": "reviewed_group", "bridge_amount": -13.27,
+            },
+        )
+
+        resolved = bookrecon._validated_clearing_allocation_references(
+            {"a": reviewed}, {"wallet:bridge": eur, "wallet:unrelated": unrelated},
+            allocation_company_slug="example", normalized_company_slug="example",
+        )
+
+        self.assertEqual(resolved, set())
+
     def test_clearing_proof_rejects_company_mismatch(self) -> None:
         movement = record(
             record_id="paypal:leg", source_system="paypal", event_type="paypal_card_deposit",
@@ -729,6 +764,86 @@ class BookreconTests(unittest.TestCase):
         )
 
         self.assertEqual(resolved, set())
+
+    def test_clearing_equations_validate_conversion_and_fee_roles(self) -> None:
+        records = {
+            "conversion:eur": record(
+                record_id="conversion:eur", source_system="wallet", event_type="conversion",
+                gross_amount=-13.27, attributes={"clearing_provider": "wallet", "clearing_account": "wallet", "reference_transaction_id": "PAIR1"},
+            ),
+            "conversion:usd": record(
+                record_id="conversion:usd", source_system="wallet", event_type="conversion",
+                gross_amount=14.94, currency="USD",
+                attributes={"clearing_provider": "wallet", "clearing_account": "wallet", "reference_transaction_id": "PAIR1"},
+            ),
+            "fee:eur": record(
+                record_id="fee:eur", source_system="wallet", event_type="fee",
+                gross_amount=-1.0, attributes={"clearing_provider": "wallet", "clearing_account": "wallet"},
+            ),
+        }
+        target = {
+            "clearing_equations": [
+                {
+                    "equation": "absolute_source_times_rate_equals_destination",
+                    "role": "currency_conversion",
+                    "record_ids": ["conversion:eur", "conversion:usd"],
+                    "source_record_id": "conversion:eur", "destination_record_id": "conversion:usd",
+                    "reference_id": "PAIR1", "rate": 1.1258477769,
+                },
+                {
+                    "equation": "single_record_equals_reviewed_fee", "role": "fee_leg",
+                    "record_ids": ["fee:eur"], "currency": "EUR", "reviewed_amount": -1.0,
+                },
+            ]
+        }
+
+        valid = bookrecon._clearing_equations_explain_claimed_records(
+            target, records,
+            claimed_record_ids={"bridge", "conversion:eur", "conversion:usd", "fee:eur"},
+            bridge_record_ids={"bridge"},
+        )
+        target["clearing_equations"][0]["rate"] = 2.0
+        bad_rate = bookrecon._clearing_equations_explain_claimed_records(
+            target, records,
+            claimed_record_ids={"bridge", "conversion:eur", "conversion:usd", "fee:eur"},
+            bridge_record_ids={"bridge"},
+        )
+        target["clearing_equations"][0].update({"rate": 1.1258477769, "reference_id": "WRONG"})
+        bad_reference = bookrecon._clearing_equations_explain_claimed_records(
+            target, records,
+            claimed_record_ids={"bridge", "conversion:eur", "conversion:usd", "fee:eur"},
+            bridge_record_ids={"bridge"},
+        )
+
+        self.assertTrue(valid)
+        self.assertFalse(bad_rate)
+        self.assertFalse(bad_reference)
+
+    def test_processor_payout_record_can_prove_exact_clearing_transfer_bridge(self) -> None:
+        payout = record(
+            record_id="processor:payout", source_system="processor", event_type="processor_payout",
+            gross_amount=20.0, channel="processor", attributes={},
+        )
+        reviewed = allocation(
+            statement_id="archive:credit", record_id="bank:credit", amount=20.0,
+            disposition="clearing_transfer",
+            target={
+                "document_type": "financial_transaction", "transaction_family": "processor_payout_transfer",
+                "clearing_record_ids": ["processor:payout"], "bridge_record_ids": ["processor:payout"],
+                "bridge_direction": "same_as_physical",
+                "clearing_evidence": [{"record_id": "processor:payout", "period": "2024-01",
+                    "currency": "EUR", "amount": 20.0, "provider": "processor",
+                    "account": "processor_payout", "source_system": "processor"}],
+                "clearing_totals": {"EUR": 20.0}, "clearing_relation": "exact_amount", "bridge_amount": 20.0,
+            },
+        )
+
+        resolved = bookrecon._validated_clearing_allocation_references(
+            {"a": reviewed}, {"processor:payout": payout},
+            allocation_company_slug="example", normalized_company_slug="example",
+        )
+
+        self.assertEqual(resolved, {"processor:payout"})
 
     def test_supported_transfer_families_are_supplier_neutral(self) -> None:
         rendered = " ".join(sorted(bookrecon.SUPPORTED_CLEARING_TRANSFER_FAMILIES)).lower()

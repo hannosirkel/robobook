@@ -577,6 +577,7 @@ class BookcheckerTests(unittest.TestCase):
                 "bridge_direction": "same_as_physical", "clearing_evidence": [],
                 "clearing_totals": {"USD": -306.32}, "clearing_relation": "reviewed_group",
                 "bridge_amount": -284.60, "fx_proof": {"rate": 0.9198876},
+                "clearing_equations": [{"equation": "signed_sum_equals_zero"}],
             },
         }
 

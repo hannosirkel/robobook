@@ -1404,6 +1404,7 @@ def parse_paypal_csv(
         str(row.get("Transaction ID") or "").strip(): counterparty(row)
         for row in rows
         if str(row.get("Type") or "").strip().lower() == "general payment"
+        and str(row.get("Status") or "").strip().lower() in {"", "completed", "refunded"}
         and parse_decimal(row.get("Gross")) > 0
         and str(row.get("Balance Impact") or "").strip().lower() == "credit"
         and str(row.get("Transaction ID") or "").strip()

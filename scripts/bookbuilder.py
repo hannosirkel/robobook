@@ -2251,12 +2251,12 @@ def _allocation_parts(allocation: dict[str, Any]) -> list[tuple[dict[str, Any], 
     return resolved
 
 
-MANUAL_FINANCIAL_DISPOSITIONS = frozenset({"bank_fee_payment", "clearing_transfer"})
+MANUAL_FINANCIAL_DISPOSITIONS = frozenset({"bank_fee_payment", "expense_reimbursement_payment", "clearing_transfer"})
 POSITIVE_BANK_DISPOSITIONS = frozenset(
     {"generated_invoice_receipt", "existing_invoice_receipt", "direct_sale_receipt"}
 )
 NEGATIVE_BANK_DISPOSITIONS = frozenset(
-    {"generated_purchase_payment", "existing_purchase_payment", "bank_fee_payment"}
+    {"generated_purchase_payment", "existing_purchase_payment", "bank_fee_payment", "expense_reimbursement_payment"}
 )
 
 

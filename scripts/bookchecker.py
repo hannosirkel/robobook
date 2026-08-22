@@ -928,6 +928,7 @@ def _allocation_part_matches_action(
         "document_type", "contact_id", "counterparty_hint", "external_number",
         "clearing_record_ids", "clearing_evidence", "clearing_totals",
         "clearing_relation", "bridge_amount", "bridge_record_ids", "bridge_direction", "fx_proof",
+        "clearing_equations",
         "target_currency", "foreign_currency_pilot_required", "pilot_requirements",
     }
     if target.get("contact_id") not in (None, "") and str(
@@ -1404,7 +1405,7 @@ def evaluate_bank_statement_completeness(
                 action_id=str(record.get("record_id") or "") or None,
             ))
             continue
-        manual_required = str(allocation.get("disposition") or "") in {"bank_fee_payment", "clearing_transfer"}
+        manual_required = str(allocation.get("disposition") or "") in {"bank_fee_payment", "expense_reimbursement_payment", "clearing_transfer"}
         if str(allocation.get("disposition") or "") == "reviewed_split":
             manual_required = any(
                 str(part.get("disposition") or "") in {"bank_fee_payment", "clearing_transfer"}
@@ -1620,6 +1621,7 @@ def manual_financial_dependency_errors(dependency: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     allowed_top_level_dispositions = {
         "bank_fee_payment",
+        "expense_reimbursement_payment",
         "clearing_transfer",
         "reviewed_split",
     }
@@ -1630,6 +1632,7 @@ def manual_financial_dependency_errors(dependency: dict[str, Any]) -> list[str]:
         "existing_purchase_payment",
         "direct_sale_receipt",
         "bank_fee_payment",
+        "expense_reimbursement_payment",
         "clearing_transfer",
     }
     required_text = (
@@ -1648,7 +1651,7 @@ def manual_financial_dependency_errors(dependency: dict[str, Any]) -> list[str]:
     if str(dependency.get("disposition") or "") not in allowed_top_level_dispositions:
         errors.append(
             "Manual financial dependency top-level disposition must be bank_fee_payment, "
-            "clearing_transfer, or reviewed_split."
+            "expense_reimbursement_payment, clearing_transfer, or reviewed_split."
         )
     try:
         date.fromisoformat(str(dependency.get("date") or ""))
@@ -1720,11 +1723,11 @@ def manual_financial_dependency_errors(dependency: dict[str, Any]) -> list[str]:
             disposition = str(part.get("disposition") or "")
             if disposition not in allowed_split_dispositions:
                 errors.append("Manual financial dependency split part disposition is invalid.")
-            if disposition in {"bank_fee_payment", "clearing_transfer"}:
+            if disposition in {"bank_fee_payment", "expense_reimbursement_payment", "clearing_transfer"}:
                 has_manual_financial_part = True
             if disposition in {"generated_invoice_receipt", "existing_invoice_receipt", "direct_sale_receipt"} and part_amount <= 0:
                 errors.append(f"Manual financial dependency {disposition} split part must be positive.")
-            if disposition in {"generated_purchase_payment", "existing_purchase_payment", "bank_fee_payment"} and part_amount >= 0:
+            if disposition in {"generated_purchase_payment", "existing_purchase_payment", "bank_fee_payment", "expense_reimbursement_payment"} and part_amount >= 0:
                 errors.append(f"Manual financial dependency {disposition} split part must be negative.")
         if not has_manual_financial_part:
             errors.append(

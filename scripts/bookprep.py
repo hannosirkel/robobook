@@ -3968,6 +3968,16 @@ def build_normalized_document(
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and "generated_at" in payload:
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            existing = None
+        if isinstance(existing, dict) and "generated_at" in existing:
+            existing_content = {key: value for key, value in existing.items() if key != "generated_at"}
+            regenerated_content = {key: value for key, value in payload.items() if key != "generated_at"}
+            if existing_content == regenerated_content:
+                payload = {**payload, "generated_at": existing["generated_at"]}
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 

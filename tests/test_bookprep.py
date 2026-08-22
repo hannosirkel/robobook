@@ -74,6 +74,25 @@ def pdf_source(root: Path, name: str, *, source_system: str) -> bookprep.SourceD
 
 
 class BookprepTests(unittest.TestCase):
+    def test_write_json_preserves_generated_at_when_normalized_content_is_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "normalized.json"
+            original = {
+                "schema_version": "1.0",
+                "company_slug": "example",
+                "period": "2024-01",
+                "generated_at": "2026-08-22T10:00:00Z",
+                "records": {"bank_transactions": []},
+            }
+            bookprep.write_json(path, original)
+            original_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+
+            regenerated = {**original, "generated_at": "2026-08-22T11:00:00Z"}
+            bookprep.write_json(path, regenerated)
+
+            self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), original_hash)
+            self.assertEqual(json.loads(path.read_text())["generated_at"], original["generated_at"])
+
     def test_parser_accepts_woo_tax_allocation_override(self) -> None:
         args = bookprep.build_parser().parse_args(
             [

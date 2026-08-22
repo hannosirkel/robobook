@@ -3644,6 +3644,8 @@ def main() -> int:
     bound_paths = [
         ("posting_policy", posting_policy_path),
         *(("discovery_overview", path) for path in discovery_overview_paths),
+        ("normalized_period", normalized_path),
+        ("reconciliation", recon_path),
     ]
     if bank_allocations_path is not None and bank_allocations_path.exists():
         bound_paths.append(("bank_allocations", bank_allocations_path))

@@ -101,6 +101,8 @@
           "enum": [
             "posting_policy",
             "discovery_overview",
+            "normalized_period",
+            "reconciliation",
             "exchange_rates",
             "bank_allocations",
             "woo_tax_allocation",

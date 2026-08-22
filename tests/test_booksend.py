@@ -286,6 +286,83 @@ def make_batch(
     }
 
 
+def write_full_prevalidation_fixture(
+    root: Path,
+    *,
+    unresolved_dependencies: list[dict] | None = None,
+) -> tuple[Path, Path, dict]:
+    company_dir = root / "companies" / "example"
+    artifacts_dir = company_dir / "artifacts"
+    actions_dir = artifacts_dir / "actions"
+    normalized_dir = artifacts_dir / "normalized"
+    recon_dir = artifacts_dir / "recon"
+    discovery_dir = artifacts_dir / "discovery"
+    for path in (actions_dir, normalized_dir, recon_dir, discovery_dir):
+        path.mkdir(parents=True, exist_ok=True)
+    (company_dir / "METADATA.md").write_text(
+        "Company name: Example Company OÜ\nCompany slug: example\nSimplbooks company ID: CID\n",
+        encoding="utf-8",
+    )
+    normalized_path = normalized_dir / "2024-01.json"
+    normalized_path.write_text(json.dumps({
+        "schema_version": "1.0",
+        "company_slug": "example",
+        "period": "2024-01",
+        "base_currency": "EUR",
+        "records": {},
+        "exceptions": [],
+    }), encoding="utf-8")
+    recon_path = recon_dir / "2024-01.json"
+    recon_path.write_text(json.dumps({
+        "schema_version": "1.0",
+        "company_slug": "example",
+        "period": "2024-01",
+        "approve_for_build": True,
+        "blocking_issue_count": 0,
+        "checks": [],
+        "exceptions": [],
+    }), encoding="utf-8")
+    policy_path = artifacts_dir / "posting_policy.json"
+    policy_path.write_text(json.dumps({
+        "schema_version": "1.0",
+        "company_slug": "example",
+        "bank_accounts": {},
+        "contacts": {},
+        "mappings": {},
+        "supplier_aliases": {},
+    }), encoding="utf-8")
+    discovery_path = discovery_dir / "2024-overview.json"
+    discovery_path.write_text(json.dumps({
+        "year": 2024,
+        "company_id": "CID",
+        "retrieved_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+    }), encoding="utf-8")
+
+    batch = make_batch(
+        approval_status="approved",
+        unresolved_dependencies=unresolved_dependencies,
+    )
+    batch["actions"] = []
+    batch["reference_artifacts"] = [
+        reference_artifacts.bind_file(policy_path, kind="posting_policy", cwd=root),
+        reference_artifacts.bind_file(discovery_path, kind="discovery_overview", cwd=root),
+        reference_artifacts.bind_file(normalized_path, kind="normalized_period", cwd=root),
+        reference_artifacts.bind_file(recon_path, kind="reconciliation", cwd=root),
+    ]
+    action_path = actions_dir / "2024-01.yaml"
+    booksend.write_yaml(action_path, batch)
+    action_sha = booksend.file_sha256(action_path)
+    (actions_dir / "2024-01.check.md").write_text(
+        "\n".join([
+            "- Result: `pass`",
+            f"- Batch ID: `{batch['batch_id']}`",
+            f"- Action file SHA256: `{action_sha}`",
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    return company_dir, recon_path, batch
+
+
 def manual_financial_dependency(*, status: str = "pending", blocking: bool = True) -> dict:
     proof = {"status": status, "required_evidence": "live_discovery_or_audit"}
     if status == "verified":
@@ -327,6 +404,83 @@ class FakeClient:
 
 
 class BooksendTests(unittest.TestCase):
+    def test_write_reruns_full_checker_and_rejects_tampered_passing_report_before_client_calls(self) -> None:
+        dependency = {
+            "kind": "contact_mapping",
+            "blocking": True,
+            "reason": "Contact mapping is still unresolved.",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            company_dir, _, _ = write_full_prevalidation_fixture(
+                root, unresolved_dependencies=[dependency]
+            )
+            client = FakeClient(responses=[])
+
+            with self.assertRaisesRegex(SimplbooksError, "full checker prevalidation"):
+                booksend.run_submission(
+                    period="2024-01",
+                    company_dir=company_dir,
+                    company_id=None,
+                    action_override=None,
+                    check_override=None,
+                    output_override=None,
+                    request_log_override=None,
+                    token_file=".apikey",
+                    mode="write",
+                    confirm_write=True,
+                    continue_on_error=False,
+                    cwd=root,
+                    client=client,
+                )
+
+        self.assertEqual(client.calls, [])
+
+    def test_write_rejects_unbound_or_changed_reconciliation_before_client_calls(self) -> None:
+        for mutation in ("unbound", "changed"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                company_dir, recon_path, batch = write_full_prevalidation_fixture(root)
+                action_path = company_dir / "artifacts" / "actions" / "2024-01.yaml"
+                if mutation == "unbound":
+                    batch["reference_artifacts"] = [
+                        item for item in batch["reference_artifacts"]
+                        if item["kind"] != "reconciliation"
+                    ]
+                    booksend.write_yaml(action_path, batch)
+                    action_sha = booksend.file_sha256(action_path)
+                    (action_path.parent / "2024-01.check.md").write_text(
+                        "\n".join([
+                            "- Result: `pass`",
+                            f"- Batch ID: `{batch['batch_id']}`",
+                            f"- Action file SHA256: `{action_sha}`",
+                        ]) + "\n",
+                        encoding="utf-8",
+                    )
+                else:
+                    recon = json.loads(recon_path.read_text(encoding="utf-8"))
+                    recon["approve_for_build"] = False
+                    recon_path.write_text(json.dumps(recon), encoding="utf-8")
+                client = FakeClient(responses=[])
+
+                with self.assertRaisesRegex(SimplbooksError, "reconciliation|changed"):
+                    booksend.run_submission(
+                        period="2024-01",
+                        company_dir=company_dir,
+                        company_id=None,
+                        action_override=None,
+                        check_override=None,
+                        output_override=None,
+                        request_log_override=None,
+                        token_file=".apikey",
+                        mode="write",
+                        confirm_write=True,
+                        continue_on_error=False,
+                        cwd=root,
+                        client=client,
+                    )
+                self.assertEqual(client.calls, [])
+
     def test_write_rejects_when_previous_required_month_is_not_successful(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -554,10 +708,16 @@ class BooksendTests(unittest.TestCase):
             )
             policy_path = root / "posting-policy.json"
             policy_path.write_text("{}", encoding="utf-8")
+            normalized_path = root / "normalized.json"
+            normalized_path.write_text("{}", encoding="utf-8")
+            recon_path = root / "recon.json"
+            recon_path.write_text("{}", encoding="utf-8")
             batch = make_batch(actions=[invoice_action()])
             batch["reference_artifacts"] = [
                 reference_artifacts.bind_file(policy_path, kind="posting_policy", cwd=root),
                 reference_artifacts.bind_file(discovery_path, kind="discovery_overview", cwd=root),
+                reference_artifacts.bind_file(normalized_path, kind="normalized_period", cwd=root),
+                reference_artifacts.bind_file(recon_path, kind="reconciliation", cwd=root),
             ]
 
             booksend.verify_submission_reference_artifacts(

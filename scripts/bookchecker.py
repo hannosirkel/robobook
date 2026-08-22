@@ -16,7 +16,6 @@ from typing import Any
 
 from bank_allocations import (
     BankAllocationError,
-    allocation_amounts,
     bank_ledger_key,
     load_bank_allocations,
     period_allocations,
@@ -521,6 +520,7 @@ def evaluate_arithmetic(
     action: dict[str, Any],
     resolved_sources: list[dict[str, Any]],
     split_payment_action_ids: set[str] | None = None,
+    physical_expected_amount: Decimal | None = None,
 ) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     payload = action.get("payload") or {}
@@ -582,7 +582,17 @@ def evaluate_arithmetic(
 
     if draft_schema == "cash_settlement_v1":
         document_type = str(payload.get("document_type") or "")
-        if document_type == "incoming":
+        if physical_expected_amount is not None:
+            expected_amount = physical_expected_amount
+            physical_bank_records = [
+                item["record"]
+                for item in resolved_sources
+                if item.get("category") == "bank_transactions"
+                and item.get("record")
+                and item.get("source_kind") == "physical_bank"
+            ]
+            payout_records = []
+        elif document_type == "incoming":
             physical_bank_records = [
                 item["record"]
                 for item in resolved_sources
@@ -601,7 +611,7 @@ def evaluate_arithmetic(
         else:
             expected_amount = Decimal("0")
 
-        if not (
+        if physical_expected_amount is not None or not (
             document_type == "payment"
             and split_payment_action_ids is not None
             and action_label(action) in split_payment_action_ids
@@ -896,23 +906,119 @@ def _allocation_part_matches_action(
     if disposition not in allowed or decimal_value(part.get("amount")) != signed_amount:
         return False
     target = part.get("target") or {}
+    expected_target_document_type = (
+        "invoice" if disposition in {
+            "generated_invoice_receipt", "existing_invoice_receipt", "direct_sale_receipt"
+        } else "purchase"
+    )
+    if target.get("document_type") not in (None, "", expected_target_document_type):
+        return False
+    allowed_common_target_fields = {"document_type", "contact_id", "counterparty_hint"}
+    if target.get("contact_id") not in (None, "") and str(
+        (payload.get("counterparty") or {}).get("contact_id") or ""
+    ) != str(target.get("contact_id")):
+        return False
+    if target.get("counterparty_hint") not in (None, "") and str(
+        payload.get("counterparty_hint") or ""
+    ) != str(target.get("counterparty_hint")):
+        return False
     if disposition == "existing_invoice_receipt":
-        return str(payload.get("linked_invoice_id") or "") == str(target.get("simplbooks_id") or "")
+        return set(target) <= allowed_common_target_fields | {"simplbooks_id"} and str(
+            payload.get("linked_invoice_id") or ""
+        ) == str(target.get("simplbooks_id") or "")
     if disposition == "existing_purchase_payment":
-        return str(payload.get("linked_purchase_id") or "") == str(target.get("simplbooks_id") or "")
+        return set(target) <= allowed_common_target_fields | {"simplbooks_id"} and str(
+            payload.get("linked_purchase_id") or ""
+        ) == str(target.get("simplbooks_id") or "")
     if disposition == "generated_invoice_receipt":
+        if not set(target) <= allowed_common_target_fields | {"action_key", "idempotency_key", "action_id"}:
+            return False
         target_keys = {
             str(target.get(name) or "")
             for name in ("action_key", "idempotency_key", "action_id")
         } - {""}
         return len(target_keys) == 1 and str(payload.get("linked_invoice_action") or "") in target_keys
     if disposition == "generated_purchase_payment":
+        if not set(target) <= allowed_common_target_fields | {"action_key", "idempotency_key", "action_id"}:
+            return False
         target_keys = {
             str(target.get(name) or "")
             for name in ("action_key", "idempotency_key", "action_id")
         } - {""}
         return len(target_keys) == 1 and str(payload.get("linked_purchase_action") or "") in target_keys
-    return bool(str(payload.get("linked_invoice_action") or ""))
+    return disposition == "direct_sale_receipt" and bool(str(payload.get("linked_invoice_action") or ""))
+
+
+def _direct_sale_invoice_errors(
+    *,
+    receipt: dict[str, Any],
+    allocation: dict[str, Any],
+    record: dict[str, Any],
+    actions_by_key: dict[str, dict[str, Any]],
+) -> list[str]:
+    payload = receipt.get("payload") or {}
+    invoice_key = str(payload.get("linked_invoice_action") or "")
+    invoice = actions_by_key.get(invoice_key)
+    if invoice is None or str(invoice.get("action_type") or "") != "create_invoice_summary":
+        return ["Direct-sale receipt does not resolve to the actual generated direct-sale invoice action."]
+    invoice_payload = invoice.get("payload") or {}
+    if str(invoice_payload.get("draft_schema") or "") != "invoice_summary_v1":
+        return ["Direct-sale invoice action has the wrong draft schema."]
+    physical_refs = [
+        ref for ref in invoice.get("source_refs") or []
+        if isinstance(ref, dict) and ref.get("source_kind") == "physical_bank"
+    ]
+    record_id = str(record.get("record_id") or "")
+    matching_indexes = [
+        index for index, ref in enumerate(physical_refs)
+        if str(ref.get("record_ref") or "") == record_id
+    ]
+    if len(matching_indexes) != 1:
+        return ["Direct-sale invoice must contain the receipt's physical source row exactly once."]
+    lines = invoice_payload.get("line_items") or []
+    line_index = matching_indexes[0]
+    if line_index >= len(lines) or not isinstance(lines[line_index], dict):
+        return ["Direct-sale invoice source-row membership does not resolve to one invoice line."]
+    line = lines[line_index]
+    target = allocation.get("target") or {}
+    scope = invoice_payload.get("summary_scope") or {}
+    errors: list[str] = []
+    supported_target_fields = {
+        "document_type", "contact_label", "posting_family", "vat_profile",
+        "product_description", "description", "quantity", "gross_amount",
+        "warehouse_id", "contact_id", "income_account_id", "vat_type_id",
+    }
+    unsupported_fields = sorted(set(target) - supported_target_fields)
+    if unsupported_fields:
+        errors.append(
+            "Direct-sale invoice cannot prove unsupported reviewed allocation target field(s): "
+            + ", ".join(unsupported_fields)
+        )
+    expected_values = (
+        ("contact label", scope.get("channel_or_source"), target.get("contact_label") or "direct-sale"),
+        ("posting family", scope.get("posting_family"), target.get("posting_family")),
+        ("VAT profile", scope.get("tax_profile"), target.get("vat_profile")),
+        ("product description", line.get("description"), target.get("product_description") or target.get("description")),
+        ("warehouse", line.get("warehouse_id_hint"), target.get("warehouse_id")),
+    )
+    for label, actual, expected in expected_values:
+        if str(actual if actual is not None else "") != str(expected if expected is not None else ""):
+            errors.append(f"Direct-sale invoice {label} does not match the reviewed allocation target.")
+    for label, actual, expected in (
+        ("quantity", line.get("quantity"), target.get("quantity")),
+        ("gross amount", line.get("gross_amount"), target.get("gross_amount")),
+    ):
+        if decimal_value(actual) != decimal_value(expected):
+            errors.append(f"Direct-sale invoice {label} does not match the reviewed allocation target.")
+    if str(invoice_payload.get("currency") or "") != str(payload.get("currency") or ""):
+        errors.append("Direct-sale invoice currency does not match its receipt.")
+    if str(target.get("contact_id") or "") and str((invoice_payload.get("counterparty") or {}).get("contact_id") or "") != str(target.get("contact_id")):
+        errors.append("Direct-sale invoice contact does not match the reviewed allocation target.")
+    if str(target.get("income_account_id") or "") and str(line.get("suggested_income_account_id") or "") != str(target.get("income_account_id")):
+        errors.append("Direct-sale invoice income account does not match the reviewed allocation target.")
+    if str(target.get("vat_type_id") or "") and str(line.get("suggested_vat_type_id") or "") != str(target.get("vat_type_id")):
+        errors.append("Direct-sale invoice VAT type does not match the reviewed allocation target.")
+    return errors
 
 
 def evaluate_bank_statement_completeness(
@@ -921,6 +1027,7 @@ def evaluate_bank_statement_completeness(
     action_path: Path,
     cwd: Path,
     posting_policy: dict[str, Any] | None = None,
+    assigned_cash_amounts: dict[str, Decimal] | None = None,
 ) -> list[dict[str, Any]]:
     """Independently prove exact-once terminal coverage for this period's physical rows."""
     findings: list[dict[str, Any]] = []
@@ -1007,7 +1114,12 @@ def evaluate_bank_statement_completeness(
                 continue
             physical_records[key] = (normalized_path.resolve(), record)
 
-    coverage: dict[tuple[str, str, str], list[tuple[str, Decimal]]] = defaultdict(list)
+    actions_by_key = {
+        action_label(action): action
+        for action in action_batch.get("actions") or []
+        if isinstance(action, dict)
+    }
+    coverage: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for action in action_batch.get("actions") or []:
         if not isinstance(action, dict) or str((action.get("payload") or {}).get("draft_schema") or "") != "cash_settlement_v1":
             continue
@@ -1083,22 +1195,7 @@ def evaluate_bank_statement_completeness(
                         summary="Physical settlement source account does not match the exact (IBAN, currency) policy mapping.",
                         action_id=action_label(action),
                     ))
-        allocation = allocations.get(key)
-        allocation_parts = (
-            [part for part in allocation.get("parts") or [] if isinstance(part, dict)]
-            if isinstance(allocation, dict) and str(allocation.get("disposition") or "") == "reviewed_split"
-            else [allocation] if isinstance(allocation, dict) else []
-        )
-        if not any(
-            _allocation_part_matches_action(part, action=action, signed_amount=signed_amount)
-            for part in allocation_parts
-        ):
-            findings.append(make_finding(
-                section="bank_statement_completeness", severity="error",
-                summary="Physical settlement disposition, signed amount, or reviewed target does not match its bank allocation.",
-                action_id=action_label(action),
-            ))
-        coverage[key].append((action_label(action), signed_amount))
+        coverage[key].append({"kind": "action", "label": action_label(action), "amount": signed_amount, "action": action})
 
     payload_cache: dict[Path, dict[str, Any]] = {}
     index_cache: dict[Path, dict[str, tuple[str, dict[str, Any]]]] = {}
@@ -1147,12 +1244,12 @@ def evaluate_bank_statement_completeness(
                     action_id=str(dependency.get("record_id") or "") or None,
                 ))
                 continue
-            coverage[key].append(
-                (
-                    str(dependency.get("record_id") or "manual dependency"),
-                    decimal_value(dependency.get("physical_signed_amount")),
-                )
-            )
+            coverage[key].append({
+                "kind": "manual",
+                "label": str(dependency.get("record_id") or "manual dependency"),
+                "amount": decimal_value(dependency.get("physical_signed_amount")),
+                "dependency": dependency,
+            })
         except SimplbooksError:
             continue
 
@@ -1172,7 +1269,12 @@ def evaluate_bank_statement_completeness(
                 str(part.get("disposition") or "") in {"bank_fee_payment", "clearing_transfer"}
                 for part in allocation.get("parts") or [] if isinstance(part, dict)
             )
-        expected_count = 1 if manual_required else len(allocation_amounts(allocation))
+        allocation_parts = (
+            [part for part in allocation.get("parts") or [] if isinstance(part, dict)]
+            if str(allocation.get("disposition") or "") == "reviewed_split"
+            else [allocation]
+        )
+        expected_count = 1 if manual_required else len(allocation_parts)
         if not items:
             findings.append(make_finding(
                 section="bank_statement_completeness", severity="error",
@@ -1186,16 +1288,68 @@ def evaluate_bank_statement_completeness(
                 summary=f"duplicate physical bank coverage: expected {expected_count} terminal coverage item(s), found {len(items)}.",
                 action_id=str(record.get("record_id") or "") or None,
             ))
-        actual_amounts = sorted((amount for _label, amount in items))
-        expected_amounts = (
-            [decimal_value(record.get("gross_amount"))]
-            if manual_required
-            else sorted(allocation_amounts(allocation))
-        )
-        if actual_amounts != expected_amounts:
+        actual_total = sum((item["amount"] for item in items), Decimal("0"))
+        if actual_total != decimal_value(record.get("gross_amount")):
             findings.append(make_finding(
                 section="bank_statement_completeness", severity="error",
-                summary="Physical settlement signed amount does not match its reviewed allocation.",
+                summary="Physical settlement signed parts do not sum to the whole reviewed bank row.",
+                action_id=str(record.get("record_id") or "") or None,
+            ))
+        if manual_required:
+            continue
+        unmatched_parts = set(range(len(allocation_parts)))
+        assignment_failed = False
+        for item in items:
+            action = item.get("action")
+            matching = [
+                index for index in sorted(unmatched_parts)
+                if isinstance(action, dict)
+                and _allocation_part_matches_action(
+                    allocation_parts[index], action=action, signed_amount=item["amount"]
+                )
+            ]
+            if not matching:
+                payload = (action or {}).get("payload") or {}
+                document_type = str(payload.get("document_type") or "")
+                allowed_dispositions = (
+                    {"generated_invoice_receipt", "existing_invoice_receipt", "direct_sale_receipt"}
+                    if document_type == "incoming"
+                    else {"generated_purchase_payment", "existing_purchase_payment"}
+                )
+                if any(
+                    str(allocation_parts[index].get("disposition") or "") in allowed_dispositions
+                    and decimal_value(allocation_parts[index].get("amount")) == item["amount"]
+                    for index in unmatched_parts
+                ):
+                    findings.append(make_finding(
+                        section="bank_statement_completeness",
+                        severity="error",
+                        summary="Cash settlement does not match the exact reviewed target for its allocation part.",
+                        action_id=str(item["label"]),
+                    ))
+                assignment_failed = True
+                continue
+            assigned_index = matching[0]
+            unmatched_parts.remove(assigned_index)
+            if assigned_cash_amounts is not None:
+                assigned_cash_amounts[str(item["label"])] = abs(
+                    decimal_value(allocation_parts[assigned_index].get("amount"))
+                )
+            if str(allocation_parts[assigned_index].get("disposition") or "") == "direct_sale_receipt":
+                for error in _direct_sale_invoice_errors(
+                    receipt=action,
+                    allocation=allocation,
+                    record=record,
+                    actions_by_key=actions_by_key,
+                ):
+                    findings.append(make_finding(
+                        section="bank_statement_completeness", severity="error",
+                        summary=error, action_id=str(item["label"]),
+                    ))
+        if assignment_failed or unmatched_parts:
+            findings.append(make_finding(
+                section="bank_statement_completeness", severity="error",
+                summary="Reviewed split/action coverage is not a bijective assignment by signed amount, disposition, and exact target.",
                 action_id=str(record.get("record_id") or "") or None,
             ))
 
@@ -1810,8 +1964,8 @@ def evaluate_reference_artifacts(
                 if expected_company_id is None:
                     raise ReferenceArtifactError("Cannot verify discovery without company metadata ID.")
                 validate_discovery(
-                    load_json(path),
-                    year=int(str(action_batch.get("period") or "0")[:4]),
+                    (overview := load_json(path)),
+                    year=int(overview.get("year") or 0),
                     company_id=expected_company_id,
                 )
         except (ReferenceArtifactError, SimplbooksError) as exc:
@@ -1970,6 +2124,7 @@ def evaluate_action_batch(
     index_cache: dict[Path, dict[str, tuple[str, dict[str, Any]]]] = {}
     resolved_sources_by_action: dict[str, list[dict[str, Any]]] = {}
 
+    assigned_cash_amounts: dict[str, Decimal] = {}
     findings.extend(evaluate_duplicates(action_batch))
     findings.extend(
         evaluate_bank_statement_completeness(
@@ -1977,6 +2132,7 @@ def evaluate_action_batch(
             action_path=action_path,
             cwd=cwd,
             posting_policy=posting_policy,
+            assigned_cash_amounts=assigned_cash_amounts,
         )
     )
     findings.extend(evaluate_exchange_rates(action_batch, exchange_rate_cache=exchange_rate_cache))
@@ -2047,6 +2203,7 @@ def evaluate_action_batch(
                 action=action,
                 resolved_sources=resolved_sources,
                 split_payment_action_ids=split_payment_action_ids,
+                physical_expected_amount=assigned_cash_amounts.get(action_label(action)),
             )
         )
         findings.extend(

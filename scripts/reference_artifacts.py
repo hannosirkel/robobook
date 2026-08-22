@@ -71,7 +71,12 @@ def verify_file_binding(binding: dict[str, Any], *, cwd: Path) -> Path:
 
 
 def required_action_binding_kinds(action_batch: dict[str, Any]) -> set[str]:
-    required = {"posting_policy", "discovery_overview"}
+    required = {
+        "posting_policy",
+        "discovery_overview",
+        "normalized_period",
+        "reconciliation",
+    }
     actions = action_batch.get("actions") or []
     if any(
         str((action.get("payload") or {}).get("currency") or "EUR").upper() != "EUR"

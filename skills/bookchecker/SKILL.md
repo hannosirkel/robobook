@@ -62,6 +62,8 @@ Implemented deterministic checks:
 - manual dependency top-level disposition scope, including the requirement that `reviewed_split`
   contains at least one bank-fee or clearing-transfer part
 - independent exact-once physical-bank coverage against the bound annual allocation and normalized files
+- bijective reviewed-split assignment by signed amount, disposition, and exact target; each cash action is checked against its assigned part
+- direct-sale receipt linkage to the generated invoice action, physical source-row line, and reviewed grouping/target fields
 - exact statement date, signed amount, currency, and `(IBAN, currency)` bank-account mapping for every cash settlement
 - verified non-blocking statement-import dependencies as terminal coverage, without allowing pending proof to pass
 

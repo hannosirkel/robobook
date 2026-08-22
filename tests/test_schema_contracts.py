@@ -286,6 +286,8 @@ class SchemaContractTests(unittest.TestCase):
         batch["reference_artifacts"] = [
             {"kind": "posting_policy", "path": "policy.json", "sha256": "0" * 64},
             {"kind": "discovery_overview", "path": "overview.json", "sha256": "1" * 64},
+            {"kind": "normalized_period", "path": "normalized.json", "sha256": "2" * 64},
+            {"kind": "reconciliation", "path": "recon.json", "sha256": "3" * 64},
         ]
         self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=batch)
 
@@ -303,6 +305,8 @@ class SchemaContractTests(unittest.TestCase):
                 {"kind": "posting_policy", "path": "policy.json", "sha256": "0" * 64},
                 {"kind": "discovery_overview", "path": "overview.json", "sha256": "1" * 64},
                 {"kind": "bank_allocations", "path": "allocations.json", "sha256": "2" * 64},
+                {"kind": "normalized_period", "path": "normalized.json", "sha256": "3" * 64},
+                {"kind": "reconciliation", "path": "recon.json", "sha256": "4" * 64},
             ],
             "actions": [],
         }

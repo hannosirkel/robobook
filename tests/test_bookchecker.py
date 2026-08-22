@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import hashlib
 import sys
@@ -433,6 +434,65 @@ class BookcheckerTests(unittest.TestCase):
 
         self.assertEqual(findings, [])
 
+    def test_full_checker_uses_assigned_split_parts_for_legacy_cash_arithmetic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            row = physical_bank_record(record_id="split-full", amount=15.0)
+            normalized_path, allocation_path = write_bank_coverage_fixture(tmp, [row])
+            allocations = json.loads(allocation_path.read_text(encoding="utf-8"))
+            allocations["allocations"][0].update({
+                "disposition": "reviewed_split",
+                "parts": [
+                    {"amount": 20.0, "disposition": "existing_invoice_receipt", "target": {"simplbooks_id": "119", "document_type": "invoice"}},
+                    {"amount": -5.0, "disposition": "existing_purchase_payment", "target": {"simplbooks_id": "88", "document_type": "purchase"}},
+                ],
+            })
+            allocation_path.write_text(json.dumps(allocations), encoding="utf-8")
+            incoming = exact_settlement_action(row=row, normalized_path=normalized_path)
+            incoming["payload"].update({"amount": 20.0, "counterparty": {"contact_id": "42"}})
+            payment = exact_settlement_action(row=row, normalized_path=normalized_path)
+            payment.update({"idempotency_key": "split-full-payment", "action_type": "create_payment_summary"})
+            payment["payload"].update({
+                "document_type": "payment", "amount": 5.0,
+                "linked_purchase_id": "88", "counterparty": {"contact_id": "18"},
+            })
+            batch = bank_coverage_batch(period="2024-01", allocation_path=allocation_path, actions=[incoming, payment])
+            recon_path = tmp / "recon.json"
+            recon = base_recon()
+            recon_path.write_text(json.dumps(recon), encoding="utf-8")
+
+            evaluation = bookchecker.evaluate_action_batch(
+                action_batch=batch,
+                action_path=tmp / "actions.yaml",
+                recon_payload=recon,
+                recon_path=recon_path,
+                policy_text=None,
+                cwd=tmp,
+            )
+
+            mutated = copy.deepcopy(batch)
+            mutated["actions"][0]["payload"]["amount"] = 19.99
+            mutated_evaluation = bookchecker.evaluate_action_batch(
+                action_batch=mutated,
+                action_path=tmp / "actions.yaml",
+                recon_payload=recon,
+                recon_path=recon_path,
+                policy_text=None,
+                cwd=tmp,
+            )
+
+        arithmetic_errors = [
+            item for item in evaluation["findings"]
+            if item["section"] == "arithmetic_consistency" and item["severity"] == "error"
+        ]
+        self.assertEqual(arithmetic_errors, [])
+        self.assertEqual(mutated_evaluation["result"], "fail")
+        self.assertTrue(any(
+            item["section"] in {"bank_statement_completeness", "arithmetic_consistency"}
+            and item["severity"] == "error"
+            for item in mutated_evaluation["findings"]
+        ))
+
     def test_checker_rejects_cash_action_target_changed_after_allocation_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -447,6 +507,77 @@ class BookcheckerTests(unittest.TestCase):
             )
 
         self.assertTrue(any("reviewed target" in item["summary"] for item in findings))
+
+    def test_checker_rejects_direct_sale_receipt_linked_to_wrong_generated_invoice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            row = physical_bank_record(record_id="direct-1", amount=20.0)
+            normalized_path, allocation_path = write_bank_coverage_fixture(tmp, [row])
+            allocations = json.loads(allocation_path.read_text(encoding="utf-8"))
+            allocations["allocations"][0].update({
+                "disposition": "direct_sale_receipt",
+                "target": {
+                    "document_type": "invoice", "contact_label": "direct-sale",
+                    "posting_family": "direct-sale-taxable", "vat_profile": "taxable",
+                    "product_description": "MoonBall", "quantity": 1,
+                    "gross_amount": 20.0, "warehouse_id": "6",
+                },
+            })
+            allocation_path.write_text(json.dumps(allocations), encoding="utf-8")
+            invoice = {
+                "idempotency_key": "correct-direct-invoice", "action_type": "create_invoice_summary",
+                "payload": {
+                    "draft_schema": "invoice_summary_v1", "document_type": "invoice",
+                    "currency": "EUR", "posting_policy_family": "direct-sale-taxable",
+                    "summary_scope": {"channel_or_source": "direct-sale", "tax_profile": "taxable", "posting_family": "direct-sale-taxable"},
+                    "counterparty": {"contact_id": "42"},
+                    "line_items": [{"line_role": "direct_sale_revenue", "description": "MoonBall", "quantity": 1,
+                                    "gross_amount": 20.0, "warehouse_id_hint": "6"}],
+                },
+                "source_refs": [{"path": str(normalized_path), "record_ref": "direct-1", "source_kind": "physical_bank"}],
+            }
+            receipt = exact_settlement_action(row=row, normalized_path=normalized_path)
+            receipt["payload"].pop("linked_invoice_id")
+            receipt["payload"].update({"linked_invoice_action": "correct-direct-invoice", "settlement_family": "direct-sale"})
+            batch = bank_coverage_batch(period="2024-01", allocation_path=allocation_path, actions=[invoice, receipt])
+
+            valid_findings = bookchecker.evaluate_bank_statement_completeness(
+                batch, action_path=tmp / "actions.yaml", cwd=tmp
+            )
+            receipt["payload"]["linked_invoice_action"] = "wrong-direct-invoice"
+            findings = bookchecker.evaluate_bank_statement_completeness(
+                batch, action_path=tmp / "actions.yaml", cwd=tmp
+            )
+
+        self.assertFalse(any("direct-sale invoice" in item["summary"] for item in valid_findings))
+        self.assertTrue(any("direct-sale invoice" in item["summary"] for item in findings))
+
+    def test_checker_rejects_duplicate_split_target_when_equal_amount_part_remains_unmatched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            row = physical_bank_record(record_id="split-equal", amount=40.0)
+            normalized_path, allocation_path = write_bank_coverage_fixture(tmp, [row])
+            allocations = json.loads(allocation_path.read_text(encoding="utf-8"))
+            allocations["allocations"][0].update({
+                "disposition": "reviewed_split",
+                "amount": 40.0,
+                "parts": [
+                    {"amount": 20.0, "disposition": "existing_invoice_receipt", "target": {"simplbooks_id": "119", "document_type": "invoice"}},
+                    {"amount": 20.0, "disposition": "existing_invoice_receipt", "target": {"simplbooks_id": "120", "document_type": "invoice"}},
+                ],
+            })
+            allocation_path.write_text(json.dumps(allocations), encoding="utf-8")
+            first = exact_settlement_action(row=row, normalized_path=normalized_path)
+            first["payload"]["amount"] = 20.0
+            duplicate = copy.deepcopy(first)
+            duplicate["idempotency_key"] = "duplicate-target"
+            batch = bank_coverage_batch(period="2024-01", allocation_path=allocation_path, actions=[first, duplicate])
+
+            findings = bookchecker.evaluate_bank_statement_completeness(
+                batch, action_path=tmp / "actions.yaml", cwd=tmp
+            )
+
+        self.assertTrue(any("bijective" in item["summary"] for item in findings))
 
     def test_checker_errors_on_month_end_date_substitution_and_currency_amount_changes(self) -> None:
         mutations = {

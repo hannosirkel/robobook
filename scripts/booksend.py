@@ -14,6 +14,7 @@ from typing import Any
 
 from bookbuilder import write_yaml
 from bookchecker import (
+    evaluate_action_batch,
     evaluate_bank_statement_completeness,
     load_yaml,
     manual_financial_dependency_errors,
@@ -1121,7 +1122,7 @@ def verify_submission_reference_artifacts(
     cwd: Path,
     period: str,
     company_id: str,
-) -> None:
+) -> dict[str, list[Path]]:
     bindings = action_batch.get("reference_artifacts") or []
     by_kind: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for binding in bindings:
@@ -1139,10 +1140,27 @@ def verify_submission_reference_artifacts(
             "Write mode action batch is not bound to required artifact(s): " + ", ".join(missing)
         )
 
+    singleton_kinds = {
+        "posting_policy",
+        "normalized_period",
+        "reconciliation",
+        "exchange_rates",
+        "bank_allocations",
+        "woo_tax_allocation",
+    }
+    duplicated = [kind for kind in sorted(singleton_kinds) if len(by_kind.get(kind) or []) > 1]
+    if duplicated:
+        raise SimplbooksError(
+            "Write mode action batch has duplicate singleton artifact binding(s): "
+            + ", ".join(duplicated)
+        )
+
+    verified: dict[str, list[Path]] = defaultdict(list)
     for binding in bindings:
         kind = str(binding.get("kind") or "")
         try:
             bound_path = verify_file_binding(binding, cwd=cwd)
+            verified[kind].append(bound_path)
             if kind == "discovery_overview":
                 overview = load_json(bound_path)
                 validate_discovery(
@@ -1152,6 +1170,7 @@ def verify_submission_reference_artifacts(
                 )
         except ReferenceArtifactError as exc:
             raise SimplbooksError(str(exc)) from exc
+    return dict(verified)
 
 
 def execute_batch(
@@ -1366,27 +1385,55 @@ def run_submission(
         check_report=check_report,
         check_path=check_path,
     )
+    verified_reference_paths: dict[str, list[Path]] = {}
+    exchange_rate_cache: dict[str, Any] | None = None
+    posting_policy: dict[str, Any] | None = None
     if mode == "write":
         if company_dir is None:
             raise SimplbooksError("Write mode requires --company-dir for bound reference verification.")
         resolved_company_id = resolve_company_id(company_id, company_dir=str(company_dir))
-        verify_submission_reference_artifacts(
+        verified_reference_paths = verify_submission_reference_artifacts(
             action_batch,
             cwd=cwd,
             period=period,
             company_id=resolved_company_id,
         )
         validate_predecessor_submission(action_path=action_path, period=period)
-        coverage_findings = evaluate_bank_statement_completeness(
-            action_batch,
+        recon_path = verified_reference_paths["reconciliation"][0]
+        normalized_path = verified_reference_paths["normalized_period"][0]
+        recon_payload = load_json(recon_path)
+        normalized_payload = load_json(normalized_path)
+        if str(recon_payload.get("period") or "") != period:
+            raise SimplbooksError("Bound reconciliation period does not match the action batch period.")
+        if str(normalized_payload.get("period") or "") != period:
+            raise SimplbooksError("Bound normalized period does not match the action batch period.")
+        if str(normalized_payload.get("company_slug") or "") != str(action_batch.get("company_slug") or ""):
+            raise SimplbooksError("Bound normalized company_slug does not match the action batch.")
+        try:
+            posting_policy = load_posting_policy(verified_reference_paths["posting_policy"][0])
+        except PostingPolicyError as exc:
+            raise SimplbooksError(str(exc)) from exc
+        if verified_reference_paths.get("exchange_rates"):
+            exchange_rate_cache = load_json(verified_reference_paths["exchange_rates"][0])
+        policy_memo_path = company_dir / "artifacts" / "policy_memo.md"
+        policy_text = policy_memo_path.read_text(encoding="utf-8") if policy_memo_path.exists() else None
+        evaluation = evaluate_action_batch(
+            action_batch=action_batch,
             action_path=action_path,
+            recon_payload=recon_payload,
+            recon_path=recon_path,
+            policy_text=policy_text,
             cwd=cwd,
+            company_dir=company_dir,
+            exchange_rate_cache=exchange_rate_cache,
+            posting_policy=posting_policy,
+            expected_company_id=resolved_company_id,
         )
-        coverage_errors = [item for item in coverage_findings if item.get("severity") == "error"]
-        if coverage_errors:
+        if evaluation["error_count"] or evaluation["warning_count"]:
+            first_finding = (evaluation.get("findings") or [{}])[0]
             raise SimplbooksError(
-                "Write mode bank statement completeness prevalidation failed before any API call: "
-                + str(coverage_errors[0].get("summary") or "unknown coverage error")
+                "Write mode full checker prevalidation failed before any API call: "
+                + str(first_finding.get("summary") or "unknown checker finding")
             )
 
     company_slug = str(
@@ -1406,22 +1453,23 @@ def run_submission(
         action_path=action_path,
         period=period,
     )
-    exchange_rate_cache_path = (
-        company_dir / "artifacts" / "reference" / f"ecb-rates-{period[:4]}.json"
-        if company_dir is not None
-        else None
-    )
-    exchange_rate_cache = (
-        load_json(exchange_rate_cache_path)
-        if exchange_rate_cache_path is not None and exchange_rate_cache_path.exists()
-        else None
-    )
-    posting_policy_path = company_dir / "artifacts" / "posting_policy.json" if company_dir is not None else None
-    posting_policy = (
-        load_posting_policy(posting_policy_path)
-        if posting_policy_path is not None and posting_policy_path.exists()
-        else None
-    )
+    if mode != "write":
+        exchange_rate_cache_path = (
+            company_dir / "artifacts" / "reference" / f"ecb-rates-{period[:4]}.json"
+            if company_dir is not None
+            else None
+        )
+        exchange_rate_cache = (
+            load_json(exchange_rate_cache_path)
+            if exchange_rate_cache_path is not None and exchange_rate_cache_path.exists()
+            else None
+        )
+        posting_policy_path = company_dir / "artifacts" / "posting_policy.json" if company_dir is not None else None
+        posting_policy = (
+            load_posting_policy(posting_policy_path)
+            if posting_policy_path is not None and posting_policy_path.exists()
+            else None
+        )
 
     if mode == "write" and client is None:
         resolved_company_id = resolve_company_id(company_id, company_dir=str(company_dir) if company_dir else None)

@@ -45,13 +45,14 @@ The report is Markdown and follows the sections in `templates/check_report.templ
 - compares statement business date, currency, signed amount, and exact source-account mapping
 - treats a complete verified manual statement-import dependency as one terminal coverage item
 - keeps pending, blocking, malformed, or source-mismatched manual proof as a hard error
-- accepts reviewed API-only splits only when their signed action amounts exactly equal the reviewed parts
+- accepts reviewed API-only splits only through a bijective assignment by signed amount, disposition, and exact target
+- binds each direct-sale receipt to its actual generated invoice, source-row line, and reviewed grouping/target values
 
 ### Arithmetic Consistency
 
 - compares invoice and purchase draft totals against referenced normalized records
 - checks line-item totals against payload totals
-- checks incoming/payment settlement amounts against referenced payouts or bank records
+- checks each reviewed-split incoming/payment against its assigned part and proves the whole signed row sum once
 
 ### Account And VAT Review
 

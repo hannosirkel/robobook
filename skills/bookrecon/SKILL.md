@@ -63,6 +63,7 @@ Implemented deterministic checks:
 - continuity with the previous period
 - physical-bank allocation coverage and CAMT movement/balance continuity per `(IBAN, currency)`
 - clearing continuity per provider, clearing account, and currency
+- structured clearing movement, resolved, and unresolved record-ID sets/counts for orchestration; do not derive these totals from human-readable check notes
 
 ## Guardrails
 

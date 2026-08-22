@@ -11,6 +11,7 @@
     "generated_at",
     "approve_for_build",
     "bank_coverage",
+    "reference_artifacts",
     "checks",
     "exceptions"
   ],
@@ -50,6 +51,12 @@
       "required": [
         "coverage_ready",
         "clearing_ready",
+        "clearing_movement_count",
+        "resolved_clearing_count",
+        "unresolved_clearing_count",
+        "clearing_movement_record_ids",
+        "resolved_clearing_record_ids",
+        "unresolved_clearing_record_ids",
         "physical_bank_row_count",
         "allocated_row_count",
         "unallocated_row_count",
@@ -61,6 +68,18 @@
       "properties": {
         "coverage_ready": {"type": "boolean"},
         "clearing_ready": {"type": "boolean"},
+        "clearing_movement_count": {"type": "integer", "minimum": 0},
+        "resolved_clearing_count": {"type": "integer", "minimum": 0},
+        "unresolved_clearing_count": {"type": "integer", "minimum": 0},
+        "clearing_movement_record_ids": {
+          "type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}
+        },
+        "resolved_clearing_record_ids": {
+          "type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}
+        },
+        "unresolved_clearing_record_ids": {
+          "type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}
+        },
         "physical_bank_row_count": {"type": "integer", "minimum": 0},
         "allocated_row_count": {"type": "integer", "minimum": 0},
         "unallocated_row_count": {"type": "integer", "minimum": 0},
@@ -72,6 +91,10 @@
           "items": {"$ref": "#/$defs/bank_ledger"}
         }
       }
+    },
+    "reference_artifacts": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/reference_binding"}
     },
     "checks": {
       "type": "array",
@@ -93,6 +116,16 @@
     }
   },
   "$defs": {
+    "reference_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path", "sha256"],
+      "properties": {
+        "kind": {"type": "string", "enum": ["normalized_period", "bank_allocations"]},
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+      }
+    },
     "bank_ledger": {
       "type": "object",
       "additionalProperties": false,

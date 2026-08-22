@@ -9,6 +9,12 @@
   "bank_coverage": {
     "coverage_ready": false,
     "clearing_ready": false,
+    "clearing_movement_count": 0,
+    "resolved_clearing_count": 0,
+    "unresolved_clearing_count": 0,
+    "clearing_movement_record_ids": [],
+    "resolved_clearing_record_ids": [],
+    "unresolved_clearing_record_ids": [],
     "physical_bank_row_count": 0,
     "allocated_row_count": 0,
     "unallocated_row_count": 0,
@@ -17,6 +23,7 @@
     "net_movement": 0,
     "ledgers": []
   },
+  "reference_artifacts": [],
   "checks": [],
   "exceptions": [],
   "notes": []

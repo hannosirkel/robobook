@@ -93,6 +93,9 @@ The file follows `schemas/recon-period.schema.json` and includes:
 - requires each movement to be referenced by a reviewed allocation or a normalized bridge reference
 - when opening and closing clearing balances are present, verifies opening plus movements equals closing; otherwise the check records the precise missing evidence
 - unresolved clearing emits a collision-safe `clearing-continuity:<provider>:<account>:<currency>: warn` and makes report-only bank write readiness false
+- emits structured movement/resolved/unresolved record-ID sets and matching counters in `bank_coverage`; annual orchestration must consume these fields, not parse check prose
+
+Each reconciliation artifact hash-binds its exact normalized-period input and reviewed annual bank-allocation input. Annual aggregation must load only the expected `YYYY-MM` filenames, verify payload company/period and both current bindings, and fail on missing, stale, or misdirected artifacts.
 
 ## Current Blocking Rules
 

@@ -14,6 +14,7 @@ from urllib.parse import quote
 
 from bank_allocations import BankAllocationError, allocation_key, bank_ledger_key, load_bank_allocations, period_allocations, statement_identity
 from bookbuilder import planned_sales_groups
+from reference_artifacts import bind_file
 from simplbooks_api import SimplbooksError, resolve_company_name
 
 
@@ -665,7 +666,7 @@ def build_clearing_continuity_checks(
     normalized_path_display: str,
     records: dict[str, list[dict[str, Any]]],
     allocations: dict[str, dict[str, Any]],
-) -> tuple[list[dict[str, Any]], bool]:
+) -> tuple[list[dict[str, Any]], bool, dict[str, Any]]:
     """Check provider/account/currency clearing evidence, retaining Phase-A report-only status."""
     grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for record in records.get("clearing_transactions", []):
@@ -710,7 +711,16 @@ def build_clearing_continuity_checks(
 
     checks: list[dict[str, Any]] = []
     ready = True
+    movement_ids: set[str] = set()
+    unresolved_ids: set[str] = set()
     for (provider, account, currency), (group_records, notes) in sorted(results.items()):
+        movement_ids.update(str(record.get("record_id")) for record in group_records if record.get("record_id"))
+        allocation_and_bridge_refs = allocation_references | bridge_references
+        unresolved_ids.update(
+            str(record.get("record_id"))
+            for record in group_records
+            if record.get("record_id") and str(record.get("record_id")) not in allocation_and_bridge_refs
+        )
         status = "pass" if not notes else "warn"
         ready = ready and status == "pass"
         checks.append(
@@ -726,7 +736,15 @@ def build_clearing_continuity_checks(
                 evidence_refs=[make_artifact_ref(normalized_path_display, record_refs_list=record_refs(group_records))],
             )
         )
-    return checks, ready
+    resolved_ids = movement_ids - unresolved_ids
+    return checks, ready, {
+        "clearing_movement_count": len(movement_ids),
+        "resolved_clearing_count": len(resolved_ids),
+        "unresolved_clearing_count": len(unresolved_ids),
+        "clearing_movement_record_ids": sorted(movement_ids),
+        "resolved_clearing_record_ids": sorted(resolved_ids),
+        "unresolved_clearing_record_ids": sorted(unresolved_ids),
+    }
 
 
 def build_woo_sales_vs_processor_check(
@@ -1246,6 +1264,7 @@ def build_recon_document(
     previous_path: Path | None = None,
     bank_allocations: dict[str, dict[str, Any]] | None = None,
     bank_allocation_errors: list[str] | None = None,
+    bank_allocations_path: Path | None = None,
 ) -> dict[str, Any]:
     normalized_path_display = display_path(normalized_path, repo_root)
     previous_path_display = display_path(previous_path, repo_root) if previous_path else None
@@ -1271,12 +1290,13 @@ def build_recon_document(
         bank_balance_records=records.get("bank_balances", []),
         allocation_errors=bank_allocation_errors,
     )
-    clearing_checks, clearing_ready = build_clearing_continuity_checks(
+    clearing_checks, clearing_ready, clearing_coverage = build_clearing_continuity_checks(
         normalized_path_display=normalized_path_display,
         records=records,
         allocations=bank_allocations or {},
     )
     bank_coverage["clearing_ready"] = clearing_ready
+    bank_coverage.update(clearing_coverage)
     bank_coverage["coverage_ready"] = bool(bank_coverage["coverage_ready"] and clearing_ready)
 
     checks: list[dict[str, Any]] = [
@@ -1342,6 +1362,12 @@ def build_recon_document(
     blocking_issue_count = sum(1 for item in sorted_checks if item["status"] == "fail")
     blocking_issue_count += sum(1 for item in sorted_exceptions if item.get("blocking"))
 
+    reference_artifacts = []
+    if normalized_path.exists():
+        reference_artifacts.append(bind_file(normalized_path, kind="normalized_period", cwd=repo_root))
+    if bank_allocations_path is not None and bank_allocations_path.exists():
+        reference_artifacts.append(bind_file(bank_allocations_path, kind="bank_allocations", cwd=repo_root))
+
     return {
         "schema_version": "1.0",
         "company_slug": normalized_payload["company_slug"],
@@ -1351,6 +1377,7 @@ def build_recon_document(
         "approve_for_build": blocking_issue_count == 0,
         "blocking_issue_count": blocking_issue_count,
         "bank_coverage": bank_coverage,
+        "reference_artifacts": reference_artifacts,
         "checks": sorted_checks,
         "exceptions": sorted_exceptions,
         "notes": notes,
@@ -1550,6 +1577,7 @@ def main() -> int:
         previous_path=previous_path if previous_payload is not None else None,
         bank_allocations=period_bank_allocations,
         bank_allocation_errors=bank_allocation_errors,
+        bank_allocations_path=bank_allocations_path,
     )
     write_json(output_path, document)
 

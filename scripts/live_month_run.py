@@ -12,6 +12,7 @@ from typing import Any, Callable
 
 import booksend
 from full_year_dry_run import parse_json_output, submitted_month_state
+from reference_artifacts import ReferenceArtifactError, verify_file_binding
 from simplbooks_api import SimplbooksError
 
 
@@ -79,6 +80,40 @@ def _interactive_approval_checkpoint(action_path: Path) -> None:
     )
 
 
+def _verify_builder_output(
+    *, summary: dict[str, Any], action_path: Path, discovery_path: Path, cwd: Path
+) -> dict[str, Any]:
+    if summary.get("approval_status") != "draft":
+        raise SimplbooksError("Action builder must report approval_status draft for a live run.")
+    reported_output = Path(str(summary.get("output") or ""))
+    if not str(summary.get("output") or "").strip():
+        raise SimplbooksError("Action builder did not report its output path.")
+    reported_resolved = reported_output if reported_output.is_absolute() else cwd / reported_output
+    if reported_resolved.resolve() != action_path.resolve():
+        raise SimplbooksError("Action builder output does not resolve to the expected action path.")
+    if not action_path.exists():
+        raise SimplbooksError(f"Action build did not create {action_path}.")
+    batch = booksend.load_yaml(action_path)
+    if str(batch.get("approval_status") or "") != "draft":
+        raise SimplbooksError("A freshly rebuilt live batch must be draft before checking.")
+    discovery_bindings = [
+        item
+        for item in batch.get("reference_artifacts") or []
+        if isinstance(item, dict) and item.get("kind") == "discovery_overview"
+    ]
+    matching = []
+    for binding in discovery_bindings:
+        try:
+            bound_path = verify_file_binding(binding, cwd=cwd)
+        except ReferenceArtifactError as exc:
+            raise SimplbooksError(f"Fresh discovery binding is missing or changed: {exc}") from exc
+        if bound_path.resolve() == discovery_path.resolve():
+            matching.append(binding)
+    if len(matching) != 1:
+        raise SimplbooksError("Freshly rebuilt batch must bind the newly refreshed discovery artifact exactly once.")
+    return batch
+
+
 def run_live_month(
     *,
     company_dir: Path,
@@ -127,9 +162,13 @@ def run_live_month(
         "--bank-allocations", str(allocation_path),
     ]
     commands.append(builder_command)
-    _run_step(command=builder_command, cwd=cwd, runner=runner, label="Action build")
-    if not action_path.exists():
-        raise SimplbooksError(f"Action build did not create {action_path}.")
+    builder_summary = _run_step(command=builder_command, cwd=cwd, runner=runner, label="Action build")
+    _verify_builder_output(
+        summary=builder_summary,
+        action_path=action_path,
+        discovery_path=discovery_path,
+        cwd=cwd,
+    )
     booksend.validate_predecessor_submission(action_path=action_path, period=period)
 
     checker_command = [

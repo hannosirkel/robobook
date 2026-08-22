@@ -381,7 +381,7 @@ class BookreconTests(unittest.TestCase):
             record(record_id="bridge", source_system="printful", event_type="bridge", gross_amount=0.0, attributes={"clearing_record_ids": ["wallet-one", "wallet-two"]}),
         ]
 
-        checks, ready = bookrecon.build_clearing_continuity_checks(
+        checks, ready, coverage = bookrecon.build_clearing_continuity_checks(
             normalized_path_display="normalized/2024-01.json",
             records=records,
             allocations={},
@@ -394,6 +394,8 @@ class BookreconTests(unittest.TestCase):
         ])
         self.assertEqual([check["lhs_amount"] for check in checks], [-3.0, 5.0])
         self.assertTrue(all(check["status"] == "pass" for check in checks))
+        self.assertEqual(coverage["clearing_movement_count"], 2)
+        self.assertEqual(coverage["resolved_clearing_count"], 2)
 
     def test_unresolved_clearing_warns_without_changing_legacy_build_approval(self) -> None:
         normalized = base_normalized()
@@ -421,6 +423,11 @@ class BookreconTests(unittest.TestCase):
         self.assertEqual(check["status"], "warn")
         self.assertFalse(document["bank_coverage"]["coverage_ready"])
         self.assertTrue(document["approve_for_build"])
+        self.assertEqual(document["bank_coverage"]["clearing_movement_record_ids"], ["printful:wallet:1"])
+        self.assertEqual(document["bank_coverage"]["resolved_clearing_record_ids"], [])
+        self.assertEqual(document["bank_coverage"]["unresolved_clearing_record_ids"], ["printful:wallet:1"])
+        self.assertEqual(document["bank_coverage"]["clearing_movement_count"], 1)
+        self.assertEqual(document["bank_coverage"]["unresolved_clearing_count"], 1)
     def test_processor_classifier_ignores_refs_nested_in_woo_vat_evidence(self) -> None:
         woo_sale = record(
             record_id="woo:1",

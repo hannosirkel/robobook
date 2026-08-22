@@ -5,7 +5,6 @@ import argparse
 import copy
 import csv
 import json
-import re
 import subprocess
 import sys
 from collections import defaultdict
@@ -17,8 +16,8 @@ from simplbooks_api import SimplbooksError, resolve_company_name, resolve_compan
 from inventory_verification import evaluate_inventory_action, load_manual_inventory_actions
 import bookprep
 import woo_tax
-from booksend import load_yaml
-from reference_artifacts import file_sha256
+from booksend import action_successfully_submitted, load_yaml, normalized_endpoint
+from reference_artifacts import ReferenceArtifactError, file_sha256, verify_file_binding
 
 
 ORIGINAL_SUBPROCESS_RUN = subprocess.run
@@ -117,8 +116,10 @@ def submitted_month_state(*, company_dir: Path, period: str) -> str:
     """Return a freeze state, failing when a success log no longer binds its YAML."""
     action_path = company_dir / "artifacts" / "actions" / f"{period}.yaml"
     submission_path = company_dir / "artifacts" / "submissions" / f"{period}.json"
+    action_batch = load_yaml(action_path) if action_path.exists() else None
+    yaml_status = str((action_batch or {}).get("approval_status") or "")
     if not submission_path.exists():
-        if action_path.exists() and str(load_yaml(action_path).get("approval_status") or "") == "submitted":
+        if yaml_status == "submitted":
             raise SimplbooksError(f"Submitted action batch has no submission log: {action_path}")
         return "not_submitted"
 
@@ -126,6 +127,10 @@ def submitted_month_state(*, company_dir: Path, period: str) -> str:
     if not isinstance(submission, dict):
         raise SimplbooksError(f"Submission log must contain an object: {submission_path}")
     if submission.get("mode") != "write":
+        if yaml_status == "submitted":
+            raise SimplbooksError(
+                f"Submitted action YAML {action_path} lacks a matching successful write submission log."
+            )
         return "not_submitted"
     summary = submission.get("summary") or {}
     successful = (
@@ -134,10 +139,14 @@ def submitted_month_state(*, company_dir: Path, period: str) -> str:
         and summary.get("stopped_on_failure") is False
     )
     if not successful:
+        if yaml_status == "submitted":
+            raise SimplbooksError(
+                f"Submitted action YAML {action_path} is backed only by a partial, unsuccessful write log."
+            )
         return "partial_submission"
     if not action_path.exists():
         raise SimplbooksError(f"Successfully submitted month has no immutable action YAML: {period}")
-    action_batch = load_yaml(action_path)
+    assert action_batch is not None
     expected_sha = str(submission.get("action_file_sha256") or "")
     if expected_sha != file_sha256(action_path):
         raise SimplbooksError(
@@ -151,10 +160,50 @@ def submitted_month_state(*, company_dir: Path, period: str) -> str:
         or str(submission.get("company_slug") or "") != str(action_batch.get("company_slug") or "")
     ):
         raise SimplbooksError(f"Successfully submitted month {period} has inconsistent frozen identities.")
+    request_log = submission.get("request_log") or []
+    for action in action_batch.get("actions") or []:
+        if not isinstance(action, dict):
+            raise SimplbooksError(
+                f"Successfully submitted month {period} lacks successful write action evidence for <unknown>."
+            )
+        action_key = str(action.get("idempotency_key") or "")
+        matching_evidence = [
+            entry
+            for entry in request_log
+            if isinstance(entry, dict)
+            and entry.get("mode") == "write"
+            and entry.get("success") is True
+            and isinstance(entry.get("http_status"), int)
+            and 200 <= int(entry["http_status"]) < 300
+            and str(entry.get("action_idempotency_key") or "") == action_key
+            and str(entry.get("method") or "POST").upper()
+            == str(action.get("method") or "POST").upper()
+            and normalized_endpoint(str(entry.get("endpoint") or ""))
+            == normalized_endpoint(str(action.get("endpoint") or ""))
+            and int(entry["http_status"]) == int(action.get("response_status") or 0)
+            and (
+                action.get("inserted_id") in (None, "")
+                or str(entry.get("inserted_id") or "") == str(action.get("inserted_id"))
+            )
+        ]
+        if (
+            not action_successfully_submitted(action)
+            or not action_key
+            or not matching_evidence
+        ):
+            raise SimplbooksError(
+                f"Successfully submitted month {period} lacks successful write action evidence for {action_key or '<unknown>'}."
+            )
     return "submitted"
 
 
-def summarize_bank_reconciliation_artifacts(*, company_dir: Path, year: int) -> dict[str, int]:
+def summarize_bank_reconciliation_artifacts(
+    *,
+    company_dir: Path,
+    year: int,
+    expected_periods: list[str] | None = None,
+    cwd: Path | None = None,
+) -> dict[str, int]:
     totals = {
         "physical_bank_row_count": 0,
         "allocated_row_count": 0,
@@ -162,26 +211,66 @@ def summarize_bank_reconciliation_artifacts(*, company_dir: Path, year: int) -> 
         "clearing_movement_count": 0,
         "unresolved_clearing_count": 0,
     }
-    clearing_ids: set[str] = set()
-    unresolved_ids: set[str] = set()
+    expected = expected_periods or periods_for_year(year)
+    root = cwd or Path.cwd()
+    expected_company_slug = resolve_company_slug(company_dir=str(company_dir)) or company_dir.name
     recon_dir = company_dir / "artifacts" / "recon"
-    for path in sorted(recon_dir.glob(f"{year}-??.json")) if recon_dir.exists() else []:
+    expected_normalized_dir = company_dir / "artifacts" / "normalized"
+    expected_allocation_path = company_dir / "artifacts" / "bank" / f"{year}-allocations.json"
+    for period in expected:
+        if not period.startswith(f"{year}-"):
+            raise SimplbooksError(f"Expected reconciliation period is outside {year}: {period}")
+        path = recon_dir / f"{period}.json"
+        if not path.exists():
+            raise SimplbooksError(f"Expected reconciliation artifact is missing: {path}")
         payload = json.loads(path.read_text(encoding="utf-8"))
+        if str(payload.get("period") or "") != period:
+            raise SimplbooksError(
+                f"Reconciliation artifact period mismatch: expected {period}, got {payload.get('period')!r}: {path}"
+            )
+        if str(payload.get("company_slug") or "") != expected_company_slug:
+            raise SimplbooksError(f"Reconciliation artifact company mismatch for {period}: {path}")
+        bindings_by_kind: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for binding in payload.get("reference_artifacts") or []:
+            if isinstance(binding, dict):
+                bindings_by_kind[str(binding.get("kind") or "")].append(binding)
+        for kind, expected_path in (
+            ("normalized_period", expected_normalized_dir / f"{period}.json"),
+            ("bank_allocations", expected_allocation_path),
+        ):
+            bindings = bindings_by_kind.get(kind) or []
+            if len(bindings) != 1:
+                raise SimplbooksError(f"Reconciliation {period} requires exactly one {kind} binding.")
+            try:
+                resolved = verify_file_binding(bindings[0], cwd=root)
+            except ReferenceArtifactError as exc:
+                raise SimplbooksError(f"Reconciliation {period} binding changed or is missing: {exc}") from exc
+            if resolved.resolve() != expected_path.resolve():
+                raise SimplbooksError(
+                    f"Reconciliation {period} {kind} binding does not resolve to the expected artifact."
+                )
         coverage = payload.get("bank_coverage") or {}
         totals["physical_bank_row_count"] += int(coverage.get("physical_bank_row_count") or 0)
         totals["allocated_row_count"] += int(coverage.get("allocated_row_count") or 0)
         totals["uncovered_row_count"] += int(coverage.get("unallocated_row_count") or 0)
-        for check in payload.get("checks") or []:
-            if not str(check.get("check_id") or "").startswith("clearing-continuity:"):
-                continue
-            for evidence in check.get("evidence_refs") or []:
-                clearing_ids.update(str(value) for value in evidence.get("record_refs") or [])
-            for note in check.get("notes") or []:
-                match = re.search(r"unresolved clearing movement record\(s\):\s*(.+?)\.$", str(note))
-                if match:
-                    unresolved_ids.update(value.strip() for value in match.group(1).split(",") if value.strip())
-    totals["clearing_movement_count"] = len(clearing_ids)
-    totals["unresolved_clearing_count"] = len(unresolved_ids)
+        movement_ids = coverage.get("clearing_movement_record_ids")
+        resolved_ids = coverage.get("resolved_clearing_record_ids")
+        unresolved_ids = coverage.get("unresolved_clearing_record_ids")
+        if not all(isinstance(values, list) for values in (movement_ids, resolved_ids, unresolved_ids)):
+            raise SimplbooksError(f"Reconciliation {period} lacks structured clearing coverage lists.")
+        movement_set = set(map(str, movement_ids))
+        resolved_set = set(map(str, resolved_ids))
+        unresolved_set = set(map(str, unresolved_ids))
+        if int(coverage.get("clearing_movement_count") or 0) != len(movement_set):
+            raise SimplbooksError(f"Reconciliation {period} clearing movement count does not match its IDs.")
+        if int(coverage.get("resolved_clearing_count") or 0) != len(resolved_set):
+            raise SimplbooksError(f"Reconciliation {period} resolved clearing count does not match its IDs.")
+        if int(coverage.get("unresolved_clearing_count") or 0) != len(unresolved_set):
+            raise SimplbooksError(f"Reconciliation {period} unresolved clearing count does not match its IDs.")
+        if resolved_set & unresolved_set or resolved_set | unresolved_set != movement_set:
+            raise SimplbooksError(f"Reconciliation {period} clearing resolution IDs do not partition movement IDs.")
+        totals["clearing_movement_count"] += len(movement_set)
+        totals["unresolved_clearing_count"] += len(unresolved_set)
     return totals
 
 
@@ -504,7 +593,12 @@ def run_full_year_dry_run(
             break
 
     reference_summary = summarize_action_artifacts(company_dir=company_dir, year=year)
-    bank_reconciliation_summary = summarize_bank_reconciliation_artifacts(company_dir=company_dir, year=year)
+    bank_reconciliation_summary = summarize_bank_reconciliation_artifacts(
+        company_dir=company_dir,
+        year=year,
+        expected_periods=target_periods,
+        cwd=cwd,
+    )
     policy_path = company_dir / "artifacts" / "posting_policy.json"
     posting_policy = json.loads(policy_path.read_text(encoding="utf-8")) if policy_path.exists() else {}
     expectations = ((posting_policy.get("year_expectations") or {}).get(str(year)) or {})

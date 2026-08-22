@@ -40,6 +40,16 @@ def write_check(path: Path, action_path: Path) -> None:
     ]), encoding="utf-8")
 
 
+def bind_discovery(action_path: Path, discovery_path: Path) -> None:
+    payload = json.loads(action_path.read_text(encoding="utf-8"))
+    payload["reference_artifacts"] = [{
+        "kind": "discovery_overview",
+        "path": str(discovery_path),
+        "sha256": hashlib.sha256(discovery_path.read_bytes()).hexdigest(),
+    }]
+    action_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+
 class LiveMonthRunTests(unittest.TestCase):
     def test_requires_explicit_confirmation_before_any_command(self) -> None:
         calls: list[list[str]] = []
@@ -85,19 +95,23 @@ class LiveMonthRunTests(unittest.TestCase):
             company_dir = Path(tmp) / "companies" / "example"
             action_path = company_dir / "artifacts" / "actions" / "2024-03.yaml"
             check_path = company_dir / "artifacts" / "actions" / "2024-03.check.md"
+            discovery_path = company_dir / "artifacts" / "discovery" / "2024-overview.json"
 
             def fake_run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
                 calls.append(cmd)
                 script = Path(cmd[1]).name
                 if script == "bookbuilder.py":
                     write_action(action_path, status="draft")
-                    payload = {"approval_status": "draft"}
+                    bind_discovery(action_path, discovery_path)
+                    payload = {"approval_status": "draft", "output": str(action_path)}
                 elif script == "bookchecker.py":
                     write_check(check_path, action_path)
                     payload = {"result": "pass", "error_count": 0, "warning_count": 0}
                 elif script == "booksend.py":
                     payload = {"mode": "write", "approval_status": "submitted"}
                 else:
+                    discovery_path.parent.mkdir(parents=True, exist_ok=True)
+                    discovery_path.write_text('{"year":2024}', encoding="utf-8")
                     payload = {"year": 2024}
                 return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
 
@@ -126,16 +140,20 @@ class LiveMonthRunTests(unittest.TestCase):
             company_dir = Path(tmp) / "companies" / "example"
             action_path = company_dir / "artifacts" / "actions" / "2024-03.yaml"
             check_path = company_dir / "artifacts" / "actions" / "2024-03.check.md"
+            discovery_path = company_dir / "artifacts" / "discovery" / "2024-overview.json"
 
             def fake_run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
                 script = Path(cmd[1]).name
                 if script == "bookbuilder.py":
                     write_action(action_path)
-                    payload = {"approval_status": "draft"}
+                    bind_discovery(action_path, discovery_path)
+                    payload = {"approval_status": "draft", "output": str(action_path)}
                 elif script == "bookchecker.py":
                     write_check(check_path, action_path)
                     payload = {"result": "pass", "error_count": 0, "warning_count": 0}
                 else:
+                    discovery_path.parent.mkdir(parents=True, exist_ok=True)
+                    discovery_path.write_text('{"year":2024}', encoding="utf-8")
                     payload = {"ok": True}
                 return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
 
@@ -174,16 +192,20 @@ class LiveMonthRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             company_dir = Path(tmp) / "companies" / "example"
             action_path = company_dir / "artifacts" / "actions" / "2024-03.yaml"
+            discovery_path = company_dir / "artifacts" / "discovery" / "2024-overview.json"
 
             def fake_run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
                 calls.append(cmd)
                 script = Path(cmd[1]).name
                 if script == "bookbuilder.py":
                     write_action(action_path)
-                    payload = {"approval_status": "draft"}
+                    bind_discovery(action_path, discovery_path)
+                    payload = {"approval_status": "draft", "output": str(action_path)}
                 elif script == "bookchecker.py":
                     payload = {"result": "pass", "error_count": 0, "warning_count": 1}
                 else:
+                    discovery_path.parent.mkdir(parents=True, exist_ok=True)
+                    discovery_path.write_text('{"year":2024}', encoding="utf-8")
                     payload = {"ok": True}
                 return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
 
@@ -201,6 +223,7 @@ class LiveMonthRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             company_dir = Path(tmp) / "companies" / "example"
             action_path = company_dir / "artifacts" / "actions" / "2024-03.yaml"
+            discovery_path = company_dir / "artifacts" / "discovery" / "2024-overview.json"
             write_action(action_path)
 
             def fake_run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
@@ -210,10 +233,13 @@ class LiveMonthRunTests(unittest.TestCase):
                     payload = json.loads(action_path.read_text(encoding="utf-8"))
                     payload["rebuilt_with_fresh_discovery"] = True
                     action_path.write_text(json.dumps(payload), encoding="utf-8")
-                    result = {"approval_status": "draft"}
+                    bind_discovery(action_path, discovery_path)
+                    result = {"approval_status": "draft", "output": str(action_path)}
                 elif script == "bookchecker.py":
                     result = {"result": "pass", "error_count": 0, "warning_count": 1}
                 else:
+                    discovery_path.parent.mkdir(parents=True, exist_ok=True)
+                    discovery_path.write_text('{"year":2024}', encoding="utf-8")
                     result = {"ok": True}
                 return SimpleNamespace(returncode=0, stdout=json.dumps(result), stderr="")
 
@@ -238,16 +264,19 @@ class LiveMonthRunTests(unittest.TestCase):
             company_dir = Path(tmp) / "companies" / "example"
             action_path = company_dir / "artifacts" / "actions" / "2024-03.yaml"
             check_path = company_dir / "artifacts" / "actions" / "2024-03.check.md"
+            discovery_path = company_dir / "artifacts" / "discovery" / "2024-overview.json"
 
             def fake_run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
                 script = Path(cmd[1]).name
                 if script == "bookbuilder.py":
                     write_action(action_path, status="approved")
-                    result = {"approval_status": "approved"}
+                    result = {"approval_status": "approved", "output": str(action_path)}
                 elif script == "bookchecker.py":
                     write_check(check_path, action_path)
                     result = {"result": "pass", "error_count": 0, "warning_count": 0}
                 else:
+                    discovery_path.parent.mkdir(parents=True, exist_ok=True)
+                    discovery_path.write_text('{"year":2024}', encoding="utf-8")
                     result = {"ok": True}
                 return SimpleNamespace(returncode=0, stdout=json.dumps(result), stderr="")
 
@@ -263,6 +292,61 @@ class LiveMonthRunTests(unittest.TestCase):
                 )
 
         self.assertFalse(checkpoint_called)
+
+    def test_rejects_builder_that_reports_a_different_output_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            company_dir = Path(tmp) / "companies" / "example"
+            discovery_path = company_dir / "artifacts" / "discovery" / "2024-overview.json"
+            action_path = company_dir / "artifacts" / "actions" / "2024-03.yaml"
+
+            def fake_run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+                script = Path(cmd[1]).name
+                if script == "examine_simplbooks_year.py":
+                    discovery_path.parent.mkdir(parents=True)
+                    discovery_path.write_text('{"year":2024}', encoding="utf-8")
+                    result = {"year": 2024}
+                elif script == "bookbuilder.py":
+                    write_action(action_path)
+                    bind_discovery(action_path, discovery_path)
+                    result = {"approval_status": "draft", "output": str(action_path.with_name("wrong.yaml"))}
+                else:
+                    self.fail("checker/write must not run for a misdirected builder")
+                return SimpleNamespace(returncode=0, stdout=json.dumps(result), stderr="")
+
+            with self.assertRaisesRegex(live_month_run.SimplbooksError, "output"):
+                live_month_run.run_live_month(
+                    company_dir=company_dir, period="2024-03", python_executable="python3",
+                    cwd=ROOT, confirm_write=True, run_command=fake_run,
+                    approval_checkpoint=lambda _path: None,
+                )
+
+    def test_rejects_noop_builder_that_leaves_stale_discovery_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            company_dir = Path(tmp) / "companies" / "example"
+            discovery_path = company_dir / "artifacts" / "discovery" / "2024-overview.json"
+            action_path = company_dir / "artifacts" / "actions" / "2024-03.yaml"
+            discovery_path.parent.mkdir(parents=True)
+            discovery_path.write_text('{"year":2024,"old":true}', encoding="utf-8")
+            write_action(action_path)
+            bind_discovery(action_path, discovery_path)
+
+            def fake_run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+                script = Path(cmd[1]).name
+                if script == "examine_simplbooks_year.py":
+                    discovery_path.write_text('{"year":2024,"fresh":true}', encoding="utf-8")
+                    result = {"year": 2024}
+                elif script == "bookbuilder.py":
+                    result = {"approval_status": "draft", "output": str(action_path)}
+                else:
+                    self.fail("checker/write must not run when builder leaves stale YAML")
+                return SimpleNamespace(returncode=0, stdout=json.dumps(result), stderr="")
+
+            with self.assertRaisesRegex(live_month_run.SimplbooksError, "discovery"):
+                live_month_run.run_live_month(
+                    company_dir=company_dir, period="2024-03", python_executable="python3",
+                    cwd=ROOT, confirm_write=True, run_command=fake_run,
+                    approval_checkpoint=lambda _path: None,
+                )
 
 
 if __name__ == "__main__":

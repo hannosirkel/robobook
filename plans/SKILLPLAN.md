@@ -457,6 +457,8 @@ Checks:
 
 - duplicate-risk check
 - missing source reference check
+- exact-once physical-bank coverage against the reviewed annual allocation artifact
+- clearing-ledger continuity and unresolved-movement review
 - arithmetic consistency
 - obviously wrong account/VAT usage
 - mismatch between action totals and reconciliation totals
@@ -491,8 +493,17 @@ Responsibilities:
 Guardrails:
 
 - no write without explicit confirmation
+- write mode reruns the independent checker from the hash-bound normalized, reconciliation, policy, discovery, rate, and bank-allocation inputs
+- require the exact preceding configured month, including the prior December across a year boundary, to be successfully submitted and immutable
+- never regenerate or mutate a successfully submitted action YAML; a matching successful submission SHA freezes it
 - no destructive cleanup by default
 - no master-data creation unless separately approved
+
+### Full-year dry run and live-month orchestration
+
+`scripts/full_year_dry_run.py` processes months chronologically, passes the reviewed annual bank allocation to reconciliation, building, and checking, and reports annual physical rows, allocated and uncovered rows, clearing movements, and unresolved clearing movements. A successfully submitted month whose submission log binds the unchanged action YAML is reported as `skipped_submitted`; `--force-build` never overrides that freeze. A changed submitted YAML or a partial write stops orchestration instead of regenerating the batch.
+
+`scripts/live_month_run.py` is the fail-closed operator entry point for one live month. Explicit `--confirm-write` is required before it starts. It refreshes read-only discovery, rebuilds only a never-submitted month, runs the checker, pauses for the human to change only `approval_status` to `approved`, reruns the checker against that exact YAML, and invokes `booksend --mode write --confirm-write`. It refuses submitted or partial periods, missing or failed configured predecessors, checker errors or warnings, stale bindings, non-approval edits at the checkpoint, and unresolved dependencies. It never sets approval itself.
 
 ### 8. `bookaudit`
 

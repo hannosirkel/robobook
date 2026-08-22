@@ -2479,6 +2479,22 @@ def resolve_exchange_rates_path(*, company_dir: Path | None, period: str, overri
     return company_dir / "artifacts" / "reference" / f"ecb-rates-{period[:4]}.json"
 
 
+def validate_explicit_bank_allocation_path(
+    *, action_batch: dict[str, Any], requested_path: Path, cwd: Path
+) -> None:
+    bound_paths = [
+        Path(str(item.get("path") or ""))
+        for item in action_batch.get("reference_artifacts") or []
+        if isinstance(item, dict) and item.get("kind") == "bank_allocations"
+    ]
+    requested = requested_path.resolve()
+    if bound_paths and not any(
+        (path if path.is_absolute() else cwd / path).resolve() == requested
+        for path in bound_paths
+    ):
+        raise SimplbooksError("Explicit bank allocation path does not match the action batch binding.")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run a pre-submit review over a draft Simplbooks action batch")
     parser.add_argument("--company-dir", help="Company folder, e.g. companies/example")
@@ -2488,6 +2504,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--policy-memo", help="Optional path to policy memo markdown")
     parser.add_argument("--exchange-rates", help="Annual ECB cache used to independently verify foreign rates")
     parser.add_argument("--posting-policy", help="Explicit posting policy used to independently verify every submit-capable ID")
+    parser.add_argument(
+        "--bank-allocations",
+        help="Reviewed annual bank allocation artifact; the action batch's hash binding remains authoritative",
+    )
     parser.add_argument("--output", help="Optional output path for the Markdown check report")
     return parser
 
@@ -2506,6 +2526,12 @@ def main() -> int:
     )
 
     action_batch = load_yaml(action_path)
+    if args.bank_allocations:
+        validate_explicit_bank_allocation_path(
+            action_batch=action_batch,
+            requested_path=Path(args.bank_allocations),
+            cwd=Path.cwd(),
+        )
     recon_payload = load_json(recon_path)
     policy_text = load_optional_text(policy_path)
     exchange_rate_cache = load_json(exchange_rates_path) if exchange_rates_path and exchange_rates_path.exists() else None

@@ -302,6 +302,7 @@ class FullYearDryRunTests(unittest.TestCase):
         self.assertEqual(cmd[-2:], ["--woo-tax-allocation", str(allocation_path)])
 
     def test_full_year_runner_propagates_reference_artifacts(self) -> None:
+        allocation_path = Path("companies/example/artifacts/bank/2024-allocations.json")
         cmd = full_year_dry_run.build_step_command(
             python_executable="python3",
             company_dir=Path("companies/example"),
@@ -310,6 +311,7 @@ class FullYearDryRunTests(unittest.TestCase):
             script_name="bookbuilder.py",
             source_dir=Path("companies/example/source"),
             force_build=False,
+            bank_allocations=allocation_path,
         )
 
         self.assertIn("--posting-policy", cmd)
@@ -318,6 +320,137 @@ class FullYearDryRunTests(unittest.TestCase):
         self.assertIn("companies/example/artifacts/reference/ecb-rates-2024.json", cmd)
         self.assertIn("--discovery-overview", cmd)
         self.assertIn("companies/example/artifacts/discovery/2024-overview.json", cmd)
+        self.assertIn("--bank-allocations", cmd)
+        self.assertIn(str(allocation_path), cmd)
+
+    def test_full_year_passes_bank_allocations_to_recon_builder_and_checker(self) -> None:
+        allocation_path = Path("companies/example/artifacts/bank/2024-allocations.json")
+        relevant = [
+            full_year_dry_run.build_step_command(
+                python_executable="python3",
+                company_dir=Path("companies/example"),
+                period="2024-03",
+                step_name=step_name,
+                script_name=f"{step_name}.py",
+                source_dir=None,
+                force_build=False,
+                bank_allocations=allocation_path,
+            )
+            for step_name in ("bookrecon", "bookbuilder", "bookchecker")
+        ]
+
+        self.assertTrue(all(call[call.index("--bank-allocations") + 1] == str(allocation_path) for call in relevant))
+
+    def test_full_year_summary_reports_bank_and_clearing_coverage_totals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            company_dir = Path(tmp) / "companies" / "example"
+            recon_dir = company_dir / "artifacts" / "recon"
+            recon_dir.mkdir(parents=True)
+            (recon_dir / "2024-01.json").write_text(json.dumps({
+                "bank_coverage": {
+                    "physical_bank_row_count": 3,
+                    "allocated_row_count": 2,
+                    "unallocated_row_count": 1,
+                },
+                "checks": [{
+                    "check_id": "clearing-continuity:printful:wallet:eur",
+                    "notes": ["wallet: unresolved clearing movement record(s): wallet-2."],
+                    "evidence_refs": [{"record_refs": ["wallet-1", "wallet-2"]}],
+                }],
+            }), encoding="utf-8")
+
+            summary = full_year_dry_run.summarize_bank_reconciliation_artifacts(
+                company_dir=company_dir, year=2024
+            )
+
+        self.assertEqual(summary, {
+            "physical_bank_row_count": 3,
+            "allocated_row_count": 2,
+            "uncovered_row_count": 1,
+            "clearing_movement_count": 2,
+            "unresolved_clearing_count": 1,
+        })
+
+    def test_full_year_dry_run_skips_unchanged_submitted_month_even_with_force_build(self) -> None:
+        called_scripts: list[str] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            company_dir = Path(tmp) / "companies" / "example"
+            action_dir = company_dir / "artifacts" / "actions"
+            submission_dir = company_dir / "artifacts" / "submissions"
+            action_dir.mkdir(parents=True)
+            submission_dir.mkdir(parents=True)
+            action_path = action_dir / "2024-03.yaml"
+            action_path.write_text(json.dumps({
+                "batch_id": "example-2024-03", "company_slug": "example",
+                "period": "2024-03", "approval_status": "submitted", "actions": [],
+            }), encoding="utf-8")
+            (submission_dir / "2024-03.json").write_text(json.dumps({
+                "batch_id": "example-2024-03", "company_slug": "example", "period": "2024-03",
+                "mode": "write", "action_file_sha256": hashlib.sha256(action_path.read_bytes()).hexdigest(),
+                "summary": {"failed_actions": 0, "stopped_on_failure": False},
+                "request_log": [],
+            }), encoding="utf-8")
+
+            def fake_run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+                called_scripts.append(Path(cmd[1]).name)
+                return SimpleNamespace(returncode=0, stdout='{"result":"pass"}', stderr="")
+
+            original_run = full_year_dry_run.subprocess.run
+            original_periods = full_year_dry_run.periods_for_year
+            original_resolve = full_year_dry_run.resolve_company_name
+            try:
+                full_year_dry_run.subprocess.run = fake_run
+                full_year_dry_run.periods_for_year = lambda _year: ["2024-03"]
+                full_year_dry_run.resolve_company_name = lambda company_dir: "Example Company OÜ"
+                result = full_year_dry_run.run_full_year_dry_run(
+                    company_dir=company_dir, year=2024, source_dir=None,
+                    python_executable="python3", continue_on_error=False,
+                    force_build=True, cwd=ROOT,
+                )
+            finally:
+                full_year_dry_run.subprocess.run = original_run
+                full_year_dry_run.periods_for_year = original_periods
+                full_year_dry_run.resolve_company_name = original_resolve
+
+        self.assertEqual(result["months"][0]["status"], "skipped_submitted")
+        self.assertEqual(called_scripts, [])
+
+    def test_full_year_refuses_changed_successfully_submitted_yaml(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            company_dir = Path(tmp) / "companies" / "example"
+            action_dir = company_dir / "artifacts" / "actions"
+            submission_dir = company_dir / "artifacts" / "submissions"
+            action_dir.mkdir(parents=True)
+            submission_dir.mkdir(parents=True)
+            (action_dir / "2024-03.yaml").write_text('{"approval_status":"submitted"}', encoding="utf-8")
+            (submission_dir / "2024-03.json").write_text(json.dumps({
+                "period": "2024-03", "mode": "write", "action_file_sha256": "0" * 64,
+                "summary": {"failed_actions": 0, "stopped_on_failure": False},
+            }), encoding="utf-8")
+
+            with self.assertRaisesRegex(full_year_dry_run.SimplbooksError, "immutable|SHA"):
+                full_year_dry_run.submitted_month_state(company_dir=company_dir, period="2024-03")
+
+    def test_full_year_refuses_success_log_for_another_company(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            company_dir = Path(tmp) / "companies" / "example"
+            action_dir = company_dir / "artifacts" / "actions"
+            submission_dir = company_dir / "artifacts" / "submissions"
+            action_dir.mkdir(parents=True)
+            submission_dir.mkdir(parents=True)
+            action_path = action_dir / "2024-03.yaml"
+            action_path.write_text(json.dumps({
+                "batch_id": "example-2024-03", "company_slug": "example",
+                "period": "2024-03", "approval_status": "submitted",
+            }), encoding="utf-8")
+            (submission_dir / "2024-03.json").write_text(json.dumps({
+                "batch_id": "example-2024-03", "company_slug": "other", "period": "2024-03",
+                "mode": "write", "action_file_sha256": hashlib.sha256(action_path.read_bytes()).hexdigest(),
+                "summary": {"failed_actions": 0, "stopped_on_failure": False},
+            }), encoding="utf-8")
+
+            with self.assertRaisesRegex(full_year_dry_run.SimplbooksError, "identities"):
+                full_year_dry_run.submitted_month_state(company_dir=company_dir, period="2024-03")
 
     def test_periods_for_year_lists_all_months(self) -> None:
         self.assertEqual(

@@ -352,6 +352,26 @@ def bank_coverage_batch(*, period: str, allocation_path: Path, actions: list[dic
 
 
 class BookcheckerTests(unittest.TestCase):
+    def test_explicit_bank_allocation_must_match_bound_artifact_path(self) -> None:
+        batch = {
+            "reference_artifacts": [{
+                "kind": "bank_allocations",
+                "path": "companies/example/artifacts/bank/2024-allocations.json",
+                "sha256": "a" * 64,
+            }]
+        }
+        bookchecker.validate_explicit_bank_allocation_path(
+            action_batch=batch,
+            requested_path=ROOT / "companies/example/artifacts/bank/2024-allocations.json",
+            cwd=ROOT,
+        )
+        with self.assertRaisesRegex(bookchecker.SimplbooksError, "does not match"):
+            bookchecker.validate_explicit_bank_allocation_path(
+                action_batch=batch,
+                requested_path=ROOT / "companies/example/artifacts/bank/2025-allocations.json",
+                cwd=ROOT,
+            )
+
     def test_manual_required_row_rejects_api_cash_coverage_without_verified_manual_item(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)

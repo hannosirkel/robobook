@@ -5,6 +5,7 @@ import argparse
 import copy
 import csv
 import json
+import re
 import subprocess
 import sys
 from collections import defaultdict
@@ -16,6 +17,8 @@ from simplbooks_api import SimplbooksError, resolve_company_name, resolve_compan
 from inventory_verification import evaluate_inventory_action, load_manual_inventory_actions
 import bookprep
 import woo_tax
+from booksend import load_yaml
+from reference_artifacts import file_sha256
 
 
 ORIGINAL_SUBPROCESS_RUN = subprocess.run
@@ -108,6 +111,78 @@ def extract_api_calls(*, period: str, step_summary: dict[str, Any]) -> list[dict
         call.setdefault("period", period)
         collected.append(call)
     return collected
+
+
+def submitted_month_state(*, company_dir: Path, period: str) -> str:
+    """Return a freeze state, failing when a success log no longer binds its YAML."""
+    action_path = company_dir / "artifacts" / "actions" / f"{period}.yaml"
+    submission_path = company_dir / "artifacts" / "submissions" / f"{period}.json"
+    if not submission_path.exists():
+        if action_path.exists() and str(load_yaml(action_path).get("approval_status") or "") == "submitted":
+            raise SimplbooksError(f"Submitted action batch has no submission log: {action_path}")
+        return "not_submitted"
+
+    submission = json.loads(submission_path.read_text(encoding="utf-8"))
+    if not isinstance(submission, dict):
+        raise SimplbooksError(f"Submission log must contain an object: {submission_path}")
+    if submission.get("mode") != "write":
+        return "not_submitted"
+    summary = submission.get("summary") or {}
+    successful = (
+        bool(str(submission.get("action_file_sha256") or ""))
+        and int(summary.get("failed_actions") or 0) == 0
+        and summary.get("stopped_on_failure") is False
+    )
+    if not successful:
+        return "partial_submission"
+    if not action_path.exists():
+        raise SimplbooksError(f"Successfully submitted month has no immutable action YAML: {period}")
+    action_batch = load_yaml(action_path)
+    expected_sha = str(submission.get("action_file_sha256") or "")
+    if expected_sha != file_sha256(action_path):
+        raise SimplbooksError(
+            f"Successfully submitted month {period} is immutable, but its action-file SHA does not match."
+        )
+    if (
+        str(submission.get("period") or "") != period
+        or str(action_batch.get("period") or "") != period
+        or str(action_batch.get("approval_status") or "") != "submitted"
+        or str(submission.get("batch_id") or "") != str(action_batch.get("batch_id") or "")
+        or str(submission.get("company_slug") or "") != str(action_batch.get("company_slug") or "")
+    ):
+        raise SimplbooksError(f"Successfully submitted month {period} has inconsistent frozen identities.")
+    return "submitted"
+
+
+def summarize_bank_reconciliation_artifacts(*, company_dir: Path, year: int) -> dict[str, int]:
+    totals = {
+        "physical_bank_row_count": 0,
+        "allocated_row_count": 0,
+        "uncovered_row_count": 0,
+        "clearing_movement_count": 0,
+        "unresolved_clearing_count": 0,
+    }
+    clearing_ids: set[str] = set()
+    unresolved_ids: set[str] = set()
+    recon_dir = company_dir / "artifacts" / "recon"
+    for path in sorted(recon_dir.glob(f"{year}-??.json")) if recon_dir.exists() else []:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        coverage = payload.get("bank_coverage") or {}
+        totals["physical_bank_row_count"] += int(coverage.get("physical_bank_row_count") or 0)
+        totals["allocated_row_count"] += int(coverage.get("allocated_row_count") or 0)
+        totals["uncovered_row_count"] += int(coverage.get("unallocated_row_count") or 0)
+        for check in payload.get("checks") or []:
+            if not str(check.get("check_id") or "").startswith("clearing-continuity:"):
+                continue
+            for evidence in check.get("evidence_refs") or []:
+                clearing_ids.update(str(value) for value in evidence.get("record_refs") or [])
+            for note in check.get("notes") or []:
+                match = re.search(r"unresolved clearing movement record\(s\):\s*(.+?)\.$", str(note))
+                if match:
+                    unresolved_ids.update(value.strip() for value in match.group(1).split(",") if value.strip())
+    totals["clearing_movement_count"] = len(clearing_ids)
+    totals["unresolved_clearing_count"] = len(unresolved_ids)
+    return totals
 
 
 def summarize_action_artifacts(*, company_dir: Path, year: int) -> dict[str, Any]:
@@ -334,6 +409,7 @@ def build_step_command(
     source_dir: Path | None,
     force_build: bool,
     woo_tax_allocation: Path | None = None,
+    bank_allocations: Path | None = None,
 ) -> list[str]:
     cmd = [python_executable, f"scripts/{script_name}", "--company-dir", str(company_dir), "--period", period]
     if step_name == "bookprep" and source_dir is not None:
@@ -354,6 +430,8 @@ def build_step_command(
         )
         if force_build:
             cmd.append("--force")
+    if step_name in {"bookrecon", "bookbuilder", "bookchecker"} and bank_allocations is not None:
+        cmd.extend(["--bank-allocations", str(bank_allocations)])
     if step_name == "booksend":
         cmd.extend(["--mode", "dry-run"])
     return cmd
@@ -371,12 +449,21 @@ def run_full_year_dry_run(
 ) -> dict[str, Any]:
     company_name = resolve_company_name(company_dir=str(company_dir))
     woo_tax_allocation = validate_woo_tax_preflight(company_dir, year, source_dir)
+    bank_allocations = company_dir / "artifacts" / "bank" / f"{year}-allocations.json"
     months: list[dict[str, Any]] = []
     api_calls: list[dict[str, Any]] = []
     overall_success = True
 
     target_periods = periods_for_year(year)
     for period in target_periods:
+        submission_state = submitted_month_state(company_dir=company_dir, period=period)
+        if submission_state == "submitted":
+            months.append({"period": period, "ok": True, "status": "skipped_submitted", "steps": []})
+            continue
+        if submission_state == "partial_submission":
+            raise SimplbooksError(
+                f"Period {period} has a partial write submission and must be resumed without regenerating its YAML."
+            )
         step_results: list[dict[str, Any]] = []
         month_success = True
         for step_name, script_name in STEP_SPECS:
@@ -389,6 +476,7 @@ def run_full_year_dry_run(
                 source_dir=source_dir,
                 force_build=force_build,
                 woo_tax_allocation=woo_tax_allocation,
+                bank_allocations=bank_allocations,
             )
             run = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
             step_summary = {
@@ -411,11 +499,12 @@ def run_full_year_dry_run(
                 month_success = False
                 overall_success = False
                 break
-        months.append({"period": period, "ok": month_success, "steps": step_results})
+        months.append({"period": period, "ok": month_success, "status": "processed", "steps": step_results})
         if not month_success and not continue_on_error:
             break
 
     reference_summary = summarize_action_artifacts(company_dir=company_dir, year=year)
+    bank_reconciliation_summary = summarize_bank_reconciliation_artifacts(company_dir=company_dir, year=year)
     policy_path = company_dir / "artifacts" / "posting_policy.json"
     posting_policy = json.loads(policy_path.read_text(encoding="utf-8")) if policy_path.exists() else {}
     expectations = ((posting_policy.get("year_expectations") or {}).get(str(year)) or {})
@@ -435,6 +524,7 @@ def run_full_year_dry_run(
         "continue_on_error": continue_on_error,
         "overall_success": overall_success,
         "reference_summary": reference_summary,
+        "bank_reconciliation_summary": bank_reconciliation_summary,
         "acceptance_issues": acceptance_issues,
         "api_calls": api_calls,
         "months": months,

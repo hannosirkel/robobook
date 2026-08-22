@@ -6,7 +6,8 @@
   },
   "contacts": {
     "sales": {
-      "woo": "42"
+      "woo": "42",
+      "direct-sale": "42"
     },
     "processors": {
       "stripe": "29"
@@ -21,6 +22,11 @@
       "shipping_income_account_id": "253",
       "vat_type_id": "21",
       "shipping_vat_type_id": "22",
+      "warehouse_id": "6"
+    },
+    "direct-sale-taxable": {
+      "income_account_id": "107",
+      "vat_type_id": "21",
       "warehouse_id": "6"
     },
     "purchase-printful": {

@@ -394,6 +394,7 @@ def resolve_action_sources(
                 "resolved_path": resolved_path,
                 "record_ref": record_ref,
                 "note": ref.get("note"),
+                "source_kind": ref.get("source_kind"),
                 "payload": payload,
                 "category": category,
                 "record": record,
@@ -565,8 +566,18 @@ def evaluate_arithmetic(
     if draft_schema == "cash_settlement_v1":
         document_type = str(payload.get("document_type") or "")
         if document_type == "incoming":
+            physical_bank_records = [
+                item["record"]
+                for item in resolved_sources
+                if item.get("category") == "bank_transactions"
+                and item.get("record")
+                and item.get("source_kind") == "physical_bank"
+            ]
             payout_records = [record for category, record in paired_records if category == "payouts"]
-            expected_amount = sum(decimal_value(record.get("gross_amount")) for record in payout_records)
+            expected_amount = sum(
+                decimal_value(record.get("gross_amount"))
+                for record in (physical_bank_records or payout_records)
+            )
         elif document_type == "payment":
             bank_records = [record for category, record in paired_records if category == "bank_transactions"]
             expected_amount = sum(abs(decimal_value(record.get("gross_amount"))) for record in bank_records)
@@ -586,12 +597,21 @@ def evaluate_arithmetic(
                 expected=expected_amount,
                 actual=decimal_value(payload.get("amount")),
             )
-        if document_type == "incoming" and "payouts" not in categories:
+        if document_type == "incoming" and not payout_records and not physical_bank_records:
             findings.append(
                 make_finding(
                     section="arithmetic_consistency",
                     severity="error",
-                    summary="Incoming action does not reference any payout records.",
+                    summary="Incoming action does not reference a payout or exact physical bank record.",
+                    action_id=action_label(action),
+                )
+            )
+        if document_type == "incoming" and physical_bank_records and len(physical_bank_records) != 1:
+            findings.append(
+                make_finding(
+                    section="source_reference_coverage",
+                    severity="error",
+                    summary="Exact physical-bank incoming action must reference exactly one statement row.",
                     action_id=action_label(action),
                 )
             )
@@ -898,9 +918,84 @@ def evaluate_exchange_rates(
     return findings
 
 
+def manual_financial_dependency_errors(dependency: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    required_text = ("statement_id", "record_id", "date", "iban", "currency", "reviewed_rationale")
+    for field in required_text:
+        if not str(dependency.get(field) or "").strip():
+            errors.append(f"Manual financial dependency requires {field}.")
+    try:
+        date.fromisoformat(str(dependency.get("date") or ""))
+    except ValueError:
+        errors.append("Manual financial dependency date must be ISO YYYY-MM-DD.")
+    if not re.fullmatch(r"[A-Z]{3}", str(dependency.get("currency") or "")):
+        errors.append("Manual financial dependency currency must be an uppercase ISO code.")
+    try:
+        physical_amount = decimal_value(dependency.get("physical_signed_amount"))
+        if not physical_amount.is_finite() or physical_amount.quantize(Decimal("0.01")) != physical_amount:
+            raise ValueError
+    except (SimplbooksError, ValueError):
+        physical_amount = Decimal("0")
+        errors.append("Manual financial dependency requires an exact physical signed amount.")
+
+    source_ref = dependency.get("source_ref")
+    if not isinstance(source_ref, dict) or (
+        not str(source_ref.get("path") or "").strip()
+        or str(source_ref.get("record_ref") or "") != str(dependency.get("record_id") or "")
+        or source_ref.get("source_kind") != "physical_bank"
+    ):
+        errors.append("Manual financial dependency requires an exact physical-bank statement ref binding.")
+
+    proof = dependency.get("statement_import_proof")
+    if not isinstance(proof, dict) or proof.get("status") not in {"pending", "verified"} or (
+        proof.get("required_evidence") != "live_discovery_or_audit"
+    ):
+        errors.append("Manual financial dependency requires a statement import proof contract.")
+    elif proof.get("status") == "verified" and (
+        not str(proof.get("simplbooks_transaction_id") or "").strip()
+        or not str(proof.get("evidence_ref") or "").strip()
+    ):
+        errors.append("Verified statement import proof requires a SimplBooks transaction ID and evidence ref.")
+
+    split_parts = dependency.get("split_parts")
+    split_proof = dependency.get("split_proof")
+    if not isinstance(split_parts, list):
+        errors.append("Manual financial dependency split_parts must be a list.")
+    elif split_parts:
+        signed_total = Decimal("0")
+        for part in split_parts:
+            if not isinstance(part, dict) or not str(part.get("disposition") or "") or not isinstance(part.get("target"), dict):
+                errors.append("Manual financial dependency split parts require disposition and target.")
+                continue
+            try:
+                signed_total += decimal_value(part.get("signed_amount"))
+            except SimplbooksError:
+                errors.append("Manual financial dependency split part requires an exact signed amount.")
+        if signed_total != physical_amount:
+            errors.append("Manual financial dependency split parts do not sum to the physical signed amount.")
+        if not isinstance(split_proof, dict) or (
+            decimal_value((split_proof or {}).get("signed_parts_total")) != signed_total
+            or decimal_value((split_proof or {}).get("physical_signed_amount")) != physical_amount
+        ):
+            errors.append("Manual financial dependency split proof does not prove the signed arithmetic.")
+    elif split_proof is not None:
+        errors.append("Manual financial dependency without split parts must not carry split proof.")
+    return errors
+
+
 def evaluate_unresolved_dependencies(action_batch: dict[str, Any]) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     for dependency in action_batch.get("unresolved_dependencies") or []:
+        if str(dependency.get("kind") or "") == "manual_statement_import_financial_transaction":
+            for error in manual_financial_dependency_errors(dependency):
+                findings.append(
+                    make_finding(
+                        section="account_and_vat_review",
+                        severity="error",
+                        summary=error,
+                        action_id=str(dependency.get("record_id") or "") or None,
+                    )
+                )
         if not dependency.get("blocking"):
             continue
         findings.append(
@@ -996,6 +1091,8 @@ def evaluate_vat_profiles(actions: list[dict[str, Any]], posting_policy: dict[st
                     )
                 )
             evidence = line.get("vat_allocation_component_evidence")
+            if str(line.get("line_role") or "") == "direct_sale_revenue":
+                continue
             if not isinstance(evidence, list) or not evidence:
                 findings.append(
                     make_finding(

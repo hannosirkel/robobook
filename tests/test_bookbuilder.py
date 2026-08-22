@@ -141,6 +141,67 @@ def existing_invoice_allocation(*, record_id: str, invoice_id: str) -> dict:
     }
 
 
+def direct_sale_allocation(*, row: dict, warehouse_id: str | None = "6") -> dict:
+    return {
+        "statement_id": f"archive:{row['record_id']}",
+        "record_id": row["record_id"],
+        "iban": row["attributes"]["iban"],
+        "period": row["event_date"][:7],
+        "disposition": "direct_sale_receipt",
+        "amount": row["gross_amount"],
+        "currency": row["currency"],
+        "target": {
+            "document_type": "invoice",
+            "contact_label": "direct-sale",
+            "posting_family": "direct-sale-taxable",
+            "vat_profile": "taxable",
+            "product_description": "Reviewed direct sale",
+            "quantity": 1,
+            "gross_amount": row["gross_amount"],
+            "warehouse_id": warehouse_id,
+        },
+        "review": {"status": "approved", "rationale": "Reviewed direct bank sale."},
+    }
+
+
+def direct_sale_policy() -> dict:
+    return {
+        "schema_version": "1.0",
+        "company_slug": "example",
+        "bank_accounts": {"EE123": {"EUR": "3"}},
+        "contacts": {"sales": {"direct-sale": "42"}, "processors": {}, "suppliers": {}},
+        "mappings": {
+            "direct-sale-taxable": {
+                "income_account_id": "107",
+                "vat_type_id": "25",
+                "warehouse_id": "6",
+            }
+        },
+        "sales_vat_profiles": [{
+            "start": "2024-01-01",
+            "end": "2024-12-31",
+            "rate": 22,
+            "goods_vat_type_id": "25",
+            "shipping_vat_type_id": "24",
+        }],
+        "supplier_aliases": {},
+    }
+
+
+def manual_allocation(*, row: dict, disposition: str, target: dict | None = None) -> dict:
+    return {
+        "statement_id": f"archive:{row['record_id']}",
+        "record_id": row["record_id"],
+        "iban": row["attributes"]["iban"],
+        "period": row["event_date"][:7],
+        "disposition": disposition,
+        "amount": row["gross_amount"],
+        "currency": row["currency"],
+        "target": target or {"financial_transaction_kind": disposition},
+        "review": {"status": "approved", "rationale": f"Reviewed {disposition}."},
+    }
+
+
 def build_with(*, bank: dict, allocation: dict, **overrides: object) -> dict:
     normalized = base_normalized(bank["event_date"][:7])
     normalized["records"]["bank_transactions"] = [bank]
@@ -268,6 +329,207 @@ def purchase_summary_action(
 
 
 class BookbuilderTests(unittest.TestCase):
+    def test_direct_sales_group_one_monthly_invoice_and_keep_exact_receipts(self) -> None:
+        normalized = base_normalized("2024-08")
+        rows = [
+            bank_row(record_id="direct-a", amount=20.0, event_date="2024-08-27"),
+            bank_row(record_id="direct-b", amount=20.0, event_date="2024-08-30"),
+        ]
+        normalized["records"]["bank_transactions"] = rows
+        allocations = {
+            (f"archive:{row['record_id']}", "EE123", "EUR"): direct_sale_allocation(row=row)
+            for row in rows
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            batch = bookbuilder.build_action_batch(
+                normalized_payload=normalized,
+                recon_payload=base_recon("2024-08"),
+                normalized_path=root / "normalized.json",
+                recon_path=root / "recon.json",
+                repo_root=root,
+                posting_policy=direct_sale_policy(),
+                bank_allocations=allocations,
+            )
+
+        invoices = actions_of_type(batch, "create_invoice_summary")
+        receipts = actions_of_type(batch, "create_incoming_summary")
+        self.assertEqual(len(invoices), 1)
+        invoice = invoices[0]
+        self.assertEqual(invoice["payload"]["counterparty"]["contact_id"], "42")
+        self.assertEqual(invoice["payload"]["totals"]["gross_amount"], 40.0)
+        self.assertEqual(invoice["payload"]["line_items"][0]["suggested_income_account_id"], "107")
+        self.assertEqual(invoice["payload"]["line_items"][0]["suggested_vat_type_id"], "25")
+        self.assertEqual(invoice["payload"]["line_items"][0]["warehouse_id_hint"], "6")
+        self.assertEqual({ref["record_ref"] for ref in invoice["source_refs"]}, {"direct-a", "direct-b"})
+        self.assertEqual([item["payload"]["document_date"] for item in receipts], ["2024-08-27", "2024-08-30"])
+        self.assertEqual([item["payload"]["amount"] for item in receipts], [20.0, 20.0])
+        self.assertTrue(all(len(item["source_refs"]) == 1 for item in receipts))
+        self.assertTrue(all(item["source_refs"][0]["source_kind"] == "physical_bank" for item in receipts))
+        self.assertEqual({tuple(item["depends_on"]) for item in receipts}, {(invoice["idempotency_key"],)})
+
+    def test_direct_sale_grouping_does_not_cross_reviewed_posting_dimensions(self) -> None:
+        normalized = base_normalized("2024-08")
+        rows = [
+            bank_row(record_id="warehouse-a", amount=20.0, event_date="2024-08-27"),
+            bank_row(record_id="warehouse-b", amount=20.0, event_date="2024-08-30"),
+        ]
+        normalized["records"]["bank_transactions"] = rows
+        first = direct_sale_allocation(row=rows[0])
+        second = direct_sale_allocation(row=rows[1], warehouse_id=None)
+        second["target"]["posting_family"] = "direct-sale-taxable-no-warehouse"
+        allocations = {
+            (first["statement_id"], first["iban"], first["currency"]): first,
+            (second["statement_id"], second["iban"], second["currency"]): second,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            batch = bookbuilder.build_action_batch(
+                normalized_payload=normalized,
+                recon_payload=base_recon("2024-08"),
+                normalized_path=root / "normalized.json",
+                recon_path=root / "recon.json",
+                repo_root=root,
+                posting_policy={
+                    **direct_sale_policy(),
+                    "mappings": {
+                        **direct_sale_policy()["mappings"],
+                        "direct-sale-taxable-no-warehouse": {
+                            "income_account_id": "107",
+                            "vat_type_id": "25",
+                        },
+                    },
+                },
+                bank_allocations=allocations,
+            )
+
+        self.assertEqual(len(actions_of_type(batch, "create_invoice_summary")), 2)
+
+    def test_direct_sale_grouping_uses_resolved_posting_tuple_not_policy_key(self) -> None:
+        normalized = base_normalized("2024-08")
+        rows = [
+            bank_row(record_id="family-a", amount=20.0, event_date="2024-08-27"),
+            bank_row(record_id="family-b", amount=20.0, event_date="2024-08-30"),
+        ]
+        normalized["records"]["bank_transactions"] = rows
+        first = direct_sale_allocation(row=rows[0])
+        second = direct_sale_allocation(row=rows[1])
+        second["target"]["posting_family"] = "direct-sale-taxable-alias"
+        policy = direct_sale_policy()
+        policy["mappings"]["direct-sale-taxable-alias"] = dict(policy["mappings"]["direct-sale-taxable"])
+        allocations = {
+            (first["statement_id"], first["iban"], first["currency"]): first,
+            (second["statement_id"], second["iban"], second["currency"]): second,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            batch = bookbuilder.build_action_batch(
+                normalized_payload=normalized,
+                recon_payload=base_recon("2024-08"),
+                normalized_path=root / "normalized.json",
+                recon_path=root / "recon.json",
+                repo_root=root,
+                posting_policy=policy,
+                bank_allocations=allocations,
+            )
+
+        self.assertEqual(len(actions_of_type(batch, "create_invoice_summary")), 1)
+
+    def test_bank_fees_create_one_manual_dependency_per_physical_row_and_no_actions(self) -> None:
+        normalized = base_normalized("2024-08")
+        rows = [
+            bank_row(record_id="monthly-card", amount=-2.0, event_date="2024-08-27"),
+            bank_row(record_id="transfer-fee", amount=-7.0, event_date="2024-08-30"),
+        ]
+        normalized["records"]["bank_transactions"] = rows
+        allocations = {}
+        for row in rows:
+            allocation = manual_allocation(row=row, disposition="bank_fee_payment")
+            allocations[(allocation["statement_id"], allocation["iban"], allocation["currency"])] = allocation
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            batch = bookbuilder.build_action_batch(
+                normalized_payload=normalized,
+                recon_payload=base_recon("2024-08"),
+                normalized_path=root / "normalized.json",
+                recon_path=root / "recon.json",
+                repo_root=root,
+                bank_allocations=allocations,
+            )
+
+        self.assertEqual(batch["actions"], [])
+        dependencies = batch["unresolved_dependencies"]
+        self.assertEqual(len(dependencies), 2)
+        self.assertEqual({item["physical_signed_amount"] for item in dependencies}, {-2.0, -7.0})
+        self.assertTrue(all(item["source_ref"]["source_kind"] == "physical_bank" for item in dependencies))
+        self.assertTrue(all(item["statement_import_proof"]["status"] == "pending" for item in dependencies))
+
+    def test_failed_payment_transfer_and_return_are_manual_and_zero_net(self) -> None:
+        normalized = base_normalized("2024-09")
+        rows = [
+            bank_row(record_id="failed-out", amount=-30.0, event_date="2024-09-02"),
+            bank_row(record_id="failed-return", amount=30.0, event_date="2024-09-04"),
+        ]
+        normalized["records"]["bank_transactions"] = rows
+        allocations = {}
+        for row in rows:
+            allocation = manual_allocation(
+                row=row,
+                disposition="clearing_transfer",
+                target={"financial_transaction_kind": "failed-payment-transfer-reversal", "pair_ref": "pair-1"},
+            )
+            allocations[(allocation["statement_id"], allocation["iban"], allocation["currency"])] = allocation
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            batch = bookbuilder.build_action_batch(
+                normalized_payload=normalized,
+                recon_payload=base_recon("2024-09"),
+                normalized_path=root / "normalized.json",
+                recon_path=root / "recon.json",
+                repo_root=root,
+                bank_allocations=allocations,
+            )
+
+        self.assertEqual(batch["actions"], [])
+        dependencies = batch["unresolved_dependencies"]
+        self.assertEqual(sum(item["physical_signed_amount"] for item in dependencies), 0.0)
+        self.assertEqual({item["target"]["pair_ref"] for item in dependencies}, {"pair-1"})
+
+    def test_netted_foreign_receipt_is_one_atomic_manual_dependency(self) -> None:
+        row = bank_row(record_id="foreign-net", amount=723.32, event_date="2024-08-30")
+        row["currency"] = "USD"
+        allocation = manual_allocation(row=row, disposition="reviewed_split")
+        allocation["parts"] = [
+            {"amount": 738.32, "disposition": "existing_invoice_receipt", "target": {"simplbooks_id": "119", "document_type": "invoice"}},
+            {"amount": -15.0, "disposition": "bank_fee_payment", "target": {"financial_transaction_kind": "correspondent-fee"}},
+        ]
+
+        batch = build_with(bank=row, allocation=allocation)
+
+        self.assertEqual(batch["actions"], [])
+        self.assertEqual(len(batch["unresolved_dependencies"]), 1)
+        dependency = batch["unresolved_dependencies"][0]
+        self.assertEqual([part["signed_amount"] for part in dependency["split_parts"]], [738.32, -15.0])
+        self.assertEqual(dependency["split_proof"]["signed_parts_total"], 723.32)
+        self.assertEqual(dependency["split_proof"]["physical_signed_amount"], 723.32)
+
+    def test_netted_foreign_receipt_rejects_incorrect_split_arithmetic(self) -> None:
+        row = bank_row(record_id="foreign-bad", amount=723.32, event_date="2024-08-30")
+        row["currency"] = "USD"
+        allocation = manual_allocation(row=row, disposition="reviewed_split")
+        allocation["parts"] = [
+            {"amount": 738.32, "disposition": "existing_invoice_receipt", "target": {"simplbooks_id": "119", "document_type": "invoice"}},
+            {"amount": -14.0, "disposition": "bank_fee_payment", "target": {"financial_transaction_kind": "correspondent-fee"}},
+        ]
+
+        with self.assertRaisesRegex(bookbuilder.SimplbooksError, "split.*sum"):
+            build_with(bank=row, allocation=allocation)
+
     def test_existing_cash_target_requires_discovery_proof(self) -> None:
         with self.assertRaisesRegex(bookbuilder.SimplbooksError, "discovery overview"):
             build_with(

@@ -213,6 +213,23 @@ def resolve_supplier_alias(policy: dict[str, Any], value: str) -> str:
     return aliases.get(supplier, supplier)
 
 
+def configured_bank_account_ids(policy: dict[str, Any]) -> set[str]:
+    """Flatten legacy and `(IBAN, currency)` mappings to their allowed SimplBooks IDs."""
+    resolved: set[str] = set()
+    for source_account, value in (policy.get("bank_accounts") or {}).items():
+        if isinstance(value, dict):
+            for currency, account_id in value.items():
+                resolved.add(
+                    normalize_id(
+                        account_id,
+                        field_name=f"bank_accounts[{source_account!r}][{currency!r}]",
+                    )
+                )
+        else:
+            resolved.add(normalize_id(value, field_name=f"bank_accounts[{source_account!r}]"))
+    return resolved
+
+
 def action_policy_errors(action: dict[str, Any], policy: dict[str, Any]) -> list[str]:
     """Independently compare every submit-capable ID in an action with explicit policy."""
     payload = action.get("payload") or {}
@@ -220,6 +237,9 @@ def action_policy_errors(action: dict[str, Any], policy: dict[str, Any]) -> list
     if action_type in {"create_invoice_summary", "create_credit_invoice_summary"}:
         role = "sales"
         label = str((payload.get("summary_scope") or {}).get("channel_or_source") or "")
+    elif action_type == "create_incoming_summary" and str(payload.get("settlement_family") or "") == "direct-sale":
+        role = "sales"
+        label = str(payload.get("counterparty_hint") or "")
     elif action_type == "create_incoming_summary" or (
         action_type == "create_purchase_summary" and slugify(str(payload.get("vendor_hint") or "")) in {"paypal", "stripe"}
     ):
@@ -242,16 +262,18 @@ def action_policy_errors(action: dict[str, Any], policy: dict[str, Any]) -> list
             errors.append(f"Contact ID {actual_contact!r} does not match policy ID {expected_contact!r} for {role}/{label}.")
 
     if action_type in {"create_incoming_summary", "create_payment_summary"}:
-        allowed = {normalize_id(value, field_name="bank_accounts") for value in (policy.get("bank_accounts") or {}).values()}
+        allowed = configured_bank_account_ids(policy)
         if str(payload.get("bank_account_id") or "") not in allowed:
             errors.append("Cash action bank_account_id is not one of the explicit posting-policy accounts.")
 
     family = ""
     if role == "sales":
-        tax_profile = str((payload.get("summary_scope") or {}).get("tax_profile") or "")
-        if not tax_profile:
-            tax_profile = "taxable" if float((payload.get("totals") or {}).get("vat_amount") or 0) else "non-taxable"
-        family = f"{slugify(label)}-{slugify(tax_profile)}"
+        if action_type in {"create_invoice_summary", "create_credit_invoice_summary"}:
+            explicit_family = str((payload.get("summary_scope") or {}).get("posting_family") or "")
+            tax_profile = str((payload.get("summary_scope") or {}).get("tax_profile") or "")
+            if not tax_profile:
+                tax_profile = "taxable" if float((payload.get("totals") or {}).get("vat_amount") or 0) else "non-taxable"
+            family = slugify(explicit_family) or f"{slugify(label)}-{slugify(tax_profile)}"
     elif action_type == "create_purchase_summary" and role == "processors":
         family = f"fees-{slugify(label)}"
     elif action_type in {"create_purchase_summary", "create_purchase_credit_summary"}:

@@ -380,6 +380,9 @@ def translate_invoice_payload(
     tasks = []
     for index, line in enumerate(payload.get("line_items") or [], start=1):
         gross_amount = abs(decimal_value(line.get("gross_amount")))
+        quantity = abs(decimal_value(line.get("quantity") if line.get("quantity") not in (None, "") else 1))
+        if quantity <= 0:
+            raise SimplbooksError(f"{action_id(action)} line {index} quantity must be positive.")
         vat_amount_hint = line.get("vat_amount_hint")
         vat_amount = None if vat_amount_hint in (None, "") else abs(decimal_value(vat_amount_hint))
         task = compact_dict(
@@ -400,8 +403,8 @@ def translate_invoice_payload(
                 ),
                 "name": str(line.get("description") or f"Line {index}"),
                 "unit": "summary",
-                "amount": 1,
-                "price_per_unit": decimal_number(gross_amount),
+                "amount": decimal_number(quantity),
+                "price_per_unit": decimal_number(gross_amount / quantity),
                 "vat": (
                     reviewed_allocated_rate(
                         line,
@@ -666,6 +669,10 @@ def translate_action_for_api(
     allow_unresolved_dependencies: bool = False,
     exchange_rate_cache: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if str(action.get("action_type") or "") == "manual_statement_import_financial_transaction":
+        raise SimplbooksError(
+            "manual statement-import financial transactions are UI-only and must not be translated into SimplBooks API calls."
+        )
     if str(action.get("action_type") or "") == "manual_inventory_writeoff":
         raise SimplbooksError(
             "manual inventory write-off actions are UI-only and must not be translated for Simplbooks API submission."
@@ -1102,6 +1109,16 @@ def execute_batch(
     exchange_rate_cache: dict[str, Any] | None = None,
     posting_policy: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    manual_dependencies = [
+        dependency
+        for dependency in action_batch.get("unresolved_dependencies") or []
+        if isinstance(dependency, dict)
+        and str(dependency.get("kind") or "") == "manual_statement_import_financial_transaction"
+    ]
+    if manual_dependencies:
+        raise SimplbooksError(
+            "Action batch contains a manual statement-import financial dependency; no API action is translated or sent until live discovery/audit proves the import."
+        )
     ordered_actions = stable_execution_order(list(action_batch.get("actions") or []))
     lookup = dict(reference_lookup or {})
     lookup.update(action_lookup(ordered_actions))

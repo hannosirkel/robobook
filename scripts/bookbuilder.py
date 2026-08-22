@@ -21,6 +21,7 @@ from bank_allocations import (
     load_bank_allocations,
     period_allocations,
     statement_identity,
+    validate_reviewed_amounts,
 )
 from document_identity import document_identity, match_existing
 from exchange_rates import ExchangeRateError, lookup_rate
@@ -2212,6 +2213,367 @@ def _allocation_parts(allocation: dict[str, Any]) -> list[tuple[dict[str, Any], 
     return resolved
 
 
+MANUAL_FINANCIAL_DISPOSITIONS = frozenset({"bank_fee_payment", "clearing_transfer"})
+
+
+def _requires_manual_financial_transaction(allocation: dict[str, Any]) -> bool:
+    return any(
+        str(part.get("disposition") or "") in MANUAL_FINANCIAL_DISPOSITIONS
+        for part, _part_number in _allocation_parts(allocation)
+    )
+
+
+def _approved_bank_allocations(
+    *,
+    records: dict[str, list[dict[str, Any]]],
+    allocations: dict[tuple[str, str, str], dict[str, Any]],
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    reviewed: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    if not allocations:
+        return reviewed
+    try:
+        validate_reviewed_amounts(list(allocations.values()))
+    except BankAllocationError as exc:
+        raise SimplbooksError(str(exc)) from exc
+    for record in records.get("bank_transactions", []):
+        if str(record.get("source_system") or "") != "bank":
+            continue
+        key = physical_bank_allocation_key(record)
+        allocation = allocations.get(key)
+        if not allocation or str((allocation.get("review") or {}).get("status") or "") != "approved":
+            continue
+        try:
+            if allocation_key(allocation) != key:
+                raise SimplbooksError(
+                    f"Reviewed allocation key does not match physical bank row {record.get('record_id') or '<unknown>'}."
+                )
+        except BankAllocationError as exc:
+            raise SimplbooksError(str(exc)) from exc
+        physical_amount = decimal_value(record.get("gross_amount"))
+        allocation_amount = decimal_value(allocation.get("amount"))
+        if physical_amount != allocation_amount:
+            raise SimplbooksError(
+                f"Reviewed allocation amount does not match physical bank row {record.get('record_id') or '<unknown>'}."
+            )
+        reviewed.append((record, allocation))
+    return reviewed
+
+
+def build_manual_financial_dependencies(
+    *,
+    normalized_path_display: str,
+    records: dict[str, list[dict[str, Any]]],
+    allocations: dict[tuple[str, str, str], dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Describe UI statement-import work without inventing submit-capable API actions."""
+    dependencies: list[dict[str, Any]] = []
+    for record, allocation in _approved_bank_allocations(records=records, allocations=allocations):
+        if not _requires_manual_financial_transaction(allocation):
+            continue
+        record_id = str(record.get("record_id") or "").strip()
+        statement_id, iban, currency = allocation_key(allocation)
+        physical_amount = decimal_value(record.get("gross_amount"))
+        parts = _allocation_parts(allocation)
+        split_parts = [
+            {
+                "signed_amount": decimal_number(decimal_value(part.get("amount"))),
+                "disposition": str(part.get("disposition") or ""),
+                "target": copy.deepcopy(part.get("target") or {}),
+            }
+            for part, part_number in parts
+            if part_number is not None
+        ]
+        split_proof = None
+        if split_parts:
+            signed_parts_total = sum(
+                (decimal_value(part["signed_amount"]) for part in split_parts),
+                Decimal("0"),
+            )
+            if signed_parts_total != physical_amount:
+                raise SimplbooksError(
+                    f"Reviewed split parts must sum to physical bank row {record_id}: "
+                    f"{signed_parts_total} != {physical_amount}."
+                )
+            split_proof = {
+                "signed_parts_total": decimal_number(signed_parts_total),
+                "physical_signed_amount": decimal_number(physical_amount),
+                "equation": " + ".join(f"{decimal_value(part['signed_amount']):.2f}" for part in split_parts)
+                + f" = {physical_amount:.2f}",
+            }
+        rationale = str((allocation.get("review") or {}).get("rationale") or "").strip()
+        source_ref = source_refs_for_records(normalized_path_display, [record], note=rationale)[0]
+        source_ref["source_kind"] = "physical_bank"
+        dependencies.append(
+            {
+                "kind": "manual_statement_import_financial_transaction",
+                "blocking": True,
+                "reason": (
+                    f"Physical bank row {record_id} requires full SimplBooks statement import and live proof; "
+                    "no public financial-transaction API endpoint is confirmed."
+                ),
+                "statement_id": statement_id,
+                "record_id": record_id,
+                "date": str(record.get("event_date") or ""),
+                "iban": iban,
+                "currency": currency,
+                "physical_signed_amount": decimal_number(physical_amount),
+                "source_ref": source_ref,
+                "reviewed_rationale": rationale,
+                "target": copy.deepcopy(allocation.get("target") or {}),
+                "split_parts": split_parts,
+                "split_proof": split_proof,
+                "statement_import_proof": {
+                    "status": "pending",
+                    "required_evidence": "live_discovery_or_audit",
+                },
+            }
+        )
+    return dependencies
+
+
+def build_direct_sale_actions(
+    *,
+    company_slug: str,
+    period: str,
+    period_end: date,
+    normalized_path_display: str,
+    records: dict[str, list[dict[str, Any]]],
+    base_currency: str,
+    posting_policy: dict[str, Any] | None,
+    allocations: dict[tuple[str, str, str], dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Create reviewed direct-sale invoices and one exact receipt per physical row."""
+    candidates = [
+        (record, allocation)
+        for record, allocation in _approved_bank_allocations(records=records, allocations=allocations)
+        if str(allocation.get("disposition") or "") == "direct_sale_receipt"
+    ]
+    if not candidates:
+        return []
+    if posting_policy is None:
+        raise SimplbooksError("Direct-sale allocations require an explicit generic posting policy.")
+
+    grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
+    for record, allocation in candidates:
+        record_id = str(record.get("record_id") or "").strip()
+        physical_amount = decimal_value(record.get("gross_amount"))
+        if physical_amount <= 0:
+            raise SimplbooksError(f"Direct-sale receipt allocation for {record_id} must be positive.")
+        target = allocation.get("target") or {}
+        if not isinstance(target, dict):
+            raise SimplbooksError(f"Direct-sale target for {record_id} must be an object.")
+        if str(target.get("document_type") or "") != "invoice":
+            raise SimplbooksError(f"Direct-sale target for {record_id} must be an invoice.")
+        description = str(target.get("product_description") or target.get("description") or "").strip()
+        if not description:
+            raise SimplbooksError(f"Direct-sale target for {record_id} requires product_description.")
+        quantity = decimal_value(target.get("quantity"))
+        if quantity <= 0:
+            raise SimplbooksError(f"Direct-sale target for {record_id} requires a positive quantity.")
+        gross_amount = decimal_value(target.get("gross_amount"))
+        if gross_amount != physical_amount:
+            raise SimplbooksError(f"Direct-sale target gross amount must equal physical bank row {record_id}.")
+
+        contact_label = str(target.get("contact_label") or "direct-sale").strip()
+        family = slugify(str(target.get("posting_family") or ""))
+        vat_profile_name = slugify(str(target.get("vat_profile") or ""))
+        if not family or not vat_profile_name:
+            raise SimplbooksError(f"Direct-sale target for {record_id} requires posting_family and vat_profile.")
+        try:
+            contact_id = resolve_contact(posting_policy, role="sales", label=contact_label)
+            income_account_id = resolve_mapping(posting_policy, family=family, field_name="income_account_id")
+            mapped_vat_type_id = resolve_mapping(posting_policy, family=family, field_name="vat_type_id")
+            profile = resolve_sales_vat_profile(
+                posting_policy,
+                event_date=date.fromisoformat(str(record.get("event_date") or "")),
+            )
+            bank_account_id = resolve_bank_account(
+                posting_policy,
+                customer_account=allocation_key(allocation)[1],
+                currency=record_currency(record, base_currency),
+                allow_legacy_single_currency=(
+                    record_currency(record, base_currency).upper() == base_currency.upper()
+                ),
+            )
+        except (PostingPolicyError, ValueError) as exc:
+            raise SimplbooksError(f"Could not resolve direct-sale posting policy for {record_id}: {exc}") from exc
+        if mapped_vat_type_id != str(profile["goods_vat_type_id"]):
+            raise SimplbooksError(
+                f"Direct-sale posting family {family!r} VAT type does not match the transaction-date sales VAT profile."
+            )
+        family_values = (posting_policy.get("mappings") or {}).get(family) or {}
+        mapped_warehouse = family_values.get("warehouse_id")
+        warehouse_id = str(mapped_warehouse) if mapped_warehouse not in (None, "") else None
+        if "warehouse_id" in target:
+            reviewed_warehouse = target.get("warehouse_id")
+            reviewed_warehouse = str(reviewed_warehouse) if reviewed_warehouse not in (None, "") else None
+            if reviewed_warehouse != warehouse_id:
+                raise SimplbooksError(
+                    f"Direct-sale target warehouse for {record_id} does not match posting family {family!r}."
+                )
+        for field, expected in (
+            ("contact_id", contact_id),
+            ("income_account_id", income_account_id),
+            ("vat_type_id", mapped_vat_type_id),
+        ):
+            if target.get(field) not in (None, "") and str(target[field]) != expected:
+                raise SimplbooksError(f"Direct-sale target {field} for {record_id} does not match posting policy.")
+        profile_period = f"{profile['start']}/{profile['end'] or 'open'}"
+        group_key = (
+            period,
+            record_currency(record, base_currency),
+            contact_id,
+            vat_profile_name,
+            profile_period,
+            profile["rate"],
+            mapped_vat_type_id,
+            income_account_id,
+            warehouse_id,
+        )
+        grouped[group_key].append(
+            {
+                "record": record,
+                "allocation": allocation,
+                "description": description,
+                "quantity": quantity,
+                "gross_amount": gross_amount,
+                "bank_account_id": bank_account_id,
+                "family": family,
+                "contact_label": contact_label,
+            }
+        )
+
+    actions: list[dict[str, Any]] = []
+    for group_key, entries in sorted(grouped.items(), key=lambda item: repr(item[0])):
+        (
+            _group_period,
+            currency,
+            contact_id,
+            vat_profile_name,
+            profile_period,
+            vat_rate,
+            vat_type_id,
+            income_account_id,
+            warehouse_id,
+        ) = group_key
+        family = entries[0]["family"]
+        contact_label = entries[0]["contact_label"]
+        digest = hashlib.sha256(json.dumps(group_key, default=str).encode()).hexdigest()[:12]
+        invoice_key = f"{company_slug}-{period}-sales-direct-{digest}"
+        invoice_total = sum((entry["gross_amount"] for entry in entries), Decimal("0"))
+        invoice_vat = sum(
+            (
+                entry["gross_amount"] * decimal_value(vat_rate) / (Decimal("100") + decimal_value(vat_rate))
+            ).quantize(Decimal("0.01"))
+            for entry in entries
+        )
+        lines = []
+        for entry in entries:
+            gross_amount = entry["gross_amount"]
+            vat_amount = (
+                gross_amount * decimal_value(vat_rate) / (Decimal("100") + decimal_value(vat_rate))
+            ).quantize(Decimal("0.01"))
+            lines.append(
+                {
+                    "line_role": "direct_sale_revenue",
+                    "description": entry["description"],
+                    "quantity": decimal_number(entry["quantity"]),
+                    "gross_amount": decimal_number(gross_amount),
+                    "vat_amount_hint": decimal_number(vat_amount),
+                    "suggested_income_account_id": income_account_id,
+                    "suggested_vat_type_id": vat_type_id,
+                    "warehouse_id_hint": warehouse_id,
+                    "record_count": 1,
+                    "vat_profile_name": vat_profile_name,
+                    "vat_profile_rate": vat_rate,
+                    "vat_profile_period": profile_period,
+                }
+            )
+        physical_refs = [
+            {**ref, "source_kind": "physical_bank"}
+            for ref in source_refs_for_records(
+                normalized_path_display,
+                [entry["record"] for entry in entries],
+            )
+        ]
+        invoice_payload = {
+            "draft_schema": "invoice_summary_v1",
+            "document_type": "invoice",
+            "document_date": period_end.isoformat(),
+            "currency": currency,
+            "summary_scope": {
+                "channel_or_source": contact_label,
+                "tax_profile": vat_profile_name,
+                "posting_family": family,
+                "record_count": len(entries),
+            },
+            "totals": {
+                "gross_amount": decimal_number(invoice_total),
+                "vat_amount": decimal_number(invoice_vat),
+                "shipping_amount": 0.0,
+                "fee_amount_observed": 0.0,
+            },
+            "counterparty": {
+                "contact_id": contact_id,
+                "display_name_hint": "Monthly reviewed direct sales",
+            },
+            "posting_policy_family": family,
+            "line_items": lines,
+        }
+        actions.append(
+            make_action(
+                period=period,
+                idempotency_key=invoice_key,
+                action_type="create_invoice_summary",
+                endpoint="invoices/create",
+                payload=invoice_payload,
+                source_refs=physical_refs,
+                reason="Create one monthly invoice for reviewed direct bank sales sharing an exact posting tuple.",
+                confidence="high",
+                depends_on=[],
+                expected_effect="Create one reviewed direct-sale invoice in SimplBooks.",
+                review_notes=[str((entry["allocation"].get("review") or {}).get("rationale") or "") for entry in entries],
+            )
+        )
+        for entry in entries:
+            record = entry["record"]
+            allocation = entry["allocation"]
+            record_id = str(record.get("record_id") or "")
+            receipt_ref = source_refs_for_records(normalized_path_display, [record])[0]
+            receipt_ref["source_kind"] = "physical_bank"
+            actions.append(
+                make_action(
+                    period=period,
+                    idempotency_key=settlement_action_key(company_slug, period, "incoming", record_id),
+                    action_type="create_incoming_summary",
+                    endpoint="incomings/create",
+                    payload={
+                        "draft_schema": "cash_settlement_v1",
+                        "document_type": "incoming",
+                        "document_date": str(record.get("event_date") or ""),
+                        "currency": currency,
+                        "counterparty": {
+                            "contact_id": contact_id,
+                            "display_name_hint": "Reviewed direct sale",
+                        },
+                        "counterparty_hint": entry["contact_label"],
+                        "settlement_family": "direct-sale",
+                        "bank_account_id": entry["bank_account_id"],
+                        "amount": decimal_number(entry["gross_amount"]),
+                        "linked_invoice_action": invoice_key,
+                        "record_count": 1,
+                    },
+                    source_refs=[receipt_ref],
+                    reason=f"Create the exact receipt for reviewed physical direct-sale row {record_id}.",
+                    confidence="high",
+                    depends_on=[invoice_key],
+                    expected_effect=f"Settle direct-sale invoice with physical bank row {record_id}.",
+                    review_notes=[str((allocation.get("review") or {}).get("rationale") or "")],
+                )
+            )
+    return actions
+
+
 def _generated_target_action_key(target: dict[str, Any]) -> str:
     keys = [
         str(target.get(name) or "").strip()
@@ -2317,6 +2679,10 @@ def build_exact_cash_actions(
         if not document_date:
             raise SimplbooksError(f"Physical bank settlement {record_id} requires event_date.")
         currency = record_currency(record, base_currency)
+        if _requires_manual_financial_transaction(allocation) or str(allocation.get("disposition") or "") == "direct_sale_receipt":
+            # The physical row is atomic: dedicated direct-sale handling or one manual
+            # statement-import dependency owns the entire row.
+            continue
         bank_account_id = default_bank_account_id
         notes = list(bank_account_notes)
         if posting_policy is not None:
@@ -2341,9 +2707,6 @@ def build_exact_cash_actions(
                 raise SimplbooksError(f"Receipt settlement allocation for {record_id} must be positive.")
             if disposition in {"generated_purchase_payment", "existing_purchase_payment", "bank_fee_payment"} and part_amount >= 0:
                 raise SimplbooksError(f"Payment settlement allocation for {record_id} must be negative.")
-            if disposition in {"clearing_transfer", "direct_sale_receipt", "bank_fee_payment"}:
-                # These require their dedicated document builders; never manufacture a substitute here.
-                continue
             if disposition in {"generated_invoice_receipt", "existing_invoice_receipt"}:
                 document_type, action_type, endpoint, role, target_kind = "incoming", "create_incoming_summary", "incomings/create", "incoming", "invoice"
             elif disposition in {"generated_purchase_payment", "existing_purchase_payment"}:
@@ -2636,6 +2999,9 @@ def apply_posting_policy(
         if action_type in {"create_invoice_summary", "create_credit_invoice_summary"}:
             role = "sales"
             label = str((payload.get("summary_scope") or {}).get("channel_or_source") or "")
+        elif action_type == "create_incoming_summary" and str(payload.get("settlement_family") or "") == "direct-sale":
+            role = "sales"
+            label = str(payload.get("counterparty_hint") or "")
         elif action_type in {"create_incoming_summary"} or action_type == "create_purchase_summary" and str(payload.get("vendor_hint")) in PROCESSOR_KEYWORDS:
             role = "processors"
             label = str(payload.get("counterparty_hint") or payload.get("vendor_hint") or "")
@@ -2665,10 +3031,16 @@ def apply_posting_policy(
 
         family = ""
         if role == "sales":
-            tax_profile = str((payload.get("summary_scope") or {}).get("tax_profile") or "")
-            if not tax_profile:
-                tax_profile = "taxable" if decimal_value((payload.get("totals") or {}).get("vat_amount")) else "non-taxable"
-            family = f"{slugify(label)}-{slugify(tax_profile)}"
+            explicit_family = str((payload.get("summary_scope") or {}).get("posting_family") or "")
+            if action_type in {"create_invoice_summary", "create_credit_invoice_summary"}:
+                tax_profile = str((payload.get("summary_scope") or {}).get("tax_profile") or "")
+                if not tax_profile:
+                    tax_profile = "taxable" if decimal_value((payload.get("totals") or {}).get("vat_amount")) else "non-taxable"
+                family = (
+                    slugify(explicit_family)
+                    if explicit_family.strip()
+                    else f"{slugify(label)}-{slugify(tax_profile)}"
+                )
         elif action_type == "create_purchase_summary" and role == "processors":
             family = f"fees-{slugify(label)}"
         elif action_type in {"create_purchase_summary", "create_purchase_credit_summary"}:
@@ -2895,6 +3267,16 @@ def build_action_batch(
         mapping_hints=mapping_hints,
         forced_note=forced_note,
     )
+    direct_sale_actions = build_direct_sale_actions(
+        company_slug=company_slug,
+        period=period,
+        period_end=period_end,
+        normalized_path_display=normalized_path_display,
+        records=records,
+        base_currency=base_currency,
+        posting_policy=posting_policy,
+        allocations=bank_allocations or {},
+    )
     cash_actions = build_exact_cash_actions(
         company_slug=company_slug,
         period=period,
@@ -2906,14 +3288,21 @@ def build_action_batch(
         entity_map=entity_map,
         posting_policy=posting_policy,
         allocations=bank_allocations or {},
-        current_actions=sales_actions + fee_actions + purchase_actions + purchase_credit_actions,
+        current_actions=sales_actions + fee_actions + purchase_actions + purchase_credit_actions + direct_sale_actions,
         historical_actions=historical_actions,
         discovery_overviews=discovery_overviews or ([discovery_overview] if discovery_overview else []),
         forced_note=forced_note,
     )
 
-    actions = sales_actions + fee_actions + purchase_actions + purchase_credit_actions + cash_actions
+    actions = sales_actions + fee_actions + purchase_actions + purchase_credit_actions + direct_sale_actions + cash_actions
     unresolved_dependencies = apply_posting_policy(actions, posting_policy=posting_policy)
+    unresolved_dependencies.extend(
+        build_manual_financial_dependencies(
+            normalized_path_display=normalized_path_display,
+            records=records,
+            allocations=bank_allocations or {},
+        )
+    )
     apply_exchange_rate_provenance(
         actions,
         base_currency=base_currency,

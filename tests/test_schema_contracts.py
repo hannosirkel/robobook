@@ -28,6 +28,16 @@ def validate(instance: Any, schema: dict[str, Any], *, root_schema: dict[str, An
     if "$ref" in schema:
         validate(instance, resolve_ref(root_schema, schema["$ref"]), root_schema=root_schema, path=path)
         return
+    for subschema in schema.get("allOf", []):
+        validate(instance, subschema, root_schema=root_schema, path=path)
+    if "if" in schema:
+        try:
+            validate(instance, schema["if"], root_schema=root_schema, path=path)
+        except AssertionError:
+            pass
+        else:
+            if "then" in schema:
+                validate(instance, schema["then"], root_schema=root_schema, path=path)
     if "const" in schema:
         assert instance == schema["const"], f"{path}: expected const {schema['const']!r}"
     if "enum" in schema:
@@ -282,6 +292,30 @@ class SchemaContractTests(unittest.TestCase):
             "actions": [],
         }
         self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=batch)
+
+    def test_action_batch_schema_rejects_manual_financial_dependency_without_statement_binding(self) -> None:
+        batch = {
+            "schema_version": "1.0",
+            "company_slug": "example",
+            "period": "2024-01",
+            "generated_at": "2024-01-01T00:00:00Z",
+            "batch_id": "example-2024-01",
+            "approval_status": "draft",
+            "already_present": [],
+            "unresolved_dependencies": [{
+                "kind": "manual_statement_import_financial_transaction",
+                "blocking": True,
+                "reason": "Statement import required.",
+            }],
+            "reference_artifacts": [
+                {"kind": "posting_policy", "path": "policy.json", "sha256": "0" * 64},
+                {"kind": "discovery_overview", "path": "overview.json", "sha256": "1" * 64},
+            ],
+            "actions": [],
+        }
+
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=batch)
 
     def test_generated_year_overview_matches_strict_schema(self) -> None:
         class EmptyClient:

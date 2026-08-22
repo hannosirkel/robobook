@@ -46,6 +46,9 @@ mapping choices explicit inside the draft payload:
   - one exact reviewed physical-bank receipt, linked to an invoice action or existing invoice ID
 - `payments/create`
   - one exact reviewed physical-bank payment, linked to a purchase action or existing purchase ID
+- `unresolved_dependencies`
+  - one exact blocking manual statement-import financial transaction per bank-fee or clearing row
+  - one atomic dependency containing every signed split part when any part needs manual financial handling
 
 Each payload currently carries a `draft_schema` marker such as `invoice_summary_v1`,
 `purchase_summary_v1`, or `cash_settlement_v1`.
@@ -78,8 +81,11 @@ Each payload currently carries a `draft_schema` marker such as `invoice_summary_
 - generated targets may be current actions or successful prior submissions; existing IDs must be
   proven by a bound discovery overview
 - processor payouts and purchase records remain supporting evidence, never settlement heuristics
-- `clearing_transfer`, direct-sale, and bank-fee dispositions do not create surrogate business
-  documents in this phase
+- direct-sale allocations create API invoices and exact physical-row receipts only from approved
+  generic posting-policy mappings
+- bank-fee and clearing-transfer dispositions never create surrogate API business documents
+- any reviewed split containing manual financial handling suppresses every API cash action for that
+  physical row and proves that signed split parts sum to the statement amount
 
 ## Current Blocking Rule
 

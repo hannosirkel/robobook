@@ -396,6 +396,79 @@ class BookcheckerTests(unittest.TestCase):
 
         self.assertEqual(findings[0]["severity"], "error")
 
+    def test_checker_rejects_manual_financial_dependency_without_statement_proof(self) -> None:
+        dependency = {
+            "kind": "manual_statement_import_financial_transaction",
+            "blocking": True,
+            "statement_id": "archive:fee-1",
+            "record_id": "fee-1",
+            "date": "2024-08-30",
+            "iban": "EE123",
+            "currency": "EUR",
+            "physical_signed_amount": -7.0,
+            "source_ref": {
+                "path": "normalized.json",
+                "record_ref": "fee-1",
+                "source_kind": "physical_bank",
+            },
+            "reviewed_rationale": "Reviewed bank fee.",
+            "split_parts": [],
+            "split_proof": None,
+        }
+
+        findings = bookchecker.evaluate_unresolved_dependencies({"unresolved_dependencies": [dependency]})
+
+        self.assertTrue(any("statement import proof" in item["summary"].lower() for item in findings))
+
+    def test_checker_rejects_manual_financial_dependency_without_statement_ref_binding(self) -> None:
+        dependency = {
+            "kind": "manual_statement_import_financial_transaction",
+            "blocking": True,
+            "statement_id": "archive:fee-1",
+            "record_id": "fee-1",
+            "date": "2024-08-30",
+            "iban": "EE123",
+            "currency": "EUR",
+            "physical_signed_amount": -7.0,
+            "source_ref": {"path": "normalized.json", "record_ref": None},
+            "reviewed_rationale": "Reviewed bank fee.",
+            "split_parts": [],
+            "split_proof": None,
+            "statement_import_proof": {"status": "pending", "required_evidence": "live_discovery_or_audit"},
+        }
+
+        findings = bookchecker.evaluate_unresolved_dependencies({"unresolved_dependencies": [dependency]})
+
+        self.assertTrue(any("statement ref" in item["summary"].lower() for item in findings))
+
+    def test_checker_rejects_manual_financial_dependency_with_bad_split_proof(self) -> None:
+        dependency = {
+            "kind": "manual_statement_import_financial_transaction",
+            "blocking": True,
+            "statement_id": "archive:net-1",
+            "record_id": "net-1",
+            "date": "2024-08-30",
+            "iban": "EE123",
+            "currency": "USD",
+            "physical_signed_amount": 723.32,
+            "source_ref": {
+                "path": "normalized.json",
+                "record_ref": "net-1",
+                "source_kind": "physical_bank",
+            },
+            "reviewed_rationale": "Reviewed net settlement.",
+            "split_parts": [
+                {"signed_amount": 738.32, "disposition": "existing_invoice_receipt", "target": {"simplbooks_id": "119"}},
+                {"signed_amount": -15.0, "disposition": "bank_fee_payment", "target": {"financial_transaction_kind": "fee"}},
+            ],
+            "split_proof": {"signed_parts_total": 722.32, "physical_signed_amount": 723.32},
+            "statement_import_proof": {"status": "pending", "required_evidence": "live_discovery_or_audit"},
+        }
+
+        findings = bookchecker.evaluate_unresolved_dependencies({"unresolved_dependencies": [dependency]})
+
+        self.assertTrue(any("split" in item["summary"].lower() for item in findings))
+
     def test_checker_requires_file_bindings_for_allocated_woo_tax_actions(self) -> None:
         action = allocated_action_fixture(line_rate=24, vat_type_id="34")["actions"][0]
         action["payload"]["line_items"][0]["vat_allocation_component"] = "goods"

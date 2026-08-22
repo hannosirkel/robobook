@@ -266,7 +266,12 @@ def existing_purchase_payment() -> dict:
     return action
 
 
-def make_batch(*, approval_status: str = "approved", actions: list[dict] | None = None) -> dict:
+def make_batch(
+    *,
+    approval_status: str = "approved",
+    actions: list[dict] | None = None,
+    unresolved_dependencies: list[dict] | None = None,
+) -> dict:
     return {
         "schema_version": "1.0",
         "company_slug": "example",
@@ -276,6 +281,7 @@ def make_batch(*, approval_status: str = "approved", actions: list[dict] | None 
         "approval_status": approval_status,
         "source_summary": "test",
         "recon_ref": "companies/example/artifacts/recon/2024-01.json",
+        "unresolved_dependencies": unresolved_dependencies or [],
         "actions": actions or [invoice_action(), incoming_action()],
     }
 
@@ -293,6 +299,63 @@ class FakeClient:
 
 
 class BooksendTests(unittest.TestCase):
+    def test_sender_preserves_reviewed_direct_sale_quantity(self) -> None:
+        action = invoice_action(key="example-2024-01-direct-sale")
+        action["payload"]["totals"].update({"gross_amount": 40.0, "vat_amount": 7.21, "shipping_amount": 0.0})
+        action["payload"]["line_items"] = [{
+            "line_role": "direct_sale_revenue",
+            "description": "Reviewed direct sale",
+            "quantity": 2,
+            "gross_amount": 40.0,
+            "vat_amount_hint": 7.21,
+            "suggested_income_account_id": "3000",
+            "suggested_vat_type_id": "22",
+            "warehouse_id_hint": "6",
+        }]
+
+        translated = booksend.translate_action_for_api(action, lookup={})
+        row = translated["payload"]["Tasks"][0]["Task"]
+
+        self.assertEqual(row["amount"], 2.0)
+        self.assertEqual(row["price_per_unit"], 20.0)
+
+    def test_sender_rejects_manual_financial_dependency_before_any_translation_or_call(self) -> None:
+        dependency = {
+            "kind": "manual_statement_import_financial_transaction",
+            "blocking": True,
+            "statement_id": "archive:fee-1",
+            "record_id": "fee-1",
+            "date": "2024-01-15",
+            "iban": "EE123",
+            "currency": "EUR",
+            "physical_signed_amount": -7.0,
+            "source_ref": {
+                "path": "companies/example/artifacts/normalized/2024-01.json",
+                "record_ref": "fee-1",
+                "source_kind": "physical_bank",
+            },
+            "reviewed_rationale": "Reviewed fee.",
+            "split_parts": [],
+            "split_proof": None,
+            "statement_import_proof": {"status": "pending", "required_evidence": "live_discovery_or_audit"},
+        }
+        client = FakeClient(responses=[{"_http_status": 201, "invoice_id": 501}])
+
+        with self.assertRaisesRegex(SimplbooksError, "manual statement-import"):
+            booksend.execute_batch(
+                action_batch=make_batch(actions=[invoice_action()], unresolved_dependencies=[dependency]),
+                mode="write",
+                client=client,
+            )
+
+        self.assertEqual(client.calls, [])
+
+    def test_sender_rejects_manual_financial_dependency_presented_as_api_action(self) -> None:
+        action = invoice_action(key="example-2024-01-manual-financial")
+        action["action_type"] = "manual_statement_import_financial_transaction"
+
+        with self.assertRaisesRegex(SimplbooksError, "manual statement-import"):
+            booksend.translate_action_for_api(action, lookup={})
     def test_sender_rejects_existing_invoice_id_with_generated_invoice_dependency(self) -> None:
         action = existing_invoice_incoming()
         action["depends_on"] = ["example-2024-01-sales-paypal"]

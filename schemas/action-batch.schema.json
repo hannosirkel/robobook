@@ -63,7 +63,20 @@
     },
     "unresolved_dependencies": {
       "type": "array",
-      "items": {"type": "object"}
+      "items": {
+        "type": "object",
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "kind": {"const": "manual_statement_import_financial_transaction"}
+              },
+              "required": ["kind"]
+            },
+            "then": {"$ref": "#/$defs/manual_financial_dependency"}
+          }
+        ]
+      }
     },
     "reference_artifacts": {
       "type": "array",
@@ -124,6 +137,92 @@
         "source_kind": {
           "type": "string",
           "enum": ["physical_bank"]
+        }
+      }
+    },
+    "manual_financial_split_part": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["signed_amount", "disposition", "target"],
+      "properties": {
+        "signed_amount": {"type": "number"},
+        "disposition": {
+          "type": "string",
+          "enum": [
+            "generated_invoice_receipt",
+            "existing_invoice_receipt",
+            "generated_purchase_payment",
+            "existing_purchase_payment",
+            "direct_sale_receipt",
+            "bank_fee_payment",
+            "clearing_transfer"
+          ]
+        },
+        "target": {"type": "object"}
+      }
+    },
+    "manual_financial_dependency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "blocking",
+        "reason",
+        "statement_id",
+        "record_id",
+        "date",
+        "iban",
+        "currency",
+        "physical_signed_amount",
+        "source_ref",
+        "reviewed_rationale",
+        "target",
+        "split_parts",
+        "split_proof",
+        "statement_import_proof"
+      ],
+      "properties": {
+        "kind": {"const": "manual_statement_import_financial_transaction"},
+        "blocking": {"type": "boolean"},
+        "reason": {"type": "string", "minLength": 1},
+        "statement_id": {"type": "string", "minLength": 1},
+        "record_id": {"type": "string", "minLength": 1},
+        "date": {"type": "string", "format": "date"},
+        "iban": {"type": "string", "minLength": 1},
+        "currency": {"type": "string", "pattern": "^[A-Z]{3}$"},
+        "physical_signed_amount": {"type": "number"},
+        "source_ref": {"$ref": "#/$defs/source_ref"},
+        "reviewed_rationale": {"type": "string", "minLength": 1},
+        "target": {"type": "object"},
+        "split_parts": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/manual_financial_split_part"}
+        },
+        "split_proof": {
+          "oneOf": [
+            {"type": "null"},
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["signed_parts_total", "physical_signed_amount", "equation"],
+              "properties": {
+                "signed_parts_total": {"type": "number"},
+                "physical_signed_amount": {"type": "number"},
+                "equation": {"type": "string", "minLength": 1}
+              }
+            }
+          ]
+        },
+        "statement_import_proof": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "required_evidence"],
+          "properties": {
+            "status": {"type": "string", "enum": ["pending", "verified"]},
+            "required_evidence": {"const": "live_discovery_or_audit"},
+            "simplbooks_transaction_id": {"type": "string", "minLength": 1},
+            "evidence_ref": {"type": "string", "minLength": 1}
+          }
         }
       }
     },

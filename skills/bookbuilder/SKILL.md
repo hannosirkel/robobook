@@ -61,6 +61,9 @@ Implemented draft actions:
 - purchase-expense summaries via `purchases/create`
 - exact statement-row incoming settlements via `incomings/create`
 - exact statement-row purchase payments via `payments/create`
+- reviewed direct-sale monthly invoices plus exact statement-row receipts
+- blocking manual statement-import financial dependencies for bank fees, clearing transfers, and
+  atomic netted-fee rows
 
 ## Guardrails
 
@@ -68,7 +71,9 @@ Implemented draft actions:
 - Keep `approval_status` as `draft`.
 - Never hide missing account, VAT, contact, or bank mappings; carry them in `review_notes`.
 - Never infer a cash action from payout, amount, or counterparty heuristics. A reviewed allocation must bind it to one exact generated or existing target.
-- Do not translate `clearing_transfer` into a business document; it remains for full-statement import.
+- Never manufacture purchases, payments, or incomings for bank fees, clearing transfers, or a
+  physical row whose reviewed split includes manual financial handling. Emit one blocking manual
+  statement-import dependency containing the whole row and every signed split part.
 - Prefer month summaries over per-order drafts unless later evidence requires finer granularity.
 
 ## References

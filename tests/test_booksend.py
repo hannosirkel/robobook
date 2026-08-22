@@ -390,6 +390,35 @@ class BooksendTests(unittest.TestCase):
 
         self.assertEqual(client.calls, [])
 
+    def test_sender_rejects_invalid_verified_manual_dependency_dispositions_before_any_call(self) -> None:
+        cases: list[tuple[str, dict]] = []
+        for disposition, amount in (("existing_invoice_receipt", 7.0), ("generated_purchase_payment", -7.0)):
+            dependency = manual_financial_dependency(status="verified", blocking=False)
+            dependency.update({"disposition": disposition, "physical_signed_amount": amount})
+            cases.append((disposition, dependency))
+        split_dependency = manual_financial_dependency(status="verified", blocking=False)
+        split_dependency.update({
+            "disposition": "reviewed_split",
+            "physical_signed_amount": 10.0,
+            "split_parts": [
+                {"signed_amount": 20.0, "disposition": "existing_invoice_receipt", "target": {"simplbooks_id": "119"}},
+                {"signed_amount": -10.0, "disposition": "generated_purchase_payment", "target": {"action_key": "purchase-1"}},
+            ],
+            "split_proof": {"signed_parts_total": 10.0, "physical_signed_amount": 10.0, "equation": "20.00 + -10.00 = 10.00"},
+        })
+        cases.append(("reviewed_split_without_manual_part", split_dependency))
+
+        for label, dependency in cases:
+            with self.subTest(label=label):
+                client = FakeClient(responses=[{"_http_status": 201, "invoice_id": 501}])
+                with self.assertRaisesRegex(SimplbooksError, "manual statement-import"):
+                    booksend.execute_batch(
+                        action_batch=make_batch(actions=[invoice_action()], unresolved_dependencies=[dependency]),
+                        mode="write",
+                        client=client,
+                    )
+                self.assertEqual(client.calls, [])
+
     def test_sender_rejects_manual_financial_dependency_presented_as_api_action(self) -> None:
         action = invoice_action(key="example-2024-01-manual-financial")
         action["action_type"] = "manual_statement_import_financial_transaction"

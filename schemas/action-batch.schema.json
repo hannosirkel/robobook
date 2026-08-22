@@ -189,11 +189,6 @@
         "disposition": {
           "type": "string",
           "enum": [
-            "generated_invoice_receipt",
-            "existing_invoice_receipt",
-            "generated_purchase_payment",
-            "existing_purchase_payment",
-            "direct_sale_receipt",
             "bank_fee_payment",
             "clearing_transfer",
             "reviewed_split"
@@ -267,6 +262,25 @@
               "statement_import_proof": {
                 "properties": {"status": {"const": "verified"}},
                 "required": ["status", "simplbooks_transaction_id", "evidence_ref"]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {"disposition": {"const": "reviewed_split"}},
+            "required": ["disposition"]
+          },
+          "then": {
+            "properties": {
+              "split_parts": {
+                "minItems": 1,
+                "contains": {
+                  "properties": {
+                    "disposition": {"enum": ["bank_fee_payment", "clearing_transfer"]}
+                  },
+                  "required": ["disposition"]
+                }
               }
             }
           }

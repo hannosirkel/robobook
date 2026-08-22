@@ -75,6 +75,15 @@ def validate(instance: Any, schema: dict[str, Any], *, root_schema: dict[str, An
         if "items" in schema:
             for index, item in enumerate(instance):
                 validate(item, schema["items"], root_schema=root_schema, path=f"{path}[{index}]")
+        if "contains" in schema:
+            matching_items = 0
+            for index, item in enumerate(instance):
+                try:
+                    validate(item, schema["contains"], root_schema=root_schema, path=f"{path}[{index}]")
+                except AssertionError:
+                    continue
+                matching_items += 1
+            assert matching_items >= schema.get("minContains", 1), f"{path}: contains match count is too small"
 
     if isinstance(instance, dict):
         if "minProperties" in schema:
@@ -355,6 +364,62 @@ class SchemaContractTests(unittest.TestCase):
             "simplbooks_transaction_id": "txn-501",
             "evidence_ref": "audit/2024-01#txn-501",
         }
+        self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=batch)
+
+    def test_action_batch_schema_restricts_top_level_manual_financial_dispositions(self) -> None:
+        dependency = {
+            "kind": "manual_statement_import_financial_transaction",
+            "blocking": False,
+            "reason": "Statement import completed.",
+            "disposition": "bank_fee_payment",
+            "statement_id": "archive:fee-1",
+            "record_id": "fee-1",
+            "date": "2024-01-15",
+            "iban": "EE123",
+            "currency": "EUR",
+            "physical_signed_amount": -7.0,
+            "source_ref": {"path": "normalized.json", "record_ref": "fee-1", "source_kind": "physical_bank"},
+            "reviewed_rationale": "Reviewed fee.",
+            "target": {"financial_transaction_kind": "bank-fee"},
+            "split_parts": [],
+            "split_proof": None,
+            "statement_import_proof": {
+                "status": "verified", "required_evidence": "live_discovery_or_audit",
+                "simplbooks_transaction_id": "txn-501", "evidence_ref": "audit/2024-01#txn-501",
+            },
+        }
+        batch = {
+            "schema_version": "1.0", "company_slug": "example", "period": "2024-01",
+            "generated_at": "2024-01-01T00:00:00Z", "batch_id": "example-2024-01",
+            "approval_status": "draft", "already_present": [], "unresolved_dependencies": [dependency],
+            "reference_artifacts": [
+                {"kind": "posting_policy", "path": "policy.json", "sha256": "0" * 64},
+                {"kind": "discovery_overview", "path": "overview.json", "sha256": "1" * 64},
+            ], "actions": [],
+        }
+
+        for disposition in ("existing_invoice_receipt", "generated_purchase_payment"):
+            with self.subTest(disposition=disposition):
+                dependency["disposition"] = disposition
+                with self.assertRaises(AssertionError):
+                    self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=batch)
+
+        dependency.update({
+            "disposition": "reviewed_split",
+            "physical_signed_amount": 10.0,
+            "split_parts": [
+                {"signed_amount": 20.0, "disposition": "existing_invoice_receipt", "target": {"simplbooks_id": "119"}},
+                {"signed_amount": -10.0, "disposition": "generated_purchase_payment", "target": {"action_key": "purchase-1"}},
+            ],
+            "split_proof": {"signed_parts_total": 10.0, "physical_signed_amount": 10.0, "equation": "20.00 + -10.00 = 10.00"},
+        })
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=batch)
+
+        dependency["split_parts"][1].update({
+            "disposition": "bank_fee_payment",
+            "target": {"financial_transaction_kind": "fee"},
+        })
         self.assert_artifact_valid(schema_name="action-batch.schema.json", artifact=batch)
 
     def test_generated_year_overview_matches_strict_schema(self) -> None:

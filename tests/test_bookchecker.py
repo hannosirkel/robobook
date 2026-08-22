@@ -527,6 +527,33 @@ class BookcheckerTests(unittest.TestCase):
 
         self.assertTrue(any("bank_fee_payment" in item["summary"] and "negative" in item["summary"] for item in findings))
 
+    def test_checker_rejects_api_owned_top_level_manual_dependency_dispositions(self) -> None:
+        cases = (("existing_invoice_receipt", 7.0), ("generated_purchase_payment", -7.0))
+        for disposition, amount in cases:
+            with self.subTest(disposition=disposition):
+                dependency = manual_financial_dependency()
+                dependency.update({"disposition": disposition, "physical_signed_amount": amount})
+
+                findings = bookchecker.evaluate_unresolved_dependencies({"unresolved_dependencies": [dependency]})
+
+                self.assertTrue(any("top-level" in item["summary"] for item in findings))
+
+    def test_checker_requires_manual_financial_part_in_reviewed_split_dependency(self) -> None:
+        dependency = manual_financial_dependency()
+        dependency.update({
+            "disposition": "reviewed_split",
+            "physical_signed_amount": 10.0,
+            "split_parts": [
+                {"signed_amount": 20.0, "disposition": "existing_invoice_receipt", "target": {"simplbooks_id": "119"}},
+                {"signed_amount": -10.0, "disposition": "generated_purchase_payment", "target": {"action_key": "purchase-1"}},
+            ],
+            "split_proof": {"signed_parts_total": 10.0, "physical_signed_amount": 10.0, "equation": "20.00 + -10.00 = 10.00"},
+        })
+
+        findings = bookchecker.evaluate_unresolved_dependencies({"unresolved_dependencies": [dependency]})
+
+        self.assertTrue(any("manual-financial part" in item["summary"] for item in findings))
+
     def test_checker_resolves_manual_dependency_against_physical_bank_record(self) -> None:
         mutations = {
             "statement_id": lambda dep: dep.update(statement_id="archive:forged"),

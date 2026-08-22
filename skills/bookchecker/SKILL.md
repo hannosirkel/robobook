@@ -59,6 +59,8 @@ Implemented deterministic checks:
 - policy-driven historical outlier warnings
 - manual statement-import proof state, signed disposition direction, and independent identity/economic
   comparison with the referenced normalized physical bank row
+- manual dependency top-level disposition scope, including the requirement that `reviewed_split`
+  contains at least one bank-fee or clearing-transfer part
 
 ## Guardrails
 

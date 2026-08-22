@@ -49,6 +49,8 @@ mapping choices explicit inside the draft payload:
 - `unresolved_dependencies`
   - one exact blocking manual statement-import financial transaction per bank-fee or clearing row
   - one atomic dependency containing every signed split part when any part needs manual financial handling
+  - top-level disposition is limited to `bank_fee_payment`, `clearing_transfer`, or `reviewed_split`;
+    API-owned receipt/payment dispositions appear only inside a split that contains a fee or transfer part
   - pending proof remains blocking; later verified proof retains the SimplBooks transaction ID and
     discovery/audit evidence reference before it can become non-blocking
 

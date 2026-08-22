@@ -921,7 +921,12 @@ def evaluate_exchange_rates(
 
 def manual_financial_dependency_errors(dependency: dict[str, Any]) -> list[str]:
     errors: list[str] = []
-    allowed_dispositions = {
+    allowed_top_level_dispositions = {
+        "bank_fee_payment",
+        "clearing_transfer",
+        "reviewed_split",
+    }
+    allowed_split_dispositions = {
         "generated_invoice_receipt",
         "existing_invoice_receipt",
         "generated_purchase_payment",
@@ -929,7 +934,6 @@ def manual_financial_dependency_errors(dependency: dict[str, Any]) -> list[str]:
         "direct_sale_receipt",
         "bank_fee_payment",
         "clearing_transfer",
-        "reviewed_split",
     }
     required_text = (
         "reason",
@@ -944,8 +948,11 @@ def manual_financial_dependency_errors(dependency: dict[str, Any]) -> list[str]:
     for field in required_text:
         if not str(dependency.get(field) or "").strip():
             errors.append(f"Manual financial dependency requires {field}.")
-    if str(dependency.get("disposition") or "") not in allowed_dispositions:
-        errors.append("Manual financial dependency disposition is invalid.")
+    if str(dependency.get("disposition") or "") not in allowed_top_level_dispositions:
+        errors.append(
+            "Manual financial dependency top-level disposition must be bank_fee_payment, "
+            "clearing_transfer, or reviewed_split."
+        )
     try:
         date.fromisoformat(str(dependency.get("date") or ""))
     except ValueError:
@@ -999,6 +1006,7 @@ def manual_financial_dependency_errors(dependency: dict[str, Any]) -> list[str]:
             errors.append("Manual financial dependency with split parts must use reviewed_split disposition.")
         signed_total = Decimal("0")
         signed_part_amounts: list[Decimal] = []
+        has_manual_financial_part = False
         for part in split_parts:
             if not isinstance(part, dict) or not str(part.get("disposition") or "") or not isinstance(part.get("target"), dict):
                 errors.append("Manual financial dependency split parts require disposition and target.")
@@ -1013,10 +1021,18 @@ def manual_financial_dependency_errors(dependency: dict[str, Any]) -> list[str]:
                 errors.append("Manual financial dependency split part requires an exact signed amount.")
                 continue
             disposition = str(part.get("disposition") or "")
+            if disposition not in allowed_split_dispositions:
+                errors.append("Manual financial dependency split part disposition is invalid.")
+            if disposition in {"bank_fee_payment", "clearing_transfer"}:
+                has_manual_financial_part = True
             if disposition in {"generated_invoice_receipt", "existing_invoice_receipt", "direct_sale_receipt"} and part_amount <= 0:
                 errors.append(f"Manual financial dependency {disposition} split part must be positive.")
             if disposition in {"generated_purchase_payment", "existing_purchase_payment", "bank_fee_payment"} and part_amount >= 0:
                 errors.append(f"Manual financial dependency {disposition} split part must be negative.")
+        if not has_manual_financial_part:
+            errors.append(
+                "Manual financial dependency reviewed_split requires at least one manual-financial part."
+            )
         if signed_total != physical_amount:
             errors.append("Manual financial dependency split parts do not sum to the physical signed amount.")
         try:

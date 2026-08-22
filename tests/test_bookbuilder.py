@@ -627,6 +627,30 @@ class BookbuilderTests(unittest.TestCase):
         self.assertEqual(action["payload"]["linked_invoice_id"], "119")
         self.assertEqual(action["source_refs"][0]["record_ref"], "receipt")
 
+    def test_existing_invoice_receipt_uses_sales_contact_policy(self) -> None:
+        allocation = existing_invoice_allocation(record_id="receipt", invoice_id="119")
+        allocation["target"].update({"contact_id": "31", "counterparty_hint": "brain-games"})
+        policy = {
+            "bank_accounts": {"EE123": {"EUR": "3"}},
+            "contacts": {
+                "sales": {"brain-games": "31"},
+                "processors": {},
+                "suppliers": {},
+            },
+            "mappings": {},
+        }
+
+        batch = build_with(
+            bank=bank_row(record_id="receipt", amount=330.0, event_date="2024-01-08"),
+            allocation=allocation,
+            posting_policy=policy,
+            discovery_overviews=[{"document_index": [{"simplbooks_id": "119", "document_type": "invoice"}]}],
+        )
+
+        action = find_action(batch, "create_incoming_summary")
+        self.assertEqual(action["payload"]["counterparty"]["contact_id"], "31")
+        self.assertFalse(any(item.get("kind") == "contact_mapping" for item in batch["unresolved_dependencies"]))
+
     def test_multiple_bank_receipts_create_multiple_actions_against_one_invoice(self) -> None:
         normalized = base_normalized("2024-08")
         rows = [

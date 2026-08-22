@@ -796,7 +796,6 @@ def evaluate_account_vat(
     for line in action_line_items(action):
         line_role = str(line.get("line_role") or "line")
         gross_amount = abs(decimal_value(line.get("gross_amount")))
-        vat_amount_hint = abs(decimal_value(line.get("vat_amount_hint")))
         income_account_id = line.get("suggested_income_account_id")
         expense_account_id = line.get("suggested_expense_account_id")
         vat_type_id = line.get("suggested_vat_type_id")
@@ -1437,7 +1436,7 @@ def evaluate_bank_statement_completeness(
                 summary=f"duplicate physical bank coverage: expected {expected_count} terminal coverage item(s), found {len(items)}.",
                 action_id=str(record.get("record_id") or "") or None,
             ))
-        actual_total = sum((item["amount"] for item in items), Decimal("0"))
+        actual_total = sum((item["amount"] for item in items), Decimal(0))
         if actual_total != decimal_value(record.get("gross_amount")):
             findings.append(make_finding(
                 section="bank_statement_completeness", severity="error",
@@ -1736,7 +1735,7 @@ def evaluate_inventory_quantities(
                 line_quantity = decimal_value(line.get("quantity"))
                 proof_quantity = decimal_value(proof.get("quantity"))
             except SimplbooksError:
-                line_quantity = proof_quantity = Decimal("0")
+                line_quantity = proof_quantity = Decimal(0)
             if proof.get("status") != "exact" or line_quantity <= 0 or proof_quantity != line_quantity:
                 problems.append("Inventory article line and proof require the same exact positive quantity.")
             if not contributors:
@@ -1744,7 +1743,7 @@ def evaluate_inventory_quantities(
             if not scope or _canonical_value_sha256(scope) != str(proof.get("scope_sha256") or ""):
                 problems.append("Inventory quantity proof scope hash does not match its declared scope.")
         seen: set[str] = set()
-        contributor_total = Decimal("0")
+        contributor_total = Decimal(0)
         for contributor in contributors:
             if not isinstance(contributor, dict) or set(contributor) != {
                 "record_id", "quantity", "quantity_source", "record_sha256"
@@ -1759,7 +1758,7 @@ def evaluate_inventory_quantities(
             try:
                 quantity = decimal_value(contributor.get("quantity"))
             except SimplbooksError:
-                quantity = Decimal("0")
+                quantity = Decimal(0)
             if quantity <= 0:
                 problems.append("Inventory quantity contributor must be positive.")
                 continue
@@ -1775,7 +1774,7 @@ def evaluate_inventory_quantities(
                 try:
                     source_quantity = decimal_value(record.get("quantity"))
                 except SimplbooksError:
-                    source_quantity = Decimal("0")
+                    source_quantity = Decimal(0)
                 if source_quantity <= 0 or source_quantity != quantity:
                     problems.append(f"Inventory quantity contributor {record_id} does not match normalized quantity.")
             elif source == "reviewed_allocation_target":
@@ -1784,7 +1783,7 @@ def evaluate_inventory_quantities(
                 try:
                     allocated_quantity = decimal_value((target or {}).get("quantity"))
                 except SimplbooksError:
-                    allocated_quantity = Decimal("0")
+                    allocated_quantity = Decimal(0)
                 if not isinstance(target, dict) or allocated_quantity <= 0 or allocated_quantity != quantity:
                     problems.append(f"Inventory quantity contributor {record_id} does not match reviewed allocation target.")
             else:
@@ -1816,7 +1815,7 @@ def evaluate_inventory_quantities(
                 try:
                     quantity = decimal_value(quantity_value)
                 except SimplbooksError:
-                    quantity = Decimal("0")
+                    quantity = Decimal(0)
                 if quantity <= 0:
                     problems.append("Inventory semantic scope contains a record without exact positive quantity.")
                     continue
@@ -1922,7 +1921,7 @@ def manual_financial_dependency_errors(
         if not physical_amount.is_finite() or physical_amount.quantize(Decimal("0.01")) != physical_amount:
             raise ValueError
     except (SimplbooksError, ValueError):
-        physical_amount = Decimal("0")
+        physical_amount = Decimal(0)
         errors.append("Manual financial dependency requires an exact physical signed amount.")
 
     source_ref = dependency.get("source_ref")
@@ -1961,7 +1960,7 @@ def manual_financial_dependency_errors(
     elif split_parts:
         if str(dependency.get("disposition") or "") != "reviewed_split":
             errors.append("Manual financial dependency with split parts must use reviewed_split disposition.")
-        signed_total = Decimal("0")
+        signed_total = Decimal(0)
         signed_part_amounts: list[Decimal] = []
         has_manual_financial_part = False
         for part in split_parts:

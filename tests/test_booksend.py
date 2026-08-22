@@ -652,7 +652,7 @@ class BooksendTests(unittest.TestCase):
                     "kind": "reviewed_direct_sale_allocation", "period": "2024-01",
                     "record_category": "bank_transactions", "statement_id": "archive:sale:1",
                 },
-                quantity=Decimal("2"),
+                quantity=Decimal(2),
                 contributors=[{
                     "record_id": "source:sale:1", "quantity": 2,
                     "quantity_source": "reviewed_allocation_target", "record_sha256": "a" * 64,
@@ -687,7 +687,7 @@ class BooksendTests(unittest.TestCase):
                     "record_category": "sales", "group_label": "woo",
                     "currency": "EUR", "tax_profile": "non_taxable",
                 },
-                quantity=Decimal("2"),
+                quantity=Decimal(2),
                 contributors=[
                     {"record_id": "woo:1", "quantity": 1, "quantity_source": "normalized_record", "record_sha256": "a" * 64},
                     {"record_id": "woo:1", "quantity": 1, "quantity_source": "normalized_record", "record_sha256": "a" * 64},
@@ -709,7 +709,7 @@ class BooksendTests(unittest.TestCase):
                     "record_category": "sales", "group_label": "woo",
                     "currency": "EUR", "tax_profile": "non_taxable",
                 },
-                quantity=Decimal("1"),
+                quantity=Decimal(1),
                 contributors=[{
                     "record_id": "woo:1", "quantity": 1,
                     "quantity_source": "normalized_record", "record_sha256": "a" * 64,

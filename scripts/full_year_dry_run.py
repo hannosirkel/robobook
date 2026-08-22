@@ -234,9 +234,11 @@ def summarize_bank_reconciliation_artifacts(
         run_state = (period_states or {}).get(period)
         if period_states is not None and run_state not in {"processed", "skipped_submitted"}:
             raise SimplbooksError(f"Period {period} was not successfully processed or frozen during this run.")
-        if run_state == "skipped_submitted" or str(action_batch.get("approval_status") or "") == "submitted":
-            if submitted_month_state(company_dir=company_dir, period=period) != "submitted":
-                raise SimplbooksError(f"Frozen period {period} lacks a successful submitted identity.")
+        if (
+            run_state == "skipped_submitted"
+            or str(action_batch.get("approval_status") or "") == "submitted"
+        ) and submitted_month_state(company_dir=company_dir, period=period) != "submitted":
+            raise SimplbooksError(f"Frozen period {period} lacks a successful submitted identity.")
 
         reconciliation_bindings = [
             binding

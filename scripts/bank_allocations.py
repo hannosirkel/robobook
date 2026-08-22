@@ -7,7 +7,7 @@ import hashlib
 import json
 import re
 from datetime import date
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +16,6 @@ from statement_import_evidence import (
     evidence_identity_errors,
     load_bound_evidence,
 )
-
 
 DISPOSITIONS = {
     "generated_invoice_receipt",
@@ -232,7 +231,7 @@ def validate_reviewed_amounts(allocations: list[dict[str, Any]]) -> None:
         amount = _decimal(allocation.get("amount"), label="Bank allocation amount")
         amounts = allocation_amounts(allocation)
         if disposition == "reviewed_split":
-            if sum(amounts, Decimal("0")).quantize(CENT) != amount.quantize(CENT):
+            if sum(amounts, Decimal(0)).quantize(CENT) != amount.quantize(CENT):
                 raise BankAllocationError("reviewed_split part amounts must sum to the allocation amount at €0.01 precision.")
         elif "parts" in allocation:
             raise BankAllocationError("Only reviewed_split allocations may contain parts.")

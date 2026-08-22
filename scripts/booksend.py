@@ -527,7 +527,7 @@ def inventory_quantity_proof_errors(action: dict[str, Any], line: dict[str, Any]
     contributors = proof.get("contributors")
     if not isinstance(contributors, list) or not contributors:
         return ["contributors are required"]
-    total = Decimal("0")
+    total = Decimal(0)
     seen: set[str] = set()
     for contributor in contributors:
         if not isinstance(contributor, dict) or set(contributor) != {
@@ -565,7 +565,7 @@ def inventory_quantity_proof_errors(action: dict[str, Any], line: dict[str, Any]
         return ["semantic scope shape is invalid"]
     if scope.get("record_category") not in {"sales", "refunds", "bank_transactions"}:
         return ["semantic scope record category is invalid"]
-    canonical = lambda value: hashlib.sha256(  # noqa: E731
+    canonical = lambda value: hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     ).hexdigest()
     if canonical(scope) != str(proof.get("scope_sha256") or ""):
@@ -1141,12 +1141,13 @@ def load_existing_submission(
     freeze_required = existing.get("mode") == "write" and (
         bool(successful_write_sha) or current_batch_status == "submitted"
     )
-    if freeze_required:
-        if not successful_write_sha or successful_write_sha != file_sha256(action_path):
-            raise SimplbooksError(
-                "The submitted batch is immutable: its successful action-file SHA does not match "
-                f"the current YAML at {action_path}."
-            )
+    if freeze_required and (
+        not successful_write_sha or successful_write_sha != file_sha256(action_path)
+    ):
+        raise SimplbooksError(
+            "The submitted batch is immutable: its successful action-file SHA does not match "
+            f"the current YAML at {action_path}."
+        )
 
     return existing
 

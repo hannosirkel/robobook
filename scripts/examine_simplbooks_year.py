@@ -144,9 +144,6 @@ def cash_document_index_entry(record: dict[str, Any], *, document_type: str) -> 
 
 
 def build_year_overview(client: SimplbooksClient, *, year: int) -> dict[str, Any]:
-    start = f"{year}-01-01"
-    end = f"{year}-12-31"
-
     financial_accounts = [
         unwrap_single_key(item)[1]
         for item in client.paginate("financial_accounts/list")

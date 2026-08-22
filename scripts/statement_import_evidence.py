@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -72,8 +72,8 @@ def validate_evidence_shape(payload: Any) -> dict[str, Any]:
     if not re.fullmatch(r"\d{4}-\d{2}", _text(payload.get("period"))):
         raise StatementImportEvidenceError("Statement-import evidence period is invalid.")
     try:
-        datetime.strptime(_text(payload.get("transaction_date")), "%Y-%m-%d")
-        datetime.fromisoformat(_text(payload.get("captured_at")).replace("Z", "+00:00"))
+        date.fromisoformat(_text(payload.get("transaction_date")))
+        datetime.fromisoformat(_text(payload.get("captured_at")))
     except ValueError as exc:
         raise StatementImportEvidenceError("Statement-import evidence date/timestamp is invalid.") from exc
     if not re.fullmatch(r"[A-Z]{3}", _text(payload.get("currency"))):

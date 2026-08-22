@@ -439,7 +439,7 @@ def _allocation_amount_matches(allocation: dict[str, Any], expected: Decimal) ->
         parts = allocation.get("parts")
         if not isinstance(parts, list) or not parts:
             return False
-        return sum((decimal_value(part.get("amount")) for part in parts if isinstance(part, dict)), Decimal("0")) == amount
+        return sum((decimal_value(part.get("amount")) for part in parts if isinstance(part, dict)), Decimal(0)) == amount
     except SimplbooksError:
         return False
 
@@ -570,7 +570,7 @@ def build_physical_bank_coverage_check(
         canonical_allocations[key] = allocation
 
     exact_allocated_keys: set[tuple[str, str, str]] = set()
-    allocation_total = Decimal("0")
+    allocation_total = Decimal(0)
     for key, (record, _) in indexed.items():
         statement_id = key[0]
         allocation = canonical_allocations.get(key)
@@ -631,8 +631,8 @@ def build_physical_bank_coverage_check(
                 "unallocated_row_count": sum(
                     1 for record in rows if (statement_identity(record), *bank_ledger_key(record)) not in exact_allocated_keys
                 ),
-                "credit_total": decimal_number(sum((max(decimal_value(row.get("gross_amount")), Decimal("0")) for row in rows), Decimal("0"))),
-                "debit_total": decimal_number(sum((min(decimal_value(row.get("gross_amount")), Decimal("0")) for row in rows), Decimal("0"))),
+                "credit_total": decimal_number(sum((max(decimal_value(row.get("gross_amount")), Decimal(0)) for row in rows), Decimal(0))),
+                "debit_total": decimal_number(sum((min(decimal_value(row.get("gross_amount")), Decimal(0)) for row in rows), Decimal(0))),
                 "net_movement": decimal_number(movement),
                 "camt_opening_balance": decimal_number(opening),
                 "computed_closing_balance": decimal_number(computed),
@@ -649,9 +649,9 @@ def build_physical_bank_coverage_check(
         "physical_bank_row_count": len(indexed),
         "allocated_row_count": len(exact_allocated_keys),
         "unallocated_row_count": len(indexed) - len(exact_allocated_keys),
-        "credit_total": decimal_number(sum((max(decimal_value(record.get("gross_amount")), Decimal("0")) for record, _ in indexed.values()), Decimal("0"))),
-        "debit_total": decimal_number(sum((min(decimal_value(record.get("gross_amount")), Decimal("0")) for record, _ in indexed.values()), Decimal("0"))),
-        "net_movement": decimal_number(sum((decimal_value(record.get("gross_amount")) for record, _ in indexed.values()), Decimal("0"))),
+        "credit_total": decimal_number(sum((max(decimal_value(record.get("gross_amount")), Decimal(0)) for record, _ in indexed.values()), Decimal(0))),
+        "debit_total": decimal_number(sum((min(decimal_value(record.get("gross_amount")), Decimal(0)) for record, _ in indexed.values()), Decimal(0))),
+        "net_movement": decimal_number(sum((decimal_value(record.get("gross_amount")) for record, _ in indexed.values()), Decimal(0))),
         "ledgers": ledgers,
     }
     if errors:
@@ -672,10 +672,10 @@ def build_physical_bank_coverage_check(
             name="Physical bank allocation coverage",
             status=status,
             lhs_label="Physical bank net movement",
-            lhs_amount=sum((decimal_value(record.get("gross_amount")) for record, _ in indexed.values()), Decimal("0")),
+            lhs_amount=sum((decimal_value(record.get("gross_amount")) for record, _ in indexed.values()), Decimal(0)),
             rhs_label="Exactly allocated bank net movement",
             rhs_amount=allocation_total,
-            delta=sum((decimal_value(record.get("gross_amount")) for record, _ in indexed.values()), Decimal("0")) - allocation_total,
+            delta=sum((decimal_value(record.get("gross_amount")) for record, _ in indexed.values()), Decimal(0)) - allocation_total,
             notes=notes,
             evidence_refs=[make_artifact_ref(normalized_path_display, record_refs_list=record_refs(list(bank_records)))],
         ),
@@ -737,7 +737,7 @@ def _validated_clearing_allocation_references(
         }
         if len(evidence_by_id) != len(evidence) or set(normalized_refs) != set(evidence_by_id):
             continue
-        computed_totals: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
+        computed_totals: dict[str, Decimal] = defaultdict(lambda: Decimal(0))
         valid = True
         for ref in refs:
             record = clearing_records.get(str(ref))
@@ -786,7 +786,7 @@ def _validated_clearing_allocation_references(
             continue
         bridge_total = sum(
             (decimal_value((record or {}).get("gross_amount")) for record in bridge_records),
-            Decimal("0"),
+            Decimal(0),
         )
         physical_amount = decimal_value(allocation.get("amount"))
         bridge_currencies = {record_currency(record or {}) for record in bridge_records}
@@ -876,7 +876,7 @@ def _clearing_equations_explain_claimed_records(
                 return False
             reference_id = str(equation.get("reference_id") or "")
             currencies = {record_currency(record or {}) for record in records}
-            total = sum((decimal_value((record or {}).get("gross_amount")) for record in records), Decimal("0"))
+            total = sum((decimal_value((record or {}).get("gross_amount")) for record in records), Decimal(0))
             if (
                 not reference_id
                 or any(reference_id not in {

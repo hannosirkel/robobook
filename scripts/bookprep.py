@@ -206,11 +206,26 @@ def source_type_from_path(path: Path) -> str:
     return mapping.get(final, "other")
 
 
-def canonical_group_for_path(path: Path) -> str:
+def canonical_group_for_path(path: Path, *, root_dir: Path | None = None) -> str:
+    """Name the group of files that describe the same thing in different formats.
+
+    The group is scoped to the directory the file sits in. Two files called `Wallet.csv`
+    in different source packs, or two half-year exports in sibling folders, are separate
+    evidence rather than competing descriptions of one thing -- without the scope the
+    later path silently suppresses the earlier, and a whole period reads as empty.
+    """
     current = Path(path.name)
     while current.suffix.lower() in {".gsheet", ".csv", ".xml", ".xls", ".xlsx", ".pdf", ".json"}:
         current = Path(current.stem)
-    return slugify(current.name)
+    stem = slugify(current.name)
+    if root_dir is None:
+        return stem
+    try:
+        parent = path.resolve().parent.relative_to(root_dir.resolve())
+    except ValueError:
+        return stem
+    scope = slugify(str(parent)) if parent.parts else ""
+    return f"{scope}:{stem}" if scope else stem
 
 
 def infer_source_system(path: Path, source_type: str, header_names: set[str] | None = None) -> str:
@@ -620,7 +635,7 @@ def inspect_source_file(
         source_system=source_system,
         covered_from=coverage[0],
         covered_until=coverage[1],
-        canonical_group=canonical_group_for_path(path),
+        canonical_group=canonical_group_for_path(path, root_dir=root_dir),
         parser_name=(
             "unrecognized_source"
             if is_no_activity_marker and marker_coverage is None
@@ -767,7 +782,7 @@ def inspect_purchase_note_markdown(
             source_system="manual",
             covered_from=event_date,
             covered_until=event_date,
-            canonical_group=canonical_group_for_path(target_path),
+            canonical_group=canonical_group_for_path(target_path, root_dir=root_dir),
             parser_name="parse_purchase_note_markdown",
             parser_notes=[f"Manual purchase note covering {target_display}."],
             context={

@@ -2569,5 +2569,50 @@ class ParserSupersessionTests(unittest.TestCase):
             self.assertTrue(exceptions[0]["blocking"])
 
 
+class CanonicalGroupScopeTests(unittest.TestCase):
+    def group(self, relative: str, root: Path) -> str:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x", encoding="utf-8")
+        return bookprep.canonical_group_for_path(path, root_dir=root)
+
+    def test_same_named_files_in_different_packs_do_not_compete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            self.assertNotEqual(
+                self.group("2024-pack/Stripe/stripe_balance_history.csv", root),
+                self.group("2025-pack/Stripe/stripe_balance_history.csv", root),
+            )
+
+    def test_half_year_exports_in_sibling_folders_do_not_compete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            self.assertNotEqual(
+                self.group("2023-pack/billing-report_2023-H1/Orders.csv", root),
+                self.group("2023-pack/billing-report_2023-H2/Orders.csv", root),
+            )
+
+    def test_the_same_file_in_two_formats_still_competes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            self.assertEqual(
+                self.group("2024-pack/kontovv_2024.csv", root),
+                self.group("2024-pack/kontovv_2024.xml", root),
+            )
+
+    def test_the_group_still_names_the_file_it_came_from(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            group = self.group("2024-pack/Stripe/stripe_balance_history.csv", Path(tmp))
+
+            self.assertTrue(group.endswith("stripe-balance-history"))
+
+    def test_a_file_at_the_source_root_keeps_a_bare_group(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self.group("kontovv_2024.csv", Path(tmp)), "kontovv-2024")
+
+
 if __name__ == "__main__":
     unittest.main()

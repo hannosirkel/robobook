@@ -547,6 +547,24 @@ def configured_bank_account_ids(policy: dict[str, Any]) -> set[str]:
     return resolved
 
 
+CASH_ACTION_TYPES = frozenset({"create_incoming_summary", "create_payment_summary"})
+
+
+def prohibited_bank_cash_action(action: dict[str, Any], policy: dict[str, Any]) -> bool:
+    """Report whether one action would post API cash against an imported statement account.
+
+    Builder, checker, and sender each ask this independently. In statement-import mode
+    the physical row is settled by the import itself, so a second API movement against
+    the same account would duplicate the cash rather than record it.
+    """
+    if cash_posting_mode(policy) != "statement_import":
+        return False
+    if str(action.get("action_type") or "") not in CASH_ACTION_TYPES:
+        return False
+    payload = action.get("payload") or {}
+    return str(payload.get("bank_account_id") or "") in bank_income_account_ids(policy)
+
+
 def action_policy_errors(action: dict[str, Any], policy: dict[str, Any]) -> list[str]:
     """Independently compare every submit-capable ID in an action with explicit policy."""
     payload = action.get("payload") or {}
@@ -585,7 +603,11 @@ def action_policy_errors(action: dict[str, Any], policy: dict[str, Any]) -> list
             errors.append(f"Contact ID {actual_contact!r} does not match policy ID {expected_contact!r} for {role}/{label}.")
 
     if action_type in {"create_incoming_summary", "create_payment_summary"}:
-        allowed = configured_bank_account_ids(policy)
+        # Reviewed processor settlement accounts are explicit policy values too, and in
+        # statement-import mode they are the only cash accounts the API may still touch.
+        allowed = configured_bank_account_ids(policy) | set(
+            validated_cash_posting(policy)["processor_income_account_ids"].values()
+        )
         if str(payload.get("bank_account_id") or "") not in allowed:
             errors.append("Cash action bank_account_id is not one of the explicit posting-policy accounts.")
 

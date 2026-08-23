@@ -26,10 +26,13 @@ from exchange_rates import ExchangeRateError, lookup_rate
 from posting_policy import (
     PostingPolicyError,
     action_policy_errors,
+    cash_posting_mode,
     load_posting_policy,
+    prohibited_bank_cash_action,
     resolve_bank_account,
     resolve_sales_vat_profile,
 )
+from statement_import_plan import StatementImportPlanError, validate_statement_import_plan
 from reference_artifacts import (
     ReferenceArtifactError,
     required_action_binding_kinds,
@@ -1169,6 +1172,159 @@ def _generated_settlement_contact_errors(
     return errors
 
 
+def _reference_binding(action_batch: dict[str, Any], kind: str) -> dict[str, Any] | None:
+    bindings = [
+        item
+        for item in action_batch.get("reference_artifacts") or []
+        if isinstance(item, dict) and str(item.get("kind") or "") == kind
+    ]
+    return bindings[0] if len(bindings) == 1 else None
+
+
+def _planned_period_keys(plan: dict[str, Any], period: str) -> set[tuple[str, str, str]]:
+    return {
+        (
+            str(row.get("statement_id") or ""),
+            re.sub(r"\s+", "", str(row.get("iban") or "")).upper(),
+            str(row.get("currency") or "").upper(),
+        )
+        for row in plan.get("rows") or []
+        if isinstance(row, dict) and str(row.get("period") or "") == period
+    }
+
+
+def _physical_period_keys(payload: dict[str, Any]) -> tuple[set[tuple[str, str, str]], list[dict[str, Any]]]:
+    keys: set[tuple[str, str, str]] = set()
+    findings: list[dict[str, Any]] = []
+    for record in (payload.get("records") or {}).get("bank_transactions") or []:
+        if not isinstance(record, dict) or str(record.get("source_system") or "") != "bank":
+            continue
+        try:
+            keys.add(_physical_record_key(record))
+        except BankAllocationError as exc:
+            findings.append(make_finding(
+                section="statement_plan_coverage", severity="error",
+                summary=f"Physical bank row has invalid identity: {exc}",
+                action_id=str(record.get("record_id") or "") or None,
+            ))
+    return keys, findings
+
+
+def _loaded_statement_plan(
+    action_batch: dict[str, Any], *, cwd: Path, period: str
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    binding = _reference_binding(action_batch, "statement_import_plan")
+    if binding is None:
+        return None, [make_finding(
+            section="statement_plan_coverage", severity="error",
+            summary="Statement-import coverage requires exactly one bound annual statement-import plan.",
+        )]
+    try:
+        plan = load_json(verify_file_binding(binding, cwd=cwd))
+        validate_statement_import_plan(plan)
+    except (ReferenceArtifactError, StatementImportPlanError, SimplbooksError, OSError) as exc:
+        return None, [make_finding(
+            section="statement_plan_coverage", severity="error",
+            summary=f"Statement-import plan is invalid or stale: {exc}",
+        )]
+    findings: list[dict[str, Any]] = []
+    if str(plan.get("company_slug") or "") != str(action_batch.get("company_slug") or ""):
+        findings.append(make_finding(
+            section="statement_plan_coverage", severity="error",
+            summary="Statement-import plan company does not match the action batch.",
+        ))
+    if str(plan.get("year") or "") != period[:4]:
+        findings.append(make_finding(
+            section="statement_plan_coverage", severity="error",
+            summary="Statement-import plan year does not match the action period.",
+        ))
+    return plan, findings
+
+
+def _double_claimed_plan_rows(
+    action_batch: dict[str, Any],
+    normalized_payload: dict[str, Any],
+    *,
+    planned_keys: set[tuple[str, str, str]],
+) -> list[dict[str, Any]]:
+    """Report API cash actions claiming a physical row the statement import already settles."""
+    record_index = build_record_index(normalized_payload)
+    findings: list[dict[str, Any]] = []
+    for action in action_batch.get("actions") or []:
+        if not isinstance(action, dict):
+            continue
+        if str((action.get("payload") or {}).get("draft_schema") or "") != "cash_settlement_v1":
+            continue
+        for ref in action.get("source_refs") or []:
+            if not isinstance(ref, dict) or ref.get("source_kind") != "physical_bank":
+                continue
+            resolved = record_index.get(str(ref.get("record_ref") or ""))
+            if resolved is None:
+                continue
+            try:
+                key = _physical_record_key(resolved[1])
+            except BankAllocationError:
+                continue
+            if key in planned_keys:
+                findings.append(make_finding(
+                    section="statement_plan_coverage", severity="error",
+                    summary=(
+                        f"Physical bank row {key[0]!r} is planned for statement import and is "
+                        "also claimed by an API cash action."
+                    ),
+                    action_id=action_label(action),
+                ))
+    return findings
+
+
+def evaluate_statement_plan_coverage(
+    action_batch: dict[str, Any], *, action_path: Path, cwd: Path
+) -> list[dict[str, Any]]:
+    """Prove the annual plan claims this period's physical rows exactly once, and alone.
+
+    In statement-import mode the plan row is the terminal coverage item. A document
+    action may support a row, but an API cash action claiming the same physical key
+    would settle it twice.
+    """
+    period = str(action_batch.get("period") or "")
+    plan, findings = _loaded_statement_plan(action_batch, cwd=cwd, period=period)
+    if plan is None:
+        return findings
+
+    normalized_binding = _reference_binding(action_batch, "normalized_period")
+    if normalized_binding is None:
+        findings.append(make_finding(
+            section="statement_plan_coverage", severity="error",
+            summary="Statement-import coverage requires exactly one bound normalized period artifact.",
+        ))
+        return findings
+    try:
+        normalized_payload = load_json(verify_file_binding(normalized_binding, cwd=cwd))
+    except (ReferenceArtifactError, SimplbooksError, OSError) as exc:
+        findings.append(make_finding(
+            section="statement_plan_coverage", severity="error",
+            summary=f"Normalized period artifact is invalid or stale: {exc}",
+        ))
+        return findings
+
+    physical_keys, identity_findings = _physical_period_keys(normalized_payload)
+    findings.extend(identity_findings)
+    planned_keys = _planned_period_keys(plan, period)
+    for key in sorted(physical_keys - planned_keys):
+        findings.append(make_finding(
+            section="statement_plan_coverage", severity="error",
+            summary=f"Physical bank row {key[0]!r} is not planned for import in {period}.",
+        ))
+    for key in sorted(planned_keys - physical_keys):
+        findings.append(make_finding(
+            section="statement_plan_coverage", severity="error",
+            summary=f"Planned statement row {key[0]!r} has no physical bank row in {period}.",
+        ))
+
+    findings.extend(_double_claimed_plan_rows(action_batch, normalized_payload, planned_keys=planned_keys))
+    return findings
+
+
 def evaluate_bank_statement_completeness(
     action_batch: dict[str, Any],
     *,
@@ -1178,6 +1334,8 @@ def evaluate_bank_statement_completeness(
     assigned_cash_amounts: dict[str, Decimal] | None = None,
 ) -> list[dict[str, Any]]:
     """Independently prove exact-once terminal coverage for this period's physical rows."""
+    if str(action_batch.get("cash_posting_mode") or "api") == "statement_import":
+        return evaluate_statement_plan_coverage(action_batch, action_path=action_path, cwd=cwd)
     findings: list[dict[str, Any]] = []
     period = str(action_batch.get("period") or "")
     physical_action_refs = [
@@ -2196,6 +2354,59 @@ def evaluate_unresolved_dependencies(
     return findings
 
 
+def evaluate_statement_import_mode(
+    action_batch: dict[str, Any], posting_policy: dict[str, Any] | None
+) -> list[dict[str, Any]]:
+    """Independently refuse API cash against an account whose statement is imported.
+
+    The builder already suppresses these actions. This repeats the judgement from the
+    batch and the policy alone, so a hand-edited or stale batch cannot smuggle one past.
+    """
+    declared = str(action_batch.get("cash_posting_mode") or "api")
+    if posting_policy is None:
+        if declared == "statement_import":
+            return [make_finding(
+                section="statement_import_mode",
+                severity="error",
+                summary="A statement-import batch cannot be checked without a bound posting policy.",
+            )]
+        return []
+
+    findings: list[dict[str, Any]] = []
+    try:
+        expected = cash_posting_mode(posting_policy)
+    except PostingPolicyError as exc:
+        return [make_finding(section="statement_import_mode", severity="error", summary=str(exc))]
+    if declared != expected:
+        findings.append(make_finding(
+            section="statement_import_mode",
+            severity="error",
+            summary=f"Batch cash_posting_mode {declared!r} does not match the bound posting policy mode {expected!r}.",
+        ))
+    for action in action_batch.get("actions") or []:
+        if not isinstance(action, dict):
+            continue
+        try:
+            prohibited = prohibited_bank_cash_action(action, posting_policy)
+        except PostingPolicyError as exc:
+            findings.append(make_finding(
+                section="statement_import_mode", severity="error", summary=str(exc),
+                action_id=action_label(action),
+            ))
+            continue
+        if prohibited:
+            findings.append(make_finding(
+                section="statement_import_mode",
+                severity="error",
+                summary=(
+                    "Prohibited bank cash action: statement-import mode settles this account "
+                    "through the imported statement, not the API."
+                ),
+                action_id=action_label(action),
+            ))
+    return findings
+
+
 def evaluate_posting_policy(
     action_batch: dict[str, Any], posting_policy: dict[str, Any] | None
 ) -> list[dict[str, Any]]:
@@ -2639,6 +2850,7 @@ def evaluate_action_batch(
             expected_company_id=expected_company_id,
         )
     )
+    findings.extend(evaluate_statement_import_mode(action_batch, posting_policy))
     findings.extend(evaluate_posting_policy(action_batch, posting_policy))
     findings.extend(evaluate_vat_profiles(action_batch.get("actions") or [], posting_policy))
     findings.extend(

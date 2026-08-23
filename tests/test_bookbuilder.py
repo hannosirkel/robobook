@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import bookbuilder  # noqa: E402, I001
 import bookchecker  # noqa: E402
+import posting_policy  # noqa: E402
 import woo_tax  # noqa: E402
 
 
@@ -202,6 +203,35 @@ def manual_allocation(*, row: dict, disposition: str, target: dict | None = None
         "target": target or {"financial_transaction_kind": disposition},
         "review": {"status": "approved", "rationale": f"Reviewed {disposition}."},
     }
+
+
+STATEMENT_IMPORT_CASH_POSTING = {
+    "mode": "statement_import",
+    "bank_income_account_ids": ["3"],
+    "processor_income_account_ids": {"paypal": "6"},
+    "bank_financial_accounts": {"EE123": {"EUR": "10"}},
+    "clearing_provider_roles": {"paypal": "paypal"},
+    "financial_accounts": {
+        "bank": "10",
+        "stripe_clearing": "30",
+        "paypal": "31",
+        "bank_fees": "32",
+        "reporting_person_payable": "33",
+        "platform_prepayment": "34",
+        "customer_receivable": "37",
+        "supplier_payable": "38",
+        "fx_gain": "35",
+        "fx_loss": "36",
+    },
+}
+
+
+def statement_import_policy() -> dict:
+    return dict(direct_sale_policy(), cash_posting=STATEMENT_IMPORT_CASH_POSTING)
+
+
+def api_cash_policy() -> dict:
+    return dict(direct_sale_policy(), cash_posting={"mode": "api"})
 
 
 def build_with(*, bank: dict, allocation: dict, **overrides: object) -> dict:
@@ -2462,6 +2492,63 @@ class BookbuilderTests(unittest.TestCase):
 
         self.assertIn("schema_version", text)
         self.assertIn("approval_status", text)
+
+
+INVOICE_58_DISCOVERY = [{"document_index": [{"simplbooks_id": "58", "document_type": "invoice"}]}]
+
+
+class StatementImportBuilderTests(unittest.TestCase):
+    def receipt_batch(self, policy: dict | None) -> dict:
+        row = bank_row(record_id="r1", amount=330.0, event_date="2024-01-15")
+        overrides: dict = {"discovery_overviews": INVOICE_58_DISCOVERY}
+        if policy is not None:
+            overrides["posting_policy"] = policy
+        return build_with(
+            bank=row,
+            allocation=existing_invoice_allocation(record_id="r1", invoice_id="58"),
+            **overrides,
+        )
+
+    def test_batch_declares_the_cash_posting_mode_it_was_built_under(self) -> None:
+        self.assertEqual(self.receipt_batch(statement_import_policy())["cash_posting_mode"], "statement_import")
+        self.assertEqual(self.receipt_batch(api_cash_policy())["cash_posting_mode"], "api")
+
+    def test_a_batch_built_without_a_policy_stays_in_api_cash_mode(self) -> None:
+        self.assertEqual(self.receipt_batch(None)["cash_posting_mode"], "api")
+
+    def test_api_cash_mode_still_settles_a_physical_bank_row(self) -> None:
+        batch = self.receipt_batch(api_cash_policy())
+
+        self.assertEqual(len(actions_of_type(batch, "create_incoming_summary")), 1)
+
+    def test_statement_import_mode_omits_bank_cash(self) -> None:
+        batch = self.receipt_batch(statement_import_policy())
+
+        self.assertEqual(actions_of_type(batch, "create_incoming_summary"), [])
+
+    def test_statement_import_mode_keeps_the_document_it_settles(self) -> None:
+        row = bank_row(record_id="r2", amount=120.0, event_date="2024-01-16")
+        batch = build_with(
+            bank=row,
+            allocation=direct_sale_allocation(row=row),
+            posting_policy=statement_import_policy(),
+        )
+
+        self.assertEqual(len(actions_of_type(batch, "create_invoice_summary")), 1)
+        self.assertEqual(actions_of_type(batch, "create_incoming_summary"), [])
+
+    def test_statement_import_mode_generates_no_prohibited_action(self) -> None:
+        policy = statement_import_policy()
+        batch = self.receipt_batch(policy)
+
+        self.assertEqual(
+            [
+                action
+                for action in batch["actions"]
+                if posting_policy.prohibited_bank_cash_action(action, policy)
+            ],
+            [],
+        )
 
 
 if __name__ == "__main__":

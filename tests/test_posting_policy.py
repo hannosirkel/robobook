@@ -378,5 +378,34 @@ class StatementImportAccountBindingTests(unittest.TestCase):
             posting_policy.validate_posting_policy(policy)
 
 
+class ProcessorCashAccountTests(unittest.TestCase):
+    def action(self, bank_account_id: str) -> dict:
+        return {
+            "action_type": "create_incoming_summary",
+            "payload": {
+                "draft_schema": "cash_settlement_v1",
+                "document_type": "incoming",
+                "linked_invoice_id": "58",
+                "counterparty_hint": "paypal",
+                "counterparty": {"contact_id": "31"},
+                "bank_account_id": bank_account_id,
+            },
+        }
+
+    def policy(self) -> dict:
+        return dict(
+            statement_import_policy_fixture(),
+            contacts={"sales": {"paypal": "31"}, "processors": {}, "suppliers": {}},
+        )
+
+    def test_a_reviewed_processor_account_is_an_explicit_cash_account(self) -> None:
+        self.assertEqual(posting_policy.action_policy_errors(self.action("6"), self.policy()), [])
+
+    def test_an_unreviewed_cash_account_is_still_rejected(self) -> None:
+        errors = posting_policy.action_policy_errors(self.action("99"), self.policy())
+
+        self.assertIn("not one of the explicit posting-policy accounts", " ".join(errors))
+
+
 if __name__ == "__main__":
     unittest.main()

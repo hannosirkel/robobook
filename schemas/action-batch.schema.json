@@ -61,6 +61,11 @@
       "type": "array",
       "items": {"type": "object"}
     },
+    "cash_posting_mode": {
+      "description": "Cash mode the batch was built under; statement_import forbids API cash on imported statement accounts.",
+      "type": "string",
+      "enum": ["api", "statement_import"]
+    },
     "unresolved_dependencies": {
       "type": "array",
       "items": {

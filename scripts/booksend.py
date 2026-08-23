@@ -24,7 +24,13 @@ from bookchecker import (
     resolve_action_sources,
 )
 from exchange_rates import ExchangeRateError, lookup_rate
-from posting_policy import PostingPolicyError, action_policy_errors, load_posting_policy
+from posting_policy import (
+    PostingPolicyError,
+    action_policy_errors,
+    cash_posting_mode,
+    load_posting_policy,
+    prohibited_bank_cash_action,
+)
 from reference_artifacts import (
     ReferenceArtifactError,
     required_action_binding_kinds,
@@ -1296,6 +1302,45 @@ def verify_submission_reference_artifacts(
     return dict(verified)
 
 
+def prove_no_prohibited_bank_cash(
+    action_batch: dict[str, Any], posting_policy: dict[str, Any] | None
+) -> None:
+    """Refuse a statement-import batch that would move cash the import already moves.
+
+    This runs before translation and before any client call, so a prohibited action
+    cannot reach SimplBooks even partially.
+    """
+    declared = str(action_batch.get("cash_posting_mode") or "api")
+    if posting_policy is None:
+        if declared == "statement_import":
+            raise SimplbooksError(
+                "Batch declares statement-import mode but no posting policy is bound to prove "
+                "which accounts the statement-import mode forbids."
+            )
+        return
+    try:
+        expected = cash_posting_mode(posting_policy)
+    except PostingPolicyError as exc:
+        raise SimplbooksError(str(exc)) from exc
+    if declared != expected:
+        raise SimplbooksError(
+            f"Batch cash_posting_mode {declared!r} does not match the bound posting policy "
+            f"mode {expected!r}; statement-import mode must be agreed by both."
+        )
+    for action in action_batch.get("actions") or []:
+        if not isinstance(action, dict):
+            continue
+        try:
+            prohibited = prohibited_bank_cash_action(action, posting_policy)
+        except PostingPolicyError as exc:
+            raise SimplbooksError(str(exc)) from exc
+        if prohibited:
+            raise SimplbooksError(
+                f"Action {action_id(action)} posts bank cash in statement-import mode; the "
+                "imported statement settles this account, so no API cash action is sent."
+            )
+
+
 def execute_batch(
     *,
     action_batch: dict[str, Any],
@@ -1310,6 +1355,7 @@ def execute_batch(
     cwd: Path | None = None,
     expected_company_id: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    prove_no_prohibited_bank_cash(action_batch, posting_policy)
     inventory_actions = [
         action for action in action_batch.get("actions") or []
         if any(

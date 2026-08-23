@@ -25,7 +25,16 @@ from bank_allocations import (
 )
 from document_identity import document_identity, match_existing
 from exchange_rates import ExchangeRateError, lookup_rate
-from posting_policy import PostingPolicyError, load_posting_policy, resolve_bank_account, resolve_contact, resolve_mapping, resolve_sales_vat_profile
+from posting_policy import (
+    PostingPolicyError,
+    bank_income_account_ids,
+    cash_posting_mode,
+    load_posting_policy,
+    resolve_bank_account,
+    resolve_contact,
+    resolve_mapping,
+    resolve_sales_vat_profile,
+)
 from reference_artifacts import ReferenceArtifactError, bind_file, validate_discovery, verify_file_binding
 from simplbooks_api import SimplbooksError, resolve_company_id, resolve_company_name
 
@@ -2483,6 +2492,13 @@ def build_foreign_currency_payment_pilot_dependencies(
     return dependencies
 
 
+def statement_import_owns_bank_cash(policy: dict[str, Any] | None, *, bank_account_id: Any) -> bool:
+    """Report whether the imported statement, not the API, settles cash on this account."""
+    if policy is None or cash_posting_mode(policy) != "statement_import":
+        return False
+    return str(bank_account_id or "") in bank_income_account_ids(policy)
+
+
 def build_direct_sale_actions(
     *,
     company_slug: str,
@@ -2718,6 +2734,9 @@ def build_direct_sale_actions(
             record = entry["record"]
             allocation = entry["allocation"]
             record_id = str(record.get("record_id") or "")
+            if statement_import_owns_bank_cash(posting_policy, bank_account_id=entry["bank_account_id"]):
+                # The imported statement row settles this invoice; an API receipt would double the cash.
+                continue
             receipt_ref = source_refs_for_records(normalized_path_display, [record])[0]
             receipt_ref["source_kind"] = "physical_bank"
             actions.append(
@@ -2875,6 +2894,9 @@ def build_exact_cash_actions(
             except PostingPolicyError as exc:
                 raise SimplbooksError(str(exc)) from exc
             notes = ["Applied exact source-bank-account mapping from the physical bank row."]
+        if statement_import_owns_bank_cash(posting_policy, bank_account_id=bank_account_id):
+            # The annual statement-import plan is this row's terminal coverage.
+            continue
 
         for part, part_number in _allocation_parts(allocation):
             disposition = str(part.get("disposition") or "")
@@ -3585,6 +3607,7 @@ def build_action_batch(
         "source_summary": source_summary,
         "recon_ref": recon_path_display,
         "already_present": already_present,
+        "cash_posting_mode": "api" if posting_policy is None else cash_posting_mode(posting_policy),
         "unresolved_dependencies": unresolved_dependencies,
         "actions": actions,
     }
@@ -3672,6 +3695,18 @@ def resolve_bank_allocations_path(*, company_dir: Path | None, normalized_path: 
     return (artifacts_dir / "bank" / f"{period[:4]}-allocations.json") if artifacts_dir is not None else None
 
 
+def resolve_statement_import_plan_path(
+    *, company_dir: Path | None, normalized_path: Path, period: str, override: str | None
+) -> Path | None:
+    if override:
+        return Path(override)
+    filename = f"{period[:4]}-plan.json"
+    if company_dir is not None:
+        return company_dir / "artifacts" / "statement-import" / filename
+    artifacts_dir = inferred_artifacts_dir(normalized_path)
+    return (artifacts_dir / "statement-import" / filename) if artifacts_dir is not None else None
+
+
 def normalized_year_paths(normalized_path: Path, *, period: str) -> list[Path]:
     if normalized_path.parent.name != "normalized":
         return [normalized_path]
@@ -3707,6 +3742,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Refreshed Simplbooks overview; repeat to bind an existing target from another discovery year.",
     )
     parser.add_argument("--bank-allocations", help="Reviewed annual bank allocation artifact")
+    parser.add_argument("--statement-import-plan", help="Annual statement-import plan artifact")
     parser.add_argument("--output", help="Optional output path for actions YAML")
     parser.add_argument("--force", action="store_true", help="Allow draft generation even when recon does not approve the month")
     return parser
@@ -3754,6 +3790,12 @@ def main() -> int:
         normalized_path=normalized_path,
         period=args.period,
         override=args.bank_allocations,
+    )
+    statement_import_plan_path = resolve_statement_import_plan_path(
+        company_dir=company_dir,
+        normalized_path=normalized_path,
+        period=args.period,
+        override=args.statement_import_plan,
     )
     output_path = resolve_output_path(company_dir=company_dir, normalized_path=normalized_path, period=args.period, override=args.output)
 
@@ -3839,6 +3881,13 @@ def main() -> int:
     ]
     if bank_allocations_path is not None and bank_allocations_path.exists():
         bound_paths.append(("bank_allocations", bank_allocations_path))
+    if batch.get("cash_posting_mode") == "statement_import":
+        if statement_import_plan_path is None or not statement_import_plan_path.exists():
+            raise SimplbooksError(
+                "Statement-import mode requires the annual statement-import plan; generate it with "
+                "statement_import_plan.py before building this month."
+            )
+        bound_paths.append(("statement_import_plan", statement_import_plan_path))
     if foreign_currencies:
         bound_paths.append(("exchange_rates", exchange_rates_path))
     batch["reference_artifacts"] = [

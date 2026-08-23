@@ -1539,5 +1539,105 @@ class BooksendTests(unittest.TestCase):
         self.assertEqual(candidates["example-2024-01-sales-paypal"]["depends_on"], ["example-2024-01-incoming-paypal"])
 
 
+class StatementImportSenderTests(unittest.TestCase):
+    def policy(self, *, mode: str = "statement_import") -> dict:
+        return {
+            "schema_version": "1.0",
+            "company_slug": "example",
+            "bank_accounts": {"EE123": {"EUR": "101"}},
+            "contacts": {"sales": {"paypal": "2001"}, "processors": {}, "suppliers": {}},
+            "mappings": {},
+            "supplier_aliases": {},
+            "cash_posting": {
+                "mode": mode,
+                "bank_income_account_ids": ["101"],
+                "processor_income_account_ids": {"paypal": "6"},
+                "bank_financial_accounts": {"EE123": {"EUR": "10"}},
+                "clearing_provider_roles": {"paypal": "paypal"},
+                "financial_accounts": {
+                    "bank": "10", "stripe_clearing": "30", "paypal": "31", "bank_fees": "32",
+                    "reporting_person_payable": "33", "platform_prepayment": "34",
+                    "customer_receivable": "37", "supplier_payable": "38",
+                    "fx_gain": "35", "fx_loss": "36",
+                },
+            },
+        }
+
+    def statement_batch(self, **overrides: object) -> dict:
+        batch = make_batch(actions=[incoming_action()])
+        batch["cash_posting_mode"] = "statement_import"
+        batch.update(overrides)
+        return batch
+
+    def test_sender_rejects_bank_cash_before_any_client_call(self) -> None:
+        client = FakeClient(responses=[{"_http_status": 201, "incoming_id": 900}])
+
+        with self.assertRaisesRegex(SimplbooksError, "statement-import mode"):
+            booksend.execute_batch(
+                action_batch=self.statement_batch(),
+                mode="write",
+                client=client,
+                posting_policy=self.policy(),
+            )
+
+        self.assertEqual(client.calls, [])
+
+    def test_sender_refuses_a_statement_import_batch_with_no_policy_to_prove_it(self) -> None:
+        client = FakeClient(responses=[])
+
+        with self.assertRaisesRegex(SimplbooksError, "statement-import mode"):
+            booksend.execute_batch(action_batch=self.statement_batch(), mode="write", client=client)
+
+        self.assertEqual(client.calls, [])
+
+    def test_sender_rejects_a_batch_whose_declared_mode_disagrees_with_its_policy(self) -> None:
+        client = FakeClient(responses=[])
+        batch = make_batch(actions=[incoming_action()])
+        batch["cash_posting_mode"] = "api"
+
+        with self.assertRaisesRegex(SimplbooksError, "statement-import mode"):
+            booksend.execute_batch(
+                action_batch=batch, mode="write", client=client, posting_policy=self.policy()
+            )
+
+        self.assertEqual(client.calls, [])
+
+    def test_sender_prevalidates_statement_plan_coverage_before_any_client_call(self) -> None:
+        action = invoice_action()
+        action["source_refs"][0]["source_kind"] = "physical_bank"
+        client = FakeClient(responses=[{"_http_status": 201, "invoice_id": 501}])
+
+        with tempfile.TemporaryDirectory() as tmpdir, self.assertRaisesRegex(
+            SimplbooksError, "bank statement completeness"
+        ):
+            booksend.execute_batch(
+                action_batch=self.statement_batch(actions=[action]),
+                mode="write",
+                client=client,
+                posting_policy=self.policy(),
+                action_path=Path(tmpdir) / "actions.yaml",
+                cwd=Path(tmpdir),
+            )
+
+        self.assertEqual(client.calls, [])
+
+    def test_sender_still_settles_a_reviewed_processor_account_in_statement_import_mode(self) -> None:
+        action = incoming_action()
+        action["payload"]["bank_account_id"] = "6"
+        action["payload"]["linked_invoice_id"] = "58"
+        action["depends_on"] = []
+        client = FakeClient(responses=[{"_http_status": 201, "incoming_id": 900}])
+
+        batch, _summary = booksend.execute_batch(
+            action_batch=self.statement_batch(actions=[action]),
+            mode="write",
+            client=client,
+            posting_policy=self.policy(),
+        )
+
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(batch["actions"][0]["inserted_id"], 900)
+
+
 if __name__ == "__main__":
     unittest.main()

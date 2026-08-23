@@ -7,6 +7,7 @@ approval_status: "draft"
 source_summary: "Replace with a short batch summary."
 recon_ref: "companies/example/artifacts/recon/2024-01.json"
 already_present: []
+cash_posting_mode: "api"
 unresolved_dependencies: []
 reference_artifacts:
   - kind: "posting_policy"

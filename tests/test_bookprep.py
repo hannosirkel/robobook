@@ -2534,6 +2534,40 @@ class ParserSupersessionTests(unittest.TestCase):
             orders = next(s for s in sources if s.parser_name == "parse_printful_orders_csv")
             self.assertTrue(orders.canonical)
 
+    def test_a_superseded_group_is_not_reported_as_missing_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sources = self.sources(Path(tmp))
+            bookprep.apply_parser_supersession(sources)
+
+            # The CSV groups have no canonical member any more, but their evidence is not
+            # missing -- a richer source describes the same stream.
+            self.assertEqual(bookprep.missing_canonical_source_exceptions(sources), [])
+
+    def test_a_source_never_supersedes_one_from_another_pack(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "2023-pack").mkdir()
+            (root / "2024-pack").mkdir()
+            older = self.source("2023-pack/Wallet.csv", "parse_printful_wallet_csv", "csv", root)
+            newer = self.source("2024-pack/Wallet_H1.csv", "parse_printful_wallet_csv", "csv", root)
+            printout = self.source("2024-pack/wallet-printout.txt", "parse_printful_wallet_printout", "other", root)
+
+            bookprep.apply_parser_supersession([older, newer, printout])
+
+            # A 2024 printout says nothing about a 2023 pack's evidence.
+            self.assertTrue(older.canonical)
+            self.assertFalse(newer.canonical)
+
+    def test_a_genuinely_unparsed_group_is_still_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            orphan = self.source("mystery.dat", "unrecognized_source", "other", Path(tmp))
+            orphan.canonical = False
+
+            exceptions = bookprep.missing_canonical_source_exceptions([orphan])
+
+            self.assertEqual(len(exceptions), 1)
+            self.assertTrue(exceptions[0]["blocking"])
+
 
 if __name__ == "__main__":
     unittest.main()

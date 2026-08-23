@@ -804,7 +804,12 @@ def apply_parser_supersession(sources: list[SourceDescriptor]) -> None:
                 continue
             if entry.source_system != winner.source_system:
                 continue
+            if entry.path.parent != winner.path.parent:
+                # Supersession is scoped to one source pack: a later year's richer export
+                # says nothing about an earlier year's evidence.
+                continue
             entry.canonical = False
+            entry.context["superseded_by"] = winner.source_id
             entry.parser_notes.append(f"Superseded by richer canonical source {winner.source_id}.")
             winner.preferred_over.append(entry.source_id)
 
@@ -3760,6 +3765,9 @@ def missing_canonical_source_exceptions(sources: list[SourceDescriptor]) -> list
     exceptions: list[dict[str, Any]] = []
     for entries in grouped.values():
         if any(entry.canonical for entry in entries):
+            continue
+        if all(entry.context.get("superseded_by") for entry in entries):
+            # Not missing evidence: a richer canonical source describes this same stream.
             continue
         first = entries[0]
         source_types = ", ".join(sorted({entry.source_type for entry in entries}))

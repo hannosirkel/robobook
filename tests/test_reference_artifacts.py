@@ -72,6 +72,19 @@ class ReferenceArtifactTests(unittest.TestCase):
         self.assertTrue(reference_artifacts.requires_bank_allocation_binding(batch))
         self.assertIn("bank_allocations", reference_artifacts.required_action_binding_kinds(batch))
 
+    def test_statement_import_batch_requires_the_annual_plan_binding(self) -> None:
+        batch = {"actions": [], "cash_posting_mode": "statement_import"}
+
+        self.assertIn("statement_import_plan", reference_artifacts.required_action_binding_kinds(batch))
+
+    def test_api_cash_batch_does_not_require_a_statement_import_plan(self) -> None:
+        batch = {"actions": [], "cash_posting_mode": "api"}
+
+        self.assertNotIn("statement_import_plan", reference_artifacts.required_action_binding_kinds(batch))
+
+    def test_a_batch_without_a_cash_mode_does_not_require_a_statement_import_plan(self) -> None:
+        self.assertNotIn("statement_import_plan", reference_artifacts.required_action_binding_kinds({"actions": []}))
+
 
 if __name__ == "__main__":
     unittest.main()

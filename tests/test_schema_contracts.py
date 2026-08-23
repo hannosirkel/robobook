@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import bookchecker  # noqa: E402, I001
 import bookbuilder  # noqa: E402
 import examine_simplbooks_year  # noqa: E402
+import statement_import_plan  # noqa: E402
 
 
 def resolve_ref(root_schema: dict[str, Any], ref: str) -> dict[str, Any]:
@@ -125,6 +126,33 @@ class SchemaContractTests(unittest.TestCase):
             (ROOT / "templates/statement-import-evidence.template.json").read_text(encoding="utf-8")
         )
         self.assert_artifact_valid(schema_name="statement-import-evidence.schema.json", artifact=artifact)
+
+    def test_statement_import_plan_template_matches_strict_schema(self) -> None:
+        artifact = json.loads(
+            (ROOT / "templates/statement-import-plan.template.json").read_text(encoding="utf-8")
+        )
+        self.assert_artifact_valid(schema_name="statement-import-plan.schema.json", artifact=artifact)
+        statement_import_plan.validate_statement_import_plan(artifact)
+
+    def test_statement_import_plan_template_covers_every_family(self) -> None:
+        artifact = json.loads(
+            (ROOT / "templates/statement-import-plan.template.json").read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(
+            sorted(artifact["coverage"]["families"]),
+            ["bank_fee", "document_settlement", "processor_or_internal_transfer", "reviewed_split"],
+        )
+        self.assertEqual(artifact["coverage"]["uncovered_count"], 0)
+
+    def test_statement_import_plan_schema_rejects_an_unknown_ui_action(self) -> None:
+        artifact = json.loads(
+            (ROOT / "templates/statement-import-plan.template.json").read_text(encoding="utf-8")
+        )
+        artifact["rows"][0]["ui_action"] = "post_via_api"
+
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="statement-import-plan.schema.json", artifact=artifact)
 
     def test_posting_policy_template_matches_strict_schema(self) -> None:
         artifact = json.loads((ROOT / "templates/posting-policy.template.json").read_text(encoding="utf-8"))

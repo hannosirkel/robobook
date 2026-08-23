@@ -936,13 +936,42 @@ def prove_warehouse_transfer_evidence(
         )
 
 
+def period_order_numbers(records: dict[str, list[dict[str, Any]]]) -> list[int]:
+    """Every exact order number the period's evidence carries, from any category.
+
+    A monthly sales summary names no order, but the processor-side charges that make it
+    up do, so the period's own evidence can still say which side of a routing boundary
+    the summary sits on.
+    """
+    numbers = {
+        number
+        for rows in records.values()
+        for row in rows or []
+        if isinstance(row, dict) and (number := sales_order_number(row)) is not None
+    }
+    return sorted(numbers)
+
+
+def routing_order_numbers(
+    records: list[dict[str, Any]], *, fallback: tuple[int, ...] | list[int] = ()
+) -> list[int]:
+    """Return the order numbers a routing decision rests on, own ones first."""
+    own = sorted({number for record in records if (number := sales_order_number(record)) is not None})
+    return own or sorted(set(fallback))
+
+
 def routed_sales_warehouse(
-    policy: dict[str, Any] | None, *, group_label: str, record: dict[str, Any]
+    policy: dict[str, Any] | None,
+    *,
+    group_label: str,
+    record: dict[str, Any],
+    fallback_order_numbers: tuple[int, ...] | list[int] = (),
 ) -> str | None:
     """Resolve the reviewed warehouse for one contributor, or None when policy routes no rule here.
 
-    A channel the policy routes must produce an exact warehouse for every contributor;
-    a missing order number raises rather than falling back to the channel's mapping.
+    An aggregated row carries no order number of its own, so the period's order evidence
+    decides. If that evidence lands on both sides of the boundary the aggregate covers two
+    warehouses at once and cannot be routed at all, which blocks rather than picking one.
     """
     if policy is None:
         return None
@@ -951,18 +980,39 @@ def routed_sales_warehouse(
         channel = slugify(group_label)
         if channel not in routing["channels"] and channel not in BOUND_WAREHOUSE_CHANNELS:
             return None
-        return resolve_sales_warehouse(policy, channel=channel, order_number=sales_order_number(record))
+        own = sales_order_number(record)
+        candidates = [own] if own is not None else list(fallback_order_numbers)
+        if not candidates:
+            return resolve_sales_warehouse(policy, channel=channel, order_number=None)
+        warehouses = {
+            resolve_sales_warehouse(policy, channel=channel, order_number=number)
+            for number in candidates
+        }
+        if len(warehouses) != 1:
+            raise SimplbooksError(
+                f"Aggregated {group_label!r} row spans the reviewed warehouse boundary "
+                f"(orders {sorted(candidates)} route to {sorted(warehouses)}); it cannot be routed as one line."
+            )
+        return warehouses.pop()
     except PostingPolicyError as exc:
         raise SimplbooksError(str(exc)) from exc
 
 
 def routed_warehouse_groups(
-    policy: dict[str, Any] | None, *, group_label: str, records: list[dict[str, Any]]
+    policy: dict[str, Any] | None,
+    *,
+    group_label: str,
+    records: list[dict[str, Any]],
+    fallback_order_numbers: tuple[int, ...] | list[int] = (),
 ) -> dict[str | None, list[dict[str, Any]]]:
     """Partition contributors by reviewed warehouse so no line spans a routing boundary."""
     grouped: dict[str | None, list[dict[str, Any]]] = defaultdict(list)
     for record in records:
-        grouped[routed_sales_warehouse(policy, group_label=group_label, record=record)].append(record)
+        warehouse = routed_sales_warehouse(
+            policy, group_label=group_label, record=record,
+            fallback_order_numbers=fallback_order_numbers,
+        )
+        grouped[warehouse].append(record)
     return dict(grouped)
 
 
@@ -1566,6 +1616,7 @@ def build_sales_actions(
         records.get("sales", []),
         base_currency=base_currency,
     )
+    known_order_numbers = period_order_numbers(records)
     repeated_sales_labels = {
         label
         for label, count in Counter(group_label for group_label, _currency in grouped_sales).items()
@@ -1590,7 +1641,8 @@ def build_sales_actions(
             # warehouses, so they cannot share an inventory line.
             for warehouse_id, routed_records in sorted(
                 routed_warehouse_groups(
-                    posting_policy, group_label=group_label, records=candidate_records
+                    posting_policy, group_label=group_label, records=candidate_records,
+                    fallback_order_numbers=known_order_numbers,
                 ).items(),
                 key=lambda item: item[0] or "",
             ):
@@ -1688,10 +1740,10 @@ def build_sales_actions(
                 payload["summary_scope"]["warehouse_routing"] = {
                     "channel": slugify(group_label),
                     "warehouse_id": routed_warehouse_id,
-                    "order_numbers": sorted(
-                        number
-                        for number in (sales_order_number(item) for item in profile_records)
-                        if number is not None
+                    # The orders the routing was actually decided on: an aggregated row has
+                    # none of its own, so the period's evidence is what the checker recomputes.
+                    "order_numbers": routing_order_numbers(
+                        profile_records, fallback=known_order_numbers
                     ),
                 }
             confidence = review_confidence(
@@ -2493,8 +2545,15 @@ def build_manual_financial_dependencies(
     normalized_path_display: str,
     records: dict[str, list[dict[str, Any]]],
     allocations: dict[tuple[str, str, str], dict[str, Any]],
+    statement_import_mode: bool = False,
 ) -> list[dict[str, Any]]:
-    """Describe UI statement-import work without inventing submit-capable API actions."""
+    """Describe UI statement-import work without inventing submit-capable API actions.
+
+    In statement-import mode the API never posts these rows at all: the annual plan
+    carries each one and post-import ledger evidence proves it. Blocking the document
+    batch on per-row live proof would then hold back documents that have nothing to do
+    with the row, so the dependency is recorded without blocking.
+    """
     dependencies: list[dict[str, Any]] = []
     for record, allocation in _approved_bank_allocations(records=records, allocations=allocations):
         if not _requires_manual_financial_transaction(allocation):
@@ -2541,14 +2600,20 @@ def build_manual_financial_dependencies(
         )
         source_ref = source_refs_for_records(normalized_path_display, [record], note=rationale)[0]
         source_ref["source_kind"] = "physical_bank"
+        reason = (
+            f"Physical bank row {record_id} is assigned by the annual statement-import plan "
+            "and proved by post-import ledger evidence; the API posts no cash for it."
+            if statement_import_mode
+            else (
+                f"Physical bank row {record_id} requires full SimplBooks statement import and live proof; "
+                "no public financial-transaction API endpoint is confirmed."
+            )
+        )
         dependencies.append(
             {
                 "kind": "manual_statement_import_financial_transaction",
-                "blocking": not proof_verified,
-                "reason": (
-                    f"Physical bank row {record_id} requires full SimplBooks statement import and live proof; "
-                    "no public financial-transaction API endpoint is confirmed."
-                ),
+                "blocking": False if statement_import_mode else not proof_verified,
+                "reason": reason,
                 "disposition": str(allocation.get("disposition") or ""),
                 "statement_id": statement_id,
                 "record_id": record_id,
@@ -3684,6 +3749,9 @@ def build_action_batch(
     unresolved_dependencies = apply_posting_policy(actions, posting_policy=posting_policy)
     unresolved_dependencies.extend(
         build_manual_financial_dependencies(
+            statement_import_mode=(
+                posting_policy is not None and cash_posting_mode(posting_policy) == "statement_import"
+            ),
             normalized_path_display=normalized_path_display,
             records=records,
             allocations=bank_allocations or {},

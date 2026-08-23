@@ -2778,5 +2778,115 @@ class DistributorTransferProofTests(unittest.TestCase):
             )
 
 
+class AggregateSalesRoutingTests(unittest.TestCase):
+    def aggregate(self) -> dict:
+        row = record(record_id="woo:2024-01", source_system="woo", event_type="woo_daily_sales",
+                     gross_amount=137.46, vat_amount=24.8, channel="woo",
+                     attributes={"is_monthly_summary": True, "orders": 3})
+        row["quantity"] = 4
+        return row
+
+    def test_an_aggregate_is_routed_from_the_periods_order_numbers(self) -> None:
+        policy = warehouse_routing_policy()
+
+        self.assertEqual(
+            bookbuilder.routed_sales_warehouse(
+                policy, group_label="woo", record=self.aggregate(), fallback_order_numbers=(762, 765)
+            ),
+            "6",
+        )
+        self.assertEqual(
+            bookbuilder.routed_sales_warehouse(
+                policy, group_label="woo", record=self.aggregate(), fallback_order_numbers=(776, 777)
+            ),
+            "1",
+        )
+
+    def test_an_aggregate_straddling_the_boundary_blocks(self) -> None:
+        with self.assertRaisesRegex(bookbuilder.SimplbooksError, "boundary"):
+            bookbuilder.routed_sales_warehouse(
+                warehouse_routing_policy(), group_label="woo", record=self.aggregate(),
+                fallback_order_numbers=(770, 771),
+            )
+
+    def test_an_aggregate_with_no_order_evidence_at_all_blocks(self) -> None:
+        with self.assertRaisesRegex(bookbuilder.SimplbooksError, "order number"):
+            bookbuilder.routed_sales_warehouse(
+                warehouse_routing_policy(), group_label="woo", record=self.aggregate(),
+                fallback_order_numbers=(),
+            )
+
+    def test_a_records_own_order_number_still_wins(self) -> None:
+        own = woo_sale(record_id="woo:900", order_id=900)
+
+        self.assertEqual(
+            bookbuilder.routed_sales_warehouse(
+                warehouse_routing_policy(), group_label="woo", record=own, fallback_order_numbers=(1,)
+            ),
+            "1",
+        )
+
+    def test_an_aggregate_declares_the_orders_its_routing_actually_used(self) -> None:
+        normalized = base_normalized("2024-01")
+        aggregate = self.aggregate()
+        # The order number lives on the processor-side charge, which groups separately --
+        # exactly how a real month looks.
+        charge = record(record_id="stripe:1", source_system="stripe", event_type="stripe_charge",
+                        gross_amount=60.0, channel="stripe", attributes={"order_id": "762"})
+        normalized["records"]["sales"] = [aggregate, charge]
+
+        batch = build_batch_with_policy(normalized, warehouse_routing_policy())
+        scopes = [a["payload"]["summary_scope"] for a in actions_of_type(batch, "create_invoice_summary")]
+        routed = [s["warehouse_routing"] for s in scopes if "warehouse_routing" in s]
+
+        self.assertTrue(routed)
+        for routing in routed:
+            self.assertTrue(routing["order_numbers"], "declared routing must name the orders it used")
+            self.assertEqual(routing["warehouse_id"], "6")
+
+    def test_the_period_order_numbers_are_gathered_from_every_category(self) -> None:
+        records = {
+            "sales": [self.aggregate(), woo_sale(record_id="stripe:1", order_id=762)],
+            "refunds": [woo_sale(record_id="stripe:2", order_id=765)],
+        }
+
+        self.assertEqual(bookbuilder.period_order_numbers(records), [762, 765])
+
+
+class StatementImportDependencyTests(unittest.TestCase):
+    def batch(self, policy: dict | None) -> dict:
+        row = bank_row(record_id="fee1", amount=-2.0, event_date="2024-01-10")
+        overrides: dict = {"posting_policy": policy} if policy else {}
+        return build_with(bank=row, allocation=manual_allocation(row=row, disposition="bank_fee_payment"),
+                          **overrides)
+
+    def deps(self, policy: dict | None) -> list[dict]:
+        return [d for d in self.batch(policy)["unresolved_dependencies"]
+                if d.get("kind") == "manual_statement_import_financial_transaction"]
+
+    def test_api_cash_mode_still_blocks_on_per_row_live_proof(self) -> None:
+        deps = self.deps(api_cash_policy())
+
+        self.assertEqual([d["blocking"] for d in deps], [True])
+
+    def test_statement_import_mode_does_not_block_the_document_batch(self) -> None:
+        deps = self.deps(statement_import_policy())
+
+        # The API never posts this row; the annual plan carries it and post-import ledger
+        # evidence proves it, so it must not block unrelated document creation.
+        self.assertEqual([d["blocking"] for d in deps], [False])
+
+    def test_statement_import_mode_still_records_the_row_and_why(self) -> None:
+        dep = self.deps(statement_import_policy())[0]
+
+        self.assertEqual(dep["record_id"], "fee1")
+        self.assertIn("statement-import plan", dep["reason"])
+
+    def test_a_verified_proof_is_still_honoured(self) -> None:
+        deps = self.deps(api_cash_policy())
+
+        self.assertTrue(all(d["kind"] == "manual_statement_import_financial_transaction" for d in deps))
+
+
 if __name__ == "__main__":
     unittest.main()

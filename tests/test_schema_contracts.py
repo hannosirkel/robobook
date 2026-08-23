@@ -13,6 +13,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import bookchecker  # noqa: E402, I001
 import bookbuilder  # noqa: E402
 import examine_simplbooks_year  # noqa: E402
+import inventory_verification  # noqa: E402
+import statement_import_plan  # noqa: E402
 
 
 def resolve_ref(root_schema: dict[str, Any], ref: str) -> dict[str, Any]:
@@ -126,8 +128,97 @@ class SchemaContractTests(unittest.TestCase):
         )
         self.assert_artifact_valid(schema_name="statement-import-evidence.schema.json", artifact=artifact)
 
+    def test_statement_import_plan_template_matches_strict_schema(self) -> None:
+        artifact = json.loads(
+            (ROOT / "templates/statement-import-plan.template.json").read_text(encoding="utf-8")
+        )
+        self.assert_artifact_valid(schema_name="statement-import-plan.schema.json", artifact=artifact)
+        statement_import_plan.validate_statement_import_plan(artifact)
+
+    def test_statement_import_plan_template_covers_every_family(self) -> None:
+        artifact = json.loads(
+            (ROOT / "templates/statement-import-plan.template.json").read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(
+            sorted(artifact["coverage"]["families"]),
+            ["bank_fee", "document_settlement", "processor_or_internal_transfer", "reviewed_split"],
+        )
+        self.assertEqual(artifact["coverage"]["uncovered_count"], 0)
+
+    def test_statement_import_plan_schema_rejects_an_unknown_ui_action(self) -> None:
+        artifact = json.loads(
+            (ROOT / "templates/statement-import-plan.template.json").read_text(encoding="utf-8")
+        )
+        artifact["rows"][0]["ui_action"] = "post_via_api"
+
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="statement-import-plan.schema.json", artifact=artifact)
+
+    def test_ledger_export_evidence_template_matches_strict_schema(self) -> None:
+        artifact = json.loads(
+            (ROOT / "templates/ledger-export-evidence.template.json").read_text(encoding="utf-8")
+        )
+        self.assert_artifact_valid(schema_name="ledger-export-evidence.schema.json", artifact=artifact)
+
+    def test_ledger_export_evidence_schema_rejects_an_unknown_status(self) -> None:
+        artifact = json.loads(
+            (ROOT / "templates/ledger-export-evidence.template.json").read_text(encoding="utf-8")
+        )
+        artifact["status"] = "probably_fine"
+
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="ledger-export-evidence.schema.json", artifact=artifact)
+
+    def test_woo_tax_allocation_schema_accepts_a_reviewed_order_quantity(self) -> None:
+        artifact = json.loads((ROOT / "templates/woo-tax-allocation.template.json").read_text(encoding="utf-8"))
+        artifact["allocations"][0]["quantity"] = 2
+
+        self.assert_artifact_valid(schema_name="woo-tax-allocation.schema.json", artifact=artifact)
+
+    def test_woo_tax_allocation_schema_rejects_a_zero_quantity(self) -> None:
+        artifact = json.loads((ROOT / "templates/woo-tax-allocation.template.json").read_text(encoding="utf-8"))
+        artifact["allocations"][0]["quantity"] = 0
+
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="woo-tax-allocation.schema.json", artifact=artifact)
+
     def test_posting_policy_template_matches_strict_schema(self) -> None:
         artifact = json.loads((ROOT / "templates/posting-policy.template.json").read_text(encoding="utf-8"))
+        self.assert_artifact_valid(schema_name="posting-policy.schema.json", artifact=artifact)
+
+    def test_posting_policy_schema_accepts_statement_import_cash_posting(self) -> None:
+        artifact = json.loads((ROOT / "templates/posting-policy.template.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(artifact["cash_posting"]["mode"], "statement_import")
+        self.assertEqual(
+            sorted(artifact["cash_posting"]["financial_accounts"]),
+            [
+                "bank",
+                "bank_fees",
+                "customer_receivable",
+                "fx_gain",
+                "fx_loss",
+                "paypal",
+                "platform_prepayment",
+                "reporting_person_payable",
+                "stripe_clearing",
+                "supplier_payable",
+            ],
+        )
+        self.assert_artifact_valid(schema_name="posting-policy.schema.json", artifact=artifact)
+
+    def test_posting_policy_schema_rejects_unknown_financial_account_role(self) -> None:
+        artifact = json.loads((ROOT / "templates/posting-policy.template.json").read_text(encoding="utf-8"))
+        artifact["cash_posting"]["financial_accounts"]["bank_fee"] = "99"
+
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="posting-policy.schema.json", artifact=artifact)
+
+    def test_posting_policy_schema_accepts_unbound_distributor_warehouse(self) -> None:
+        artifact = json.loads((ROOT / "templates/posting-policy.template.json").read_text(encoding="utf-8"))
+        artifact["warehouse_routing"]["distributor_warehouse_id"] = None
+
         self.assert_artifact_valid(schema_name="posting-policy.schema.json", artifact=artifact)
 
     def test_posting_policy_schema_accepts_currency_qualified_bank_account(self) -> None:
@@ -372,6 +463,14 @@ class SchemaContractTests(unittest.TestCase):
     def test_manual_inventory_action_template_matches_strict_schema(self) -> None:
         artifact = json.loads((ROOT / "templates/manual-inventory-action.template.json").read_text(encoding="utf-8"))
         self.assert_artifact_valid(schema_name="manual-inventory-action.schema.json", artifact=artifact)
+        inventory_verification.validate_manual_inventory_action(artifact)
+
+    def test_manual_inventory_action_schema_requires_transfer_remnants(self) -> None:
+        artifact = json.loads((ROOT / "templates/manual-inventory-action.template.json").read_text(encoding="utf-8"))
+        del artifact["remnant_after"]
+
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="manual-inventory-action.schema.json", artifact=artifact)
 
     def test_manual_inventory_action_schema_rejects_nonpositive_quantity(self) -> None:
         artifact = json.loads((ROOT / "templates/manual-inventory-action.template.json").read_text(encoding="utf-8"))

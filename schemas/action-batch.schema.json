@@ -61,6 +61,11 @@
       "type": "array",
       "items": {"type": "object"}
     },
+    "cash_posting_mode": {
+      "description": "Cash mode the batch was built under; statement_import forbids API cash on imported statement accounts.",
+      "type": "string",
+      "enum": ["api", "statement_import"]
+    },
     "unresolved_dependencies": {
       "type": "array",
       "items": {
@@ -98,6 +103,22 @@
     }
   },
   "$defs": {
+    "warehouse_routing_proof": {
+      "type": "object",
+      "description": "Facts a checker recomputes the reviewed warehouse from; never a warehouse taken on trust.",
+      "additionalProperties": false,
+      "required": ["channel", "warehouse_id", "order_numbers"],
+      "properties": {
+        "channel": {"type": "string", "minLength": 1},
+        "warehouse_id": {"type": "string", "pattern": "^[0-9]+$"},
+        "order_numbers": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "integer", "minimum": 1}
+        }
+      }
+    },
     "reference_artifact": {
       "type": "object",
       "additionalProperties": false,
@@ -449,6 +470,13 @@
             "line_items": {
               "type": "array",
               "items": {"$ref": "#/$defs/inventory_line"}
+            },
+            "summary_scope": {
+              "type": "object",
+              "additionalProperties": true,
+              "properties": {
+                "warehouse_routing": {"$ref": "#/$defs/warehouse_routing_proof"}
+              }
             }
           },
           "additionalProperties": true

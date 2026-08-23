@@ -1870,5 +1870,455 @@ class BookcheckerTests(unittest.TestCase):
         self.assertEqual(evaluation["error_count"], 0)
 
 
+class StatementImportModeCheckerTests(unittest.TestCase):
+    def policy(self) -> dict:
+        return {
+            "schema_version": "1.0",
+            "company_slug": "example",
+            "bank_accounts": {"EE123": {"EUR": "3"}},
+            "contacts": {},
+            "mappings": {},
+            "supplier_aliases": {},
+            "cash_posting": {
+                "mode": "statement_import",
+                "bank_income_account_ids": ["3"],
+                "processor_income_account_ids": {"paypal": "6"},
+                "bank_financial_accounts": {"EE123": {"EUR": "10"}},
+                "clearing_provider_roles": {"paypal": "paypal"},
+                "financial_accounts": {
+                    "bank": "10", "stripe_clearing": "30", "paypal": "31", "bank_fees": "32",
+                    "reporting_person_payable": "33", "platform_prepayment": "34",
+                    "customer_receivable": "37", "supplier_payable": "38",
+                    "fx_gain": "35", "fx_loss": "36",
+                },
+            },
+        }
+
+    def batch(self, *, bank_account_id: str, mode: str = "statement_import") -> dict:
+        return {
+            "company_slug": "example",
+            "period": "2024-01",
+            "cash_posting_mode": mode,
+            "actions": [{
+                "idempotency_key": "example-2024-01-incoming-1",
+                "action_type": "create_incoming_summary",
+                "payload": {"draft_schema": "cash_settlement_v1", "bank_account_id": bank_account_id},
+            }],
+        }
+
+    def test_checker_rejects_a_bank_cash_action_in_statement_import_mode(self) -> None:
+        findings = bookchecker.evaluate_statement_import_mode(self.batch(bank_account_id="3"), self.policy())
+
+        self.assertTrue(any("bank cash action" in item["summary"] for item in findings))
+        self.assertTrue(all(item["severity"] == "error" for item in findings))
+
+    def test_checker_allows_a_reviewed_processor_account_in_statement_import_mode(self) -> None:
+        self.assertEqual(
+            bookchecker.evaluate_statement_import_mode(self.batch(bank_account_id="6"), self.policy()), []
+        )
+
+    def test_checker_leaves_api_cash_mode_alone(self) -> None:
+        policy = dict(self.policy(), cash_posting={"mode": "api"})
+
+        self.assertEqual(
+            bookchecker.evaluate_statement_import_mode(self.batch(bank_account_id="3", mode="api"), policy), []
+        )
+
+    def test_checker_rejects_a_batch_whose_mode_disagrees_with_its_policy(self) -> None:
+        findings = bookchecker.evaluate_statement_import_mode(self.batch(bank_account_id="6", mode="api"), self.policy())
+
+        self.assertTrue(any("cash_posting_mode" in item["summary"] for item in findings))
+
+    def test_checker_cannot_clear_a_statement_import_batch_without_a_policy(self) -> None:
+        findings = bookchecker.evaluate_statement_import_mode(self.batch(bank_account_id="3"), None)
+
+        self.assertTrue(any("without a bound posting policy" in item["summary"] for item in findings))
+
+
+class StatementPlanCoverageTests(unittest.TestCase):
+    def plan(self, rows: list[dict], *, company_slug: str = "example", year: int = 2024) -> dict:
+        return {
+            "schema_version": "1.0",
+            "company_slug": company_slug,
+            "year": year,
+            "cash_posting_mode": "statement_import",
+            "rate_bindings": [],
+            "coverage": {
+                "physical_row_count": len(rows),
+                "planned_row_count": len(rows),
+                "uncovered_count": 0,
+                "extra_count": 0,
+                "families": {},
+                "movement": {},
+            },
+            "rows": rows,
+        }
+
+    def plan_row(self, row: dict) -> dict:
+        return {
+            "statement_id": f"archive:{row['record_id']}",
+            "record_id": row["record_id"],
+            "iban": "EE123",
+            "currency": "EUR",
+            "period": row["event_date"][:7],
+            "date": row["event_date"],
+            "signed_amount": f"{row['gross_amount']:.2f}",
+            "counterparty": "",
+            "description": "",
+            "disposition": "bank_fee_payment",
+            "family": "bank_fee",
+            "ui_action": "assign_general_ledger",
+            "financial_accounts": {"debit": "32", "credit": "10"},
+            "financial_account_roles": {"debit": "bank_fees", "credit": "bank"},
+            "document_refs": [],
+            "ecb": None,
+            "parts": [],
+            "split_equation": "",
+            "source": {"source_id": "s", "path": "source/camt.xml", "sha256": "a" * 64, "row_ref": row["record_id"]},
+            "status": "pending",
+            "evidence": None,
+        }
+
+    def fixture(self, tmp: Path, *, rows: list[dict], plan_rows: list[dict] | None = None) -> dict:
+        normalized_path, _allocation_path = write_bank_coverage_fixture(tmp, rows)
+        plan = self.plan([self.plan_row(row) for row in (plan_rows if plan_rows is not None else rows)])
+        plan_path = tmp / "2024-plan.json"
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        return {
+            "company_slug": "example",
+            "period": "2024-01",
+            "approval_status": "approved",
+            "cash_posting_mode": "statement_import",
+            "reference_artifacts": [
+                {
+                    "kind": "normalized_period",
+                    "path": str(normalized_path),
+                    "sha256": hashlib.sha256(normalized_path.read_bytes()).hexdigest(),
+                },
+                {
+                    "kind": "statement_import_plan",
+                    "path": str(plan_path),
+                    "sha256": hashlib.sha256(plan_path.read_bytes()).hexdigest(),
+                },
+            ],
+            "actions": [],
+            "unresolved_dependencies": [],
+        }
+
+    def evaluate(self, tmp: Path, batch: dict) -> list[dict]:
+        return bookchecker.evaluate_statement_plan_coverage(
+            batch, action_path=tmp / "actions.yaml", cwd=tmp
+        )
+
+    def test_a_fully_planned_period_has_no_finding(self) -> None:
+        rows = [physical_bank_record(record_id="r1", amount=-12.5)]
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+
+            self.assertEqual(self.evaluate(tmp, self.fixture(tmp, rows=rows)), [])
+
+    def test_a_physical_row_missing_from_the_plan_is_an_error(self) -> None:
+        rows = [physical_bank_record(record_id="r1", amount=-12.5), physical_bank_record(record_id="r2", amount=-5.0)]
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            findings = self.evaluate(tmp, self.fixture(tmp, rows=rows, plan_rows=rows[:1]))
+
+            self.assertTrue(any("not planned" in item["summary"] for item in findings))
+
+    def test_a_plan_row_without_a_physical_row_is_an_error(self) -> None:
+        rows = [physical_bank_record(record_id="r1", amount=-12.5)]
+        extra = physical_bank_record(record_id="r9", amount=-1.0)
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            findings = self.evaluate(tmp, self.fixture(tmp, rows=rows, plan_rows=[*rows, extra]))
+
+            self.assertTrue(any("no physical bank row" in item["summary"] for item in findings))
+
+    def test_a_missing_plan_binding_is_an_error(self) -> None:
+        rows = [physical_bank_record(record_id="r1", amount=-12.5)]
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            batch = self.fixture(tmp, rows=rows)
+            batch["reference_artifacts"] = [
+                item for item in batch["reference_artifacts"] if item["kind"] != "statement_import_plan"
+            ]
+
+            self.assertTrue(any("statement-import plan" in item["summary"] for item in self.evaluate(tmp, batch)))
+
+    def test_a_changed_plan_file_is_an_error(self) -> None:
+        rows = [physical_bank_record(record_id="r1", amount=-12.5)]
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            batch = self.fixture(tmp, rows=rows)
+            (tmp / "2024-plan.json").write_text("{}", encoding="utf-8")
+
+            self.assertTrue(any("invalid or stale" in item["summary"] for item in self.evaluate(tmp, batch)))
+
+    def test_a_plan_for_another_company_is_an_error(self) -> None:
+        rows = [physical_bank_record(record_id="r1", amount=-12.5)]
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            batch = self.fixture(tmp, rows=rows)
+            plan = self.plan([self.plan_row(rows[0])], company_slug="other")
+            plan_path = tmp / "2024-plan.json"
+            plan_path.write_text(json.dumps(plan), encoding="utf-8")
+            for item in batch["reference_artifacts"]:
+                if item["kind"] == "statement_import_plan":
+                    item["sha256"] = hashlib.sha256(plan_path.read_bytes()).hexdigest()
+
+            self.assertTrue(any("company" in item["summary"] for item in self.evaluate(tmp, batch)))
+
+    def test_an_api_cash_action_cannot_also_claim_a_planned_row(self) -> None:
+        rows = [physical_bank_record(record_id="r1", amount=-12.5)]
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            batch = self.fixture(tmp, rows=rows)
+            normalized_path = next(
+                Path(item["path"]) for item in batch["reference_artifacts"] if item["kind"] == "normalized_period"
+            )
+            batch["actions"] = [exact_settlement_action(row=rows[0], normalized_path=normalized_path)]
+
+            findings = self.evaluate(tmp, batch)
+
+            self.assertTrue(any("also claimed by an API cash action" in item["summary"] for item in findings))
+
+
+class LedgerEvidenceCheckerTests(unittest.TestCase):
+    HEADER = (
+        "company_id,period,account_id,account_code,transaction_id,business_date,"
+        "currency,debit,credit,description,document_ref"
+    )
+
+    def write_export(self, tmp: Path, rows: list[str]) -> Path:
+        path = tmp / "ledger.csv"
+        path.write_text("\n".join([self.HEADER, *rows]) + "\n", encoding="utf-8")
+        return path
+
+    def batch(self, tmp: Path, *, bind: bool = True, rows: list[str] | None = None) -> dict:
+        default = [
+            "42,2024,32,C32,t1,2024-01-15,EUR,12.50,0.00,Fee,",
+            "42,2024,10,C10,t1,2024-01-15,EUR,0.00,12.50,Fee,",
+        ]
+        export_path = self.write_export(tmp, default if rows is None else rows)
+        artifacts = []
+        if bind:
+            artifacts.append({
+                "kind": "ledger_export_evidence",
+                "path": str(export_path),
+                "sha256": hashlib.sha256(export_path.read_bytes()).hexdigest(),
+            })
+        return {
+            "company_slug": "example",
+            "period": "2024-01",
+            "cash_posting_mode": "statement_import",
+            "reference_artifacts": artifacts,
+            "actions": [],
+        }
+
+    def test_an_unbound_export_yields_no_finding_before_import(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+
+            self.assertEqual(
+                bookchecker.evaluate_ledger_export_evidence(self.batch(tmp, bind=False), cwd=tmp), []
+            )
+
+    def test_a_changed_export_is_an_error(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            batch = self.batch(tmp)
+            (tmp / "ledger.csv").write_text("tampered\n", encoding="utf-8")
+
+            findings = bookchecker.evaluate_ledger_export_evidence(batch, cwd=tmp)
+
+            self.assertTrue(any("SHA" in item["summary"] for item in findings))
+            self.assertTrue(all(item["severity"] == "error" for item in findings))
+
+    def test_an_unsupported_export_format_is_an_error(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            batch = self.batch(tmp, rows=[])
+            path = tmp / "ledger.csv"
+            path.write_text("not,a,ledger\n", encoding="utf-8")
+            batch["reference_artifacts"][0]["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+
+            findings = bookchecker.evaluate_ledger_export_evidence(batch, cwd=tmp)
+
+            self.assertTrue(any("column" in item["summary"] for item in findings))
+
+    def test_a_bound_and_readable_export_yields_no_finding(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+
+            self.assertEqual(bookchecker.evaluate_ledger_export_evidence(self.batch(tmp), cwd=tmp), [])
+
+
+class PendingProofBlockingTests(unittest.TestCase):
+    def dependency(self, *, blocking: bool) -> dict:
+        return {
+            "kind": "manual_statement_import_financial_transaction",
+            "blocking": blocking,
+            "disposition": "bank_fee_payment",
+            "statement_import_proof": {"status": "pending", "required_evidence": "live_discovery_or_audit"},
+        }
+
+    def errors(self, *, blocking: bool, statement_import_mode: bool) -> list[str]:
+        return [
+            e for e in bookchecker.manual_financial_dependency_errors(
+                self.dependency(blocking=blocking),
+                bookchecker.DependencyCheckContext(statement_import_mode=statement_import_mode),
+            ) if "blocking" in e
+        ]
+
+    def test_api_cash_mode_still_demands_a_pending_proof_blocks(self) -> None:
+        self.assertTrue(self.errors(blocking=False, statement_import_mode=False))
+
+    def test_api_cash_mode_accepts_a_blocking_pending_proof(self) -> None:
+        self.assertEqual(self.errors(blocking=True, statement_import_mode=False), [])
+
+    def test_statement_import_mode_accepts_a_non_blocking_pending_proof(self) -> None:
+        # The API posts no cash for this row; the annual plan carries it.
+        self.assertEqual(self.errors(blocking=False, statement_import_mode=True), [])
+
+    def test_statement_import_mode_still_accepts_a_blocking_one(self) -> None:
+        self.assertEqual(self.errors(blocking=True, statement_import_mode=True), [])
+
+
+class AllocatedOrderProofTests(unittest.TestCase):
+    ORDER = "763"
+
+    def proof(self, *, quantity: float = 2.0, order: str | None = None) -> dict:
+        order_id = order or self.ORDER
+        contributor = {
+            "record_id": order_id,
+            "quantity": quantity,
+            "quantity_source": "reviewed_woo_tax_allocation",
+            "record_sha256": bookchecker._canonical_value_sha256(
+                {"order_id": order_id, "source_row_id": "woo-tax:2"}
+            ),
+        }
+        scope = {
+            "kind": "reviewed_allocated_order", "period": "2024-01",
+            "record_category": "sales", "group_label": "woo", "order_id": order_id,
+        }
+        return {
+            "status": "exact", "quantity": quantity, "scope": scope,
+            "scope_sha256": bookchecker._canonical_value_sha256(scope),
+            "contributor_count": 1,
+            "contributor_set_sha256": bookchecker._canonical_value_sha256([contributor]),
+            "contributors": [contributor],
+        }
+
+    def action(self, *, proof: dict, evidence_quantity: float = 2.0) -> dict:
+        return {
+            "idempotency_key": "example-2024-01-sales-woo-wh6",
+            "action_type": "create_invoice_summary",
+            "payload": {
+                "document_type": "invoice",
+                "line_items": [{
+                    "line_role": "sales_revenue",
+                    "article_id_hint": "3",
+                    "quantity": proof["quantity"],
+                    "inventory_quantity_proof": proof,
+                    "vat_allocation_component": "goods",
+                    "vat_allocation_component_evidence": [
+                        {"order_id": self.ORDER, "quantity": evidence_quantity, "source_row_id": "woo-tax:2"}
+                    ],
+                }],
+            },
+        }
+
+    def findings(self, action: dict) -> list[str]:
+        return [
+            f["summary"] for f in bookchecker.evaluate_inventory_quantities(
+                action=action, resolved_sources=[], reviewed_allocations={}
+            )
+        ]
+
+    def test_a_matching_allocated_order_proof_passes(self) -> None:
+        self.assertEqual(self.findings(self.action(proof=self.proof())), [])
+
+    def test_a_quantity_the_allocation_does_not_support_is_rejected(self) -> None:
+        found = self.findings(self.action(proof=self.proof(quantity=2.0), evidence_quantity=1.0))
+
+        self.assertTrue(any("reviewed allocation" in f for f in found), found)
+
+    def test_an_order_absent_from_the_line_evidence_is_rejected(self) -> None:
+        found = self.findings(self.action(proof=self.proof(order="999")))
+
+        self.assertTrue(any("reviewed allocation" in f for f in found), found)
+
+    def test_a_tampered_contributor_hash_is_rejected(self) -> None:
+        proof = self.proof()
+        proof["contributors"][0]["record_sha256"] = "0" * 64
+        proof["contributor_set_sha256"] = bookchecker._canonical_value_sha256(proof["contributors"])
+
+        self.assertTrue(self.findings(self.action(proof=proof)))
+
+
+class ResidualDerivationCheckTests(unittest.TestCase):
+    def record(self, *, summary: float, allocated: float, residual: float, quantity: float) -> dict:
+        return {
+            "record_id": "woo:2024-04:zero-rated-residual",
+            "quantity": quantity,
+            "attributes": {"quantity_derivation": {
+                "summary_quantity": summary,
+                "allocated_quantity": allocated,
+                "residual_quantity": residual,
+            }},
+        }
+
+    def test_a_sound_derivation_is_accepted(self) -> None:
+        self.assertEqual(
+            bookchecker.residual_quantity_derivation_errors(
+                self.record(summary=4, allocated=2, residual=2, quantity=2)
+            ),
+            [],
+        )
+
+    def test_a_subtraction_that_does_not_hold_is_rejected(self) -> None:
+        errors = bookchecker.residual_quantity_derivation_errors(
+            self.record(summary=4, allocated=2, residual=3, quantity=3)
+        )
+
+        self.assertTrue(any("does not equal" in e for e in errors), errors)
+
+    def test_a_quantity_that_disagrees_with_its_own_derivation_is_rejected(self) -> None:
+        errors = bookchecker.residual_quantity_derivation_errors(
+            self.record(summary=4, allocated=2, residual=2, quantity=5)
+        )
+
+        self.assertTrue(any("does not match" in e for e in errors), errors)
+
+    def test_a_record_without_a_derivation_is_left_alone(self) -> None:
+        self.assertEqual(
+            bookchecker.residual_quantity_derivation_errors({"record_id": "x", "quantity": 1}), []
+        )
+
+
+class DuplicateBindingTests(unittest.TestCase):
+    def batch(self, count: int) -> dict:
+        return {
+            "company_slug": "example", "period": "2024-01", "cash_posting_mode": "statement_import",
+            "reference_artifacts": [
+                {"kind": "ledger_export_evidence", "path": f"l{i}.csv", "sha256": "a" * 64}
+                for i in range(count)
+            ],
+            "actions": [],
+        }
+
+    def test_no_binding_is_nothing_to_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(
+                bookchecker.evaluate_ledger_export_evidence(self.batch(0), cwd=Path(tmp)), []
+            )
+
+    def test_a_duplicated_binding_is_an_error_not_a_bypass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            findings = bookchecker.evaluate_ledger_export_evidence(self.batch(2), cwd=Path(tmp))
+
+            self.assertTrue(any("more than one" in f["summary"] for f in findings), findings)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -9,6 +9,7 @@ import subprocess
 import sys
 import unicodedata
 from collections import Counter, defaultdict  # noqa: F401
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
@@ -26,10 +27,14 @@ from exchange_rates import ExchangeRateError, lookup_rate
 from posting_policy import (
     PostingPolicyError,
     action_policy_errors,
+    cash_posting_mode,
     load_posting_policy,
+    prohibited_bank_cash_action,
     resolve_bank_account,
     resolve_sales_vat_profile,
 )
+from ledger_export_evidence import LedgerEvidenceError, load_ledger_export
+from statement_import_plan import StatementImportPlanError, validate_statement_import_plan
 from reference_artifacts import (
     ReferenceArtifactError,
     required_action_binding_kinds,
@@ -1169,6 +1174,195 @@ def _generated_settlement_contact_errors(
     return errors
 
 
+def _reference_bindings(action_batch: dict[str, Any], kind: str) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in action_batch.get("reference_artifacts") or []
+        if isinstance(item, dict) and str(item.get("kind") or "") == kind
+    ]
+
+
+def _reference_binding(action_batch: dict[str, Any], kind: str) -> dict[str, Any] | None:
+    bindings = _reference_bindings(action_batch, kind)
+    return bindings[0] if len(bindings) == 1 else None
+
+
+def _planned_period_keys(plan: dict[str, Any], period: str) -> set[tuple[str, str, str]]:
+    return {
+        (
+            str(row.get("statement_id") or ""),
+            re.sub(r"\s+", "", str(row.get("iban") or "")).upper(),
+            str(row.get("currency") or "").upper(),
+        )
+        for row in plan.get("rows") or []
+        if isinstance(row, dict) and str(row.get("period") or "") == period
+    }
+
+
+def _physical_period_keys(payload: dict[str, Any]) -> tuple[set[tuple[str, str, str]], list[dict[str, Any]]]:
+    keys: set[tuple[str, str, str]] = set()
+    findings: list[dict[str, Any]] = []
+    for record in (payload.get("records") or {}).get("bank_transactions") or []:
+        if not isinstance(record, dict) or str(record.get("source_system") or "") != "bank":
+            continue
+        try:
+            keys.add(_physical_record_key(record))
+        except BankAllocationError as exc:
+            findings.append(make_finding(
+                section="statement_plan_coverage", severity="error",
+                summary=f"Physical bank row has invalid identity: {exc}",
+                action_id=str(record.get("record_id") or "") or None,
+            ))
+    return keys, findings
+
+
+def _loaded_statement_plan(
+    action_batch: dict[str, Any], *, cwd: Path, period: str
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    binding = _reference_binding(action_batch, "statement_import_plan")
+    if binding is None:
+        return None, [make_finding(
+            section="statement_plan_coverage", severity="error",
+            summary="Statement-import coverage requires exactly one bound annual statement-import plan.",
+        )]
+    try:
+        plan = load_json(verify_file_binding(binding, cwd=cwd))
+        validate_statement_import_plan(plan)
+    except (ReferenceArtifactError, StatementImportPlanError, SimplbooksError, OSError) as exc:
+        return None, [make_finding(
+            section="statement_plan_coverage", severity="error",
+            summary=f"Statement-import plan is invalid or stale: {exc}",
+        )]
+    findings: list[dict[str, Any]] = []
+    if str(plan.get("company_slug") or "") != str(action_batch.get("company_slug") or ""):
+        findings.append(make_finding(
+            section="statement_plan_coverage", severity="error",
+            summary="Statement-import plan company does not match the action batch.",
+        ))
+    if str(plan.get("year") or "") != period[:4]:
+        findings.append(make_finding(
+            section="statement_plan_coverage", severity="error",
+            summary="Statement-import plan year does not match the action period.",
+        ))
+    return plan, findings
+
+
+def _double_claimed_plan_rows(
+    action_batch: dict[str, Any],
+    normalized_payload: dict[str, Any],
+    *,
+    planned_keys: set[tuple[str, str, str]],
+) -> list[dict[str, Any]]:
+    """Report API cash actions claiming a physical row the statement import already settles."""
+    record_index = build_record_index(normalized_payload)
+    findings: list[dict[str, Any]] = []
+    for action in action_batch.get("actions") or []:
+        if not isinstance(action, dict):
+            continue
+        if str((action.get("payload") or {}).get("draft_schema") or "") != "cash_settlement_v1":
+            continue
+        for ref in action.get("source_refs") or []:
+            if not isinstance(ref, dict) or ref.get("source_kind") != "physical_bank":
+                continue
+            resolved = record_index.get(str(ref.get("record_ref") or ""))
+            if resolved is None:
+                continue
+            try:
+                key = _physical_record_key(resolved[1])
+            except BankAllocationError:
+                continue
+            if key in planned_keys:
+                findings.append(make_finding(
+                    section="statement_plan_coverage", severity="error",
+                    summary=(
+                        f"Physical bank row {key[0]!r} is planned for statement import and is "
+                        "also claimed by an API cash action."
+                    ),
+                    action_id=action_label(action),
+                ))
+    return findings
+
+
+def evaluate_ledger_export_evidence(
+    action_batch: dict[str, Any], *, cwd: Path
+) -> list[dict[str, Any]]:
+    """Check a bound post-import ledger export is present, unchanged, and readable.
+
+    An export is optional before the statement is imported, so a document-only dry run
+    is not blocked by evidence that cannot exist yet. Once one is bound it must hold:
+    a stale or unsupported file is worse than none, because it looks like proof.
+    """
+    bindings = _reference_bindings(action_batch, "ledger_export_evidence")
+    if len(bindings) > 1:
+        # Duplicated bindings must not read as "nothing bound"; that would turn a second
+        # binding into a way of skipping the check entirely.
+        return [make_finding(
+            section="ledger_export_evidence",
+            severity="error",
+            summary=f"Batch binds more than one ledger export ({len(bindings)}); exactly one is required.",
+        )]
+    if not bindings:
+        return []
+    binding = bindings[0]
+    try:
+        load_ledger_export(binding, cwd=cwd)
+    except (LedgerEvidenceError, OSError) as exc:
+        return [make_finding(
+            section="ledger_export_evidence",
+            severity="error",
+            summary=f"Bound ledger export is not usable evidence: {exc}",
+        )]
+    return []
+
+
+def evaluate_statement_plan_coverage(
+    action_batch: dict[str, Any], *, action_path: Path, cwd: Path
+) -> list[dict[str, Any]]:
+    """Prove the annual plan claims this period's physical rows exactly once, and alone.
+
+    In statement-import mode the plan row is the terminal coverage item. A document
+    action may support a row, but an API cash action claiming the same physical key
+    would settle it twice.
+    """
+    period = str(action_batch.get("period") or "")
+    plan, findings = _loaded_statement_plan(action_batch, cwd=cwd, period=period)
+    if plan is None:
+        return findings
+
+    normalized_binding = _reference_binding(action_batch, "normalized_period")
+    if normalized_binding is None:
+        findings.append(make_finding(
+            section="statement_plan_coverage", severity="error",
+            summary="Statement-import coverage requires exactly one bound normalized period artifact.",
+        ))
+        return findings
+    try:
+        normalized_payload = load_json(verify_file_binding(normalized_binding, cwd=cwd))
+    except (ReferenceArtifactError, SimplbooksError, OSError) as exc:
+        findings.append(make_finding(
+            section="statement_plan_coverage", severity="error",
+            summary=f"Normalized period artifact is invalid or stale: {exc}",
+        ))
+        return findings
+
+    physical_keys, identity_findings = _physical_period_keys(normalized_payload)
+    findings.extend(identity_findings)
+    planned_keys = _planned_period_keys(plan, period)
+    for key in sorted(physical_keys - planned_keys):
+        findings.append(make_finding(
+            section="statement_plan_coverage", severity="error",
+            summary=f"Physical bank row {key[0]!r} is not planned for import in {period}.",
+        ))
+    for key in sorted(planned_keys - physical_keys):
+        findings.append(make_finding(
+            section="statement_plan_coverage", severity="error",
+            summary=f"Planned statement row {key[0]!r} has no physical bank row in {period}.",
+        ))
+
+    findings.extend(_double_claimed_plan_rows(action_batch, normalized_payload, planned_keys=planned_keys))
+    return findings
+
+
 def evaluate_bank_statement_completeness(
     action_batch: dict[str, Any],
     *,
@@ -1178,6 +1372,8 @@ def evaluate_bank_statement_completeness(
     assigned_cash_amounts: dict[str, Decimal] | None = None,
 ) -> list[dict[str, Any]]:
     """Independently prove exact-once terminal coverage for this period's physical rows."""
+    if str(action_batch.get("cash_posting_mode") or "api") == "statement_import":
+        return evaluate_statement_plan_coverage(action_batch, action_path=action_path, cwd=cwd)
     findings: list[dict[str, Any]] = []
     period = str(action_batch.get("period") or "")
     physical_action_refs = [
@@ -1647,6 +1843,64 @@ def _inventory_group_label(record: dict[str, Any]) -> str:
     )
 
 
+def residual_quantity_derivation_errors(record: dict[str, Any]) -> list[str]:
+    """Re-check a derived residual quantity instead of trusting the arithmetic that made it."""
+    derivation = (record.get("attributes") or {}).get("quantity_derivation")
+    if not isinstance(derivation, dict):
+        return []
+    try:
+        summary = decimal_value(derivation.get("summary_quantity"))
+        allocated = decimal_value(derivation.get("allocated_quantity"))
+        residual = decimal_value(derivation.get("residual_quantity"))
+        quantity = decimal_value(record.get("quantity"))
+    except SimplbooksError as exc:
+        return [f"Residual quantity derivation is not numeric: {exc}"]
+    errors: list[str] = []
+    if summary - allocated != residual:
+        errors.append(
+            f"Residual quantity derivation does not equal its inputs: "
+            f"{summary} - {allocated} != {residual}."
+        )
+    if quantity != residual:
+        errors.append(
+            f"Residual record quantity {quantity} does not match its derived residual {residual}."
+        )
+    if residual <= 0:
+        errors.append("Residual quantity derivation must be positive.")
+    return errors
+
+
+def _allocated_order_components(line: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Index the reviewed order components a VAT-allocated line declares, by order."""
+    return {
+        str(item.get("order_id") or ""): item
+        for item in line.get("vat_allocation_component_evidence") or []
+        if isinstance(item, dict) and str(item.get("order_id") or "")
+    }
+
+
+def _expected_allocated_order_contributors(line: dict[str, Any]) -> list[dict[str, Any]]:
+    """Rebuild the contributor set a VAT-allocated goods line must carry."""
+    expected: list[dict[str, Any]] = []
+    for order_id, item in _allocated_order_components(line).items():
+        try:
+            quantity = decimal_value(item.get("quantity"))
+        except SimplbooksError:
+            continue
+        if quantity <= 0:
+            continue
+        expected.append({
+            "record_id": order_id,
+            "quantity": decimal_number(quantity),
+            "quantity_source": "reviewed_woo_tax_allocation",
+            "record_sha256": _canonical_value_sha256(
+                {"order_id": order_id, "source_row_id": str(item.get("source_row_id") or "")}
+            ),
+        })
+    expected.sort(key=lambda item: (item["record_id"], item["record_sha256"]))
+    return expected
+
+
 def _inventory_scope_records(
     scope: dict[str, Any], *, normalized_payloads: list[dict[str, Any]],
     reviewed_allocations: dict[str, dict[str, Any]],
@@ -1764,12 +2018,15 @@ def evaluate_inventory_quantities(
                 problems.append("Inventory quantity contributor must be positive.")
                 continue
             contributor_total += quantity
-            record = records.get(record_id)
-            if not isinstance(record, dict):
-                problems.append(f"Inventory quantity contributor {record_id} is not an action source.")
-                continue
-            if _canonical_record_sha256(record) != str(contributor.get("record_sha256") or ""):
-                problems.append(f"Inventory quantity contributor {record_id} SHA-256 does not match its source record.")
+            if contributor.get("quantity_source") != "reviewed_woo_tax_allocation":
+                record = records.get(record_id)
+                if not isinstance(record, dict):
+                    problems.append(f"Inventory quantity contributor {record_id} is not an action source.")
+                    continue
+                if _canonical_record_sha256(record) != str(contributor.get("record_sha256") or ""):
+                    problems.append(
+                        f"Inventory quantity contributor {record_id} SHA-256 does not match its source record."
+                    )
             source = contributor.get("quantity_source")
             if source == "normalized_record":
                 try:
@@ -1778,6 +2035,7 @@ def evaluate_inventory_quantities(
                     source_quantity = Decimal("0")  # noqa: FURB157
                 if source_quantity <= 0 or source_quantity != quantity:
                     problems.append(f"Inventory quantity contributor {record_id} does not match normalized quantity.")
+                problems.extend(residual_quantity_derivation_errors(record))
             elif source == "reviewed_allocation_target":
                 allocation = reviewed_allocations.get(record_id)
                 target = allocation.get("target") if isinstance(allocation, dict) else None
@@ -1787,6 +2045,16 @@ def evaluate_inventory_quantities(
                     allocated_quantity = Decimal("0")  # noqa: FURB157
                 if not isinstance(target, dict) or allocated_quantity <= 0 or allocated_quantity != quantity:
                     problems.append(f"Inventory quantity contributor {record_id} does not match reviewed allocation target.")
+            elif source == "reviewed_woo_tax_allocation":
+                component = _allocated_order_components(line).get(record_id)
+                try:
+                    allocated_quantity = decimal_value((component or {}).get("quantity"))
+                except SimplbooksError:
+                    allocated_quantity = Decimal("0")  # noqa: FURB157
+                if not isinstance(component, dict) or allocated_quantity <= 0 or allocated_quantity != quantity:
+                    problems.append(
+                        f"Inventory quantity contributor {record_id} does not match its reviewed allocation component."
+                    )
             else:
                 problems.append(f"Inventory quantity contributor {record_id} has unsupported quantity source.")
         try:
@@ -1801,7 +2069,19 @@ def evaluate_inventory_quantities(
             if isinstance(payload, dict) and id(payload) not in seen_payload_ids:
                 normalized_payloads.append(payload)
                 seen_payload_ids.add(id(payload))
-        if isinstance(proof, dict) and isinstance(proof.get("scope"), dict):
+        if (
+            isinstance(proof, dict)
+            and isinstance(proof.get("scope"), dict)
+            and proof["scope"].get("kind") == "reviewed_allocated_order"
+        ):
+            expected_contributors = _expected_allocated_order_contributors(line)
+            if (
+                contributors != expected_contributors
+                or int(proof.get("contributor_count") or -1) != len(expected_contributors)
+                or str(proof.get("contributor_set_sha256") or "") != _canonical_value_sha256(expected_contributors)
+            ):
+                problems.append("Inventory proof does not contain the complete contributor set for its semantic scope.")
+        elif isinstance(proof, dict) and isinstance(proof.get("scope"), dict):
             expected_records, quantity_source = _inventory_scope_records(
                 proof["scope"], normalized_payloads=normalized_payloads,
                 reviewed_allocations=reviewed_allocations,
@@ -1869,11 +2149,26 @@ def load_reviewed_allocation_index(
         )]
 
 
+@dataclass(frozen=True)
+class DependencyCheckContext:
+    """What a manual statement dependency is being checked against."""
+
+    cwd: Path | None = None
+    expected_company_id: str | None = None
+    require_typed_context: bool = False
+    discovery_payloads: tuple[dict[str, Any], ...] | list[dict[str, Any]] | None = None
+    statement_import_mode: bool = False
+
+
 def manual_financial_dependency_errors(
-    dependency: dict[str, Any], *, cwd: Path | None = None,
-    expected_company_id: str | None = None, require_typed_context: bool = False,
-    discovery_payloads: list[dict[str, Any]] | None = None,
+    dependency: dict[str, Any], context: DependencyCheckContext | None = None
 ) -> list[str]:
+    context = context or DependencyCheckContext()
+    cwd = context.cwd
+    expected_company_id = context.expected_company_id
+    require_typed_context = context.require_typed_context
+    discovery_payloads = context.discovery_payloads
+    statement_import_mode = context.statement_import_mode
     errors: list[str] = []
     allowed_top_level_dispositions = {
         "bank_fee_payment",
@@ -1949,9 +2244,19 @@ def manual_financial_dependency_errors(
         or set(proof.get("evidence_binding") or {}) != {"path", "sha256"}
     ):
         errors.append("Verified statement import proof requires a SimplBooks transaction ID and evidence binding.")
-    elif proof.get("status") == "pending" and dependency.get("blocking") is not True:
+    elif (
+        proof.get("status") == "pending"
+        and dependency.get("blocking") is not True
+        and not statement_import_mode
+    ):
+        # In statement-import mode the API posts no cash for this row, so a pending proof
+        # does not hold back the documents; the annual plan carries the row instead.
         errors.append("Pending statement import proof must remain blocking.")
-    elif dependency.get("blocking") is False and proof.get("status") != "verified":
+    elif (
+        dependency.get("blocking") is False
+        and proof.get("status") != "verified"
+        and not statement_import_mode
+    ):
         errors.append("Only verified statement import proof may be non-blocking.")
 
     split_parts = dependency.get("split_parts")
@@ -2160,8 +2465,12 @@ def evaluate_unresolved_dependencies(
     for dependency in action_batch.get("unresolved_dependencies") or []:
         if str(dependency.get("kind") or "") == "manual_statement_import_financial_transaction":
             dependency_errors = manual_financial_dependency_errors(
-                dependency, cwd=cwd, expected_company_id=expected_company_id,
-                require_typed_context=True, discovery_payloads=discovery_payloads,
+                dependency,
+                DependencyCheckContext(
+                    cwd=cwd, expected_company_id=expected_company_id,
+                    require_typed_context=True, discovery_payloads=discovery_payloads,
+                    statement_import_mode=str(action_batch.get("cash_posting_mode") or "") == "statement_import",
+                ),
             )
             dependency_errors.extend(discovery_errors)
             if action_path is not None and cwd is not None:
@@ -2193,6 +2502,59 @@ def evaluate_unresolved_dependencies(
                 action_id=str(dependency.get("action_id") or "") or None,
             )
         )
+    return findings
+
+
+def evaluate_statement_import_mode(
+    action_batch: dict[str, Any], posting_policy: dict[str, Any] | None
+) -> list[dict[str, Any]]:
+    """Independently refuse API cash against an account whose statement is imported.
+
+    The builder already suppresses these actions. This repeats the judgement from the
+    batch and the policy alone, so a hand-edited or stale batch cannot smuggle one past.
+    """
+    declared = str(action_batch.get("cash_posting_mode") or "api")
+    if posting_policy is None:
+        if declared == "statement_import":
+            return [make_finding(
+                section="statement_import_mode",
+                severity="error",
+                summary="A statement-import batch cannot be checked without a bound posting policy.",
+            )]
+        return []
+
+    findings: list[dict[str, Any]] = []
+    try:
+        expected = cash_posting_mode(posting_policy)
+    except PostingPolicyError as exc:
+        return [make_finding(section="statement_import_mode", severity="error", summary=str(exc))]
+    if declared != expected:
+        findings.append(make_finding(
+            section="statement_import_mode",
+            severity="error",
+            summary=f"Batch cash_posting_mode {declared!r} does not match the bound posting policy mode {expected!r}.",
+        ))
+    for action in action_batch.get("actions") or []:
+        if not isinstance(action, dict):
+            continue
+        try:
+            prohibited = prohibited_bank_cash_action(action, posting_policy)
+        except PostingPolicyError as exc:
+            findings.append(make_finding(
+                section="statement_import_mode", severity="error", summary=str(exc),
+                action_id=action_label(action),
+            ))
+            continue
+        if prohibited:
+            findings.append(make_finding(
+                section="statement_import_mode",
+                severity="error",
+                summary=(
+                    "Prohibited bank cash action: statement-import mode settles this account "
+                    "through the imported statement, not the API."
+                ),
+                action_id=action_label(action),
+            ))
     return findings
 
 
@@ -2639,6 +3001,8 @@ def evaluate_action_batch(
             expected_company_id=expected_company_id,
         )
     )
+    findings.extend(evaluate_statement_import_mode(action_batch, posting_policy))
+    findings.extend(evaluate_ledger_export_evidence(action_batch, cwd=cwd))
     findings.extend(evaluate_posting_policy(action_batch, posting_policy))
     findings.extend(evaluate_vat_profiles(action_batch.get("actions") or [], posting_policy))
     findings.extend(

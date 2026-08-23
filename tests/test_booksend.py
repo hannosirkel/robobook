@@ -1,6 +1,7 @@
 from __future__ import annotations  # noqa: I001
 
 import copy
+import hashlib
 import json
 import sys
 import tempfile
@@ -1537,6 +1538,205 @@ class BooksendTests(unittest.TestCase):
         self.assertIn("example-2024-01-sales-paypal", candidates)
         self.assertEqual(candidates["example-2024-01-incoming-paypal"]["depends_on"], [])
         self.assertEqual(candidates["example-2024-01-sales-paypal"]["depends_on"], ["example-2024-01-incoming-paypal"])
+
+
+class StatementImportSenderTests(unittest.TestCase):
+    def policy(self, *, mode: str = "statement_import") -> dict:
+        return {
+            "schema_version": "1.0",
+            "company_slug": "example",
+            "bank_accounts": {"EE123": {"EUR": "101"}},
+            "contacts": {"sales": {"paypal": "2001"}, "processors": {}, "suppliers": {}},
+            "mappings": {},
+            "supplier_aliases": {},
+            "cash_posting": {
+                "mode": mode,
+                "bank_income_account_ids": ["101"],
+                "processor_income_account_ids": {"paypal": "6"},
+                "bank_financial_accounts": {"EE123": {"EUR": "10"}},
+                "clearing_provider_roles": {"paypal": "paypal"},
+                "financial_accounts": {
+                    "bank": "10", "stripe_clearing": "30", "paypal": "31", "bank_fees": "32",
+                    "reporting_person_payable": "33", "platform_prepayment": "34",
+                    "customer_receivable": "37", "supplier_payable": "38",
+                    "fx_gain": "35", "fx_loss": "36",
+                },
+            },
+        }
+
+    def statement_batch(self, **overrides: object) -> dict:
+        batch = make_batch(actions=[incoming_action()],
+                           unresolved_dependencies=overrides.pop("unresolved_dependencies", None))
+        batch["cash_posting_mode"] = "statement_import"
+        batch.update(overrides)
+        return batch
+
+    def test_sender_rejects_bank_cash_before_any_client_call(self) -> None:
+        client = FakeClient(responses=[{"_http_status": 201, "incoming_id": 900}])
+
+        with self.assertRaisesRegex(SimplbooksError, "statement-import mode"):
+            booksend.execute_batch(
+                action_batch=self.statement_batch(),
+                mode="write",
+                client=client,
+                posting_policy=self.policy(),
+            )
+
+        self.assertEqual(client.calls, [])
+
+    def test_sender_refuses_a_statement_import_write_with_no_policy_to_prove_it(self) -> None:
+        client = FakeClient(responses=[])
+
+        with self.assertRaisesRegex(SimplbooksError, "statement-import mode"):
+            booksend.execute_batch(action_batch=self.statement_batch(), mode="write", client=client)
+
+        self.assertEqual(client.calls, [])
+
+    def test_a_dry_run_without_a_bound_policy_is_still_allowed(self) -> None:
+        action = incoming_action()
+        action["depends_on"] = []
+        batch = self.statement_batch(actions=[action])
+
+        updated, summary = booksend.execute_batch(action_batch=batch, mode="dry-run", client=None)
+
+        # A dry run sends nothing, so an unprovable prohibition is not a reason to stop it.
+        self.assertEqual(summary["mode"], "dry-run")
+        self.assertEqual(updated["actions"][0]["response_status"], 0)
+
+    def test_sender_rejects_a_batch_whose_declared_mode_disagrees_with_its_policy(self) -> None:
+        client = FakeClient(responses=[])
+        batch = make_batch(actions=[incoming_action()])
+        batch["cash_posting_mode"] = "api"
+
+        with self.assertRaisesRegex(SimplbooksError, "statement-import mode"):
+            booksend.execute_batch(
+                action_batch=batch, mode="write", client=client, posting_policy=self.policy()
+            )
+
+        self.assertEqual(client.calls, [])
+
+    def test_sender_prevalidates_statement_plan_coverage_before_any_client_call(self) -> None:
+        action = invoice_action()
+        action["source_refs"][0]["source_kind"] = "physical_bank"
+        client = FakeClient(responses=[{"_http_status": 201, "invoice_id": 501}])
+
+        with tempfile.TemporaryDirectory() as tmpdir, self.assertRaisesRegex(
+            SimplbooksError, "bank statement completeness"
+        ):
+            booksend.execute_batch(
+                action_batch=self.statement_batch(actions=[action]),
+                mode="write",
+                client=client,
+                posting_policy=self.policy(),
+                action_path=Path(tmpdir) / "actions.yaml",
+                cwd=Path(tmpdir),
+            )
+
+        self.assertEqual(client.calls, [])
+
+    def manual_dependency(self, *, blocking: bool = False) -> dict:
+        return {
+            "kind": "manual_statement_import_financial_transaction",
+            "blocking": blocking,
+            "record_id": "bank:3",
+            "statement_id": "archive:a",
+            "disposition": "bank_fee_payment",
+            "date": "2024-01-10",
+            "iban": "EE123",
+            "currency": "EUR",
+            "physical_signed_amount": -2.0,
+            "reason": "Assigned by the annual statement-import plan.",
+            "reviewed_rationale": "Reviewed bank fee.",
+            "source_ref": {
+                "path": "companies/example/artifacts/normalized/2024-01.json",
+                "record_ref": "bank:3", "note": None, "source_kind": "physical_bank",
+            },
+            "target": {"document_type": "financial_transaction", "transaction_family": "bank-fee"},
+            "split_parts": [],
+            "split_proof": None,
+            "statement_import_proof": {"status": "pending", "required_evidence": "live_discovery_or_audit"},
+        }
+
+    def test_import_mode_does_not_demand_live_proof_for_a_planned_row(self) -> None:
+        action = invoice_action()
+        action["depends_on"] = []
+        batch = self.statement_batch(actions=[action],
+                                     unresolved_dependencies=[self.manual_dependency()])
+
+        # The plan carries this row and the API sends no cash for it, so a dry run proceeds.
+        _updated, summary = booksend.execute_batch(action_batch=batch, mode="dry-run", client=None)
+
+        self.assertEqual(summary["mode"], "dry-run")
+
+    def test_api_cash_mode_still_refuses_a_pending_dependency(self) -> None:
+        action = invoice_action()
+        action["depends_on"] = []
+        batch = make_batch(actions=[action],
+                           unresolved_dependencies=[self.manual_dependency(blocking=True)])
+        batch["cash_posting_mode"] = "api"
+
+        with self.assertRaisesRegex(SimplbooksError, "pending manual statement-import"):
+            booksend.execute_batch(action_batch=batch, mode="dry-run", client=None)
+
+    def test_sender_still_settles_a_reviewed_processor_account_in_statement_import_mode(self) -> None:
+        action = incoming_action()
+        action["payload"]["bank_account_id"] = "6"
+        action["payload"]["linked_invoice_id"] = "58"
+        action["depends_on"] = []
+        client = FakeClient(responses=[{"_http_status": 201, "incoming_id": 900}])
+
+        batch, _summary = booksend.execute_batch(
+            action_batch=self.statement_batch(actions=[action]),
+            mode="write",
+            client=client,
+            posting_policy=self.policy(),
+        )
+
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(batch["actions"][0]["inserted_id"], 900)
+
+
+class AllocatedOrderProofSenderTests(unittest.TestCase):
+    def line(self, *, quantity: float = 2.0, order: str = "763") -> dict:
+        contributor = {
+            "record_id": order, "quantity": quantity,
+            "quantity_source": "reviewed_woo_tax_allocation",
+            "record_sha256": "a" * 64,
+        }
+        scope = {"kind": "reviewed_allocated_order", "period": "2024-01",
+                 "record_category": "sales", "group_label": "woo", "order_id": order}
+        canonical = lambda v: hashlib.sha256(
+            json.dumps(v, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        ).hexdigest()
+        return {
+            "line_role": "sales_revenue", "article_id_hint": "3", "quantity": quantity,
+            "inventory_quantity_proof": {
+                "status": "exact", "quantity": quantity, "scope": scope,
+                "scope_sha256": canonical(scope), "contributor_count": 1,
+                "contributor_set_sha256": canonical([contributor]), "contributors": [contributor],
+            },
+        }
+
+    def action(self, line: dict) -> dict:
+        return {"idempotency_key": "k", "action_type": "create_invoice_summary",
+                "payload": {"document_type": "invoice", "line_items": [line]}}
+
+    def test_an_allocated_order_proof_is_accepted(self) -> None:
+        line = self.line()
+
+        self.assertEqual(booksend.inventory_quantity_proof_errors(self.action(line), line), [])
+
+    def test_a_mismatched_contributor_total_is_still_refused(self) -> None:
+        line = self.line()
+        line["quantity"] = 3.0
+
+        self.assertTrue(booksend.inventory_quantity_proof_errors(self.action(line), line))
+
+    def test_an_unknown_quantity_source_is_still_refused(self) -> None:
+        line = self.line()
+        line["inventory_quantity_proof"]["contributors"][0]["quantity_source"] = "guessed"
+
+        self.assertTrue(booksend.inventory_quantity_proof_errors(self.action(line), line))
 
 
 if __name__ == "__main__":

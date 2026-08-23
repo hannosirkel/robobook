@@ -206,11 +206,26 @@ def source_type_from_path(path: Path) -> str:
     return mapping.get(final, "other")
 
 
-def canonical_group_for_path(path: Path) -> str:
+def canonical_group_for_path(path: Path, *, root_dir: Path | None = None) -> str:
+    """Name the group of files that describe the same thing in different formats.
+
+    The group is scoped to the directory the file sits in. Two files called `Wallet.csv`
+    in different source packs, or two half-year exports in sibling folders, are separate
+    evidence rather than competing descriptions of one thing -- without the scope the
+    later path silently suppresses the earlier, and a whole period reads as empty.
+    """
     current = Path(path.name)
     while current.suffix.lower() in {".gsheet", ".csv", ".xml", ".xls", ".xlsx", ".pdf", ".json"}:
         current = Path(current.stem)
-    return slugify(current.name)
+    stem = slugify(current.name)
+    if root_dir is None:
+        return stem
+    try:
+        parent = path.resolve().parent.relative_to(root_dir.resolve())
+    except ValueError:
+        return stem
+    scope = slugify(str(parent)) if parent.parts else ""
+    return f"{scope}:{stem}" if scope else stem
 
 
 def infer_source_system(path: Path, source_type: str, header_names: set[str] | None = None) -> str:
@@ -469,6 +484,8 @@ def detect_parser(path: Path, source_type: str, source_system: str, header_names
             return "parse_printful_other_csv"
         if headers >= ROW_EVENT_HEADERS["printful_services_csv"]:
             return "parse_printful_services_csv"
+    if source_system == "printful" and source_type in {"other", "manual"} and is_wallet_printout(path):
+        return "parse_printful_wallet_printout"
     if source_type == "csv" and source_system == "bank":
         return "parse_bank_csv"
     if source_type == "xml" and source_system == "bank":
@@ -618,7 +635,7 @@ def inspect_source_file(
         source_system=source_system,
         covered_from=coverage[0],
         covered_until=coverage[1],
-        canonical_group=canonical_group_for_path(path),
+        canonical_group=canonical_group_for_path(path, root_dir=root_dir),
         parser_name=(
             "unrecognized_source"
             if is_no_activity_marker and marker_coverage is None
@@ -765,7 +782,7 @@ def inspect_purchase_note_markdown(
             source_system="manual",
             covered_from=event_date,
             covered_until=event_date,
-            canonical_group=canonical_group_for_path(target_path),
+            canonical_group=canonical_group_for_path(target_path, root_dir=root_dir),
             parser_name="parse_purchase_note_markdown",
             parser_notes=[f"Manual purchase note covering {target_display}."],
             context={
@@ -779,6 +796,37 @@ def inspect_purchase_note_markdown(
         )
         descriptors.append(descriptor)
     return descriptors
+
+
+# One logical stream can be described by more than one file. Filename-based grouping
+# cannot see that, and source-type priority would pick the thinner description, so the
+# richer-description relationship is declared here.
+PARSER_SUPERSEDES: dict[str, tuple[str, ...]] = {
+    "parse_printful_wallet_printout": ("parse_printful_wallet_csv",),
+}
+
+
+def apply_parser_supersession(sources: list[SourceDescriptor]) -> None:
+    """Drop a thinner description of a stream another canonical source already describes.
+
+    Without this the wallet CSV and the wallet printout both stay canonical and the same
+    movement is counted twice, once from each.
+    """
+    for winner in [s for s in sources if s.canonical and s.parser_name in PARSER_SUPERSEDES]:
+        superseded_parsers = PARSER_SUPERSEDES[winner.parser_name]
+        for entry in sources:
+            if entry is winner or not entry.canonical or entry.parser_name not in superseded_parsers:
+                continue
+            if entry.source_system != winner.source_system:
+                continue
+            if entry.path.parent != winner.path.parent:
+                # Supersession is scoped to one source pack: a later year's richer export
+                # says nothing about an earlier year's evidence.
+                continue
+            entry.canonical = False
+            entry.context["superseded_by"] = winner.source_id
+            entry.parser_notes.append(f"Superseded by richer canonical source {winner.source_id}.")
+            winner.preferred_over.append(entry.source_id)
 
 
 def choose_canonical_sources(sources: list[SourceDescriptor]) -> list[SourceDescriptor]:
@@ -803,7 +851,28 @@ def choose_canonical_sources(sources: list[SourceDescriptor]) -> list[SourceDesc
             for entry in entries:
                 entry.canonical = False
                 entry.parser_notes.append("Reference-only source group; no canonical machine-readable input available.")
+
+    apply_parser_supersession(sources)
     return sources
+
+
+def load_company_profile(company_dir: Path) -> dict[str, Any]:
+    profile_path = company_dir / "artifacts" / "company_profile.json"
+    if not profile_path.exists():
+        return {}
+    try:
+        profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return profile if isinstance(profile, dict) else {}
+
+
+def load_wallet_card_owners(company_dir: Path) -> dict[str, str]:
+    """Return the reviewed card-suffix to owner mapping; an unmapped card blocks parsing."""
+    owners = load_company_profile(company_dir).get("wallet_card_owners")
+    if not isinstance(owners, dict):
+        return {}
+    return {str(key).strip(): str(value).strip() for key, value in owners.items()}
 
 
 def load_company_base_currency(company_dir: Path, override: str | None = None) -> str:
@@ -2354,6 +2423,136 @@ def parse_printful_wallet_csv(
     return result, exceptions
 
 
+WALLET_PRINTOUT_COLUMNS = ("payment", "status", "amount", "date", "id")
+
+# A masked instrument such as "000000********1111": mostly digits and masking stars,
+# ending in the four digits that identify the card.
+MASKED_CARD = re.compile(r"^[0-9*\s]{8,}?(?P<last4>[0-9]{4})$")
+
+WALLET_ACTIONS = {
+    "deposit to wallet": ("printful_wallet_deposit", -1),
+    "withdrawal from wallet": ("printful_wallet_withdrawal", 1),
+}
+
+
+def is_wallet_printout(path: Path) -> bool:
+    """Detect the reviewed wallet printout by its stable column headings.
+
+    Keying on the headings rather than the extension keeps an unrelated text file
+    dropped into the source pack from being read as wallet evidence.
+    """
+    try:
+        header = path.read_text(encoding="utf-8", errors="replace").splitlines()[:1]
+    except (OSError, IndexError):
+        return False
+    if not header:
+        return False
+    names = {slugify(name) for name in header[0].split("\t")}
+    return all(column in names for column in WALLET_PRINTOUT_COLUMNS)
+
+
+def parse_wallet_printout_date(value: str) -> date:
+    """Parse the printout's `Mon D, YYYY` date, refusing anything else."""
+    try:
+        return datetime.strptime(normalize_ascii(value).strip(), "%b %d, %Y").date()  # noqa: DTZ007
+    except ValueError as exc:
+        raise SimplbooksError(f"Wallet printout date {value!r} is not in 'Mon D, YYYY' form.") from exc
+
+
+def wallet_payment_instrument(payment: str) -> tuple[str, str | None]:
+    """Split the payment cell into its action and the card that funded it, if any.
+
+    The cell holds the action on one line and the instrument on the next. A masked card
+    number means the movement was funded by that card; anything else means it came from
+    the wallet balance and funds nothing.
+    """
+    lines = [line.strip() for line in str(payment or "").splitlines() if line.strip()]
+    if not lines:
+        return "", None
+    if len(lines) < 2:
+        return lines[0], None
+    match = MASKED_CARD.match(lines[1].replace(" ", ""))
+    return lines[0], (match.group("last4") if match else None)
+
+
+def parse_printful_wallet_printout(
+    source: SourceDescriptor,
+    *,
+    period_start: date,
+    period_end: date,
+    base_currency: str,
+    card_owners: dict[str, str] | None = None,
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    """Parse reviewed wallet movements, attributing each to the card that funded it."""
+    owners = {str(key).strip(): str(value).strip() for key, value in (card_owners or {}).items()}
+    result = parser_result()
+    exceptions: list[dict[str, Any]] = []
+    seen_dates: list[date] = []
+
+    with source.path.open("r", encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+
+    for line_no, row in enumerate(rows, start=2):
+        payment = str(row.get("Payment") or "")
+        if not payment.strip():
+            continue
+        event_date = parse_wallet_printout_date(str(row.get("Date") or ""))
+        if event_date < period_start or event_date > period_end:
+            continue
+
+        action, card_last4 = wallet_payment_instrument(payment)
+        amount, currency = parse_money_cell(row.get("Amount"), default_currency=base_currency)
+        external_ref = str(row.get("ID") or "").strip()
+        normalized_action = normalize_ascii(action).lower()
+        event_type, sign = WALLET_ACTIONS.get(normalized_action, ("printful_wallet_consumption", -1))
+
+        attributes: dict[str, Any] = {
+            "action": action,
+            "status": str(row.get("Status") or "").strip(),
+            "payment_instrument": "card" if card_last4 else "wallet",
+            "clearing_provider": "printful",
+            "clearing_account": "printful_wallet",
+        }
+        if card_last4 is not None:
+            owner = owners.get(card_last4)
+            if owner is None:
+                raise SimplbooksError(
+                    f"Wallet printout card {card_last4} has no reviewed owner; add it to the company profile."
+                )
+            attributes["card_last4"] = card_last4
+            attributes["funding_owner"] = owner
+        elif normalized_action in WALLET_ACTIONS:
+            # A deposit or withdrawal moves money between a card and the wallet, so it must
+            # say which card. Comparing the event type to the action map's values compared a
+            # string with tuples and never fired.
+            raise SimplbooksError(
+                f"Wallet printout row {line_no} funds the wallet but names no card."
+            )
+
+        signed_amount = sign * abs(amount)
+        seen_dates.append(event_date)
+        category, record = make_record(
+            source=source,
+            category="clearing_transactions",
+            record_id=f"{source.source_id}:wallet:{external_ref or line_no}",
+            event_type=event_type,
+            event_date=event_date,
+            settlement_date=event_date,
+            description=f"Printful wallet {action}",
+            currency=currency or base_currency,
+            gross_amount=signed_amount,
+            net_amount=signed_amount,
+            external_ref=external_ref or f"{slugify(action)}:{line_no}",
+            channel="printful",
+            attributes=attributes,
+            row_ref=f"line:{line_no}",
+        )
+        result[category].append(record)
+
+    update_coverage_from_dates(source, seen_dates)
+    return result, exceptions
+
+
 def parse_printful_other_csv(
     source: SourceDescriptor,
     *,
@@ -3533,6 +3732,7 @@ PARSERS: dict[str, Callable[..., tuple[dict[str, list[dict[str, Any]]], list[dic
     "parse_quartermaster_orders_csv": parse_quartermaster_orders_csv,
     "parse_printful_orders_csv": parse_printful_orders_csv,
     "parse_printful_wallet_csv": parse_printful_wallet_csv,
+    "parse_printful_wallet_printout": parse_printful_wallet_printout,
     "parse_printful_other_csv": parse_printful_other_csv,
     "parse_printful_services_csv": parse_printful_services_csv,
     "parse_bank_csv": parse_bank_csv,
@@ -3583,6 +3783,9 @@ def missing_canonical_source_exceptions(sources: list[SourceDescriptor]) -> list
     exceptions: list[dict[str, Any]] = []
     for entries in grouped.values():
         if any(entry.canonical for entry in entries):
+            continue
+        if all(entry.context.get("superseded_by") for entry in entries):
+            # Not missing evidence: a richer canonical source describes this same stream.
             continue
         first = entries[0]
         source_types = ", ".join(sorted({entry.source_type for entry in entries}))
@@ -3666,6 +3869,7 @@ def aggregate_results(
     period_start: date,
     period_end: date,
     base_currency: str,
+    card_owners: dict[str, str] | None = None,
 ) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
     records = parser_result()
     exceptions: list[dict[str, Any]] = missing_canonical_source_exceptions(sources)
@@ -3694,7 +3898,15 @@ def aggregate_results(
             )
             continue
 
-        if source.parser_name == "parse_printful_pdf":
+        if source.parser_name == "parse_printful_wallet_printout":
+            parsed_records, parsed_exceptions = parser(
+                source,
+                period_start=period_start,
+                period_end=period_end,
+                base_currency=base_currency,
+                card_owners=card_owners,
+            )
+        elif source.parser_name == "parse_printful_pdf":
             parsed_records, parsed_exceptions = parser(
                 source,
                 period_start=period_start,
@@ -4047,6 +4259,7 @@ def main() -> int:
         period_start=period_start,
         period_end=period_end,
         base_currency=base_currency,
+        card_owners=load_wallet_card_owners(company_dir),
     )
     if any(source.parser_name == "parse_woo_tax_summary_csv" for source in sources):
         allocation_path = (

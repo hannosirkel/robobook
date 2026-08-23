@@ -12,7 +12,31 @@ from simplbooks_api import SimplbooksClient, SimplbooksError, load_token, resolv
 
 
 MANUAL_ACTION_TYPE = "manual_inventory_writeoff"
-MANUAL_ACTION_STATUSES = frozenset({"required", "completed", "verified"})
+MANUAL_ACTION_TYPES = frozenset({"manual_inventory_writeoff", "warehouse_transfer", "year_end_adjustment"})
+MANUAL_ACTION_STATUSES = frozenset({"required", "completed", "verified", "complete"})
+
+WRITEOFF_FIELDS = (
+    "effective_date", "article_id", "warehouse_id", "quantity", "expense_account_id",
+    "expected_remnant_after", "reason", "approval", "status", "source_refs",
+)
+
+TRANSFER_FIELDS = (
+    "effective_date", "article_id", "source_warehouse_id", "destination_warehouse_id",
+    "quantity", "remnant_before", "remnant_after", "reason", "approval", "status", "source_refs",
+)
+
+ADJUSTMENT_FIELDS = (
+    "effective_date", "article_id", "warehouse_id", "direction", "quantity",
+    "expense_account_id", "reason", "approval", "status", "source_refs",
+)
+
+MANUAL_ACTION_FIELDS = {
+    "manual_inventory_writeoff": WRITEOFF_FIELDS,
+    "warehouse_transfer": TRANSFER_FIELDS,
+    "year_end_adjustment": ADJUSTMENT_FIELDS,
+}
+
+EQUATION_TERMS = ("opening", "purchases", "transfers_in", "transfers_out", "sales", "writeoffs", "adjustments")
 
 
 def decimal_value(value: Any, *, field_name: str) -> Decimal:
@@ -25,22 +49,47 @@ def decimal_value(value: Any, *, field_name: str) -> Decimal:
     return parsed
 
 
+def _remnant_map(value: Any, *, field_name: str) -> dict[str, Decimal]:
+    if not isinstance(value, dict) or not value:
+        raise SimplbooksError(f"Manual inventory action {field_name} must map warehouse IDs to quantities.")
+    return {
+        str(warehouse_id): decimal_value(quantity, field_name=f"{field_name}[{warehouse_id}]")
+        for warehouse_id, quantity in value.items()
+    }
+
+
+def _validate_writeoff(action: dict[str, Any]) -> None:
+    if decimal_value(action["expected_remnant_after"], field_name="expected_remnant_after") < 0:
+        raise SimplbooksError("Manual inventory action expected_remnant_after cannot be negative.")
+
+
+def _validate_transfer_shape(action: dict[str, Any]) -> None:
+    if str(action["source_warehouse_id"]) == str(action["destination_warehouse_id"]):
+        raise SimplbooksError("A warehouse transfer cannot move stock to the same warehouse it came from.")
+    _remnant_map(action["remnant_before"], field_name="remnant_before")
+    _remnant_map(action["remnant_after"], field_name="remnant_after")
+
+
+def _validate_adjustment(action: dict[str, Any]) -> None:
+    if str(action["direction"]) not in {"increase", "decrease"}:
+        raise SimplbooksError("Year-end adjustment direction must be increase or decrease.")
+
+
+TYPE_VALIDATORS = {
+    "manual_inventory_writeoff": _validate_writeoff,
+    "warehouse_transfer": _validate_transfer_shape,
+    "year_end_adjustment": _validate_adjustment,
+}
+
+
 def validate_manual_inventory_action(action: dict[str, Any]) -> None:
-    required = (
-        "effective_date",
-        "article_id",
-        "warehouse_id",
-        "quantity",
-        "expense_account_id",
-        "expected_remnant_after",
-        "reason",
-        "approval",
-        "status",
-        "source_refs",
-    )
-    if str(action.get("action_type") or "") != MANUAL_ACTION_TYPE:
-        raise SimplbooksError(f"Manual inventory action must use action_type {MANUAL_ACTION_TYPE!r}.")
-    missing = [field for field in required if action.get(field) in (None, "")]
+    """Validate one typed manual inventory action against the fields its type requires."""
+    action_type = str(action.get("action_type") or "")
+    if action_type not in MANUAL_ACTION_TYPES:
+        raise SimplbooksError(
+            f"Manual inventory action_type must be one of {sorted(MANUAL_ACTION_TYPES)}, got {action_type!r}."
+        )
+    missing = [field for field in MANUAL_ACTION_FIELDS[action_type] if action.get(field) in (None, "")]
     if missing:
         raise SimplbooksError(f"Manual inventory action is missing required fields: {', '.join(missing)}.")
     try:
@@ -49,12 +98,148 @@ def validate_manual_inventory_action(action: dict[str, Any]) -> None:
         raise SimplbooksError("Manual inventory action effective_date must be YYYY-MM-DD.") from exc
     if decimal_value(action["quantity"], field_name="quantity") <= 0:
         raise SimplbooksError("Manual inventory action quantity must be positive.")
-    if decimal_value(action["expected_remnant_after"], field_name="expected_remnant_after") < 0:
-        raise SimplbooksError("Manual inventory action expected_remnant_after cannot be negative.")
     if str(action["status"]) not in MANUAL_ACTION_STATUSES:
-        raise SimplbooksError("Manual inventory action status must be required, completed, or verified.")
+        raise SimplbooksError(f"Manual inventory action status must be one of {sorted(MANUAL_ACTION_STATUSES)}.")
     if not isinstance(action["source_refs"], list) or not action["source_refs"]:
         raise SimplbooksError("Manual inventory action requires at least one source reference.")
+    TYPE_VALIDATORS[action_type](action)
+
+
+def evaluate_transfer(action: dict[str, Any]) -> dict[str, Any]:
+    """Prove one historical transfer moved exactly the reviewed quantity and created none.
+
+    A transfer only relocates stock, so the totals before and after must be equal. A
+    transfer that changes the total is a write-off or a receipt wearing a transfer's name.
+    """
+    validate_manual_inventory_action(action)
+    before = _remnant_map(action["remnant_before"], field_name="remnant_before")
+    after = _remnant_map(action["remnant_after"], field_name="remnant_after")
+    source = str(action["source_warehouse_id"])
+    destination = str(action["destination_warehouse_id"])
+    quantity = decimal_value(action["quantity"], field_name="quantity")
+
+    errors: list[str] = []
+    named = {source, destination}
+    for label, snapshot in (("remnant_before", before), ("remnant_after", after)):
+        if not named <= set(snapshot):
+            errors.append(
+                f"{label} does not cover both the source and destination warehouse {sorted(named)}."
+            )
+    if errors:
+        return {"errors": errors, "moved": None}
+
+    total_before = sum(before.values(), Decimal(0))
+    total_after = sum(after.values(), Decimal(0))
+    if total_before != total_after:
+        errors.append(
+            f"Transfer changed total stock from {total_before} to {total_after}; a transfer only relocates it."
+        )
+    moved_out = before[source] - after[source]
+    moved_in = after[destination] - before[destination]
+    if moved_out != quantity or moved_in != quantity:
+        errors.append(
+            f"Transfer moved {moved_out} out and {moved_in} in, not the reviewed quantity {quantity}."
+        )
+    return {"errors": errors, "moved": moved_in if not errors else None}
+
+
+def _warehouse_equation(terms: Any, *, warehouse_id: str) -> tuple[Decimal, list[str]]:
+    if not isinstance(terms, dict):
+        return Decimal(0), [f"Warehouse {warehouse_id} has no stock-movement evidence."]
+    values = {
+        term: decimal_value(terms.get(term, 0), field_name=f"{warehouse_id}.{term}")
+        for term in EQUATION_TERMS
+    }
+    closing = (
+        values["opening"] + values["purchases"] + values["transfers_in"]
+        - values["transfers_out"] - values["sales"] - values["writeoffs"] + values["adjustments"]
+    )
+    return closing, []
+
+
+def evaluate_stock_equation(
+    evidence: dict[str, Any], *, inventory_change_account_id: str | None = None
+) -> dict[str, Any]:
+    """Compare computed closing stock with the selected count, per warehouse and in total.
+
+    Per-warehouse first: two offsetting warehouse errors leave the aggregate at zero, so
+    an aggregate match alone would declare a wrong inventory correct.
+    """
+    warehouses = evidence.get("warehouses")
+    if not isinstance(warehouses, dict) or not warehouses:
+        raise SimplbooksError("Stock equation evidence requires per-warehouse movement terms.")
+    selected = evidence.get("selected_closing")
+    if not isinstance(selected, dict):
+        raise SimplbooksError("Stock equation evidence requires the selected closing count.")
+
+    errors: list[str] = []
+    results: dict[str, dict[str, Decimal]] = {}
+    for warehouse_id in sorted(warehouses):
+        closing, warehouse_errors = _warehouse_equation(warehouses[warehouse_id], warehouse_id=warehouse_id)
+        errors.extend(warehouse_errors)
+        if warehouse_id not in selected:
+            errors.append(f"Warehouse {warehouse_id} has no selected closing count to reconcile against.")
+            results[warehouse_id] = {"closing": closing, "selected": Decimal(0), "difference": Decimal(0)}
+            continue
+        selected_closing = decimal_value(selected[warehouse_id], field_name=f"selected_closing[{warehouse_id}]")
+        results[warehouse_id] = {
+            "closing": closing,
+            "selected": selected_closing,
+            "difference": selected_closing - closing,
+        }
+    for warehouse_id in sorted(set(selected) - set(warehouses)):
+        errors.append(f"Selected closing count names warehouse {warehouse_id} with no movement evidence.")
+
+    aggregate_closing = sum((item["closing"] for item in results.values()), Decimal(0))
+    aggregate_selected = sum((item["selected"] for item in results.values()), Decimal(0))
+    differing = [
+        warehouse_id for warehouse_id, item in results.items() if item["difference"] != 0
+    ]
+    for warehouse_id in differing:
+        errors.append(
+            f"Warehouse {warehouse_id} closing {results[warehouse_id]['closing']} differs from the "
+            f"selected count {results[warehouse_id]['selected']}."
+        )
+    return {
+        "article_id": str(evidence.get("article_id") or ""),
+        "warehouses": results,
+        "aggregate": {
+            "closing": aggregate_closing,
+            "selected": aggregate_selected,
+            "difference": aggregate_selected - aggregate_closing,
+        },
+        "errors": errors,
+        "instruction": _adjustment_instruction(
+            evidence,
+            results=results,
+            differing=differing,
+            inventory_change_account_id=inventory_change_account_id,
+        ),
+    }
+
+
+def _adjustment_instruction(
+    evidence: dict[str, Any],
+    *,
+    results: dict[str, dict[str, Decimal]],
+    differing: list[str],
+    inventory_change_account_id: str | None,
+) -> dict[str, Any] | None:
+    """Describe the single correction a reviewer would have to approve, never execute it."""
+    if len(differing) != 1 or inventory_change_account_id is None:
+        return None
+    warehouse_id = differing[0]
+    difference = results[warehouse_id]["difference"]
+    return {
+        "action_type": "year_end_adjustment",
+        "effective_date": str(evidence.get("effective_date") or ""),
+        "article_id": str(evidence.get("article_id") or ""),
+        "warehouse_id": warehouse_id,
+        "direction": "increase" if difference > 0 else "decrease",
+        "quantity": abs(difference),
+        "expense_account_id": str(inventory_change_account_id),
+        "status": "requires_separate_approval",
+    }
 
 
 def load_manual_inventory_actions(path: Path) -> dict[str, Any]:
@@ -71,9 +256,22 @@ def load_manual_inventory_actions(path: Path) -> dict[str, Any]:
 
 
 def remnant_value(action: dict[str, Any], remnant_response: dict[str, Any]) -> Decimal:
+    """Read one dated remnant, treating "no stock rows at all" as the zero it is.
+
+    SimplBooks answers an article with no stock anywhere with an empty list rather than
+    a zero. Left unhandled that is indistinguishable from a genuine lookup failure, so a
+    warehouse that has simply never held the article would look like a wrong ID.
+    """
     try:
         data = remnant_response["data"]
         article = data[str(action["article_id"])]
+    except (KeyError, TypeError) as exc:
+        raise SimplbooksError("Dated inventory remnant response did not contain the requested article and warehouse.") from exc
+    if isinstance(article, list):
+        if article:
+            raise SimplbooksError("Dated inventory remnant response has an unexpected article payload.")
+        return Decimal(0)
+    try:
         value = article[str(action["warehouse_id"])]
     except (KeyError, TypeError) as exc:
         raise SimplbooksError("Dated inventory remnant response did not contain the requested article and warehouse.") from exc

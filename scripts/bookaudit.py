@@ -927,6 +927,81 @@ def evaluate_vat_review(source: dict[str, Any], live: dict[str, Any]) -> list[di
     return findings
 
 
+def evaluate_ledger_evidence_review(summary: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Fail the audit unless the posted ledger matches the plan that produced it.
+
+    Absent evidence is an error here rather than a warning: at audit time the import has
+    happened, and "we did not check" is not a passing result.
+    """
+    section = "bank_and_processor_completeness"
+    if not summary:
+        return [make_finding(
+            section=section,
+            severity="error",
+            summary="Audit has no post-import ledger evidence to prove the imported statement posted as planned.",
+        )]
+    findings = [
+        make_finding(section=section, severity="error", summary=message)
+        for message in summary.get("errors") or []
+    ]
+    if str(summary.get("status") or "") != "pass" and not findings:
+        findings.append(make_finding(
+            section=section,
+            severity="error",
+            summary="Post-import ledger evidence did not pass.",
+        ))
+    return findings
+
+
+def evaluate_stock_equation_review(equation: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Fail the audit unless posted stock reconciles, per warehouse and in aggregate.
+
+    Both are checked because they fail independently: two offsetting warehouse errors
+    leave the aggregate at zero, and an aggregate difference can hide inside warehouses
+    that each look plausible on their own.
+    """
+    if not equation:
+        return []
+    findings = [
+        make_finding(section="inventory_review", severity="error", summary=message)
+        for message in equation.get("errors") or []
+    ]
+    aggregate = equation.get("aggregate") or {}
+    if decimal_value(aggregate.get("difference")) != 0:
+        findings.append(
+            make_finding(
+                section="inventory_review",
+                severity="error",
+                summary="Posted inventory closing differs from the selected count.",
+                evidence=[
+                    f"Computed closing: {decimal_text(decimal_value(aggregate.get('closing')))}",
+                    f"Selected closing: {decimal_text(decimal_value(aggregate.get('selected')))}",
+                ],
+            )
+        )
+    for warehouse_id, item in sorted((equation.get("warehouses") or {}).items()):
+        if decimal_value(item.get("difference")) == 0:
+            continue
+        findings.append(
+            make_finding(
+                section="inventory_review",
+                severity="error",
+                summary=f"Posted inventory in warehouse {warehouse_id} differs from the selected count.",
+                evidence=[
+                    f"Computed closing: {decimal_text(decimal_value(item.get('closing')))}",
+                    f"Selected closing: {decimal_text(decimal_value(item.get('selected')))}",
+                ],
+            )
+        )
+    instruction = equation.get("instruction")
+    if findings and isinstance(instruction, dict):
+        findings[-1]["evidence"].append(
+            f"Proposed {instruction.get('direction')} of {decimal_text(decimal_value(instruction.get('quantity')))} "
+            f"in warehouse {instruction.get('warehouse_id')} requires separate approval before it is executed."
+        )
+    return findings
+
+
 def evaluate_inventory_review(source: dict[str, Any], live: dict[str, Any]) -> list[dict[str, Any]]:
     if not source["inventory_expected"]:
         return []
@@ -1117,19 +1192,38 @@ def evaluate_spot_checks(live: dict[str, Any], scope: AuditScope) -> list[dict[s
     return findings
 
 
+@dataclass(frozen=True)
+class PostImportEvidence:
+    """What a statement-import year must show for itself once the import has happened."""
+
+    ledger_evidence: dict[str, Any] | None = None
+    stock_equation: dict[str, Any] | None = None
+    statement_import_mode: bool = False
+
+
+@dataclass(frozen=True)
+class AuditSources:
+    """The normalized evidence an audit reads, this period and the one before it."""
+
+    payloads: list[dict[str, Any]]
+    previous_payloads: list[dict[str, Any]] | None = None
+    policy_text: str | None = None
+
+
 def evaluate_audit(
     *,
-    source_payloads: list[dict[str, Any]],
+    sources: AuditSources,
     live_state: dict[str, Any],
     scope: AuditScope,
-    policy_text: str | None,
-    previous_source_payloads: list[dict[str, Any]] | None = None,
+    post_import: PostImportEvidence | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None]:
-    source_snapshot = build_source_snapshot(source_payloads, policy_text=policy_text)
+    post_import = post_import or PostImportEvidence()
+    policy_text = sources.policy_text
+    source_snapshot = build_source_snapshot(sources.payloads, policy_text=policy_text)
     live_snapshot = build_live_snapshot(live_state)
     previous_source_snapshot = (
-        build_source_snapshot(previous_source_payloads, policy_text=policy_text)
-        if previous_source_payloads
+        build_source_snapshot(sources.previous_payloads, policy_text=policy_text)
+        if sources.previous_payloads
         else None
     )
 
@@ -1141,6 +1235,11 @@ def evaluate_audit(
     findings.extend(evaluate_continuity_review(source_snapshot, previous_source_snapshot))
     findings.extend(evaluate_date_semantics_review(live_snapshot))
     findings.extend(evaluate_spot_checks(live_snapshot, scope))
+    if post_import.statement_import_mode:
+        # The imported statement is only proven by the ledger it produced, so a year
+        # audited in this mode is asked for that evidence rather than assumed to have it.
+        findings.extend(evaluate_ledger_evidence_review(post_import.ledger_evidence))
+    findings.extend(evaluate_stock_equation_review(post_import.stock_equation))
 
     error_count = sum(1 for item in findings if item["severity"] == "error")
     warning_count = sum(1 for item in findings if item["severity"] == "warn")
@@ -1267,11 +1366,13 @@ def run_audit(
 
     live_state = collect_live_state(client, scope=scope)
     evaluation, source_snapshot, previous_source_snapshot = evaluate_audit(
-        source_payloads=normalized_payloads,
+        sources=AuditSources(
+            payloads=normalized_payloads,
+            previous_payloads=previous_payloads,
+            policy_text=policy_text,
+        ),
         live_state=live_state,
         scope=scope,
-        policy_text=policy_text,
-        previous_source_payloads=previous_payloads,
     )
     live_snapshot = build_live_snapshot(live_state)
 

@@ -344,6 +344,20 @@ def infer_income_account_ids(entity_map: dict[str, Any]) -> tuple[list[str], lis
     return bank_ids, cash_ids, notes
 
 
+def merge_company_profile(
+    existing: dict[str, Any], discovered: dict[str, Any]
+) -> dict[str, Any]:
+    """Refresh the discovered fields while keeping reviewed ones discovery does not own.
+
+    Discovery is read-only against SimplBooks but rewrites this file, so anything it does
+    not know about — a reviewed card-owner mapping, for instance — would be destroyed by a
+    routine refresh. Whatever discovery produces wins; everything else is carried through.
+    """
+    if not existing:
+        return discovered
+    return {**{key: value for key, value in existing.items() if key not in discovered}, **discovered}
+
+
 def build_company_profile_document(
     *,
     company_name: str,
@@ -864,7 +878,9 @@ def main() -> int:
         metadata=metadata,
         entity_map=entity_map,
     )
-    write_json(paths["company_profile"], company_profile)
+    profile_path = paths["company_profile"]
+    existing_profile = load_json_file(profile_path) if profile_path.exists() else {}
+    write_json(profile_path, merge_company_profile(existing_profile, company_profile))
 
     write_text(
         paths["policy_memo"],

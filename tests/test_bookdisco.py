@@ -172,5 +172,44 @@ class BookdiscoTests(unittest.TestCase):
         self.assertNotIn("- - No downstream implications were generated.", findings)
 
 
+class CompanyProfilePreservationTests(unittest.TestCase):
+    def discovered(self) -> dict:
+        return {
+            "schema_version": "1.0",
+            "company_name": "Example Company OU",
+            "company_slug": "example",
+            "simplbooks_company_id": "42",
+            "base_currency": "EUR",
+            "vat_registered": True,
+            "bank_account_ids": ["3"],
+        }
+
+    def test_reviewed_fields_survive_a_discovery_refresh(self) -> None:
+        existing = {
+            **self.discovered(),
+            "wallet_card_owners": {"1111": "reporting_person"},
+            "notes": ["a reviewed note"],
+        }
+
+        merged = bookdisco.merge_company_profile(existing, self.discovered())
+
+        self.assertEqual(merged["wallet_card_owners"], {"1111": "reporting_person"})
+
+    def test_discovered_fields_still_win_over_stale_ones(self) -> None:
+        existing = {**self.discovered(), "bank_account_ids": ["999"], "wallet_card_owners": {}}
+
+        merged = bookdisco.merge_company_profile(existing, self.discovered())
+
+        self.assertEqual(merged["bank_account_ids"], ["3"])
+
+    def test_a_first_run_with_no_existing_profile_is_unchanged(self) -> None:
+        self.assertEqual(bookdisco.merge_company_profile({}, self.discovered()), self.discovered())
+
+    def test_a_reviewed_field_is_not_invented_when_absent(self) -> None:
+        merged = bookdisco.merge_company_profile(self.discovered(), self.discovered())
+
+        self.assertNotIn("wallet_card_owners", merged)
+
+
 if __name__ == "__main__":
     unittest.main()

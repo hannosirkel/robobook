@@ -1,5 +1,6 @@
 from __future__ import annotations  # noqa: I001
 
+import json
 import tempfile
 import hashlib
 import sys
@@ -13,6 +14,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import bookbuilder  # noqa: E402, I001
 import bookchecker  # noqa: E402
+import posting_policy  # noqa: E402
 import woo_tax  # noqa: E402
 
 
@@ -204,6 +206,35 @@ def manual_allocation(*, row: dict, disposition: str, target: dict | None = None
     }
 
 
+STATEMENT_IMPORT_CASH_POSTING = {
+    "mode": "statement_import",
+    "bank_income_account_ids": ["3"],
+    "processor_income_account_ids": {"paypal": "6"},
+    "bank_financial_accounts": {"EE123": {"EUR": "10"}},
+    "clearing_provider_roles": {"paypal": "paypal"},
+    "financial_accounts": {
+        "bank": "10",
+        "stripe_clearing": "30",
+        "paypal": "31",
+        "bank_fees": "32",
+        "reporting_person_payable": "33",
+        "platform_prepayment": "34",
+        "customer_receivable": "37",
+        "supplier_payable": "38",
+        "fx_gain": "35",
+        "fx_loss": "36",
+    },
+}
+
+
+def statement_import_policy() -> dict:
+    return dict(direct_sale_policy(), cash_posting=STATEMENT_IMPORT_CASH_POSTING)
+
+
+def api_cash_policy() -> dict:
+    return dict(direct_sale_policy(), cash_posting={"mode": "api"})
+
+
 def build_with(*, bank: dict, allocation: dict, **overrides: object) -> dict:
     normalized = base_normalized(bank["event_date"][:7])
     normalized["records"]["bank_transactions"] = [bank]
@@ -360,7 +391,7 @@ class BookbuilderTests(unittest.TestCase):
         )
 
         self.assertEqual(cleaned, ["Built from 2 normalized record(s)."])
-    def test_direct_sales_group_one_monthly_invoice_and_keep_exact_receipts(self) -> None:
+    def test_direct_sales_create_one_invoice_per_receipt_with_exact_receipts(self) -> None:
         normalized = base_normalized("2024-08")
         rows = [
             bank_row(record_id="direct-a", amount=20.0, event_date="2024-08-27"),
@@ -386,25 +417,28 @@ class BookbuilderTests(unittest.TestCase):
 
         invoices = actions_of_type(batch, "create_invoice_summary")
         receipts = actions_of_type(batch, "create_incoming_summary")
-        self.assertEqual(len(invoices), 1)
+        self.assertEqual(len(invoices), 2)
         invoice = invoices[0]
         self.assertEqual(invoice["payload"]["counterparty"]["contact_id"], "42")
-        self.assertEqual(invoice["payload"]["totals"]["gross_amount"], 40.0)
+        self.assertEqual(invoice["payload"]["totals"]["gross_amount"], 20.0)
         self.assertEqual(invoice["payload"]["line_items"][0]["suggested_income_account_id"], "107")
         self.assertEqual(invoice["payload"]["line_items"][0]["suggested_vat_type_id"], "25")
         self.assertEqual(invoice["payload"]["line_items"][0]["warehouse_id_hint"], "6")
         self.assertEqual(invoice["payload"]["line_items"][0]["article_id_hint"], "3")
-        self.assertEqual({ref["record_ref"] for ref in invoice["source_refs"]}, {"direct-a", "direct-b"})
+        self.assertEqual(
+            sorted(ref["record_ref"] for item in invoices for ref in item["source_refs"]),
+            ["direct-a", "direct-b"],
+        )
         self.assertEqual([item["payload"]["document_date"] for item in receipts], ["2024-08-27", "2024-08-30"])
         self.assertEqual([item["payload"]["amount"] for item in receipts], [20.0, 20.0])
         self.assertTrue(all(len(item["source_refs"]) == 1 for item in receipts))
         self.assertTrue(all(item["source_refs"][0]["source_kind"] == "physical_bank" for item in receipts))
-        self.assertEqual({tuple(item["depends_on"]) for item in receipts}, {(invoice["idempotency_key"],)})
+        self.assertEqual(
+            {tuple(item["depends_on"]) for item in receipts},
+            {(item["idempotency_key"],) for item in invoices},
+        )
         allocation_by_record = {allocation["record_id"]: allocation for allocation in allocations.values()}
-        resolved = [
-            {"record_ref": row["record_id"], "record": row, "payload": normalized}
-            for row in rows
-        ]
+        resolved = [{"record_ref": rows[0]["record_id"], "record": rows[0], "payload": normalized}]
         self.assertEqual(
             bookchecker.evaluate_inventory_quantities(
                 action=invoice, resolved_sources=resolved,
@@ -490,7 +524,8 @@ class BookbuilderTests(unittest.TestCase):
                 bank_allocations=allocations,
             )
 
-        self.assertEqual(len(actions_of_type(batch, "create_invoice_summary")), 1)
+        # One invoice per physical receipt, even when both share a resolved posting tuple.
+        self.assertEqual(len(actions_of_type(batch, "create_invoice_summary")), 2)
 
     def test_bank_fees_create_one_manual_dependency_per_physical_row_and_no_actions(self) -> None:
         normalized = base_normalized("2024-08")
@@ -2462,6 +2497,624 @@ class BookbuilderTests(unittest.TestCase):
 
         self.assertIn("schema_version", text)
         self.assertIn("approval_status", text)
+
+
+INVOICE_58_DISCOVERY = [{"document_index": [{"simplbooks_id": "58", "document_type": "invoice"}]}]
+
+
+class StatementImportBuilderTests(unittest.TestCase):
+    def receipt_batch(self, policy: dict | None) -> dict:
+        row = bank_row(record_id="r1", amount=330.0, event_date="2024-01-15")
+        overrides: dict = {"discovery_overviews": INVOICE_58_DISCOVERY}
+        if policy is not None:
+            overrides["posting_policy"] = policy
+        return build_with(
+            bank=row,
+            allocation=existing_invoice_allocation(record_id="r1", invoice_id="58"),
+            **overrides,
+        )
+
+    def test_batch_declares_the_cash_posting_mode_it_was_built_under(self) -> None:
+        self.assertEqual(self.receipt_batch(statement_import_policy())["cash_posting_mode"], "statement_import")
+        self.assertEqual(self.receipt_batch(api_cash_policy())["cash_posting_mode"], "api")
+
+    def test_a_batch_built_without_a_policy_stays_in_api_cash_mode(self) -> None:
+        self.assertEqual(self.receipt_batch(None)["cash_posting_mode"], "api")
+
+    def test_api_cash_mode_still_settles_a_physical_bank_row(self) -> None:
+        batch = self.receipt_batch(api_cash_policy())
+
+        self.assertEqual(len(actions_of_type(batch, "create_incoming_summary")), 1)
+
+    def test_statement_import_mode_omits_bank_cash(self) -> None:
+        batch = self.receipt_batch(statement_import_policy())
+
+        self.assertEqual(actions_of_type(batch, "create_incoming_summary"), [])
+
+    def test_statement_import_mode_keeps_the_document_it_settles(self) -> None:
+        row = bank_row(record_id="r2", amount=120.0, event_date="2024-01-16")
+        batch = build_with(
+            bank=row,
+            allocation=direct_sale_allocation(row=row),
+            posting_policy=statement_import_policy(),
+        )
+
+        self.assertEqual(len(actions_of_type(batch, "create_invoice_summary")), 1)
+        self.assertEqual(actions_of_type(batch, "create_incoming_summary"), [])
+
+    def test_statement_import_mode_generates_no_prohibited_action(self) -> None:
+        policy = statement_import_policy()
+        batch = self.receipt_batch(policy)
+
+        self.assertEqual(
+            [
+                action
+                for action in batch["actions"]
+                if posting_policy.prohibited_bank_cash_action(action, policy)
+            ],
+            [],
+        )
+
+
+def woo_sale(*, record_id: str, order_id: str | int | None, gross: float = 60.0, quantity: int = 1) -> dict:
+    sale = record(
+        record_id=record_id,
+        source_system="woo",
+        event_type="woo_order",
+        gross_amount=gross,
+        vat_amount=round(gross - gross / 1.22, 2),
+        channel="woo",
+        attributes={} if order_id is None else {"order_id": str(order_id)},
+    )
+    sale["quantity"] = quantity
+    return sale
+
+
+def warehouse_routing_policy(**routing: object) -> dict:
+    policy = dict(statement_import_policy())
+    policy["warehouse_routing"] = {
+        "woo": {"before_order": 771, "before_warehouse_id": "6", "from_warehouse_id": "1"},
+        "direct_sale_warehouse_id": "1",
+        "distributor_warehouse_id": None,
+        **routing,
+    }
+    policy["contacts"] = {"sales": {"woo": "42", "direct-sale": "42"}, "processors": {}, "suppliers": {}}
+    policy["mappings"] = {
+        **policy["mappings"],
+        "woo-taxable": {
+            "income_account_id": "107", "shipping_income_account_id": "253",
+            "vat_type_id": "25", "shipping_vat_type_id": "24", "warehouse_id": "6", "article_id": "3",
+        },
+    }
+    return policy
+
+
+class SalesWarehouseRoutingTests(unittest.TestCase):
+    def test_each_side_of_the_boundary_routes_to_its_reviewed_warehouse(self) -> None:
+        policy = warehouse_routing_policy()
+
+        self.assertEqual(
+            bookbuilder.routed_sales_warehouse(policy, group_label="woo", record=woo_sale(record_id="a", order_id=770)),
+            "6",
+        )
+        self.assertEqual(
+            bookbuilder.routed_sales_warehouse(policy, group_label="woo", record=woo_sale(record_id="b", order_id=771)),
+            "1",
+        )
+
+    def test_a_channel_without_a_routing_rule_keeps_the_existing_mapping(self) -> None:
+        policy = warehouse_routing_policy()
+
+        self.assertIsNone(
+            bookbuilder.routed_sales_warehouse(
+                policy, group_label="stripe", record=woo_sale(record_id="c", order_id=900)
+            )
+        )
+
+    def test_a_routed_contributor_without_an_order_number_blocks(self) -> None:
+        policy = warehouse_routing_policy()
+
+        with self.assertRaisesRegex(bookbuilder.SimplbooksError, "order number"):
+            bookbuilder.routed_sales_warehouse(
+                policy, group_label="woo", record=woo_sale(record_id="d", order_id=None)
+            )
+
+    def test_a_policy_without_routing_leaves_every_record_unrouted(self) -> None:
+        self.assertIsNone(
+            bookbuilder.routed_sales_warehouse(
+                policy_with_24_percent_profile(), group_label="woo", record=woo_sale(record_id="e", order_id=1)
+            )
+        )
+
+    def test_contributors_on_opposite_sides_never_share_an_inventory_line(self) -> None:
+        normalized = base_normalized("2024-01")
+        normalized["records"]["sales"] = [
+            woo_sale(record_id="woo:770", order_id=770),
+            woo_sale(record_id="woo:771", order_id=771),
+        ]
+
+        batch = build_batch_with_policy(normalized, warehouse_routing_policy())
+
+        warehouses = sorted(
+            line["warehouse_id_hint"]
+            for action in actions_of_type(batch, "create_invoice_summary")
+            for line in action["payload"]["line_items"]
+        )
+        self.assertEqual(warehouses, ["1", "6"])
+
+    def test_each_routed_group_records_the_rule_it_applied(self) -> None:
+        normalized = base_normalized("2024-01")
+        normalized["records"]["sales"] = [woo_sale(record_id="woo:770", order_id=770)]
+
+        batch = build_batch_with_policy(normalized, warehouse_routing_policy())
+        scope = actions_of_type(batch, "create_invoice_summary")[0]["payload"]["summary_scope"]
+
+        self.assertEqual(scope["warehouse_routing"]["warehouse_id"], "6")
+        self.assertEqual(scope["warehouse_routing"]["order_numbers"], [770])
+
+
+def build_direct_sales(rows: list[dict], *, policy: dict | None = None, **overrides: object) -> dict:
+    normalized = base_normalized(rows[0]["event_date"][:7])
+    normalized["records"]["bank_transactions"] = rows
+    allocations = {}
+    for row in rows:
+        item = direct_sale_allocation(row=row)
+        allocations[(item["statement_id"], item["iban"], item["currency"])] = item
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        return bookbuilder.build_action_batch(
+            normalized_payload=normalized,
+            recon_payload=base_recon(normalized["period"]),
+            normalized_path=root / "normalized.json",
+            recon_path=root / "recon.json",
+            repo_root=root,
+            company_profile={"bank_account_ids": ["101"]},
+            posting_policy=policy or direct_sale_policy(),
+            bank_allocations=allocations,
+            **overrides,
+        )
+
+
+class DirectSaleInvoicePerReceiptTests(unittest.TestCase):
+    def rows(self) -> list[dict]:
+        return [
+            bank_row(record_id="d1", amount=60.0, event_date="2024-01-10"),
+            bank_row(record_id="d2", amount=60.0, event_date="2024-01-20"),
+        ]
+
+    def test_each_physical_receipt_gets_its_own_invoice(self) -> None:
+        batch = build_direct_sales(self.rows())
+
+        invoices = actions_of_type(batch, "create_invoice_summary")
+        self.assertEqual(len(invoices), 2)
+
+    def test_identical_direct_receipts_stay_distinct(self) -> None:
+        batch = build_direct_sales(self.rows())
+
+        keys = [action["idempotency_key"] for action in actions_of_type(batch, "create_invoice_summary")]
+        self.assertEqual(len(set(keys)), 2)
+
+    def test_each_direct_invoice_covers_exactly_one_physical_row(self) -> None:
+        batch = build_direct_sales(self.rows())
+
+        for action in actions_of_type(batch, "create_invoice_summary"):
+            self.assertEqual(len(action["source_refs"]), 1)
+            self.assertEqual(action["payload"]["summary_scope"]["record_count"], 1)
+
+
+class DistributorTransferProofTests(unittest.TestCase):
+    def policy(self) -> dict:
+        policy = warehouse_routing_policy(distributor_warehouse_id="9")
+        policy["mappings"]["distributor-taxable"] = {
+            "income_account_id": "107", "vat_type_id": "25", "warehouse_id": "9", "article_id": "3",
+        }
+        policy["contacts"]["sales"]["distributor"] = "44"
+        return policy
+
+    def normalized_with_distributor_sale(self) -> dict:
+        normalized = base_normalized("2024-01")
+        sale = record(
+            record_id="distributor:1",
+            source_system="distributor",
+            event_type="distributor_order",
+            gross_amount=100.0,
+            vat_amount=18.03,
+            channel="distributor",
+            attributes={"order_id": "5001"},
+        )
+        sale["quantity"] = 2
+        normalized["records"]["sales"] = [sale]
+        return normalized
+
+    def test_distributor_sales_require_bound_transfer_evidence(self) -> None:
+        with self.assertRaisesRegex(bookbuilder.SimplbooksError, "warehouse transfer evidence"):
+            build_batch_with_policy(self.normalized_with_distributor_sale(), self.policy())
+
+    def test_an_unbound_distributor_warehouse_blocks_before_any_document(self) -> None:
+        policy = self.policy()
+        policy["warehouse_routing"]["distributor_warehouse_id"] = None
+
+        with self.assertRaisesRegex(bookbuilder.SimplbooksError, "distributor"):
+            build_batch_with_policy(self.normalized_with_distributor_sale(), policy)
+
+    def test_bound_transfer_evidence_allows_the_distributor_document(self) -> None:
+        evidence = [{
+            "action_type": "warehouse_transfer",
+            "destination_warehouse_id": "9",
+            "source_warehouse_id": "1",
+            "article_id": "3",
+            "status": "complete",
+        }]
+
+        batch = bookbuilder.build_action_batch(
+            normalized_payload=self.normalized_with_distributor_sale(),
+            recon_payload=base_recon("2024-01"),
+            normalized_path=Path("normalized.json"),
+            recon_path=Path("recon.json"),
+            repo_root=Path("."),
+            posting_policy=self.policy(),
+            inventory_transfer_evidence=evidence,
+        )
+
+        self.assertEqual(len(actions_of_type(batch, "create_invoice_summary")), 1)
+
+    def test_transfer_evidence_for_another_warehouse_does_not_count(self) -> None:
+        evidence = [{
+            "action_type": "warehouse_transfer",
+            "destination_warehouse_id": "7",
+            "source_warehouse_id": "1",
+            "article_id": "3",
+            "status": "complete",
+        }]
+
+        with self.assertRaisesRegex(bookbuilder.SimplbooksError, "warehouse transfer evidence"):
+            bookbuilder.build_action_batch(
+                normalized_payload=self.normalized_with_distributor_sale(),
+                recon_payload=base_recon("2024-01"),
+                normalized_path=Path("normalized.json"),
+                recon_path=Path("recon.json"),
+                repo_root=Path("."),
+                posting_policy=self.policy(),
+                inventory_transfer_evidence=evidence,
+            )
+
+
+class AggregateSalesRoutingTests(unittest.TestCase):
+    def aggregate(self) -> dict:
+        row = record(record_id="woo:2024-01", source_system="woo", event_type="woo_daily_sales",
+                     gross_amount=137.46, vat_amount=24.8, channel="woo",
+                     attributes={"is_monthly_summary": True, "orders": 3})
+        row["quantity"] = 4
+        return row
+
+    def test_an_aggregate_is_routed_from_the_periods_order_numbers(self) -> None:
+        policy = warehouse_routing_policy()
+
+        self.assertEqual(
+            bookbuilder.routed_sales_warehouse(
+                policy, group_label="woo", record=self.aggregate(), fallback_order_numbers=(762, 765)
+            ),
+            "6",
+        )
+        self.assertEqual(
+            bookbuilder.routed_sales_warehouse(
+                policy, group_label="woo", record=self.aggregate(), fallback_order_numbers=(776, 777)
+            ),
+            "1",
+        )
+
+    def test_an_aggregate_straddling_the_boundary_blocks(self) -> None:
+        with self.assertRaisesRegex(bookbuilder.SimplbooksError, "boundary"):
+            bookbuilder.routed_sales_warehouse(
+                warehouse_routing_policy(), group_label="woo", record=self.aggregate(),
+                fallback_order_numbers=(770, 771),
+            )
+
+    def test_an_aggregate_with_no_order_evidence_at_all_blocks(self) -> None:
+        with self.assertRaisesRegex(bookbuilder.SimplbooksError, "order number"):
+            bookbuilder.routed_sales_warehouse(
+                warehouse_routing_policy(), group_label="woo", record=self.aggregate(),
+                fallback_order_numbers=(),
+            )
+
+    def test_a_records_own_order_number_still_wins(self) -> None:
+        own = woo_sale(record_id="woo:900", order_id=900)
+
+        self.assertEqual(
+            bookbuilder.routed_sales_warehouse(
+                warehouse_routing_policy(), group_label="woo", record=own, fallback_order_numbers=(1,)
+            ),
+            "1",
+        )
+
+    def test_an_aggregate_declares_the_orders_its_routing_actually_used(self) -> None:
+        normalized = base_normalized("2024-01")
+        aggregate = self.aggregate()
+        # The order number lives on the processor-side charge, which groups separately --
+        # exactly how a real month looks.
+        charge = record(record_id="stripe:1", source_system="stripe", event_type="stripe_charge",
+                        gross_amount=60.0, channel="stripe", attributes={"order_id": "762"})
+        normalized["records"]["sales"] = [aggregate, charge]
+
+        batch = build_batch_with_policy(normalized, warehouse_routing_policy())
+        scopes = [a["payload"]["summary_scope"] for a in actions_of_type(batch, "create_invoice_summary")]
+        routed = [s["warehouse_routing"] for s in scopes if "warehouse_routing" in s]
+
+        self.assertTrue(routed)
+        for routing in routed:
+            self.assertTrue(routing["order_numbers"], "declared routing must name the orders it used")
+            self.assertEqual(routing["warehouse_id"], "6")
+
+    def test_the_reviewed_vat_allocation_also_names_orders(self) -> None:
+        sale = record(record_id="woo:1", source_system="woo", event_type="woo_monthly_sales",
+                      gross_amount=30.0, channel="woo",
+                      attributes={"vat_allocation": {"allocated_order_ids": ["763", "765"]}})
+
+        self.assertEqual(bookbuilder.period_order_numbers({"sales": [sale]}), [763, 765])
+
+    def test_the_period_order_numbers_are_gathered_from_every_category(self) -> None:
+        records = {
+            "sales": [self.aggregate(), woo_sale(record_id="stripe:1", order_id=762)],
+            "refunds": [woo_sale(record_id="stripe:2", order_id=765)],
+        }
+
+        self.assertEqual(bookbuilder.period_order_numbers(records), [762, 765])
+
+
+class StatementImportDependencyTests(unittest.TestCase):
+    def batch(self, policy: dict | None) -> dict:
+        row = bank_row(record_id="fee1", amount=-2.0, event_date="2024-01-10")
+        overrides: dict = {"posting_policy": policy} if policy else {}
+        return build_with(bank=row, allocation=manual_allocation(row=row, disposition="bank_fee_payment"),
+                          **overrides)
+
+    def deps(self, policy: dict | None) -> list[dict]:
+        return [d for d in self.batch(policy)["unresolved_dependencies"]
+                if d.get("kind") == "manual_statement_import_financial_transaction"]
+
+    def test_api_cash_mode_still_blocks_on_per_row_live_proof(self) -> None:
+        deps = self.deps(api_cash_policy())
+
+        self.assertEqual([d["blocking"] for d in deps], [True])
+
+    def test_statement_import_mode_does_not_block_the_document_batch(self) -> None:
+        deps = self.deps(statement_import_policy())
+
+        # The API never posts this row; the annual plan carries it and post-import ledger
+        # evidence proves it, so it must not block unrelated document creation.
+        self.assertEqual([d["blocking"] for d in deps], [False])
+
+    def test_statement_import_mode_still_records_the_row_and_why(self) -> None:
+        dep = self.deps(statement_import_policy())[0]
+
+        self.assertEqual(dep["record_id"], "fee1")
+        self.assertIn("statement-import plan", dep["reason"])
+
+    def test_a_verified_proof_is_still_honoured(self) -> None:
+        deps = self.deps(api_cash_policy())
+
+        self.assertTrue(all(d["kind"] == "manual_statement_import_financial_transaction" for d in deps))
+
+
+def allocated_order_sale(*, quantity: float | None) -> dict:
+    """A monthly Woo summary whose VAT allocation names one order, optionally with a quantity."""
+    sale = record(record_id="woo:2024-01", source_system="woo", event_type="woo_monthly_sales",
+                  gross_amount=35.82, vat_amount=6.46, shipping_amount=5.82, channel="woo",
+                  attributes={"is_monthly_summary": True, "orders": 1})
+    sale["event_date"] = "2024-01-31"
+    entry = {
+        "order_id": "763", "event_date": "2024-01-08",
+        "fixed_product_gross": 30.0, "product_vat": 5.41,
+        "fixed_shipping_gross": 5.82, "shipping_vat": 1.05,
+        "source_row_id": "woo-tax:2", "source_refs": [],
+    }
+    if quantity is not None:
+        entry["quantity"] = quantity
+    sale["attributes"]["vat_allocation"] = {
+        "fixed_product_gross": 30.0, "fixed_shipping_gross": 5.82,
+        "product_vat": 5.41, "shipping_vat": 1.05,
+        "allocation_path": "companies/example/artifacts/vat/2024-woo-tax-allocation.json",
+        "allocated_order_ids": ["763"],
+        "component_vat_evidence": [entry],
+    }
+    return sale
+
+
+class AllocatedOrderQuantityTests(unittest.TestCase):
+    def goods_line(self, *, quantity: float | None) -> dict:
+        normalized = base_normalized("2024-01")
+        normalized["records"]["sales"] = [allocated_order_sale(quantity=quantity)]
+        batch = build_batch_with_policy(normalized, warehouse_routing_policy())
+        action = actions_of_type(batch, "create_invoice_summary")[0]
+        return next(
+            line for line in action["payload"]["line_items"]
+            if line.get("vat_allocation_component") == "goods"
+        )
+
+    def test_a_reviewed_order_quantity_reaches_the_goods_line(self) -> None:
+        line = self.goods_line(quantity=2)
+
+        self.assertEqual(line["quantity"], 2.0)
+
+    def test_the_goods_line_carries_an_exact_proof_naming_the_order(self) -> None:
+        proof = self.goods_line(quantity=2)["inventory_quantity_proof"]
+
+        self.assertEqual(proof["status"], "exact")
+        self.assertEqual(proof["quantity"], 2.0)
+        self.assertEqual(proof["contributor_count"], 1)
+        self.assertEqual(proof["contributors"][0]["record_id"], "763")
+        self.assertEqual(proof["contributors"][0]["quantity_source"], "reviewed_woo_tax_allocation")
+
+    def test_an_order_without_a_reviewed_quantity_gets_no_proof(self) -> None:
+        line = self.goods_line(quantity=None)
+
+        self.assertIsNone(line.get("quantity"))
+        self.assertIsNone(line.get("inventory_quantity_proof"))
+
+    def test_a_zero_quantity_is_refused_rather_than_treated_as_one(self) -> None:
+        line = self.goods_line(quantity=0)
+
+        self.assertIsNone(line.get("inventory_quantity_proof"))
+
+    def test_the_shipping_line_never_claims_a_quantity(self) -> None:
+        normalized = base_normalized("2024-01")
+        normalized["records"]["sales"] = [allocated_order_sale(quantity=2)]
+        batch = build_batch_with_policy(normalized, warehouse_routing_policy())
+        action = actions_of_type(batch, "create_invoice_summary")[0]
+        shipping = next(
+            line for line in action["payload"]["line_items"]
+            if line.get("vat_allocation_component") == "shipping"
+        )
+
+        self.assertIsNone(shipping.get("quantity"))
+        self.assertIsNone(shipping.get("inventory_quantity_proof"))
+
+
+class NonInventoryRefundTests(unittest.TestCase):
+    def normalized(self) -> dict:
+        normalized = base_normalized("2024-05")
+        normalized["records"]["refunds"] = [
+            record(record_id="pp:chargeback", source_system="paypal", event_type="paypal_chargeback",
+                   gross_amount=-32.85, channel="woo"),
+            record(record_id="pp:disputefee", source_system="paypal", event_type="paypal_dispute_fee",
+                   gross_amount=-14.0, channel="woo"),
+        ]
+        return normalized
+
+    def policy(self, *, declared: bool) -> dict:
+        policy = warehouse_routing_policy()
+        policy["mappings"]["woo-non-taxable"] = {
+            "income_account_id": "109", "vat_type_id": "12", "warehouse_id": "6", "article_id": "3",
+        }
+        if declared:
+            policy["non_inventory_event_types"] = ["paypal_chargeback", "paypal_dispute_fee"]
+        return policy
+
+    def refund_lines(self, *, declared: bool) -> list[dict]:
+        batch = build_batch_with_policy(self.normalized(), self.policy(declared=declared))
+        actions = [a for a in batch["actions"] if "refund" in a["idempotency_key"]]
+        return [line for a in actions for line in a["payload"]["line_items"]]
+
+    def test_a_declared_cash_reversal_takes_no_article(self) -> None:
+        for line in self.refund_lines(declared=True):
+            self.assertIsNone(line.get("article_id_hint"))
+
+    def test_a_declared_cash_reversal_raises_no_quantity_dependency(self) -> None:
+        batch = build_batch_with_policy(self.normalized(), self.policy(declared=True))
+        quantity_blocks = [
+            d for d in batch["unresolved_dependencies"] if d.get("kind") == "inventory_quantity"
+        ]
+
+        self.assertEqual(quantity_blocks, [])
+
+    def test_an_undeclared_event_still_blocks_on_its_missing_quantity(self) -> None:
+        batch = build_batch_with_policy(self.normalized(), self.policy(declared=False))
+        quantity_blocks = [
+            d for d in batch["unresolved_dependencies"] if d.get("kind") == "inventory_quantity"
+        ]
+
+        self.assertTrue(quantity_blocks)
+
+    def test_the_line_records_the_event_types_it_was_built_from(self) -> None:
+        lines = self.refund_lines(declared=True)
+
+        self.assertTrue(any(line.get("contributor_event_types") for line in lines))
+        for line in lines:
+            for event_type in line.get("contributor_event_types") or []:
+                self.assertIn(event_type, {"paypal_chargeback", "paypal_dispute_fee"})
+
+
+class ForeignCurrencyPilotGateTests(unittest.TestCase):
+    def inputs(self) -> tuple[dict, dict]:
+        row = bank_row(record_id="fx1", amount=-30.2, event_date="2024-11-01")
+        item = manual_allocation(row=row, disposition="generated_purchase_payment")
+        item["target"] = {
+            "document_type": "purchase",
+            "action_key": "example-2024-10-purchase-distributor",
+            "foreign_currency_pilot_required": True,
+            "target_currency": "USD",
+            "pilot_requirements": ["applied_ecb_rate"],
+        }
+        records = {"bank_transactions": [row]}
+        allocations = {(item["statement_id"], item["iban"], item["currency"]): item}
+        return records, allocations
+
+    def deps(self, policy: dict | None) -> list[dict]:
+        records, allocations = self.inputs()
+        return bookbuilder.build_foreign_currency_payment_pilot_dependencies(
+            records=records, allocations=allocations, posting_policy=policy,
+        )
+
+    def test_a_pilot_is_required_when_no_policy_says_otherwise(self) -> None:
+        self.assertEqual([d["blocking"] for d in self.deps(None)], [True])
+
+    def test_api_cash_mode_still_requires_the_pilot(self) -> None:
+        self.assertEqual([d["blocking"] for d in self.deps(api_cash_policy())], [True])
+
+    def test_import_mode_does_not_require_a_pilot_for_a_payment_it_never_posts(self) -> None:
+        # The API creates no payment for this row; the imported statement settles it.
+        self.assertEqual(self.deps(statement_import_policy()), [])
+
+    def test_a_row_on_an_unmanaged_account_still_requires_the_pilot(self) -> None:
+        policy = statement_import_policy()
+        policy["cash_posting"] = dict(policy["cash_posting"], bank_income_account_ids=["999"])
+
+        self.assertEqual([d["blocking"] for d in self.deps(policy)], [True])
+
+    def test_a_row_without_the_reviewed_flag_needs_no_pilot(self) -> None:
+        records, allocations = self.inputs()
+        for item in allocations.values():
+            item["target"].pop("foreign_currency_pilot_required")
+
+        self.assertEqual(
+            bookbuilder.build_foreign_currency_payment_pilot_dependencies(
+                records=records, allocations=allocations, posting_policy=None), [])
+
+
+class TransferEvidencePathTests(unittest.TestCase):
+    def test_the_default_path_sits_with_the_other_company_artifacts(self) -> None:
+        path = bookbuilder.resolve_inventory_transfer_evidence_path(
+            company_dir=Path("companies/example"), normalized_path=Path("x"), period="2024-11", override=None,
+        )
+
+        self.assertEqual(path, Path("companies/example/artifacts/actions/2024-inventory-transfers.json"))
+
+    def test_an_explicit_override_wins(self) -> None:
+        path = bookbuilder.resolve_inventory_transfer_evidence_path(
+            company_dir=Path("companies/example"), normalized_path=Path("x"),
+            period="2024-11", override="elsewhere.json",
+        )
+
+        self.assertEqual(path, Path("elsewhere.json"))
+
+    def test_a_missing_file_loads_as_no_evidence_rather_than_failing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(
+                bookbuilder.load_inventory_transfer_evidence(Path(tmp) / "absent.json"), []
+            )
+
+    def test_a_single_reviewed_transfer_loads_as_one_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.json"
+            path.write_text(json.dumps({
+                "action_type": "warehouse_transfer", "destination_warehouse_id": "9",
+                "source_warehouse_id": "1", "article_id": "3", "status": "complete",
+            }), encoding="utf-8")
+
+            evidence = bookbuilder.load_inventory_transfer_evidence(path)
+
+            self.assertEqual(len(evidence), 1)
+            self.assertEqual(evidence[0]["destination_warehouse_id"], "9")
+
+    def test_a_list_of_transfers_loads_whole(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.json"
+            path.write_text(json.dumps([
+                {"action_type": "warehouse_transfer", "destination_warehouse_id": "9"},
+                {"action_type": "warehouse_transfer", "destination_warehouse_id": "7"},
+            ]), encoding="utf-8")
+
+            self.assertEqual(len(bookbuilder.load_inventory_transfer_evidence(path)), 2)
 
 
 if __name__ == "__main__":

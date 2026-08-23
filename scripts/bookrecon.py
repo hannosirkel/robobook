@@ -936,6 +936,146 @@ def _clearing_balance_value(records: list[dict[str, Any]], names: tuple[str, ...
     return (next(iter(values)), len(values) == 1) if values else (None, True)
 
 
+WALLET_EVENT_TYPES = frozenset({"printful_wallet_deposit", "printful_wallet_withdrawal"})
+
+FUNDING_OWNERS = ("personal", "company")
+
+OWNER_ATTRIBUTE = {"personal": "reporting_person", "company": "company"}
+
+
+def _wallet_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        record
+        for record in records
+        if isinstance(record, dict) and str(record.get("event_type") or "") in WALLET_EVENT_TYPES
+    ]
+
+
+def physical_statement_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return only genuine physical bank rows.
+
+    Wallet movements are clearing evidence, not bank statement lines. Counting them as
+    statement coverage would make an annual row count look complete while physical rows
+    were still unassigned.
+    """
+    return [
+        record
+        for record in records
+        if isinstance(record, dict) and str(record.get("source_system") or "") == "bank"
+    ]
+
+
+def _wallet_totals(rows: list[dict[str, Any]], *, owner: str) -> dict[str, Decimal]:
+    attribute = OWNER_ATTRIBUTE[owner]
+    owned = [
+        row for row in rows
+        if str((row.get("attributes") or {}).get("funding_owner") or "") == attribute
+    ]
+    deposits = sum(
+        (abs(decimal_value(row.get("gross_amount"))) for row in owned
+         if str(row.get("event_type") or "") == "printful_wallet_deposit"),
+        Decimal(0),
+    )
+    refunds = sum(
+        (abs(decimal_value(row.get("gross_amount"))) for row in owned
+         if str(row.get("event_type") or "") == "printful_wallet_withdrawal"),
+        Decimal(0),
+    )
+    return {"deposits": deposits, "refunds": refunds, "liability_change": deposits - refunds}
+
+
+def printful_wallet_equation_errors(records: list[dict[str, Any]]) -> list[str]:
+    """Report reviewed wallet funding that does not hold as an equation."""
+    rows = _wallet_rows(records)
+    errors: list[str] = []
+    for row in rows:
+        if not str((row.get("attributes") or {}).get("funding_owner") or ""):
+            errors.append(
+                f"Wallet movement {row.get('record_id') or '<unknown>'} has no reviewed funding owner."
+            )
+    for owner in FUNDING_OWNERS:
+        totals = _wallet_totals(rows, owner=owner)
+        if totals["refunds"] > totals["deposits"]:
+            label = "personal-card funding" if owner == "personal" else "company-card funding"
+            errors.append(
+                f"Wallet refund exceeds reviewed {label}: refunds {decimal_text(totals['refunds'])} "
+                f"against deposits {decimal_text(totals['deposits'])}."
+            )
+    return errors
+
+
+def printful_wallet_summary(
+    records: list[dict[str, Any]], *, consumption: Decimal | None = None
+) -> dict[str, Any]:
+    """Report deposits, refunds, consumption, and remaining balance as separate terms."""
+    rows = _wallet_rows(records)
+    personal = _wallet_totals(rows, owner="personal")
+    company = _wallet_totals(rows, owner="company")
+    used = consumption or Decimal(0)
+    return {
+        "personal": personal,
+        "company": company,
+        "consumption": used,
+        "closing": personal["liability_change"] + company["liability_change"] - used,
+        "errors": printful_wallet_equation_errors(records),
+    }
+
+
+def build_wallet_funding_check(
+    *,
+    normalized_path_display: str,
+    records: dict[str, list[dict[str, Any]]],
+    annual_clearing_records: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Reconcile card-funded wallet movements, so an unattributed one cannot pass silently.
+
+    The funding and its reversal need not fall in the same month -- a wallet topped up in
+    April can be refunded in July -- so the equation is evaluated over the year's movements
+    where they are available. Judging it a month at a time would fail July for spending
+    April's money.
+    """
+    period_rows = _wallet_rows(records.get("clearing_transactions", []))
+    rows = _wallet_rows(list((annual_clearing_records or {}).values())) or period_rows
+    if not period_rows:
+        return make_check(
+            check_id="wallet-funding-equation",
+            name="Wallet funding equation",
+            status="skipped",
+            notes=["No wallet movements were normalized for this period."],
+        )
+    summary = printful_wallet_summary(rows)
+    # Attribution is enforced where the source can supply it: the printout parser refuses an
+    # unknown card outright. A source that carries no card at all -- a plain wallet export --
+    # is reported here rather than blocking, while the funding equation itself still fails.
+    errors = [e for e in summary["errors"] if "no reviewed funding owner" not in e]
+    unattributed = [e for e in summary["errors"] if "no reviewed funding owner" in e]
+    notes = [
+        (
+            f"Personal card: deposits {decimal_text(summary['personal']['deposits'])}, "
+            f"refunds {decimal_text(summary['personal']['refunds'])}, "
+            f"liability change {decimal_text(summary['personal']['liability_change'])}."
+        ),
+        (
+            f"Company card: deposits {decimal_text(summary['company']['deposits'])}, "
+            f"refunds {decimal_text(summary['company']['refunds'])}."
+        ),
+        *errors,
+        *unattributed,
+    ]
+    return make_check(
+        check_id="wallet-funding-equation",
+        name="Wallet funding equation",
+        status="fail" if errors else "pass",
+        lhs_label="Personal deposits",
+        lhs_amount=summary["personal"]["deposits"],
+        rhs_label="Personal refunds",
+        rhs_amount=summary["personal"]["refunds"],
+        delta=summary["personal"]["liability_change"],
+        notes=notes,
+        evidence_refs=[make_artifact_ref(normalized_path_display, record_refs_list=record_refs(period_rows))],
+    )
+
+
 def build_clearing_continuity_checks(
     *,
     normalized_path_display: str,
@@ -1404,6 +1544,25 @@ def build_purchase_credit_checks(
     return checks
 
 
+INVENTORY_ACTIVITY_CATEGORIES = (
+    "sales",
+    "refunds",
+    "purchase_expenses",
+    "inventory_movements",
+    "manual_adjustments",
+)
+
+
+def has_inventory_activity(records: dict[str, list[dict[str, Any]]]) -> bool:
+    """Report whether the period contains anything that could move stock.
+
+    Records without a quantity still count: a sale that should carry one and does not
+    is exactly what the warning is for. What does not count is company configuration —
+    having warehouses says nothing about whether this month had activity.
+    """
+    return any(records.get(category) for category in INVENTORY_ACTIVITY_CATEGORIES)
+
+
 def build_inventory_check(
     *,
     normalized_path_display: str,
@@ -1482,6 +1641,20 @@ def build_inventory_check(
         )
 
     if inventory_expected:
+        if not has_inventory_activity(records):
+            return make_check(
+                check_id="inventory-quantity-evidence",
+                name="Inventory quantity evidence",
+                status="pass",
+                threshold=quantity_threshold,
+                notes=[
+                    (
+                        "Inventory is relevant to this company, but the period has no "
+                        "inventory-affecting activity to reconcile."
+                    )
+                ],
+                evidence_refs=evidence,
+            )
         return make_check(
             check_id="inventory-quantity-evidence",
             name="Inventory quantity evidence",
@@ -1610,6 +1783,11 @@ def build_recon_document(
     checks: list[dict[str, Any]] = [
         physical_bank_check,
         *clearing_checks,
+        build_wallet_funding_check(
+            normalized_path_display=normalized_path_display,
+            records=records,
+            annual_clearing_records=annual_clearing_records,
+        ),
         build_woo_sales_vs_processor_check(
             normalized_path_display=normalized_path_display,
             records=records,

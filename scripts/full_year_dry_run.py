@@ -8,6 +8,7 @@ import json
 import subprocess
 import sys
 from collections import defaultdict
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ from inventory_verification import evaluate_inventory_action, load_manual_invent
 import bookprep
 import woo_tax
 from booksend import action_successfully_submitted, load_yaml, normalized_endpoint
+from posting_policy import PostingPolicyError, cash_posting_mode, prohibited_bank_cash_action
 from reference_artifacts import ReferenceArtifactError, file_sha256, verify_file_binding
 
 
@@ -29,6 +31,139 @@ STEP_SPECS = (
     ("bookchecker", "bookchecker.py"),
     ("booksend", "booksend.py"),
 )
+
+# The run advances through these in order. The first three are states reached; the next
+# three name what the run is waiting on, each of which is a person doing something in
+# the SimplBooks UI that the published API cannot do.
+PHASES = (
+    "source_ready",
+    "master_data_ready",
+    "documents_ready",
+    "statement_import_pending",
+    "ledger_evidence_pending",
+    "inventory_audit_pending",
+    "fx_revaluation_pending",
+    "final_checks_ready",
+)
+
+
+def fx_revaluation_state(evidence: dict[str, Any] | None) -> dict[str, Any]:
+    """Answer both halves of the year-end FX question: is it needed, and was it done?
+
+    Revaluing a held foreign-currency balance is a journal entry, and the published API
+    has no endpoint for one, so it stays a manual step. A manual step with no record is
+    indistinguishable from one nobody did, which is why absent evidence reads as
+    unanswered rather than as settled.
+    """
+    if not evidence:
+        return {
+            "verdict": "unknown",
+            "settled": False,
+            "reason": "No year-end FX revaluation evidence exists, so it is unknown whether one is needed.",
+        }
+    balances = evidence.get("balances") or {}
+    has_foreign_balance = any(
+        Decimal(str(amount)) != 0 for amount in balances.values() if str(amount).strip()
+    )
+    required = bool(evidence.get("required"))
+    status = str(evidence.get("status") or "")
+
+    if has_foreign_balance and not required:
+        return {
+            "verdict": "contradictory",
+            "settled": False,
+            "reason": (
+                "Evidence claims no revaluation is required while reporting a non-zero "
+                f"foreign-currency balance: {balances}."
+            ),
+        }
+    if not required and not has_foreign_balance:
+        return {
+            "verdict": "not_required",
+            "settled": True,
+            "reason": "No foreign-currency balance remained at year end, so no revaluation is due.",
+        }
+    if status == "posted":
+        return {
+            "verdict": "posted",
+            "settled": True,
+            "reason": "The year-end FX revaluation entry is recorded as posted.",
+        }
+    return {
+        "verdict": "pending",
+        "settled": False,
+        "reason": f"A year-end FX revaluation is required for {sorted(balances)} and is not yet posted.",
+    }
+
+
+@dataclass(frozen=True)
+class YearGates:
+    """What a year's evidence currently proves. Each field is one gate on the way to done."""
+
+    statement_import_mode: bool
+    master_data_resolved: bool
+    documents_ready: bool
+    ledger_evidence_status: str | None
+    inventory_audit_status: str | None
+    fx_revaluation_settled: bool
+
+
+def resolve_run_phase(gates: YearGates) -> str:
+    """Report the furthest phase the year's evidence actually supports."""
+    if not gates.master_data_resolved:
+        return "source_ready"
+    if not gates.documents_ready:
+        return "master_data_ready"
+    if not gates.statement_import_mode:
+        return "documents_ready"
+    if gates.ledger_evidence_status is None:
+        return "statement_import_pending"
+    if gates.ledger_evidence_status != "pass":
+        return "ledger_evidence_pending"
+    if gates.inventory_audit_status != "pass":
+        return "inventory_audit_pending"
+    if not gates.fx_revaluation_settled:
+        return "fx_revaluation_pending"
+    return "final_checks_ready"
+
+
+def load_optional_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def statement_import_year(company_dir: Path) -> bool:
+    policy = load_optional_json(company_dir / "artifacts" / "posting_policy.json")
+    try:
+        return cash_posting_mode(policy) == "statement_import"
+    except PostingPolicyError:
+        return False
+
+
+def count_bank_api_cash_actions(company_dir: Path, *, year: int) -> int:
+    """Count actions that would move bank cash the imported statement already moves."""
+    policy = load_optional_json(company_dir / "artifacts" / "posting_policy.json")
+    actions_dir = company_dir / "artifacts" / "actions"
+    if not actions_dir.exists():
+        return 0
+    total = 0
+    for path in sorted(actions_dir.glob(f"{year}-*.yaml")):
+        try:
+            batch = load_yaml(path)
+        except (OSError, SimplbooksError):
+            continue
+        for action in (batch or {}).get("actions") or []:
+            try:
+                if isinstance(action, dict) and prohibited_bank_cash_action(action, policy):
+                    total += 1
+            except PostingPolicyError:
+                continue
+    return total
 
 
 def periods_for_year(year: int) -> list[str]:
@@ -573,6 +708,104 @@ def build_step_command(
     return cmd
 
 
+def run_phase_from_evidence(
+    *,
+    company_dir: Path,
+    year: int,
+    statement_import_mode: bool,
+    master_data_resolved: bool,
+    documents_ready: bool,
+) -> str:
+    """Read the year's post-import evidence and report the phase it supports."""
+    ledger_evidence = load_optional_json(
+        company_dir / "artifacts" / "ledger" / f"{year}-ledger-evidence.json"
+    )
+    inventory_audit = load_optional_json(
+        company_dir / "artifacts" / "audits" / f"{year}-inventory-equation.json"
+    )
+    fx_revaluation = load_optional_json(
+        company_dir / "artifacts" / "audits" / f"{year}-fx-revaluation.json"
+    )
+    return resolve_run_phase(
+        YearGates(
+            statement_import_mode=statement_import_mode,
+            master_data_resolved=master_data_resolved,
+            documents_ready=documents_ready,
+            ledger_evidence_status=str(ledger_evidence.get("status")) if ledger_evidence else None,
+            inventory_audit_status=str(inventory_audit.get("status")) if inventory_audit else None,
+            fx_revaluation_settled=fx_revaluation_state(fx_revaluation or None)["settled"],
+        )
+    )
+
+
+def normalize_all_periods(
+    *,
+    periods: list[str],
+    command_for: Any,
+    cwd: Path,
+    continue_on_error: bool,
+) -> None:
+    """Normalize every period before anything derived from the normalized data is built."""
+    for period in periods:
+        run = subprocess.run(command_for(period), cwd=cwd, capture_output=True, text=True)  # noqa: PLW1510
+        if run.returncode != 0 and not continue_on_error:
+            raise SimplbooksError(
+                f"Normalization failed for {period} before the annual plan could be built: "
+                + (run.stderr or run.stdout or "unknown error").strip()
+            )
+
+
+def normalize_then_plan(
+    *,
+    periods: list[str],
+    command_for: Any,
+    plan: Any,
+    cwd: Path,
+    continue_on_error: bool,
+) -> dict[str, Any]:
+    """Normalize every period, then build the annual plan from what that produced.
+
+    The plan is derived from the normalized artifacts, so building it first would describe
+    the previous run's normalization -- and on a fresh company there would be nothing to
+    describe at all.
+    """
+    normalize_all_periods(
+        periods=periods, command_for=command_for, cwd=cwd, continue_on_error=continue_on_error,
+    )
+    return plan()
+
+
+def generate_annual_statement_plan(
+    *,
+    company_dir: Path,
+    year: int,
+    python_executable: str,
+    cwd: Path,
+    continue_on_error: bool,
+) -> dict[str, Any]:
+    """Build the annual plan before any month, so no batch is built against a stale one."""
+    command = [
+        python_executable,
+        str(Path("scripts") / "statement_import_plan.py"),
+        "--company-dir",
+        str(company_dir),
+        "--year",
+        str(year),
+    ]
+    run = subprocess.run(command, cwd=cwd, capture_output=True, text=True)  # noqa: PLW1510
+    if run.returncode != 0 and not continue_on_error:
+        raise SimplbooksError(
+            "Annual statement-import plan generation failed; no month is built against a stale plan: "
+            + (run.stderr or run.stdout or "unknown error").strip()
+        )
+    return {
+        "step": "statement_import_plan",
+        "ok": run.returncode == 0,
+        "returncode": run.returncode,
+        "summary": parse_json_output(run.stdout),
+    }
+
+
 def run_full_year_dry_run(
     *,
     company_dir: Path,
@@ -591,7 +824,30 @@ def run_full_year_dry_run(
     successful_period_states: dict[str, str] = {}
     overall_success = True
 
+    statement_import_mode = statement_import_year(company_dir)
     target_periods = periods_for_year(year)
+
+    plan_step = (
+        normalize_then_plan(
+            periods=target_periods,
+            command_for=lambda period: build_step_command(
+                python_executable=python_executable, company_dir=company_dir, period=period,
+                step_name="bookprep", script_name="bookprep.py", source_dir=source_dir,
+                force_build=force_build, woo_tax_allocation=woo_tax_allocation,
+                bank_allocations=bank_allocations,
+            ),
+            plan=lambda: generate_annual_statement_plan(
+                company_dir=company_dir, year=year, python_executable=python_executable,
+                cwd=cwd, continue_on_error=continue_on_error,
+            ),
+            cwd=cwd,
+            continue_on_error=continue_on_error,
+        )
+        if statement_import_mode
+        else None
+    )
+    overall_success = overall_success and (plan_step is None or plan_step["ok"])
+
     for period in target_periods:
         submission_state = submitted_month_state(company_dir=company_dir, period=period)
         if submission_state == "submitted":
@@ -604,7 +860,13 @@ def run_full_year_dry_run(
             )
         step_results: list[dict[str, Any]] = []
         month_success = True
-        for step_name, script_name in STEP_SPECS:
+        month_steps = [
+            (step_name, script_name)
+            for step_name, script_name in STEP_SPECS
+            # Normalization already ran for every month before the annual plan was built.
+            if not (statement_import_mode and step_name == "bookprep")
+        ]
+        for step_name, script_name in month_steps:
             cmd = build_step_command(
                 python_executable=python_executable,
                 company_dir=company_dir,
@@ -668,6 +930,13 @@ def run_full_year_dry_run(
     if len(months) != len(target_periods):
         acceptance_issues.append(f"Expected {len(target_periods)} processed months, found {len(months)}.")
     overall_success = overall_success and not acceptance_issues
+    phase = run_phase_from_evidence(
+        company_dir=company_dir,
+        year=year,
+        statement_import_mode=statement_import_mode,
+        master_data_resolved=not unprocessed_periods,
+        documents_ready=overall_success,
+    )
     return {
         "company_dir": str(company_dir),
         "company_name": company_name,
@@ -684,6 +953,10 @@ def run_full_year_dry_run(
         "reference_summary": reference_summary,
         "bank_reconciliation_summary": bank_reconciliation_summary,
         "acceptance_issues": acceptance_issues,
+        "cash_posting_mode": "statement_import" if statement_import_mode else "api",
+        "phase": phase,
+        "statement_import_plan_step": plan_step,
+        "bank_api_cash_action_count": count_bank_api_cash_actions(company_dir, year=year),
         "api_calls": api_calls,
         "months": months,
     }

@@ -1,0 +1,18 @@
+{
+  "schema_version": "1.0",
+  "company_slug": "example",
+  "company_id": "42",
+  "year": 2024,
+  "binding": {
+    "path": "companies/example/artifacts/ledger/2024-account-ledger.csv",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "planned_row_count": 1,
+  "ledger_row_count": 2,
+  "movement": {
+    "10|EUR": "-12.50",
+    "32|EUR": "12.50"
+  },
+  "errors": [],
+  "status": "pass"
+}

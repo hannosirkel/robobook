@@ -1083,5 +1083,273 @@ class FullYearDryRunTests(unittest.TestCase):
             self.assertTrue(summary_path.exists())
 
 
+STATEMENT_IMPORT_POLICY = {
+    "schema_version": "1.0",
+    "company_slug": "example",
+    "bank_accounts": {"EE123": {"EUR": "3"}},
+    "contacts": {},
+    "mappings": {},
+    "supplier_aliases": {},
+    "cash_posting": {
+        "mode": "statement_import",
+        "bank_income_account_ids": ["3"],
+        "processor_income_account_ids": {},
+        "bank_financial_accounts": {"EE123": {"EUR": "10"}},
+        "clearing_provider_roles": {},
+        "financial_accounts": {
+            "bank": "10", "stripe_clearing": "30", "paypal": "31", "bank_fees": "32",
+            "reporting_person_payable": "33", "platform_prepayment": "34",
+            "customer_receivable": "37", "supplier_payable": "38",
+            "fx_gain": "35", "fx_loss": "36",
+        },
+    },
+}
+
+
+class StatementImportOrchestrationTests(unittest.TestCase):
+    def run_year(self, company_dir: Path, *, called: list[str]) -> dict:
+        def fake_run(cmd: list[str], cwd: Path, capture_output: bool, text: bool) -> SimpleNamespace:
+            del capture_output, text
+            script = Path(cmd[1]).name
+            called.append(script)
+            if script == "bookrecon.py":
+                write_bound_recon(company_dir, cmd[cmd.index("--period") + 1], cwd=cwd)
+            if script == "bookbuilder.py":
+                write_action_bound_to_recon(company_dir, cmd[cmd.index("--period") + 1], cwd=cwd)
+            payload = {"result": "pass"} if script == "bookchecker.py" else {"ok": True}
+            return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+        original_run = full_year_dry_run.subprocess.run
+        original_periods = full_year_dry_run.periods_for_year
+        original_resolve = full_year_dry_run.resolve_company_name
+        try:
+            full_year_dry_run.subprocess.run = fake_run
+            full_year_dry_run.periods_for_year = lambda _year: ["2024-01"]
+            full_year_dry_run.resolve_company_name = lambda company_dir: "Example Company OÜ"
+            return full_year_dry_run.run_full_year_dry_run(
+                company_dir=company_dir,
+                year=2024,
+                source_dir=None,
+                python_executable="python3",
+                continue_on_error=False,
+                force_build=False,
+                cwd=Path.cwd(),
+            )
+        finally:
+            full_year_dry_run.subprocess.run = original_run
+            full_year_dry_run.periods_for_year = original_periods
+            full_year_dry_run.resolve_company_name = original_resolve
+
+    def company(self, tmp: Path, policy: dict) -> Path:
+        company_dir = tmp / "companies" / "example"
+        (company_dir / "artifacts").mkdir(parents=True)
+        (company_dir / "artifacts" / "posting_policy.json").write_text(json.dumps(policy), encoding="utf-8")
+        return company_dir
+
+    def test_the_annual_plan_is_generated_before_any_monthly_build(self) -> None:
+        called: list[str] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            self.run_year(self.company(Path(tmp), STATEMENT_IMPORT_POLICY), called=called)
+
+        self.assertIn("statement_import_plan.py", called)
+        self.assertLess(called.index("statement_import_plan.py"), called.index("bookbuilder.py"))
+
+    def test_a_statement_import_year_stops_at_the_import_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = self.run_year(self.company(Path(tmp), STATEMENT_IMPORT_POLICY), called=[])
+
+        self.assertEqual(summary["phase"], "statement_import_pending")
+
+    def test_a_statement_import_year_submits_no_bank_api_cash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = self.run_year(self.company(Path(tmp), STATEMENT_IMPORT_POLICY), called=[])
+
+        self.assertEqual(summary["bank_api_cash_action_count"], 0)
+
+    def test_an_api_cash_year_runs_no_statement_import_plan_step(self) -> None:
+        called: list[str] = []
+        policy = dict(STATEMENT_IMPORT_POLICY, cash_posting={"mode": "api"})
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = self.run_year(self.company(Path(tmp), policy), called=called)
+
+        self.assertNotIn("statement_import_plan.py", called)
+        self.assertEqual(summary["phase"], "documents_ready")
+
+
+class RunPhaseTests(unittest.TestCase):
+    def resolve(self, **overrides: object) -> str:
+        kwargs: dict = {
+            "statement_import_mode": True,
+            "master_data_resolved": True,
+            "documents_ready": True,
+            "ledger_evidence_status": None,
+            "inventory_audit_status": None,
+            "fx_revaluation_settled": False,
+        }
+        kwargs.update(overrides)
+        return full_year_dry_run.resolve_run_phase(full_year_dry_run.YearGates(**kwargs))
+
+    def test_every_phase_it_can_return_is_a_declared_phase(self) -> None:
+        phases = {
+            self.resolve(master_data_resolved=False),
+            self.resolve(documents_ready=False),
+            self.resolve(statement_import_mode=False),
+            self.resolve(),
+            self.resolve(ledger_evidence_status="fail"),
+            self.resolve(ledger_evidence_status="pass"),
+            self.resolve(ledger_evidence_status="pass", inventory_audit_status="pass"),
+        }
+
+        self.assertTrue(phases <= set(full_year_dry_run.PHASES))
+
+    def test_unresolved_master_data_holds_the_run_at_source_ready(self) -> None:
+        self.assertEqual(self.resolve(master_data_resolved=False), "source_ready")
+
+    def test_incomplete_documents_hold_the_run_before_the_import(self) -> None:
+        self.assertEqual(self.resolve(documents_ready=False), "master_data_ready")
+
+    def test_a_failing_ledger_export_holds_the_run_at_ledger_evidence(self) -> None:
+        self.assertEqual(self.resolve(ledger_evidence_status="fail"), "ledger_evidence_pending")
+
+    def test_a_passing_ledger_export_moves_on_to_the_inventory_audit(self) -> None:
+        self.assertEqual(self.resolve(ledger_evidence_status="pass"), "inventory_audit_pending")
+
+    def test_everything_proven_reaches_the_final_checks(self) -> None:
+        self.assertEqual(
+            self.resolve(
+                ledger_evidence_status="pass",
+                inventory_audit_status="pass",
+                fx_revaluation_settled=True,
+            ),
+            "final_checks_ready",
+        )
+
+    def test_an_unanswered_fx_revaluation_holds_an_otherwise_proven_year(self) -> None:
+        self.assertEqual(
+            self.resolve(ledger_evidence_status="pass", inventory_audit_status="pass"),
+            "fx_revaluation_pending",
+        )
+
+
+class FxRevaluationGateTests(unittest.TestCase):
+    def status(self, **overrides: object) -> dict:
+        evidence = {
+            "year": 2024,
+            "required": True,
+            "status": "pending",
+            "balances": {"USD": "4670.50"},
+        }
+        evidence.update(overrides)
+        return full_year_dry_run.fx_revaluation_state(evidence)
+
+    def test_a_year_with_no_foreign_balance_needs_no_revaluation(self) -> None:
+        state = self.status(required=False, balances={}, status="not_required")
+
+        self.assertEqual(state["verdict"], "not_required")
+        self.assertTrue(state["settled"])
+
+    def test_a_required_but_unposted_revaluation_is_not_settled(self) -> None:
+        state = self.status()
+
+        self.assertEqual(state["verdict"], "pending")
+        self.assertFalse(state["settled"])
+
+    def test_a_posted_revaluation_settles_the_year(self) -> None:
+        state = self.status(status="posted")
+
+        self.assertEqual(state["verdict"], "posted")
+        self.assertTrue(state["settled"])
+
+    def test_absent_evidence_is_treated_as_unanswered_not_as_done(self) -> None:
+        state = full_year_dry_run.fx_revaluation_state(None)
+
+        self.assertEqual(state["verdict"], "unknown")
+        self.assertFalse(state["settled"])
+
+    def test_a_foreign_balance_with_a_not_required_claim_is_contradictory(self) -> None:
+        state = self.status(required=False, status="not_required")
+
+        self.assertEqual(state["verdict"], "contradictory")
+        self.assertFalse(state["settled"])
+
+
+class FxRevaluationPhaseTests(unittest.TestCase):
+    def resolve(self, **overrides: object) -> str:
+        kwargs: dict = {
+            "statement_import_mode": True,
+            "master_data_resolved": True,
+            "documents_ready": True,
+            "ledger_evidence_status": "pass",
+            "inventory_audit_status": "pass",
+            "fx_revaluation_settled": True,
+        }
+        kwargs.update(overrides)
+        return full_year_dry_run.resolve_run_phase(full_year_dry_run.YearGates(**kwargs))
+
+    def test_an_unsettled_revaluation_holds_the_year_open(self) -> None:
+        self.assertEqual(self.resolve(fx_revaluation_settled=False), "fx_revaluation_pending")
+
+    def test_a_settled_revaluation_reaches_the_final_checks(self) -> None:
+        self.assertEqual(self.resolve(), "final_checks_ready")
+
+    def test_the_revaluation_gate_sits_after_the_inventory_audit(self) -> None:
+        phases = full_year_dry_run.PHASES
+
+        self.assertLess(phases.index("inventory_audit_pending"), phases.index("fx_revaluation_pending"))
+        self.assertLess(phases.index("fx_revaluation_pending"), phases.index("final_checks_ready"))
+
+    def test_an_earlier_gate_still_wins_over_the_revaluation_gate(self) -> None:
+        self.assertEqual(
+            self.resolve(inventory_audit_status="fail", fx_revaluation_settled=False),
+            "inventory_audit_pending",
+        )
+
+
+class PlanOrderingTests(unittest.TestCase):
+    def test_every_month_is_normalized_before_the_annual_plan_is_built(self) -> None:
+        called: list[str] = []
+
+        def fake_run(cmd: list[str], cwd: Path, capture_output: bool, text: bool) -> SimpleNamespace:
+            del capture_output, text
+            script = Path(cmd[1]).name
+            called.append(script)
+            if script == "bookrecon.py":
+                write_bound_recon(company_dir, cmd[cmd.index("--period") + 1], cwd=cwd)
+            if script == "bookbuilder.py":
+                write_action_bound_to_recon(company_dir, cmd[cmd.index("--period") + 1], cwd=cwd)
+            payload = {"result": "pass"} if script == "bookchecker.py" else {"ok": True}
+            return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            company_dir = Path(tmp) / "companies" / "example"
+            (company_dir / "artifacts").mkdir(parents=True)
+            (company_dir / "artifacts" / "posting_policy.json").write_text(
+                json.dumps(STATEMENT_IMPORT_POLICY), encoding="utf-8")
+            original_run = full_year_dry_run.subprocess.run
+            original_periods = full_year_dry_run.periods_for_year
+            original_resolve = full_year_dry_run.resolve_company_name
+            try:
+                full_year_dry_run.subprocess.run = fake_run
+                full_year_dry_run.periods_for_year = lambda _y: ["2024-01", "2024-02"]
+                full_year_dry_run.resolve_company_name = lambda company_dir: "Example Company OU"
+                full_year_dry_run.run_full_year_dry_run(
+                    company_dir=company_dir, year=2024, source_dir=None,
+                    python_executable="python3", continue_on_error=True,
+                    force_build=False, cwd=Path.cwd(),
+                )
+            finally:
+                full_year_dry_run.subprocess.run = original_run
+                full_year_dry_run.periods_for_year = original_periods
+                full_year_dry_run.resolve_company_name = original_resolve
+
+        plan_at = called.index("statement_import_plan.py")
+        # The plan is derived from the normalized artifacts, so every month must be
+        # normalized before it is built -- otherwise it describes the previous run.
+        # Once per month, all before the plan, and not repeated inside the month loop.
+        self.assertEqual(called.count("bookprep.py"), 2)
+        self.assertLess(plan_at, called.index("bookbuilder.py"))
+        self.assertEqual([s for s in called[:plan_at] if s == "bookprep.py"], ["bookprep.py"] * 2)
+
+
 if __name__ == "__main__":
     unittest.main()

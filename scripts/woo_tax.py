@@ -697,6 +697,47 @@ def apply_allocation_to_sale(
     set_allocated_sale_components(sale, items, allocation, components)
 
 
+def residual_quantity_derivation(
+    summary_quantity: Any, allocated_quantities: list[Any]
+) -> dict[str, float] | None:
+    """Derive the zero-rated residual's quantity from the two reviewed numbers around it.
+
+    The monthly summary states how many items the month sold and the reviewed allocation
+    states how many belong to each named order; what is left is the residual. This is
+    arithmetic, not inference, so it is recorded with both inputs and refuses to produce
+    anything unless every term is known: one order missing a quantity would silently
+    inflate the residual by that order's units.
+    """
+    if summary_quantity in (None, ""):
+        return None
+    total = decimal_value(summary_quantity)
+    allocated = Decimal(0)
+    for value in allocated_quantities:
+        if value in (None, ""):
+            return None
+        allocated += decimal_value(value)
+    residual = total - allocated
+    if total <= 0 or allocated < 0 or residual <= 0:
+        return None
+    return {
+        "summary_quantity": decimal_number(total),
+        "allocated_quantity": decimal_number(allocated),
+        "residual_quantity": decimal_number(residual),
+    }
+
+
+def allocation_component_quantity(item: dict[str, Any]) -> float | None:
+    """Return one order's reviewed goods quantity, or None when it has none.
+
+    Absent means unknown, never one: a defaulted quantity would silently move stock.
+    """
+    raw = item.get("quantity")
+    if raw in (None, ""):
+        return None
+    quantity = decimal_value(raw)
+    return decimal_number(quantity) if quantity > 0 else None
+
+
 def set_allocated_sale_components(
     sale: dict[str, Any],
     items: list[dict[str, Any]],
@@ -753,6 +794,7 @@ def set_allocated_sale_components(
         "component_vat_evidence": [
             {
                 "order_id": str(item["order_id"]),
+                "quantity": allocation_component_quantity(item),
                 "event_date": str(item.get("event_date") or ""),
                 "source_row_id": str(item.get("source_row_id") or ""),
                 "processor_ref": str(item.get("processor_ref") or ""),
@@ -776,6 +818,58 @@ def set_allocated_sale_components(
             for profile in [select_vat_period(date_value(item.get("event_date")), periods)]
         ],
     }
+
+
+def build_zero_rated_residual(
+    sale: dict[str, Any],
+    items: list[dict[str, Any]],
+    residual_product_gross: Decimal,
+    residual_shipping_gross: Decimal,
+    label: str,
+) -> dict[str, Any]:
+    """Build the part of a monthly summary the reviewed allocation does not name."""
+    residual_gross = residual_product_gross + residual_shipping_gross
+    residual = copy.deepcopy(sale)
+    original_attributes = sale.get("attributes")
+    total_orders = (
+        int(original_attributes.get("orders"))
+        if isinstance(original_attributes, dict)
+        and isinstance(original_attributes.get("orders"), int)
+        else None
+    )
+    if total_orders is not None and total_orders < len(items):
+        raise WooTaxError(
+            f"Woo monthly summary component evidence does not reconcile for {label}."
+        )
+
+    residual["record_id"] = f"{residual.get('record_id')}:zero-rated-residual"
+    residual["description"] = f"{residual.get('description') or 'Woo monthly summary'} zero-rated residual"
+    residual["external_ref"] = f"{residual.get('external_ref') or label}:zero-rated-residual"
+    residual["gross_amount"] = decimal_number(residual_gross)
+    residual["net_amount"] = decimal_number(residual_gross)
+    residual["vat_amount"] = 0.0
+    residual["shipping_amount"] = decimal_number(residual_shipping_gross)
+    residual_derivation = residual_quantity_derivation(
+        sale.get("quantity"), [item.get("quantity") for item in items]
+    )
+    residual["quantity"] = (
+        residual_derivation["residual_quantity"] if residual_derivation else None
+    )
+    residual_attributes = residual.setdefault("attributes", {})
+    if not isinstance(residual_attributes, dict):
+        raise WooTaxError("Woo monthly summary residual has invalid attributes.")
+    residual_attributes.pop("vat_allocation", None)
+    if total_orders is not None:
+        residual_attributes["orders"] = total_orders - len(items)
+    residual_attributes["zero_rated_residual"] = {
+        "fixed_product_gross": decimal_number(residual_product_gross),
+        "fixed_shipping_gross": decimal_number(residual_shipping_gross),
+        "allocated_order_ids": sorted(str(item["order_id"]) for item in items),
+    }
+    if residual_derivation is not None:
+        # Both inputs are recorded so the subtraction can be re-checked rather than trusted.
+        residual_attributes["quantity_derivation"] = residual_derivation
+    return residual
 
 
 def apply_allocation_to_monthly_summary(
@@ -828,44 +922,16 @@ def apply_allocation_to_monthly_summary(
             f"Woo monthly summary component evidence does not reconcile for {label}."
         )
 
-    residual = copy.deepcopy(sale)
-    original_attributes = sale.get("attributes")
-    total_orders = (
-        int(original_attributes.get("orders"))
-        if isinstance(original_attributes, dict)
-        and isinstance(original_attributes.get("orders"), int)
-        else None
-    )
-    if total_orders is not None and total_orders < len(items):
-        raise WooTaxError(
-            f"Woo monthly summary component evidence does not reconcile for {label}."
-        )
-
+    # Snapshot before the taxable half is rewritten: the residual is the part of the
+    # original month the allocation does not name, so it must see the original counts.
+    residual_source = copy.deepcopy(sale)
     set_allocated_sale_components(sale, items, allocation, components)
     sale_attributes = sale.get("attributes")
     if isinstance(sale_attributes, dict):
         sale_attributes["orders"] = len(items)
-
-    residual["record_id"] = f"{residual.get('record_id')}:zero-rated-residual"
-    residual["description"] = f"{residual.get('description') or 'Woo monthly summary'} zero-rated residual"
-    residual["external_ref"] = f"{residual.get('external_ref') or label}:zero-rated-residual"
-    residual["gross_amount"] = decimal_number(residual_gross)
-    residual["net_amount"] = decimal_number(residual_gross)
-    residual["vat_amount"] = 0.0
-    residual["shipping_amount"] = decimal_number(residual_shipping_gross)
-    residual["quantity"] = None
-    residual_attributes = residual.setdefault("attributes", {})
-    if not isinstance(residual_attributes, dict):
-        raise WooTaxError("Woo monthly summary residual has invalid attributes.")
-    residual_attributes.pop("vat_allocation", None)
-    if total_orders is not None:
-        residual_attributes["orders"] = total_orders - len(items)
-    residual_attributes["zero_rated_residual"] = {
-        "fixed_product_gross": decimal_number(residual_product_gross),
-        "fixed_shipping_gross": decimal_number(residual_shipping_gross),
-        "allocated_order_ids": sorted(str(item["order_id"]) for item in items),
-    }
-    return residual
+    return build_zero_rated_residual(
+        residual_source, items, residual_product_gross, residual_shipping_gross, label,
+    )
 
 
 def zero_unsupported_sale(sale: dict[str, Any]) -> None:

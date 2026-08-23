@@ -1,0 +1,195 @@
+{
+  "schema_version": "1.0",
+  "company_slug": "example",
+  "year": 2024,
+  "cash_posting_mode": "statement_import",
+  "rate_bindings": [],
+  "coverage": {
+    "physical_row_count": 4,
+    "planned_row_count": 4,
+    "uncovered_count": 0,
+    "extra_count": 0,
+    "families": {
+      "bank_fee": 1,
+      "document_settlement": 1,
+      "processor_or_internal_transfer": 1,
+      "reviewed_split": 1
+    },
+    "movement": {
+      "EE001234567890|EUR": "-52.50"
+    }
+  },
+  "rows": [
+    {
+      "statement_id": "archive:a",
+      "record_id": "rec-fee",
+      "iban": "EE001234567890",
+      "currency": "EUR",
+      "period": "2024-01",
+      "date": "2024-01-15",
+      "signed_amount": "-12.50",
+      "counterparty": "Acme OU",
+      "description": "Service fee",
+      "disposition": "bank_fee_payment",
+      "family": "bank_fee",
+      "ui_action": "assign_general_ledger",
+      "financial_accounts": {
+        "debit": "32",
+        "credit": "10"
+      },
+      "financial_account_roles": {
+        "debit": "bank_fees",
+        "credit": "bank"
+      },
+      "document_refs": [],
+      "ecb": null,
+      "parts": [],
+      "split_equation": "",
+      "source": {
+        "source_id": "camt-2024",
+        "path": "source/2024/camt.xml",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "row_ref": "rec-fee"
+      },
+      "status": "pending",
+      "evidence": null
+    },
+    {
+      "statement_id": "archive:b",
+      "record_id": "rec-receipt",
+      "iban": "EE001234567890",
+      "currency": "EUR",
+      "period": "2024-01",
+      "date": "2024-01-20",
+      "signed_amount": "100.00",
+      "counterparty": "Brain Games",
+      "description": "Statement row",
+      "disposition": "existing_invoice_receipt",
+      "family": "document_settlement",
+      "ui_action": "match_document",
+      "financial_accounts": {
+        "debit": "10",
+        "credit": "37"
+      },
+      "financial_account_roles": {
+        "debit": "bank",
+        "credit": "customer_receivable"
+      },
+      "document_refs": [
+        {
+          "document_type": "invoice",
+          "simplbooks_id": "58"
+        }
+      ],
+      "ecb": null,
+      "parts": [],
+      "split_equation": "",
+      "source": {
+        "source_id": "camt-2024",
+        "path": "source/2024/camt.xml",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "row_ref": "rec-receipt"
+      },
+      "status": "pending",
+      "evidence": null
+    },
+    {
+      "statement_id": "archive:c",
+      "record_id": "rec-clear",
+      "iban": "EE001234567890",
+      "currency": "EUR",
+      "period": "2024-01",
+      "date": "2024-01-24",
+      "signed_amount": "-40.00",
+      "counterparty": "Processor",
+      "description": "Statement row",
+      "disposition": "clearing_transfer",
+      "family": "processor_or_internal_transfer",
+      "ui_action": "assign_general_ledger",
+      "financial_accounts": {
+        "debit": "31",
+        "credit": "10"
+      },
+      "financial_account_roles": {
+        "debit": "paypal",
+        "credit": "bank"
+      },
+      "document_refs": [],
+      "ecb": null,
+      "parts": [],
+      "split_equation": "",
+      "source": {
+        "source_id": "camt-2024",
+        "path": "source/2024/camt.xml",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "row_ref": "rec-clear"
+      },
+      "status": "pending",
+      "evidence": null
+    },
+    {
+      "statement_id": "archive:d",
+      "record_id": "rec-split",
+      "iban": "EE001234567890",
+      "currency": "EUR",
+      "period": "2024-01",
+      "date": "2024-01-28",
+      "signed_amount": "-100.00",
+      "counterparty": "Carrier",
+      "description": "Statement row",
+      "disposition": "reviewed_split",
+      "family": "reviewed_split",
+      "ui_action": "split_and_assign",
+      "financial_accounts": {},
+      "financial_account_roles": {},
+      "document_refs": [],
+      "ecb": null,
+      "parts": [
+        {
+          "part_number": 1,
+          "signed_amount": "-10.00",
+          "disposition": "bank_fee_payment",
+          "family": "bank_fee",
+          "financial_accounts": {
+            "debit": "32",
+            "credit": "10"
+          },
+          "financial_account_roles": {
+            "debit": "bank_fees",
+            "credit": "bank"
+          },
+          "document_refs": []
+        },
+        {
+          "part_number": 2,
+          "signed_amount": "-90.00",
+          "disposition": "existing_purchase_payment",
+          "family": "document_settlement",
+          "financial_accounts": {
+            "debit": "38",
+            "credit": "10"
+          },
+          "financial_account_roles": {
+            "debit": "supplier_payable",
+            "credit": "bank"
+          },
+          "document_refs": [
+            {
+              "document_type": "purchase",
+              "simplbooks_id": "77"
+            }
+          ]
+        }
+      ],
+      "split_equation": "-100.00 = -10.00 + -90.00",
+      "source": {
+        "source_id": "camt-2024",
+        "path": "source/2024/camt.xml",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "row_ref": "rec-split"
+      },
+      "status": "pending",
+      "evidence": null
+    }
+  ]
+}

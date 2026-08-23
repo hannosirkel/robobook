@@ -14,6 +14,7 @@ from typing import Any
 
 from bookbuilder import write_yaml
 from bookchecker import (
+    DependencyCheckContext,
     evaluate_action_batch,
     evaluate_bank_statement_completeness,
     evaluate_inventory_quantities,
@@ -24,7 +25,13 @@ from bookchecker import (
     resolve_action_sources,
 )
 from exchange_rates import ExchangeRateError, lookup_rate
-from posting_policy import PostingPolicyError, action_policy_errors, load_posting_policy
+from posting_policy import (
+    PostingPolicyError,
+    action_policy_errors,
+    cash_posting_mode,
+    load_posting_policy,
+    prohibited_bank_cash_action,
+)
 from reference_artifacts import (
     ReferenceArtifactError,
     required_action_binding_kinds,
@@ -540,7 +547,9 @@ def inventory_quantity_proof_errors(action: dict[str, Any], line: dict[str, Any]
         if record_id in seen:
             return ["contributor record IDs must be unique"]
         seen.add(record_id)
-        if contributor.get("quantity_source") not in {"normalized_record", "reviewed_allocation_target"}:
+        if contributor.get("quantity_source") not in {
+            "normalized_record", "reviewed_allocation_target", "reviewed_woo_tax_allocation",
+        }:
             return ["contributor quantity_source is invalid"]
         if not re.fullmatch(r"[a-f0-9]{64}", str(contributor.get("record_sha256") or "")):
             return ["contributor record SHA-256 is invalid"]
@@ -559,6 +568,8 @@ def inventory_quantity_proof_errors(action: dict[str, Any], line: dict[str, Any]
         if scope_kind == "normalized_sales_group"
         else {"kind", "period", "record_category", "statement_id"}
         if scope_kind == "reviewed_direct_sale_allocation"
+        else {"kind", "period", "record_category", "group_label", "order_id"}
+        if scope_kind == "reviewed_allocated_order"
         else set()
     )
     if not expected_scope_fields or set(scope) != expected_scope_fields:
@@ -577,10 +588,11 @@ def inventory_quantity_proof_errors(action: dict[str, Any], line: dict[str, Any]
         return ["contributor count is invalid"]
     if canonical(ordered) != str(proof.get("contributor_set_sha256") or ""):
         return ["contributor set hash is invalid"]
-    required_source = (
-        "normalized_record" if scope_kind == "normalized_sales_group"
-        else "reviewed_allocation_target"
-    )
+    required_source = {
+        "normalized_sales_group": "normalized_record",
+        "reviewed_direct_sale_allocation": "reviewed_allocation_target",
+        "reviewed_allocated_order": "reviewed_woo_tax_allocation",
+    }.get(str(scope_kind or ""), "reviewed_allocation_target")
     if any(item.get("quantity_source") != required_source for item in contributors):
         return ["contributor quantity source does not match semantic scope"]
     contract_error = inventory_quantity_action_contract_error(action, line)
@@ -1296,6 +1308,47 @@ def verify_submission_reference_artifacts(
     return dict(verified)
 
 
+def prove_no_prohibited_bank_cash(
+    action_batch: dict[str, Any], posting_policy: dict[str, Any] | None, *, mode: str = "write"
+) -> None:
+    """Refuse a statement-import batch that would move cash the import already moves.
+
+    This runs before translation and before any client call, so a prohibited action
+    cannot reach SimplBooks even partially. With no policy bound there is nothing to
+    prove the prohibition against, which is fatal for a write and merely unprovable for
+    a dry run — a dry run sends nothing, so it is allowed to proceed.
+    """
+    declared = str(action_batch.get("cash_posting_mode") or "api")
+    if posting_policy is None:
+        if declared == "statement_import" and mode == "write":
+            raise SimplbooksError(
+                "Batch declares statement-import mode but no posting policy is bound to prove "
+                "which accounts the statement-import mode forbids."
+            )
+        return
+    try:
+        expected = cash_posting_mode(posting_policy)
+    except PostingPolicyError as exc:
+        raise SimplbooksError(str(exc)) from exc
+    if declared != expected:
+        raise SimplbooksError(
+            f"Batch cash_posting_mode {declared!r} does not match the bound posting policy "
+            f"mode {expected!r}; statement-import mode must be agreed by both."
+        )
+    for action in action_batch.get("actions") or []:
+        if not isinstance(action, dict):
+            continue
+        try:
+            prohibited = prohibited_bank_cash_action(action, posting_policy)
+        except PostingPolicyError as exc:
+            raise SimplbooksError(str(exc)) from exc
+        if prohibited:
+            raise SimplbooksError(
+                f"Action {action_id(action)} posts bank cash in statement-import mode; the "
+                "imported statement settles this account, so no API cash action is sent."
+            )
+
+
 def execute_batch(
     *,
     action_batch: dict[str, Any],
@@ -1310,6 +1363,7 @@ def execute_batch(
     cwd: Path | None = None,
     expected_company_id: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    prove_no_prohibited_bank_cash(action_batch, posting_policy, mode=mode)
     inventory_actions = [
         action for action in action_batch.get("actions") or []
         if any(
@@ -1364,16 +1418,23 @@ def execute_batch(
         if isinstance(dependency, dict)
         and str(dependency.get("kind") or "") == "manual_statement_import_financial_transaction"
     ]
+    statement_import_batch = str(action_batch.get("cash_posting_mode") or "") == "statement_import"
     discovery_payloads: list[dict[str, Any]] = []
     discovery_errors: list[str] = []
-    if manual_dependencies and cwd is not None:
+    if manual_dependencies and cwd is not None and not statement_import_batch:
+        # In statement-import mode no live per-row cash transaction is expected to exist
+        # yet, so there is nothing for a discovery lookup to find.
         discovery_payloads, discovery_errors = load_bound_discovery_payloads(
             action_batch, cwd=cwd, expected_company_id=expected_company_id,
         )
     for dependency in manual_dependencies:
         dependency_errors = manual_financial_dependency_errors(
-            dependency, cwd=cwd, expected_company_id=expected_company_id,
-            require_typed_context=True, discovery_payloads=discovery_payloads,
+            dependency,
+            DependencyCheckContext(
+                cwd=cwd, expected_company_id=expected_company_id,
+                require_typed_context=True, discovery_payloads=discovery_payloads,
+                statement_import_mode=statement_import_batch,
+            ),
         )
         dependency_errors.extend(discovery_errors)
         if dependency_errors:
@@ -1382,6 +1443,10 @@ def execute_batch(
                 f"{dependency.get('record_id') or '<unknown>'}: {dependency_errors[0]}"
             )
         proof = dependency.get("statement_import_proof") or {}
+        if statement_import_batch:
+            # The annual plan assigns this row and post-import ledger evidence proves it.
+            # The API sends no cash for it, so a pending proof stops nothing here.
+            continue
         if dependency.get("blocking") is not False or proof.get("status") != "verified":
             raise SimplbooksError(
                 "Action batch contains a pending manual statement-import financial dependency; "
@@ -1636,6 +1701,10 @@ def run_submission(
             if posting_policy_path is not None and posting_policy_path.exists()
             else None
         )
+
+    # Before the token is read and the client exists: a batch that must not be sent
+    # should not even reach for the credentials it would be sent with.
+    prove_no_prohibited_bank_cash(action_batch, posting_policy, mode=mode)
 
     if mode == "write" and client is None:
         resolved_company_id = resolve_company_id(company_id, company_dir=str(company_dir) if company_dir else None)

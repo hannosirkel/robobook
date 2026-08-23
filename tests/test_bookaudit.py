@@ -263,10 +263,9 @@ class BookauditTests(unittest.TestCase):
         )
 
         evaluation, _, _ = bookaudit.evaluate_audit(
-            source_payloads=[normalized],
+            sources=bookaudit.AuditSources(payloads=[normalized]),
             live_state=live_state(invoice_total=20.0, output_vat=4.0),
             scope=bookaudit.parse_scope("2024-01"),
-            policy_text=None,
         )
 
         self.assertEqual(evaluation["result"], "fail")
@@ -290,14 +289,15 @@ class BookauditTests(unittest.TestCase):
         )
 
         evaluation, _, _ = bookaudit.evaluate_audit(
-            source_payloads=[normalized],
+            sources=bookaudit.AuditSources(
+                payloads=[normalized], policy_text="Warehouse identity matters materially."
+            ),
             live_state=live_state(
                 invoice_total=24.0,
                 output_vat=4.0,
                 invoice_rows=[{"vat_type_id": "vat-std", "article_id": None, "warehouse_id": None}],
             ),
             scope=bookaudit.parse_scope("2024-01"),
-            policy_text="Warehouse identity matters materially.",
         )
 
         self.assertEqual(evaluation["result"], "warn")
@@ -389,6 +389,185 @@ class BookauditTests(unittest.TestCase):
 
         self.assertEqual(snapshot["purchase_total"], Decimal("7.9"))
         self.assertEqual(snapshot["input_vat_total"], Decimal("0"))  # noqa: FURB157
+
+
+class StockEquationAuditTests(unittest.TestCase):
+    def equation(self, **overrides: object) -> dict:
+        result = {
+            "article_id": "3",
+            "warehouses": {
+                "1": {"closing": Decimal(900), "selected": Decimal(900), "difference": Decimal(0)},
+                "9": {"closing": Decimal(176), "selected": Decimal(176), "difference": Decimal(0)},
+            },
+            "aggregate": {
+                "closing": Decimal(1076), "selected": Decimal(1076), "difference": Decimal(0),
+            },
+            "errors": [],
+            "instruction": None,
+        }
+        result.update(overrides)
+        return result
+
+    def test_a_reconciled_equation_has_no_finding(self) -> None:
+        self.assertEqual(bookaudit.evaluate_stock_equation_review(self.equation()), [])
+
+    def test_an_aggregate_difference_is_an_error(self) -> None:
+        equation = self.equation(
+            aggregate={"closing": Decimal(1076), "selected": Decimal(1070), "difference": Decimal(-6)}
+        )
+
+        findings = bookaudit.evaluate_stock_equation_review(equation)
+
+        self.assertEqual([item["severity"] for item in findings], ["error"])
+        self.assertIn("differs from the selected count", findings[0]["summary"])
+
+    def test_offsetting_warehouse_differences_are_still_an_error(self) -> None:
+        equation = self.equation(
+            warehouses={
+                "1": {"closing": Decimal(900), "selected": Decimal(890), "difference": Decimal(-10)},
+                "9": {"closing": Decimal(176), "selected": Decimal(186), "difference": Decimal(10)},
+            }
+        )
+
+        findings = bookaudit.evaluate_stock_equation_review(equation)
+
+        # Both warehouses are named: the aggregate is zero, so neither would be found otherwise.
+        self.assertEqual([item["severity"] for item in findings], ["error", "error"])
+        self.assertIn("warehouse 1", " ".join(item["summary"] for item in findings))
+        self.assertIn("warehouse 9", " ".join(item["summary"] for item in findings))
+
+    def test_equation_errors_are_reported_as_findings(self) -> None:
+        equation = self.equation(errors=["Warehouse 9 has no selected closing count to reconcile against."])
+
+        findings = bookaudit.evaluate_stock_equation_review(equation)
+
+        self.assertTrue(any("no selected closing count" in item["summary"] for item in findings))
+
+    def test_a_pending_adjustment_instruction_is_surfaced_for_approval(self) -> None:
+        equation = self.equation(
+            aggregate={"closing": Decimal(1076), "selected": Decimal(1070), "difference": Decimal(-6)},
+            instruction={
+                "action_type": "year_end_adjustment", "direction": "decrease",
+                "quantity": Decimal(6), "warehouse_id": "9", "article_id": "3",
+                "expense_account_id": "115", "status": "requires_separate_approval",
+            },
+        )
+
+        findings = bookaudit.evaluate_stock_equation_review(equation)
+
+        self.assertTrue(any("separate approval" in " ".join(item["evidence"]) for item in findings))
+
+    def test_no_equation_evidence_yields_no_finding(self) -> None:
+        self.assertEqual(bookaudit.evaluate_stock_equation_review(None), [])
+
+    def test_stock_equation_findings_land_in_a_rendered_section(self) -> None:
+        equation = self.equation(
+            aggregate={"closing": Decimal(1076), "selected": Decimal(1070), "difference": Decimal(-6)}
+        )
+
+        for finding in bookaudit.evaluate_stock_equation_review(equation):
+            self.assertIn(finding["section"], bookaudit.SECTIONS)
+
+
+class LedgerEvidenceAuditTests(unittest.TestCase):
+    def summary(self, **overrides: object) -> dict:
+        result = {
+            "schema_version": "1.0",
+            "company_slug": "example",
+            "company_id": "42",
+            "year": 2024,
+            "binding": {"path": "ledger.csv", "sha256": "a" * 64},
+            "planned_row_count": 1,
+            "ledger_row_count": 2,
+            "movement": {"10|EUR": "-12.50", "32|EUR": "12.50"},
+            "errors": [],
+            "status": "pass",
+        }
+        result.update(overrides)
+        return result
+
+    def test_a_passing_summary_has_no_finding(self) -> None:
+        self.assertEqual(bookaudit.evaluate_ledger_evidence_review(self.summary()), [])
+
+    def test_missing_evidence_is_an_error_at_audit_time(self) -> None:
+        findings = bookaudit.evaluate_ledger_evidence_review(None)
+
+        self.assertEqual([item["severity"] for item in findings], ["error"])
+        self.assertIn("no post-import ledger evidence", findings[0]["summary"])
+
+    def test_every_evidence_error_becomes_a_finding(self) -> None:
+        summary = self.summary(
+            status="fail",
+            errors=["archive:a has no ledger posting for debit account 32 of -12.50 EUR on 2024-01-15."],
+        )
+
+        findings = bookaudit.evaluate_ledger_evidence_review(summary)
+
+        self.assertTrue(any("no ledger posting" in item["summary"] for item in findings))
+        self.assertTrue(all(item["severity"] == "error" for item in findings))
+
+    def test_a_failing_status_without_listed_errors_is_still_an_error(self) -> None:
+        findings = bookaudit.evaluate_ledger_evidence_review(self.summary(status="fail"))
+
+        self.assertEqual([item["severity"] for item in findings], ["error"])
+
+    def test_every_finding_lands_in_a_section_the_report_renders(self) -> None:
+        findings = [
+            *bookaudit.evaluate_ledger_evidence_review(None),
+            *bookaudit.evaluate_ledger_evidence_review(self.summary(status="fail", errors=["boom"])),
+        ]
+
+        self.assertTrue(findings)
+        for finding in findings:
+            self.assertIn(finding["section"], bookaudit.SECTIONS)
+
+
+class AuditEnforcementTests(unittest.TestCase):
+    """The audit must actually run the reviews it declares, not merely define them."""
+
+    def audit(self, **kwargs: object) -> dict:
+        report, _live, _prev = bookaudit.evaluate_audit(
+            sources=bookaudit.AuditSources(payloads=[base_normalized()]),
+            live_state=live_state(invoice_total=0.0, output_vat=0.0),
+            scope=bookaudit.parse_scope("2024-01"),
+            post_import=bookaudit.PostImportEvidence(**kwargs),
+        )
+        return report
+
+    def test_a_statement_import_year_fails_without_ledger_evidence(self) -> None:
+        report = self.audit(statement_import_mode=True)
+
+        self.assertTrue(any("post-import ledger evidence" in f["summary"] for f in report["findings"]))
+        self.assertEqual(report["result"], "fail")
+
+    def test_an_api_cash_year_is_not_asked_for_ledger_evidence(self) -> None:
+        report = self.audit(statement_import_mode=False)
+
+        self.assertFalse(any("post-import ledger evidence" in f["summary"] for f in report["findings"]))
+
+    def test_a_failing_stock_equation_reaches_the_report(self) -> None:
+        from decimal import Decimal
+        equation = {
+            "article_id": "3", "warehouses": {},
+            "aggregate": {"closing": Decimal(10), "selected": Decimal(8), "difference": Decimal(-2)},
+            "errors": [], "instruction": None,
+        }
+
+        report = self.audit(stock_equation=equation)
+
+        self.assertTrue(any("differs from the selected count" in f["summary"] for f in report["findings"]))
+
+    def test_a_reconciling_stock_equation_adds_nothing(self) -> None:
+        from decimal import Decimal
+        equation = {
+            "article_id": "3", "warehouses": {},
+            "aggregate": {"closing": Decimal(10), "selected": Decimal(10), "difference": Decimal(0)},
+            "errors": [], "instruction": None,
+        }
+
+        report = self.audit(stock_equation=equation)
+
+        self.assertFalse(any("differs from the selected count" in f["summary"] for f in report["findings"]))
 
 
 if __name__ == "__main__":

@@ -25,7 +25,19 @@ from bank_allocations import (
 )
 from document_identity import document_identity, match_existing
 from exchange_rates import ExchangeRateError, lookup_rate
-from posting_policy import PostingPolicyError, load_posting_policy, resolve_bank_account, resolve_contact, resolve_mapping, resolve_sales_vat_profile
+from posting_policy import (
+    PostingPolicyError,
+    bank_income_account_ids,
+    cash_posting_mode,
+    load_posting_policy,
+    resolve_bank_account,
+    resolve_contact,
+    resolve_mapping,
+    resolve_sales_vat_profile,
+    resolve_sales_warehouse,
+    non_inventory_event_types,
+    validated_warehouse_routing,
+)
 from reference_artifacts import ReferenceArtifactError, bind_file, validate_discovery, verify_file_binding
 from simplbooks_api import SimplbooksError, resolve_company_id, resolve_company_name
 
@@ -179,6 +191,42 @@ def inventory_proof_envelope(
         "contributor_set_sha256": canonical_value_sha256(ordered),
         "contributors": ordered,
     }
+
+
+def allocated_order_quantity_proof(
+    evidence: dict[str, Any], *, group_label: str, direction: str
+) -> dict[str, Any] | None:
+    """Prove one allocated order's quantity from the reviewed allocation that names it.
+
+    A monthly summary carries no per-order quantity, so the reviewed VAT allocation is
+    where an exact one can live. An order without a positive reviewed quantity yields no
+    proof at all rather than a defaulted one.
+    """
+    quantity = decimal_value(evidence.get("quantity") or 0)
+    order_id = str(evidence.get("order_id") or "")
+    if quantity <= 0 or not order_id:
+        return None
+    contributor = {
+        "record_id": order_id,
+        "quantity": decimal_number(quantity),
+        "quantity_source": "reviewed_woo_tax_allocation",
+        "record_sha256": canonical_value_sha256(
+            {"order_id": order_id, "source_row_id": str(evidence.get("source_row_id") or "")}
+        ),
+    }
+    scope = {
+        "kind": "reviewed_allocated_order",
+        "period": str(evidence.get("event_date") or "")[:7],
+        "record_category": "sales" if direction == "sales" else "refunds",
+        "group_label": group_label,
+        "order_id": order_id,
+    }
+    return inventory_proof_envelope(scope=scope, contributors=[contributor], quantity=quantity)
+
+
+def contributor_event_types(records: list[dict[str, Any]]) -> list[str]:
+    """Report the event types a line was built from, so policy can judge them."""
+    return sorted({str(record.get("event_type") or "") for record in records if record.get("event_type")})
 
 
 def normalized_inventory_quantity_proof(
@@ -892,6 +940,128 @@ def taxable_profile(record: dict[str, Any]) -> str:
     return "taxable" if abs(decimal_value(record.get("vat_amount"))) > 0 else "non_taxable"
 
 
+def sales_order_number(record: dict[str, Any]) -> int | None:
+    """Return the exact order number of one sales contributor, or None when it has none."""
+    raw = (record.get("attributes") or {}).get("order_id")
+    digits = re.sub(r"[^0-9]", "", str(raw or ""))
+    return int(digits) if digits else None
+
+
+BOUND_WAREHOUSE_CHANNELS = frozenset({"distributor"})
+
+
+def prove_warehouse_transfer_evidence(
+    warehouse_id: str, *, evidence: list[dict[str, Any]] | None
+) -> None:
+    """Refuse a distributor document until a completed transfer proves stock is there.
+
+    Selling from a warehouse nothing was moved into would post a sale against stock the
+    ledger never received, so the proof is required before the document, not after.
+    """
+    matching = [
+        item
+        for item in evidence or []
+        if isinstance(item, dict)
+        and str(item.get("action_type") or "") == "warehouse_transfer"
+        and str(item.get("destination_warehouse_id") or "") == str(warehouse_id)
+        and str(item.get("status") or "") == "complete"
+    ]
+    if not matching:
+        raise SimplbooksError(
+            f"Sales into warehouse {warehouse_id} require bound warehouse transfer evidence "
+            "proving the stock was moved there first."
+        )
+
+
+def period_order_numbers(records: dict[str, list[dict[str, Any]]]) -> list[int]:
+    """Every exact order number the period's evidence carries, from any category.
+
+    A monthly sales summary names no order, but the processor-side charges that make it
+    up do, so the period's own evidence can still say which side of a routing boundary
+    the summary sits on.
+    """
+    numbers: set[int] = set()
+    for rows in records.values():
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            own = sales_order_number(row)
+            if own is not None:
+                numbers.add(own)
+            # The reviewed VAT allocation names the orders it split, which is a stronger
+            # statement of order identity than a processor charge that happens to carry one.
+            allocation = (row.get("attributes") or {}).get("vat_allocation") or {}
+            for order_id in allocation.get("allocated_order_ids") or []:
+                digits = re.sub(r"[^0-9]", "", str(order_id or ""))
+                if digits:
+                    numbers.add(int(digits))
+    return sorted(numbers)
+
+
+def routing_order_numbers(
+    records: list[dict[str, Any]], *, fallback: tuple[int, ...] | list[int] = ()
+) -> list[int]:
+    """Return the order numbers a routing decision rests on, own ones first."""
+    own = sorted({number for record in records if (number := sales_order_number(record)) is not None})
+    return own or sorted(set(fallback))
+
+
+def routed_sales_warehouse(
+    policy: dict[str, Any] | None,
+    *,
+    group_label: str,
+    record: dict[str, Any],
+    fallback_order_numbers: tuple[int, ...] | list[int] = (),
+) -> str | None:
+    """Resolve the reviewed warehouse for one contributor, or None when policy routes no rule here.
+
+    An aggregated row carries no order number of its own, so the period's order evidence
+    decides. If that evidence lands on both sides of the boundary the aggregate covers two
+    warehouses at once and cannot be routed at all, which blocks rather than picking one.
+    """
+    if policy is None:
+        return None
+    try:
+        routing = validated_warehouse_routing(policy)
+        channel = slugify(group_label)
+        if channel not in routing["channels"] and channel not in BOUND_WAREHOUSE_CHANNELS:
+            return None
+        own = sales_order_number(record)
+        candidates = [own] if own is not None else list(fallback_order_numbers)
+        if not candidates:
+            return resolve_sales_warehouse(policy, channel=channel, order_number=None)
+        warehouses = {
+            resolve_sales_warehouse(policy, channel=channel, order_number=number)
+            for number in candidates
+        }
+        if len(warehouses) != 1:
+            raise SimplbooksError(
+                f"Aggregated {group_label!r} row spans the reviewed warehouse boundary "
+                f"(orders {sorted(candidates)} route to {sorted(warehouses)}); it cannot be routed as one line."
+            )
+        return warehouses.pop()
+    except PostingPolicyError as exc:
+        raise SimplbooksError(str(exc)) from exc
+
+
+def routed_warehouse_groups(
+    policy: dict[str, Any] | None,
+    *,
+    group_label: str,
+    records: list[dict[str, Any]],
+    fallback_order_numbers: tuple[int, ...] | list[int] = (),
+) -> dict[str | None, list[dict[str, Any]]]:
+    """Partition contributors by reviewed warehouse so no line spans a routing boundary."""
+    grouped: dict[str | None, list[dict[str, Any]]] = defaultdict(list)
+    for record in records:
+        warehouse = routed_sales_warehouse(
+            policy, group_label=group_label, record=record,
+            fallback_order_numbers=fallback_order_numbers,
+        )
+        grouped[warehouse].append(record)
+    return dict(grouped)
+
+
 def maybe_single_warehouse(records: list[dict[str, Any]]) -> str | None:
     values = summarize_warehouses(records)
     if len(values) == 1:
@@ -1291,8 +1461,11 @@ def build_sales_lines(
                         raise SimplbooksError(
                             "Woo VAT allocation requires per-order component rounding evidence for multiple orders."
                         )
+                    # The single-order fallback has no per-order evidence to read, so the
+                    # record's own quantity is the only exact figure available for it.
                     entries = [{
                         "order_id": order_ids[0],
+                        "quantity": record.get("quantity"),
                         gross_field: allocation.get(gross_field),
                         vat_field: allocation.get(vat_field),
                     }]
@@ -1304,6 +1477,7 @@ def build_sales_lines(
                     evidence.append(
                         {
                             "order_id": str(entry["order_id"]),
+                            "quantity": entry.get("quantity"),
                             "event_date": str(entry.get("event_date") or ""),
                             "gross_amount": decimal_number(abs(decimal_value(entry.get(gross_field)))),
                             "vat_amount": decimal_number(abs(decimal_value(entry.get(vat_field)))),
@@ -1335,6 +1509,12 @@ def build_sales_lines(
                         raise SimplbooksError("Woo VAT allocation cannot carry VAT on a zero-gross component.")
                     continue
                 binding = evidence.pop("vat_evidence_binding")
+                order_quantity = decimal_value(evidence.get("quantity") or 0)
+                allocation_proof = (
+                    allocated_order_quantity_proof(evidence, group_label=group_label, direction=direction)
+                    if component == "goods" and order_quantity > 0
+                    else None
+                )
                 lines.append({
                     "line_role": line_role,
                     "description": f"{description} - order {evidence['order_id']}",
@@ -1345,6 +1525,8 @@ def build_sales_lines(
                     "suggested_vat_type_id": vat_type_id,
                     "warehouse_id_hint": maybe_single_warehouse(allocated_records) or default_warehouse_id,
                     "record_count": 1,
+                    "quantity": decimal_number(order_quantity) if allocation_proof else None,
+                    "inventory_quantity_proof": allocation_proof,
                     "vat_allocation_component": component,
                     "vat_allocation_component_evidence": [evidence],
                     "vat_evidence_binding": binding,
@@ -1387,6 +1569,7 @@ def build_sales_lines(
                 "warehouse_id_hint": maybe_single_warehouse(records) or default_warehouse_id,
                 "quantity": decimal_number(sum((decimal_value(record.get("quantity") or 0) for record in records), Decimal("0"))) or None,  # noqa: FURB157
                 "inventory_quantity_proof": inventory_proof,
+                "contributor_event_types": contributor_event_types(records),
                 "record_count": len(records),
             }
         )
@@ -1427,6 +1610,7 @@ def build_sales_lines(
                     "warehouse_id_hint": maybe_single_warehouse(profile_records) or default_warehouse_id,
                     "quantity": decimal_number(sum((decimal_value(record.get("quantity") or 0) for record in profile_records), Decimal("0"))) or None,  # noqa: FURB157
                     "inventory_quantity_proof": inventory_proof,
+                    "contributor_event_types": contributor_event_types(profile_records),
                     "record_count": len(profile_records),
                 }
             )
@@ -1482,6 +1666,8 @@ def build_sales_actions(
     entity_map: dict[str, Any] | None,
     mapping_hints: dict[str, tuple[str | None, list[str]]],
     forced_note: str | None,
+    posting_policy: dict[str, Any] | None = None,
+    inventory_transfer_evidence: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[tuple[str, str], str], dict[str, list[str]]]:
     actions: list[dict[str, Any]] = []
     action_ids: dict[tuple[str, str], str] = {}
@@ -1490,6 +1676,7 @@ def build_sales_actions(
         records.get("sales", []),
         base_currency=base_currency,
     )
+    known_order_numbers = period_order_numbers(records)
     repeated_sales_labels = {
         label
         for label, count in Counter(group_label for group_label, _currency in grouped_sales).items()
@@ -1505,11 +1692,27 @@ def build_sales_actions(
         split_profiles = len(nonempty_profiles) > 1
         matched_processor_labels = matched_processors.get((group_label, currency), [])
 
+        routed_profiles: list[tuple[str, str | None, list[dict[str, Any]]]] = []
         for profile_name in nonempty_profiles or ["non_taxable"]:
-            profile_records = grouped_by_profile.get(profile_name) or list(group_records)
-            if not profile_records:
+            candidate_records = grouped_by_profile.get(profile_name) or list(group_records)
+            if not candidate_records:
                 continue
+            # Contributors on opposite sides of a routing boundary relieve different
+            # warehouses, so they cannot share an inventory line.
+            for warehouse_id, routed_records in sorted(
+                routed_warehouse_groups(
+                    posting_policy, group_label=group_label, records=candidate_records,
+                    fallback_order_numbers=known_order_numbers,
+                ).items(),
+                key=lambda item: item[0] or "",
+            ):
+                if warehouse_id is not None and slugify(group_label) in BOUND_WAREHOUSE_CHANNELS:
+                    prove_warehouse_transfer_evidence(
+                        warehouse_id, evidence=inventory_transfer_evidence
+                    )
+                routed_profiles.append((profile_name, warehouse_id, routed_records))
 
+        for profile_name, routed_warehouse_id, profile_records in routed_profiles:
             profile_mapping_hints = mapping_hints
             online_sales_override_applied = False
             if slugify(group_label) in ONLINE_SALES_CHANNELS:
@@ -1556,11 +1759,16 @@ def build_sales_actions(
                 review_notes.append(forced_note)
             review_notes.append(record_count_note(profile_records))
 
+            suffix_parts = [profile_name.replace("_", "-")] if split_profiles else []
+            if routed_warehouse_id is not None:
+                for line in lines:
+                    line["warehouse_id_hint"] = routed_warehouse_id
+                suffix_parts.append(f"wh{routed_warehouse_id}")
             action_key_suffix = idempotency_suffix(
                 group_label=group_label,
                 currency=currency,
                 repeated_labels=repeated_sales_labels,
-                extra_suffix=profile_name.replace("_", "-") if split_profiles else None,
+                extra_suffix="-".join(suffix_parts) or None,
             )
             idempotency_key = f"{company_slug}-{period}-sales-{action_key_suffix}"
             payload = {
@@ -1586,6 +1794,18 @@ def build_sales_actions(
             }
             if split_profiles:
                 payload["summary_scope"]["tax_profile"] = profile_name
+            if routed_warehouse_id is not None:
+                # Checker and sender recompute the routing from these facts rather than
+                # trusting the warehouse the builder chose.
+                payload["summary_scope"]["warehouse_routing"] = {
+                    "channel": slugify(group_label),
+                    "warehouse_id": routed_warehouse_id,
+                    # The orders the routing was actually decided on: an aggregated row has
+                    # none of its own, so the period's evidence is what the checker recomputes.
+                    "order_numbers": routing_order_numbers(
+                        profile_records, fallback=known_order_numbers
+                    ),
+                }
             confidence = review_confidence(
                 open_issues=unresolved_review_issues(review_notes),
                 required_ids=[profile_mapping_hints["revenue_account"][0]],
@@ -2385,8 +2605,15 @@ def build_manual_financial_dependencies(
     normalized_path_display: str,
     records: dict[str, list[dict[str, Any]]],
     allocations: dict[tuple[str, str, str], dict[str, Any]],
+    statement_import_mode: bool = False,
 ) -> list[dict[str, Any]]:
-    """Describe UI statement-import work without inventing submit-capable API actions."""
+    """Describe UI statement-import work without inventing submit-capable API actions.
+
+    In statement-import mode the API never posts these rows at all: the annual plan
+    carries each one and post-import ledger evidence proves it. Blocking the document
+    batch on per-row live proof would then hold back documents that have nothing to do
+    with the row, so the dependency is recorded without blocking.
+    """
     dependencies: list[dict[str, Any]] = []
     for record, allocation in _approved_bank_allocations(records=records, allocations=allocations):
         if not _requires_manual_financial_transaction(allocation):
@@ -2433,14 +2660,20 @@ def build_manual_financial_dependencies(
         )
         source_ref = source_refs_for_records(normalized_path_display, [record], note=rationale)[0]
         source_ref["source_kind"] = "physical_bank"
+        reason = (
+            f"Physical bank row {record_id} is assigned by the annual statement-import plan "
+            "and proved by post-import ledger evidence; the API posts no cash for it."
+            if statement_import_mode
+            else (
+                f"Physical bank row {record_id} requires full SimplBooks statement import and live proof; "
+                "no public financial-transaction API endpoint is confirmed."
+            )
+        )
         dependencies.append(
             {
                 "kind": "manual_statement_import_financial_transaction",
-                "blocking": not proof_verified,
-                "reason": (
-                    f"Physical bank row {record_id} requires full SimplBooks statement import and live proof; "
-                    "no public financial-transaction API endpoint is confirmed."
-                ),
+                "blocking": False if statement_import_mode else not proof_verified,
+                "reason": reason,
                 "disposition": str(allocation.get("disposition") or ""),
                 "statement_id": statement_id,
                 "record_id": record_id,
@@ -2463,12 +2696,32 @@ def build_foreign_currency_payment_pilot_dependencies(
     *,
     records: dict[str, list[dict[str, Any]]],
     allocations: dict[tuple[str, str, str], dict[str, Any]],
+    posting_policy: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    """Require a live pilot before the API first pays a foreign-currency document.
+
+    The pilot exists because SimplBooks' behaviour on such a payment is unverified. Where
+    the imported statement settles the row instead, the API makes no such payment, so
+    there is no unverified API behaviour to pilot; the same rate, balance and realized-FX
+    questions are answered by the post-import ledger evidence for that row.
+    """
     dependencies: list[dict[str, Any]] = []
     for record, allocation in _approved_bank_allocations(records=records, allocations=allocations):
         target = allocation.get("target") or {}
         if not target.get("foreign_currency_pilot_required"):
             continue
+        if posting_policy is not None:
+            try:
+                bank_account_id = resolve_bank_account(
+                    posting_policy,
+                    customer_account=bank_ledger_key(record)[0],
+                    currency=record_currency(record, "EUR"),
+                    allow_legacy_single_currency=True,
+                )
+            except (BankAllocationError, PostingPolicyError):
+                bank_account_id = None
+            if statement_import_owns_bank_cash(posting_policy, bank_account_id=bank_account_id):
+                continue
         dependencies.append({
             "kind": "foreign_currency_payment_pilot",
             "blocking": True,
@@ -2481,6 +2734,13 @@ def build_foreign_currency_payment_pilot_dependencies(
             "required_evidence": list(target.get("pilot_requirements") or []),
         })
     return dependencies
+
+
+def statement_import_owns_bank_cash(policy: dict[str, Any] | None, *, bank_account_id: Any) -> bool:
+    """Report whether the imported statement, not the API, settles cash on this account."""
+    if policy is None or cash_posting_mode(policy) != "statement_import":
+        return False
+    return str(bank_account_id or "") in bank_income_account_ids(policy)
 
 
 def build_direct_sale_actions(
@@ -2580,8 +2840,11 @@ def build_direct_sale_actions(
             if target.get(field) not in (None, "") and str(target[field]) != expected:
                 raise SimplbooksError(f"Direct-sale target {field} for {record_id} does not match posting policy.")
         profile_period = f"{profile['start']}/{profile['end'] or 'open'}"
+        # One invoice per physical receipt: the immutable statement identity is part of
+        # the key, so each imported statement row matches exactly one document.
         group_key = (
             period,
+            statement_identity(record),
             record_currency(record, base_currency),
             contact_id,
             vat_profile_name,
@@ -2609,6 +2872,7 @@ def build_direct_sale_actions(
     for group_key, entries in sorted(grouped.items(), key=lambda item: repr(item[0])):
         (
             _group_period,
+            _statement_id,
             currency,
             contact_id,
             vat_profile_name,
@@ -2718,6 +2982,9 @@ def build_direct_sale_actions(
             record = entry["record"]
             allocation = entry["allocation"]
             record_id = str(record.get("record_id") or "")
+            if statement_import_owns_bank_cash(posting_policy, bank_account_id=entry["bank_account_id"]):
+                # The imported statement row settles this invoice; an API receipt would double the cash.
+                continue
             receipt_ref = source_refs_for_records(normalized_path_display, [record])[0]
             receipt_ref["source_kind"] = "physical_bank"
             actions.append(
@@ -2875,6 +3142,9 @@ def build_exact_cash_actions(
             except PostingPolicyError as exc:
                 raise SimplbooksError(str(exc)) from exc
             notes = ["Applied exact source-bank-account mapping from the physical bank row."]
+        if statement_import_owns_bank_cash(posting_policy, bank_account_id=bank_account_id):
+            # The annual statement-import plan is this row's terminal coverage.
+            continue
 
         for part, part_number in _allocation_parts(allocation):
             disposition = str(part.get("disposition") or "")
@@ -3305,13 +3575,27 @@ def apply_posting_policy(
                 line["suggested_vat_type_id"] = resolve_mapping(
                     posting_policy, family=family, field_name=vat_field
                 )
-                if family_values.get("warehouse_id") not in (None, ""):
+                routed_warehouse = str(
+                    ((payload.get("summary_scope") or {}).get("warehouse_routing") or {}).get("warehouse_id") or ""
+                )
+                if routed_warehouse:
+                    # The reviewed order-number boundary is more specific than the
+                    # channel's single mapping, so it decides which warehouse is relieved.
+                    line["warehouse_id_hint"] = routed_warehouse
+                elif family_values.get("warehouse_id") not in (None, ""):
                     line["warehouse_id_hint"] = resolve_mapping(
                         posting_policy, family=family, field_name="warehouse_id"
                     )
                 else:
                     line["warehouse_id_hint"] = None
-                if not is_shipping and family_values.get("article_id") not in (None, ""):
+                declared_non_inventory = bool(line.get("contributor_event_types")) and set(
+                    line.get("contributor_event_types") or []
+                ) <= non_inventory_event_types(posting_policy)
+                if declared_non_inventory:
+                    # A reviewed cash reversal or processor fee moves no stock, so it takes
+                    # no article and is not held back waiting for a quantity.
+                    line["article_id_hint"] = None
+                elif not is_shipping and family_values.get("article_id") not in (None, ""):
                     proof = line.get("inventory_quantity_proof")
                     exact_quantity = decimal_value(line.get("quantity"))
                     proof_quantity = decimal_value(proof.get("quantity")) if isinstance(proof, dict) else Decimal("0")  # noqa: FURB157
@@ -3408,6 +3692,7 @@ def build_action_batch(
     discovery_overview: dict[str, Any] | None = None,
     discovery_overviews: list[dict[str, Any]] | None = None,
     bank_allocations: dict[tuple[str, str, str], dict[str, Any]] | None = None,
+    inventory_transfer_evidence: list[dict[str, Any]] | None = None,
     force: bool = False,
 ) -> dict[str, Any]:
     if normalized_payload.get("period") != recon_payload.get("period"):
@@ -3484,6 +3769,8 @@ def build_action_batch(
         entity_map=entity_map,
         mapping_hints=mapping_hints,
         forced_note=forced_note,
+        posting_policy=posting_policy,
+        inventory_transfer_evidence=inventory_transfer_evidence,
     )
     fee_actions, _fee_action_ids = build_fee_actions(
         company_slug=company_slug,
@@ -3549,6 +3836,9 @@ def build_action_batch(
     unresolved_dependencies = apply_posting_policy(actions, posting_policy=posting_policy)
     unresolved_dependencies.extend(
         build_manual_financial_dependencies(
+            statement_import_mode=(
+                posting_policy is not None and cash_posting_mode(posting_policy) == "statement_import"
+            ),
             normalized_path_display=normalized_path_display,
             records=records,
             allocations=bank_allocations or {},
@@ -3558,6 +3848,7 @@ def build_action_batch(
         build_foreign_currency_payment_pilot_dependencies(
             records=records,
             allocations=bank_allocations or {},
+            posting_policy=posting_policy,
         )
     )
     apply_exchange_rate_provenance(
@@ -3585,6 +3876,7 @@ def build_action_batch(
         "source_summary": source_summary,
         "recon_ref": recon_path_display,
         "already_present": already_present,
+        "cash_posting_mode": "api" if posting_policy is None else cash_posting_mode(posting_policy),
         "unresolved_dependencies": unresolved_dependencies,
         "actions": actions,
     }
@@ -3672,6 +3964,49 @@ def resolve_bank_allocations_path(*, company_dir: Path | None, normalized_path: 
     return (artifacts_dir / "bank" / f"{period[:4]}-allocations.json") if artifacts_dir is not None else None
 
 
+def resolve_inventory_transfer_evidence_path(
+    *, company_dir: Path | None, normalized_path: Path, period: str, override: str | None
+) -> Path | None:
+    if override:
+        return Path(override)
+    filename = f"{period[:4]}-inventory-transfers.json"
+    if company_dir is not None:
+        return company_dir / "artifacts" / "actions" / filename
+    artifacts_dir = inferred_artifacts_dir(normalized_path)
+    return (artifacts_dir / "actions" / filename) if artifacts_dir is not None else None
+
+
+def load_inventory_transfer_evidence(path: Path | None) -> list[dict[str, Any]]:
+    """Load reviewed warehouse transfers, treating absence as no evidence rather than an error.
+
+    A company with no distributor warehouse has no transfers to record, and must still be
+    able to build. A company that does have one is stopped by the transfer-evidence gate
+    instead, which says exactly what is missing.
+    """
+    if path is None or not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SimplbooksError(f"Reviewed inventory transfer evidence {path} is unreadable: {exc}") from exc
+    entries = payload if isinstance(payload, list) else [payload]
+    if not all(isinstance(entry, dict) for entry in entries):
+        raise SimplbooksError(f"Reviewed inventory transfer evidence {path} must contain objects.")
+    return entries
+
+
+def resolve_statement_import_plan_path(
+    *, company_dir: Path | None, normalized_path: Path, period: str, override: str | None
+) -> Path | None:
+    if override:
+        return Path(override)
+    filename = f"{period[:4]}-plan.json"
+    if company_dir is not None:
+        return company_dir / "artifacts" / "statement-import" / filename
+    artifacts_dir = inferred_artifacts_dir(normalized_path)
+    return (artifacts_dir / "statement-import" / filename) if artifacts_dir is not None else None
+
+
 def normalized_year_paths(normalized_path: Path, *, period: str) -> list[Path]:
     if normalized_path.parent.name != "normalized":
         return [normalized_path]
@@ -3707,6 +4042,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Refreshed Simplbooks overview; repeat to bind an existing target from another discovery year.",
     )
     parser.add_argument("--bank-allocations", help="Reviewed annual bank allocation artifact")
+    parser.add_argument("--statement-import-plan", help="Annual statement-import plan artifact")
+    parser.add_argument("--inventory-transfers", help="Reviewed warehouse transfer evidence JSON")
     parser.add_argument("--output", help="Optional output path for actions YAML")
     parser.add_argument("--force", action="store_true", help="Allow draft generation even when recon does not approve the month")
     return parser
@@ -3754,6 +4091,18 @@ def main() -> int:
         normalized_path=normalized_path,
         period=args.period,
         override=args.bank_allocations,
+    )
+    inventory_transfer_evidence_path = resolve_inventory_transfer_evidence_path(
+        company_dir=company_dir,
+        normalized_path=normalized_path,
+        period=args.period,
+        override=args.inventory_transfers,
+    )
+    statement_import_plan_path = resolve_statement_import_plan_path(
+        company_dir=company_dir,
+        normalized_path=normalized_path,
+        period=args.period,
+        override=args.statement_import_plan,
     )
     output_path = resolve_output_path(company_dir=company_dir, normalized_path=normalized_path, period=args.period, override=args.output)
 
@@ -3829,6 +4178,7 @@ def main() -> int:
         discovery_overview=discovery_overview,
         discovery_overviews=discovery_overviews,
         bank_allocations=bank_allocations,
+        inventory_transfer_evidence=load_inventory_transfer_evidence(inventory_transfer_evidence_path),
         force=args.force,
     )
     bound_paths = [
@@ -3839,6 +4189,13 @@ def main() -> int:
     ]
     if bank_allocations_path is not None and bank_allocations_path.exists():
         bound_paths.append(("bank_allocations", bank_allocations_path))
+    if batch.get("cash_posting_mode") == "statement_import":
+        if statement_import_plan_path is None or not statement_import_plan_path.exists():
+            raise SimplbooksError(
+                "Statement-import mode requires the annual statement-import plan; generate it with "
+                "statement_import_plan.py before building this month."
+            )
+        bound_paths.append(("statement_import_plan", statement_import_plan_path))
     if foreign_currencies:
         bound_paths.append(("exchange_rates", exchange_rates_path))
     batch["reference_artifacts"] = [

@@ -94,6 +94,10 @@ def required_action_binding_kinds(action_batch: dict[str, Any]) -> set[str]:
         required.update({"woo_tax_allocation", "woo_tax_source"})
     if requires_bank_allocation_binding(action_batch):
         required.add("bank_allocations")
+    if str(action_batch.get("cash_posting_mode") or "") == "statement_import":
+        # The annual plan is the cash source of truth in this mode, so it is bound
+        # like any other reviewed artifact rather than consulted informally.
+        required.add("statement_import_plan")
     return required
 
 

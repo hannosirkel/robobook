@@ -13,6 +13,45 @@ class PostingPolicyError(RuntimeError):
     pass
 
 
+CASH_POSTING_MODES = frozenset({"api", "statement_import"})
+
+CASH_POSTING_KEYS = frozenset(
+    {
+        "mode",
+        "bank_income_account_ids",
+        "processor_income_account_ids",
+        "bank_financial_accounts",
+        "clearing_provider_roles",
+        "financial_accounts",
+    }
+)
+
+REQUIRED_FINANCIAL_ACCOUNT_ROLES = frozenset(
+    {
+        "bank",
+        "stripe_clearing",
+        "paypal",
+        "bank_fees",
+        "reporting_person_payable",
+        "platform_prepayment",
+        "customer_receivable",
+        "supplier_payable",
+        "fx_gain",
+        "fx_loss",
+    }
+)
+
+OPTIONAL_FINANCIAL_ACCOUNT_ROLES = frozenset({"inventory_change"})
+
+KNOWN_FINANCIAL_ACCOUNT_ROLES = REQUIRED_FINANCIAL_ACCOUNT_ROLES | OPTIONAL_FINANCIAL_ACCOUNT_ROLES
+
+ORDER_ROUTED_CHANNELS = ("woo",)
+
+WAREHOUSE_ROUTING_KEYS = frozenset({*ORDER_ROUTED_CHANNELS, "direct_sale_warehouse_id", "distributor_warehouse_id"})
+
+WAREHOUSE_ROUTING_RULE_KEYS = frozenset({"before_order", "before_warehouse_id", "from_warehouse_id"})
+
+
 def slugify(value: str) -> str:
     normalized = unicodedata.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode("ascii")
     return re.sub(r"[^a-z0-9]+", "-", normalized.lower()).strip("-")
@@ -141,6 +180,264 @@ def validate_posting_policy(payload: dict[str, Any]) -> None:
     validate_mapping_ids(payload["mappings"], path="mappings")
     if "sales_vat_profiles" in payload:
         validated_sales_vat_profiles(payload)
+    validated_cash_posting(payload)
+    validated_warehouse_routing(payload)
+    non_inventory_event_types(payload)
+
+
+def _cash_posting_bank_ids(section: dict[str, Any], *, required: bool) -> list[str]:
+    value = section.get("bank_income_account_ids")
+    if value is None and not required:
+        return []
+    if not isinstance(value, list) or not value:
+        raise PostingPolicyError(
+            "cash_posting.bank_income_account_ids must be a non-empty array of Simplbooks income-account IDs."
+        )
+    resolved = [
+        normalize_id(item, field_name=f"cash_posting.bank_income_account_ids[{index}]")
+        for index, item in enumerate(value)
+    ]
+    if len(set(resolved)) != len(resolved):
+        raise PostingPolicyError("cash_posting.bank_income_account_ids must not repeat an ID.")
+    return resolved
+
+
+def _cash_posting_processor_ids(section: dict[str, Any], *, required: bool) -> dict[str, str]:
+    value = section.get("processor_income_account_ids")
+    if value is None and not required:
+        return {}
+    if not isinstance(value, dict):
+        raise PostingPolicyError("cash_posting.processor_income_account_ids must be an object.")
+    resolved: dict[str, str] = {}
+    for key, account_id in value.items():
+        label = slugify(key)
+        if not label:
+            raise PostingPolicyError("cash_posting.processor_income_account_ids keys cannot be empty.")
+        resolved[label] = normalize_id(
+            account_id, field_name=f"cash_posting.processor_income_account_ids[{key!r}]"
+        )
+    return resolved
+
+
+def _cash_posting_financial_accounts(section: dict[str, Any], *, required: bool) -> dict[str, str]:
+    value = section.get("financial_accounts")
+    if value is None and not required:
+        return {}
+    if not isinstance(value, dict):
+        raise PostingPolicyError("cash_posting.financial_accounts must be an object.")
+    unknown_roles = sorted(set(value) - KNOWN_FINANCIAL_ACCOUNT_ROLES)
+    if unknown_roles:
+        raise PostingPolicyError(f"cash_posting.financial_accounts has unknown role(s): {', '.join(unknown_roles)}.")
+    resolved = {
+        role: normalize_id(account_id, field_name=f"cash_posting.financial_accounts[{role!r}]")
+        for role, account_id in value.items()
+    }
+    missing_roles = sorted(REQUIRED_FINANCIAL_ACCOUNT_ROLES - set(resolved)) if required else []
+    if missing_roles:
+        raise PostingPolicyError(
+            f"cash_posting.financial_accounts is missing required role(s): {', '.join(missing_roles)}."
+        )
+    return resolved
+
+
+def _cash_posting_bank_financial_accounts(section: dict[str, Any], *, required: bool) -> dict[str, Any]:
+    value = section.get("bank_financial_accounts")
+    if value is None and not required:
+        return {}
+    if not isinstance(value, dict) or not value:
+        raise PostingPolicyError(
+            "cash_posting.bank_financial_accounts must map each imported statement account to its ledger account."
+        )
+    for account, mapping in value.items():
+        field = f"cash_posting.bank_financial_accounts[{account!r}]"
+        if not str(account).strip():
+            raise PostingPolicyError("cash_posting.bank_financial_accounts keys cannot be empty.")
+        if isinstance(mapping, dict):
+            if not mapping:
+                raise PostingPolicyError(f"{field} requires at least one currency mapping.")
+            for currency, account_id in mapping.items():
+                if not re.fullmatch(r"[A-Z]{3}", str(currency or "").strip()):
+                    raise PostingPolicyError(f"{field} has invalid currency {currency!r}.")
+                normalize_id(account_id, field_name=f"{field}[{currency!r}]")
+        else:
+            normalize_id(mapping, field_name=field)
+    return value
+
+
+def _cash_posting_clearing_provider_roles(
+    section: dict[str, Any], *, required: bool, accounts: dict[str, str]
+) -> dict[str, str]:
+    value = section.get("clearing_provider_roles")
+    if value is None and not required:
+        return {}
+    if not isinstance(value, dict):
+        raise PostingPolicyError("cash_posting.clearing_provider_roles must be an object.")
+    resolved: dict[str, str] = {}
+    for provider, role in value.items():
+        label = slugify(provider)
+        if not label:
+            raise PostingPolicyError("cash_posting.clearing_provider_roles keys cannot be empty.")
+        role_name = str(role or "").strip()
+        if role_name not in KNOWN_FINANCIAL_ACCOUNT_ROLES:
+            raise PostingPolicyError(
+                f"cash_posting.clearing_provider_roles[{provider!r}] names unknown role {role_name!r}."
+            )
+        if role_name not in accounts:
+            raise PostingPolicyError(
+                f"cash_posting.clearing_provider_roles[{provider!r}] names role {role_name!r}, "
+                "which has no bound financial account."
+            )
+        resolved[label] = role_name
+    return resolved
+
+
+def validated_cash_posting(policy: dict[str, Any]) -> dict[str, Any]:
+    """Normalize the optional cash-posting section; an absent section means legacy API cash posting."""
+    section = policy.get("cash_posting")
+    if section is None:
+        return {"mode": "api", "bank_income_account_ids": [], "processor_income_account_ids": {}, "financial_accounts": {}}
+    if not isinstance(section, dict):
+        raise PostingPolicyError("cash_posting must be an object.")
+    unknown_keys = sorted(set(section) - CASH_POSTING_KEYS)
+    if unknown_keys:
+        raise PostingPolicyError(f"cash_posting has unknown key(s): {', '.join(unknown_keys)}.")
+
+    mode = str(section.get("mode") or "").strip()
+    if mode not in CASH_POSTING_MODES:
+        raise PostingPolicyError(
+            f"cash_posting.mode must be one of {sorted(CASH_POSTING_MODES)}, got {section.get('mode')!r}."
+        )
+
+    required = mode == "statement_import"
+    bank_ids = _cash_posting_bank_ids(section, required=required)
+    processors = _cash_posting_processor_ids(section, required=required)
+    accounts = _cash_posting_financial_accounts(section, required=required)
+    bank_ledgers = _cash_posting_bank_financial_accounts(section, required=required)
+    clearing_roles = _cash_posting_clearing_provider_roles(section, required=required, accounts=accounts)
+
+    shared = sorted(set(bank_ids) & set(processors.values()))
+    if shared:
+        raise PostingPolicyError(
+            f"cash_posting bank and processor income accounts must be disjoint; shared ID(s): {', '.join(shared)}."
+        )
+    return {
+        "mode": mode,
+        "bank_income_account_ids": bank_ids,
+        "processor_income_account_ids": processors,
+        "bank_financial_accounts": bank_ledgers,
+        "clearing_provider_roles": clearing_roles,
+        "financial_accounts": accounts,
+    }
+
+
+def cash_posting_mode(policy: dict[str, Any]) -> str:
+    return validated_cash_posting(policy)["mode"]
+
+
+def statement_import_policy(policy: dict[str, Any]) -> dict[str, Any]:
+    """Return the normalized cash-posting section, refusing any non-`statement_import` policy."""
+    resolved = validated_cash_posting(policy)
+    if resolved["mode"] != "statement_import":
+        raise PostingPolicyError(
+            f"Posting policy cash mode is {resolved['mode']!r}, not 'statement_import'."
+        )
+    return resolved
+
+
+def bank_income_account_ids(policy: dict[str, Any]) -> set[str]:
+    return set(validated_cash_posting(policy)["bank_income_account_ids"])
+
+
+def _warehouse_routing_rule(rule: Any, *, path: str) -> dict[str, Any]:
+    if not isinstance(rule, dict):
+        raise PostingPolicyError(f"{path} must be an object.")
+    extra = sorted(set(rule) - WAREHOUSE_ROUTING_RULE_KEYS)
+    if extra:
+        raise PostingPolicyError(f"{path} has unknown key(s): {', '.join(extra)}.")
+    for field_name in sorted(WAREHOUSE_ROUTING_RULE_KEYS):
+        if field_name not in rule:
+            raise PostingPolicyError(f"{path} requires {field_name}.")
+    before_order = rule["before_order"]
+    if isinstance(before_order, bool) or not isinstance(before_order, int) or before_order <= 0:
+        raise PostingPolicyError(
+            f"{path}.before_order must be a positive integer order number, got {before_order!r}."
+        )
+    return {
+        "before_order": before_order,
+        "before_warehouse_id": normalize_id(rule["before_warehouse_id"], field_name=f"{path}.before_warehouse_id"),
+        "from_warehouse_id": normalize_id(rule["from_warehouse_id"], field_name=f"{path}.from_warehouse_id"),
+    }
+
+
+def non_inventory_event_types(policy: dict[str, Any]) -> frozenset[str]:
+    """Event types a reviewer has declared never to bear inventory.
+
+    A chargeback reverses cash without returning goods, and a dispute fee is not goods at
+    all. Neither should attract an article, and neither should be held back waiting for a
+    quantity that will never exist. Which events those are is a reviewed decision, not
+    something to read off an event name.
+    """
+    values = policy.get("non_inventory_event_types")
+    if values is None:
+        return frozenset()
+    if not isinstance(values, list):
+        raise PostingPolicyError("non_inventory_event_types must be an array of event types.")
+    resolved = {str(value).strip() for value in values}
+    if not all(resolved) or len(resolved) != len(values):
+        raise PostingPolicyError("non_inventory_event_types entries must be unique and non-empty.")
+    return frozenset(resolved)
+
+
+def validated_warehouse_routing(policy: dict[str, Any]) -> dict[str, Any]:
+    """Normalize reviewed sales-warehouse routing; an unbound warehouse stays None until it exists."""
+    section = policy.get("warehouse_routing")
+    if section is None:
+        return {"channels": {}, "direct_sale_warehouse_id": None, "distributor_warehouse_id": None}
+    if not isinstance(section, dict):
+        raise PostingPolicyError("warehouse_routing must be an object.")
+    unknown_keys = sorted(set(section) - WAREHOUSE_ROUTING_KEYS)
+    if unknown_keys:
+        raise PostingPolicyError(f"warehouse_routing has unknown key(s): {', '.join(unknown_keys)}.")
+
+    channels = {
+        channel: _warehouse_routing_rule(section[channel], path=f"warehouse_routing.{channel}")
+        for channel in ORDER_ROUTED_CHANNELS
+        if section.get(channel) is not None
+    }
+    resolved: dict[str, Any] = {"channels": channels}
+    for field_name in ("direct_sale_warehouse_id", "distributor_warehouse_id"):
+        value = section.get(field_name)
+        resolved[field_name] = (
+            None if value is None else normalize_id(value, field_name=f"warehouse_routing.{field_name}")
+        )
+    return resolved
+
+
+def resolve_sales_warehouse(
+    policy: dict[str, Any],
+    *,
+    channel: str,
+    order_number: int | None = None,
+) -> str:
+    """Resolve one reviewed sales warehouse; never guess a warehouse from anything but policy plus source facts."""
+    routing = validated_warehouse_routing(policy)
+    key = slugify(channel)
+    rule = routing["channels"].get(key)
+    if rule is not None:
+        if isinstance(order_number, bool) or not isinstance(order_number, int):
+            raise PostingPolicyError(
+                f"Sales channel {channel!r} requires an exact reviewed order number, got {order_number!r}."
+            )
+        return rule["before_warehouse_id"] if order_number < rule["before_order"] else rule["from_warehouse_id"]
+    if key in {"direct-sale", "distributor"}:
+        field_name = "direct_sale_warehouse_id" if key == "direct-sale" else "distributor_warehouse_id"
+        warehouse_id = routing[field_name]
+        if warehouse_id is None:
+            raise PostingPolicyError(
+                f"warehouse_routing.{field_name} is not bound to a reviewed Simplbooks warehouse."
+            )
+        return warehouse_id
+    raise PostingPolicyError(f"No reviewed warehouse-routing rule exists for sales channel {channel!r}.")
 
 
 def load_posting_policy(path: Path) -> dict[str, Any]:
@@ -154,6 +451,47 @@ def load_posting_policy(path: Path) -> dict[str, Any]:
     return payload
 
 
+def resolve_account_mapping(
+    mappings: Any,
+    *,
+    customer_account: str,
+    currency: str | None,
+    field: str,
+    allow_legacy_single_currency: bool = False,
+) -> str:
+    """Resolve one `(source account[, currency])` mapping to an exact Simplbooks ID.
+
+    `field` names the policy path the mapping lives at, so a failure points at the
+    exact key to fix rather than at a prose description of it.
+    """
+    source_account = re.sub(r"\s+", "", str(customer_account or "")).upper()
+    normalized_mappings = {
+        re.sub(r"\s+", "", str(key)).upper(): value
+        for key, value in (mappings or {}).items()
+    }
+    if source_account not in normalized_mappings:
+        raise PostingPolicyError(f"No exact {field} mapping exists for source account {customer_account!r}.")
+    account_mapping = normalized_mappings[source_account]
+    if isinstance(account_mapping, dict):
+        normalized_currency = str(currency or "").strip().upper()
+        if not re.fullmatch(r"[A-Z]{3}", normalized_currency):
+            raise PostingPolicyError(f"{field} mapping for {customer_account!r} requires a three-letter currency.")
+        currency_mappings = {str(key).strip().upper(): value for key, value in account_mapping.items()}
+        if normalized_currency not in currency_mappings:
+            raise PostingPolicyError(
+                f"No exact {field} mapping exists for source account {customer_account!r} and currency {normalized_currency}."
+            )
+        return normalize_id(
+            currency_mappings[normalized_currency],
+            field_name=f"{field}[{customer_account!r}][{normalized_currency!r}]",
+        )
+    if currency is not None and not allow_legacy_single_currency:
+        raise PostingPolicyError(
+            f"{field} mapping for {customer_account!r} must specify currency {str(currency).upper()!r}."
+        )
+    return normalize_id(account_mapping, field_name=f"{field}[{customer_account!r}]")
+
+
 def resolve_bank_account(
     policy: dict[str, Any],
     *,
@@ -161,33 +499,32 @@ def resolve_bank_account(
     currency: str | None = None,
     allow_legacy_single_currency: bool = False,
 ) -> str:
-    source_account = re.sub(r"\s+", "", str(customer_account or "")).upper()
-    mappings = policy.get("bank_accounts") or {}
-    normalized_mappings = {
-        re.sub(r"\s+", "", str(key)).upper(): value
-        for key, value in mappings.items()
-    }
-    if source_account not in normalized_mappings:
-        raise PostingPolicyError(f"No exact bank-account mapping exists for source account {customer_account!r}.")
-    account_mapping = normalized_mappings[source_account]
-    if isinstance(account_mapping, dict):
-        normalized_currency = str(currency or "").strip().upper()
-        if not re.fullmatch(r"[A-Z]{3}", normalized_currency):
-            raise PostingPolicyError(f"Bank-account mapping for {customer_account!r} requires a three-letter currency.")
-        currency_mappings = {str(key).strip().upper(): value for key, value in account_mapping.items()}
-        if normalized_currency not in currency_mappings:
-            raise PostingPolicyError(
-                f"No exact bank-account mapping exists for source account {customer_account!r} and currency {normalized_currency}."
-            )
-        return normalize_id(
-            currency_mappings[normalized_currency],
-            field_name=f"bank_accounts[{customer_account!r}][{normalized_currency!r}]",
-        )
-    if currency is not None and not allow_legacy_single_currency:
-        raise PostingPolicyError(
-            f"Bank-account mapping for {customer_account!r} must specify currency {str(currency).upper()!r}."
-        )
-    return normalize_id(account_mapping, field_name=f"bank_accounts[{customer_account!r}]")
+    return resolve_account_mapping(
+        policy.get("bank_accounts"),
+        customer_account=customer_account,
+        currency=currency,
+        field="bank_accounts",
+        allow_legacy_single_currency=allow_legacy_single_currency,
+    )
+
+
+def resolve_bank_financial_account(policy: dict[str, Any], *, iban: str, currency: str) -> str:
+    """Resolve the ledger account behind one imported statement account, never a similar one."""
+    return resolve_account_mapping(
+        statement_import_policy(policy)["bank_financial_accounts"],
+        customer_account=iban,
+        currency=currency,
+        field="cash_posting.bank_financial_accounts",
+    )
+
+
+def resolve_clearing_account(policy: dict[str, Any], *, provider: str) -> tuple[str, str]:
+    """Resolve one reviewed clearing provider to its `(role, account ID)` pair."""
+    resolved = statement_import_policy(policy)
+    role = resolved["clearing_provider_roles"].get(slugify(provider))
+    if role is None:
+        raise PostingPolicyError(f"No reviewed financial-account role exists for clearing provider {provider!r}.")
+    return role, resolved["financial_accounts"][role]
 
 
 def resolve_contact(policy: dict[str, Any], *, role: str, label: str) -> str:
@@ -230,6 +567,53 @@ def configured_bank_account_ids(policy: dict[str, Any]) -> set[str]:
     return resolved
 
 
+CASH_ACTION_TYPES = frozenset({"create_incoming_summary", "create_payment_summary"})
+
+
+def prohibited_bank_cash_action(action: dict[str, Any], policy: dict[str, Any]) -> bool:
+    """Report whether one action would post API cash against an imported statement account.
+
+    Builder, checker, and sender each ask this independently. In statement-import mode
+    the physical row is settled by the import itself, so a second API movement against
+    the same account would duplicate the cash rather than record it.
+    """
+    if cash_posting_mode(policy) != "statement_import":
+        return False
+    if str(action.get("action_type") or "") not in CASH_ACTION_TYPES:
+        return False
+    payload = action.get("payload") or {}
+    return str(payload.get("bank_account_id") or "") in bank_income_account_ids(policy)
+
+
+def recomputed_sales_routing(
+    payload: dict[str, Any], policy: dict[str, Any]
+) -> tuple[str | None, list[str]]:
+    """Recompute a declared warehouse routing from policy rather than trusting the batch."""
+    declared = (payload.get("summary_scope") or {}).get("warehouse_routing")
+    if not isinstance(declared, dict):
+        return None, []
+    channel = str(declared.get("channel") or "")
+    warehouse_id = str(declared.get("warehouse_id") or "")
+    order_numbers = declared.get("order_numbers")
+    if not channel or not warehouse_id or not isinstance(order_numbers, list) or not order_numbers:
+        return None, ["Declared warehouse routing requires a channel, warehouse, and order numbers."]
+    errors: list[str] = []
+    for order_number in order_numbers:
+        if isinstance(order_number, bool) or not isinstance(order_number, int):
+            errors.append(f"Declared warehouse routing order number {order_number!r} is not an exact integer.")
+            continue
+        try:
+            expected = resolve_sales_warehouse(policy, channel=channel, order_number=order_number)
+        except PostingPolicyError as exc:
+            errors.append(str(exc))
+            continue
+        if expected != warehouse_id:
+            errors.append(
+                f"Order {order_number} routes to warehouse {expected!r}, not the declared {warehouse_id!r}."
+            )
+    return (None, errors) if errors else (warehouse_id, [])
+
+
 def action_policy_errors(action: dict[str, Any], policy: dict[str, Any]) -> list[str]:
     """Independently compare every submit-capable ID in an action with explicit policy."""
     payload = action.get("payload") or {}
@@ -268,7 +652,11 @@ def action_policy_errors(action: dict[str, Any], policy: dict[str, Any]) -> list
             errors.append(f"Contact ID {actual_contact!r} does not match policy ID {expected_contact!r} for {role}/{label}.")
 
     if action_type in {"create_incoming_summary", "create_payment_summary"}:
-        allowed = configured_bank_account_ids(policy)
+        # Reviewed processor settlement accounts are explicit policy values too, and in
+        # statement-import mode they are the only cash accounts the API may still touch.
+        allowed = configured_bank_account_ids(policy) | set(
+            validated_cash_posting(policy)["processor_income_account_ids"].values()
+        )
         if str(payload.get("bank_account_id") or "") not in allowed:
             errors.append("Cash action bank_account_id is not one of the explicit posting-policy accounts.")
 
@@ -291,6 +679,9 @@ def action_policy_errors(action: dict[str, Any], policy: dict[str, Any]) -> list
     if not isinstance(family_values, dict):
         errors.append(f"Posting family {family!r} is absent from the explicit posting policy.")
         return errors
+
+    routed_warehouse_id, routing_errors = recomputed_sales_routing(payload, policy)
+    errors.extend(routing_errors)
     if str(payload.get("posting_policy_family") or "") != family:
         errors.append(f"Action is not bound to posting-policy family {family!r}.")
 
@@ -323,11 +714,17 @@ def action_policy_errors(action: dict[str, Any], policy: dict[str, Any]) -> list
         if str(line.get("suggested_vat_type_id") or "") != expected_vat:
             errors.append(f"Line VAT type does not match policy family {family!r}.")
         expected_warehouse = family_values.get("warehouse_id") if role == "sales" else line_values.get("warehouse_id")
+        if role == "sales" and routed_warehouse_id is not None:
+            expected_warehouse = routed_warehouse_id
         actual_warehouse = line.get("warehouse_id_hint")
         if str(actual_warehouse or "") != str(expected_warehouse or ""):
             errors.append(f"Line warehouse does not match policy family {family!r}.")
+        declared_event_types = line.get("contributor_event_types")
+        declared_non_inventory = bool(declared_event_types) and set(declared_event_types) <= non_inventory_event_types(policy)
         expected_article = (
-            None if role == "sales" and line_role.endswith("_shipping")
+            # A reviewed cash reversal or processor fee moves no stock, so its line
+            # legitimately carries no article and must not carry one.
+            None if declared_non_inventory or (role == "sales" and line_role.endswith("_shipping"))
             else family_values.get("article_id") if role == "sales"
             else line_values.get("article_id")
         )

@@ -5,6 +5,7 @@ import json
 import sys
 import tempfile
 import unittest
+from decimal import Decimal
 from pathlib import Path
 
 
@@ -1206,6 +1207,193 @@ class BookreconTests(unittest.TestCase):
         self.assertEqual(check["status"], "pass")
         self.assertEqual(check["lhs_amount"], 21.0)
         self.assertEqual(check["rhs_amount"], 21.0)
+
+
+def wallet_row(*, record_id: str, amount: str, owner: str, deposit: bool = True) -> dict:
+    return {
+        "record_id": record_id,
+        "source_system": "printful",
+        "event_type": "printful_wallet_deposit" if deposit else "printful_wallet_withdrawal",
+        "event_date": "2024-04-10",
+        "currency": "EUR",
+        "gross_amount": float(amount),
+        "attributes": {
+            "clearing_provider": "printful",
+            "clearing_account": "printful_wallet",
+            "card_last4": "1111" if owner == "reporting_person" else "2222",
+            "funding_owner": owner,
+        },
+    }
+
+
+def deposit(amount: str, *, owner: str = "reporting_person", record_id: str = "d1") -> dict:
+    return wallet_row(record_id=record_id, amount=f"-{amount}", owner=owner, deposit=True)
+
+
+def refund(amount: str, *, owner: str = "reporting_person", record_id: str = "r1") -> dict:
+    return wallet_row(record_id=record_id, amount=amount, owner=owner, deposit=False)
+
+
+class WalletEquationTests(unittest.TestCase):
+    def test_personal_wallet_refund_cannot_exceed_bound_deposits(self) -> None:
+        errors = bookrecon.printful_wallet_equation_errors([deposit("10.00"), refund("11.00")])
+
+        self.assertIn("refund exceeds reviewed personal-card funding", " ".join(errors))
+
+    def test_a_balanced_personal_wallet_group_has_no_error(self) -> None:
+        self.assertEqual(bookrecon.printful_wallet_equation_errors([deposit("10.00"), refund("10.00")]), [])
+
+    def test_company_card_refunds_are_measured_against_company_deposits(self) -> None:
+        rows = [deposit("10.00"), refund("11.00", owner="company", record_id="r2")]
+
+        self.assertIn("company-card funding", " ".join(bookrecon.printful_wallet_equation_errors(rows)))
+
+    def test_a_row_without_a_reviewed_owner_is_an_error(self) -> None:
+        row = deposit("10.00")
+        del row["attributes"]["funding_owner"]
+
+        self.assertIn("no reviewed funding owner", " ".join(bookrecon.printful_wallet_equation_errors([row])))
+
+    def test_wallet_summary_reports_each_term_separately(self) -> None:
+        rows = [
+            deposit("45.00"),
+            deposit("30.12", owner="company", record_id="d2"),
+            refund("15.00"),
+        ]
+
+        summary = bookrecon.printful_wallet_summary(rows, consumption=Decimal("20.00"))
+
+        self.assertEqual(summary["personal"]["deposits"], Decimal("45.00"))
+        self.assertEqual(summary["personal"]["refunds"], Decimal("15.00"))
+        self.assertEqual(summary["personal"]["liability_change"], Decimal("30.00"))
+        self.assertEqual(summary["company"]["deposits"], Decimal("30.12"))
+        self.assertEqual(summary["consumption"], Decimal("20.00"))
+        self.assertEqual(summary["closing"], Decimal("40.12"))
+
+    def test_wallet_rows_are_never_counted_as_physical_statement_coverage(self) -> None:
+        rows = [deposit("45.00"), refund("15.00")]
+
+        self.assertEqual(bookrecon.physical_statement_rows(rows), [])
+
+
+EMPTY_RECORDS = {
+    "sales": [], "refunds": [], "fees": [], "payouts": [], "bank_transactions": [],
+    "clearing_transactions": [], "bank_balances": [], "purchase_expenses": [],
+    "purchase_credits": [], "inventory_movements": [], "manual_adjustments": [], "other": [],
+}
+
+
+def inventory_check(records: dict, *, inventory_expected: bool = True) -> dict:
+    return bookrecon.build_inventory_check(
+        normalized_path_display="normalized.json",
+        records=records,
+        inventory_expected=inventory_expected,
+        quantity_threshold=Decimal(0),
+    )
+
+
+class EmptyMonthInventoryTests(unittest.TestCase):
+    def test_an_inventory_relevant_company_has_no_warning_in_an_empty_month(self) -> None:
+        check = inventory_check(dict(EMPTY_RECORDS))
+
+        self.assertEqual(check["status"], "pass")
+
+    def test_a_sale_without_quantity_proof_still_warns(self) -> None:
+        records = dict(EMPTY_RECORDS, sales=[{"record_id": "s1", "gross_amount": 10.0, "quantity": None}])
+
+        check = inventory_check(records)
+
+        self.assertEqual(check["status"], "warn")
+
+    def test_a_purchase_without_quantity_proof_still_warns(self) -> None:
+        records = dict(
+            EMPTY_RECORDS, purchase_expenses=[{"record_id": "p1", "gross_amount": 10.0, "quantity": None}]
+        )
+
+        self.assertEqual(inventory_check(records)["status"], "warn")
+
+    def test_an_inventory_movement_without_quantity_proof_still_warns(self) -> None:
+        records = dict(
+            EMPTY_RECORDS, inventory_movements=[{"record_id": "m1", "gross_amount": 0.0, "quantity": None}]
+        )
+
+        self.assertEqual(inventory_check(records)["status"], "warn")
+
+    def test_warehouse_configuration_alone_is_not_activity(self) -> None:
+        check = inventory_check(dict(EMPTY_RECORDS))
+
+        self.assertIn("no inventory-affecting activity", " ".join(check["notes"]))
+
+    def test_a_company_without_inventory_still_skips_an_empty_month(self) -> None:
+        check = inventory_check(dict(EMPTY_RECORDS), inventory_expected=False)
+
+        self.assertEqual(check["status"], "skipped")
+
+
+class WalletFundingCheckTests(unittest.TestCase):
+    def check(self, rows: list[dict]) -> dict:
+        return bookrecon.build_wallet_funding_check(
+            normalized_path_display="normalized.json",
+            records={"clearing_transactions": rows},
+        )
+
+    def test_a_period_with_no_wallet_rows_is_skipped(self) -> None:
+        self.assertEqual(self.check([])["status"], "skipped")
+
+    def test_balanced_personal_funding_passes(self) -> None:
+        self.assertEqual(self.check([deposit("10.00"), refund("10.00")])["status"], "pass")
+
+    def test_a_refund_exceeding_its_funding_fails(self) -> None:
+        result = self.check([deposit("10.00"), refund("11.00")])
+
+        self.assertEqual(result["status"], "fail")
+        self.assertIn("refund exceeds", " ".join(result["notes"]).lower())
+
+    def test_a_refund_of_an_earlier_months_funding_is_not_a_failure(self) -> None:
+        # Deposits in April, refunds in July: within July alone the refunds exceed that
+        # month's deposits, but the year's funding covers them.
+        annual = {
+            "d-apr": deposit("45.00", record_id="d-apr"),
+            "r-jul": refund("15.00", record_id="r-jul"),
+        }
+        result = bookrecon.build_wallet_funding_check(
+            normalized_path_display="normalized.json",
+            records={"clearing_transactions": [annual["r-jul"]]},
+            annual_clearing_records=annual,
+        )
+
+        self.assertEqual(result["status"], "pass")
+
+    def test_the_annual_view_still_catches_an_impossible_refund(self) -> None:
+        annual = {
+            "d1": deposit("10.00", record_id="d1"),
+            "r1": refund("11.00", record_id="r1"),
+        }
+        result = bookrecon.build_wallet_funding_check(
+            normalized_path_display="normalized.json",
+            records={"clearing_transactions": [annual["r1"]]},
+            annual_clearing_records=annual,
+        )
+
+        self.assertEqual(result["status"], "fail")
+
+    def test_a_row_without_a_reviewed_owner_is_reported_not_blocked(self) -> None:
+        # The printout parser already refuses an unknown card; a source with no card data
+        # at all is named here rather than blocking a period that predates attribution.
+        row = deposit("10.00")
+        del row["attributes"]["funding_owner"]
+
+        result = self.check([row])
+
+        self.assertEqual(result["status"], "pass")
+        self.assertIn("no reviewed funding owner", " ".join(result["notes"]))
+
+    def test_the_check_reports_each_term_separately(self) -> None:
+        result = self.check([deposit("45.00"), refund("15.00")])
+
+        notes = " ".join(result["notes"])
+        self.assertIn("45", notes)
+        self.assertIn("15", notes)
 
 
 if __name__ == "__main__":

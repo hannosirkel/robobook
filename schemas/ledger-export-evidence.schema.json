@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.books/schemas/ledger-export-evidence.schema.json",
+  "title": "Post-Import Ledger Export Evidence",
+  "description": "Verdict from comparing an annual statement-import plan with a hash-bound SimplBooks account-ledger export.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "company_slug", "company_id", "year", "binding",
+    "planned_row_count", "ledger_row_count", "movement", "errors", "status"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "company_slug": {"type": "string", "pattern": "^[a-z0-9-]+$"},
+    "company_id": {"type": "string", "minLength": 1},
+    "year": {"type": "integer", "minimum": 1000, "maximum": 9999},
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+      }
+    },
+    "planned_row_count": {"type": "integer", "minimum": 0},
+    "ledger_row_count": {"type": "integer", "minimum": 0},
+    "movement": {
+      "type": "object",
+      "description": "Signed annual movement per account and currency, as debit minus credit.",
+      "additionalProperties": {"type": "string", "pattern": "^-?[0-9]+\\.[0-9]{2}$"}
+    },
+    "errors": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "status": {"type": "string", "enum": ["pass", "fail"]}
+  }
+}

@@ -5,6 +5,7 @@ import json
 import sys
 import tempfile
 import unittest
+from decimal import Decimal
 from pathlib import Path
 
 
@@ -1206,6 +1207,73 @@ class BookreconTests(unittest.TestCase):
         self.assertEqual(check["status"], "pass")
         self.assertEqual(check["lhs_amount"], 21.0)
         self.assertEqual(check["rhs_amount"], 21.0)
+
+
+def wallet_row(*, record_id: str, amount: str, owner: str, deposit: bool = True) -> dict:
+    return {
+        "record_id": record_id,
+        "source_system": "printful",
+        "event_type": "printful_wallet_deposit" if deposit else "printful_wallet_withdrawal",
+        "event_date": "2024-04-10",
+        "currency": "EUR",
+        "gross_amount": float(amount),
+        "attributes": {
+            "clearing_provider": "printful",
+            "clearing_account": "printful_wallet",
+            "card_last4": "1111" if owner == "reporting_person" else "2222",
+            "funding_owner": owner,
+        },
+    }
+
+
+def deposit(amount: str, *, owner: str = "reporting_person", record_id: str = "d1") -> dict:
+    return wallet_row(record_id=record_id, amount=f"-{amount}", owner=owner, deposit=True)
+
+
+def refund(amount: str, *, owner: str = "reporting_person", record_id: str = "r1") -> dict:
+    return wallet_row(record_id=record_id, amount=amount, owner=owner, deposit=False)
+
+
+class WalletEquationTests(unittest.TestCase):
+    def test_personal_wallet_refund_cannot_exceed_bound_deposits(self) -> None:
+        errors = bookrecon.printful_wallet_equation_errors([deposit("10.00"), refund("11.00")])
+
+        self.assertIn("refund exceeds reviewed personal-card funding", " ".join(errors))
+
+    def test_a_balanced_personal_wallet_group_has_no_error(self) -> None:
+        self.assertEqual(bookrecon.printful_wallet_equation_errors([deposit("10.00"), refund("10.00")]), [])
+
+    def test_company_card_refunds_are_measured_against_company_deposits(self) -> None:
+        rows = [deposit("10.00"), refund("11.00", owner="company", record_id="r2")]
+
+        self.assertIn("company-card funding", " ".join(bookrecon.printful_wallet_equation_errors(rows)))
+
+    def test_a_row_without_a_reviewed_owner_is_an_error(self) -> None:
+        row = deposit("10.00")
+        del row["attributes"]["funding_owner"]
+
+        self.assertIn("no reviewed funding owner", " ".join(bookrecon.printful_wallet_equation_errors([row])))
+
+    def test_wallet_summary_reports_each_term_separately(self) -> None:
+        rows = [
+            deposit("45.00"),
+            deposit("30.12", owner="company", record_id="d2"),
+            refund("15.00"),
+        ]
+
+        summary = bookrecon.printful_wallet_summary(rows, consumption=Decimal("20.00"))
+
+        self.assertEqual(summary["personal"]["deposits"], Decimal("45.00"))
+        self.assertEqual(summary["personal"]["refunds"], Decimal("15.00"))
+        self.assertEqual(summary["personal"]["liability_change"], Decimal("30.00"))
+        self.assertEqual(summary["company"]["deposits"], Decimal("30.12"))
+        self.assertEqual(summary["consumption"], Decimal("20.00"))
+        self.assertEqual(summary["closing"], Decimal("40.12"))
+
+    def test_wallet_rows_are_never_counted_as_physical_statement_coverage(self) -> None:
+        rows = [deposit("45.00"), refund("15.00")]
+
+        self.assertEqual(bookrecon.physical_statement_rows(rows), [])
 
 
 if __name__ == "__main__":

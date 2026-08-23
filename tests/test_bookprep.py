@@ -2322,5 +2322,127 @@ class BookprepTests(unittest.TestCase):
             json.dumps(document)
 
 
+WALLET_PRINTOUT = """Printful Wallet
+Transaction history
+
+Date        Action                      Payment Instrument      Amount
+2024-04-10  Deposit to wallet           Visa ending 1111        45.00
+2024-04-18  Deposit to wallet           Visa ending 2222        30.12
+2024-05-02  Withdrawal from wallet      Visa ending 1111        -15.00
+2024-07-12  Deposit to wallet           Visa ending 1111        58.00
+
+Total deposits to wallet    133.12
+"""
+
+CARD_OWNERS = {"1111": "reporting_person", "2222": "company"}
+
+
+def wallet_printout_source(root: Path, text: str = WALLET_PRINTOUT) -> bookprep.SourceDescriptor:
+    path = root / "wallet-printout.txt"
+    path.write_text(text, encoding="utf-8")
+    return bookprep.SourceDescriptor(
+        path=path,
+        rel_path=str(path.relative_to(root)),
+        source_id=bookprep.source_id_for_path(path, root_dir=root),
+        source_type="other",
+        source_system="printful",
+        covered_from=date(2024, 4, 1),
+        covered_until=date(2024, 7, 31),
+        canonical_group=bookprep.canonical_group_for_path(path),
+        parser_name="parse_printful_wallet_printout",
+        canonical=True,
+    )
+
+
+def parse_wallet(root: Path, text: str = WALLET_PRINTOUT, *, owners: dict | None = None) -> tuple[dict, list]:
+    return bookprep.parse_printful_wallet_printout(
+        wallet_printout_source(root, text),
+        period_start=date(2024, 4, 1),
+        period_end=date(2024, 7, 31),
+        base_currency="EUR",
+        card_owners=CARD_OWNERS if owners is None else owners,
+    )
+
+
+class WalletPrintoutTests(unittest.TestCase):
+    def test_wallet_printout_routes_reviewed_personal_and_company_cards(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            records, _exceptions = parse_wallet(Path(tmp))
+
+            rows = records["clearing_transactions"]
+            personal = [row for row in rows if row["attributes"]["card_last4"] == "1111"]
+            company = [row for row in rows if row["attributes"]["card_last4"] == "2222"]
+            self.assertEqual({row["attributes"]["funding_owner"] for row in personal}, {"reporting_person"})
+            self.assertEqual({row["attributes"]["funding_owner"] for row in company}, {"company"})
+            self.assertEqual(len(rows), 4)
+
+    def test_wallet_deposits_and_refunds_carry_opposite_signs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = parse_wallet(Path(tmp))[0]["clearing_transactions"]
+
+            deposits = [row for row in rows if row["event_type"] == "printful_wallet_deposit"]
+            refunds = [row for row in rows if row["event_type"] == "printful_wallet_withdrawal"]
+            self.assertTrue(all(row["gross_amount"] < 0 for row in deposits))
+            self.assertTrue(all(row["gross_amount"] > 0 for row in refunds))
+            self.assertEqual(len(deposits), 3)
+            self.assertEqual(len(refunds), 1)
+
+    def test_an_unreviewed_card_suffix_is_rejected(self) -> None:
+        text = WALLET_PRINTOUT.replace("1111", "9999")
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(bookprep.SimplbooksError, "9999"):
+            parse_wallet(Path(tmp), text)
+
+    def test_rows_outside_the_period_are_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            records, _exceptions = bookprep.parse_printful_wallet_printout(
+                wallet_printout_source(Path(tmp)),
+                period_start=date(2024, 4, 1),
+                period_end=date(2024, 4, 30),
+                base_currency="EUR",
+                card_owners=CARD_OWNERS,
+            )
+
+            self.assertEqual(len(records["clearing_transactions"]), 2)
+
+    def test_every_row_binds_its_source_row_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = parse_wallet(Path(tmp))[0]["clearing_transactions"]
+
+            self.assertTrue(all(row["source_refs"][0]["row_ref"].startswith("line:") for row in rows))
+            self.assertEqual(len({row["record_id"] for row in rows}), 4)
+
+
+class WalletPrintoutDetectionTests(unittest.TestCase):
+    def test_a_wallet_printout_is_detected_by_its_stable_headings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "wallet-printout.txt"
+            path.write_text(WALLET_PRINTOUT, encoding="utf-8")
+
+            self.assertEqual(
+                bookprep.detect_parser(path, "other", "printful"), "parse_printful_wallet_printout"
+            )
+
+    def test_an_arbitrary_text_file_is_not_treated_as_wallet_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "wallet-printout.txt"
+            path.write_text("Some unrelated note about a wallet.\n", encoding="utf-8")
+
+            self.assertNotEqual(
+                bookprep.detect_parser(path, "other", "printful"), "parse_printful_wallet_printout"
+            )
+
+    def test_structured_csv_still_wins_over_a_printout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "wallet.csv"
+            path.write_text("Date,Action,Amount\n", encoding="utf-8")
+
+            self.assertEqual(
+                bookprep.detect_parser(
+                    path, "csv", "printful", bookprep.ROW_EVENT_HEADERS["printful_wallet_csv"]
+                ),
+                "parse_printful_wallet_csv",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

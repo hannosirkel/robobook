@@ -469,6 +469,8 @@ def detect_parser(path: Path, source_type: str, source_system: str, header_names
             return "parse_printful_other_csv"
         if headers >= ROW_EVENT_HEADERS["printful_services_csv"]:
             return "parse_printful_services_csv"
+    if source_system == "printful" and source_type in {"other", "manual"} and is_wallet_printout(path):
+        return "parse_printful_wallet_printout"
     if source_type == "csv" and source_system == "bank":
         return "parse_bank_csv"
     if source_type == "xml" and source_system == "bank":
@@ -804,6 +806,25 @@ def choose_canonical_sources(sources: list[SourceDescriptor]) -> list[SourceDesc
                 entry.canonical = False
                 entry.parser_notes.append("Reference-only source group; no canonical machine-readable input available.")
     return sources
+
+
+def load_company_profile(company_dir: Path) -> dict[str, Any]:
+    profile_path = company_dir / "artifacts" / "company_profile.json"
+    if not profile_path.exists():
+        return {}
+    try:
+        profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return profile if isinstance(profile, dict) else {}
+
+
+def load_wallet_card_owners(company_dir: Path) -> dict[str, str]:
+    """Return the reviewed card-suffix to owner mapping; an unmapped card blocks parsing."""
+    owners = load_company_profile(company_dir).get("wallet_card_owners")
+    if not isinstance(owners, dict):
+        return {}
+    return {str(key).strip(): str(value).strip() for key, value in owners.items()}
 
 
 def load_company_base_currency(company_dir: Path, override: str | None = None) -> str:
@@ -2354,6 +2375,117 @@ def parse_printful_wallet_csv(
     return result, exceptions
 
 
+WALLET_PRINTOUT_HEADINGS = ("printful wallet", "transaction history")
+
+WALLET_PRINTOUT_LINE = re.compile(
+    r"^(?P<date>\d{4}-\d{2}-\d{2})\s+"
+    r"(?P<action>.+?)\s{2,}"
+    r"(?P<instrument>.+?)\s{2,}"
+    r"(?P<amount>-?[\d.,]+)\s*$"
+)
+
+CARD_SUFFIX = re.compile(r"(\d{4})\s*$")
+
+
+def is_wallet_printout(path: Path) -> bool:
+    """Detect the reviewed wallet printout by its stable headings, not by its extension.
+
+    Without this an arbitrary text file dropped into the source pack would be read as
+    wallet evidence, which is exactly the kind of guess this pipeline must not make.
+    """
+    try:
+        head = normalize_ascii(path.read_text(encoding="utf-8", errors="replace")[:2000]).lower()
+    except OSError:
+        return False
+    return all(heading in head for heading in WALLET_PRINTOUT_HEADINGS)
+
+
+def parse_printful_wallet_printout(
+    source: SourceDescriptor,
+    *,
+    period_start: date,
+    period_end: date,
+    base_currency: str,
+    card_owners: dict[str, str] | None = None,
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
+    """Parse reviewed wallet movements, attributing each to the card that funded it."""
+    owners = {str(key).strip(): str(value).strip() for key, value in (card_owners or {}).items()}
+    result = parser_result()
+    exceptions: list[dict[str, Any]] = []
+    seen_dates: list[date] = []
+
+    for line_no, line in enumerate(source.path.read_text(encoding="utf-8").splitlines(), start=1):
+        match = WALLET_PRINTOUT_LINE.match(normalize_ascii(line).rstrip())
+        if match is None:
+            continue
+        event_date = parse_date_value(match.group("date"))
+        if event_date < period_start or event_date > period_end:
+            continue
+
+        action = match.group("action").strip().lower()
+        if "deposit to wallet" in action:
+            event_type, sign = "printful_wallet_deposit", -1
+        elif "withdrawal from wallet" in action:
+            event_type, sign = "printful_wallet_withdrawal", 1
+        else:
+            exceptions.append(
+                make_exception(
+                    source=source,
+                    exception_id=f"{source.source_id}:action:{line_no}",
+                    severity="warn",
+                    reason=f"Skipped wallet printout row with unrecognized action {action!r}.",
+                    blocking=False,
+                    row_ref=f"line:{line_no}",
+                    suggested_follow_up="Extend the wallet printout parser if this action affects bookkeeping.",
+                )
+            )
+            continue
+
+        instrument = match.group("instrument").strip()
+        suffix_match = CARD_SUFFIX.search(instrument)
+        if suffix_match is None:
+            raise SimplbooksError(
+                f"Wallet printout row {line_no} names no card suffix; funding ownership cannot be reviewed."
+            )
+        card_last4 = suffix_match.group(1)
+        owner = owners.get(card_last4)
+        if owner is None:
+            raise SimplbooksError(
+                f"Wallet printout card {card_last4} has no reviewed owner; add it to the company profile."
+            )
+
+        amount, currency = parse_money_cell(match.group("amount"), default_currency=base_currency)
+        signed_amount = sign * abs(amount)
+        seen_dates.append(event_date)
+        category, record = make_record(
+            source=source,
+            category="clearing_transactions",
+            record_id=f"{source.source_id}:wallet:{line_no}",
+            event_type=event_type,
+            event_date=event_date,
+            settlement_date=event_date,
+            description=f"Printful wallet {'funding' if sign < 0 else 'refund'} via {instrument}",
+            currency=currency or base_currency,
+            gross_amount=signed_amount,
+            net_amount=signed_amount,
+            external_ref=f"{slugify(action)}:{line_no}",
+            channel="printful",
+            attributes={
+                "action": match.group("action").strip(),
+                "payment_instrument": instrument,
+                "card_last4": card_last4,
+                "funding_owner": owner,
+                "clearing_provider": "printful",
+                "clearing_account": "printful_wallet",
+            },
+            row_ref=f"line:{line_no}",
+        )
+        result[category].append(record)
+
+    update_coverage_from_dates(source, seen_dates)
+    return result, exceptions
+
+
 def parse_printful_other_csv(
     source: SourceDescriptor,
     *,
@@ -3533,6 +3665,7 @@ PARSERS: dict[str, Callable[..., tuple[dict[str, list[dict[str, Any]]], list[dic
     "parse_quartermaster_orders_csv": parse_quartermaster_orders_csv,
     "parse_printful_orders_csv": parse_printful_orders_csv,
     "parse_printful_wallet_csv": parse_printful_wallet_csv,
+    "parse_printful_wallet_printout": parse_printful_wallet_printout,
     "parse_printful_other_csv": parse_printful_other_csv,
     "parse_printful_services_csv": parse_printful_services_csv,
     "parse_bank_csv": parse_bank_csv,
@@ -3666,6 +3799,7 @@ def aggregate_results(
     period_start: date,
     period_end: date,
     base_currency: str,
+    card_owners: dict[str, str] | None = None,
 ) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]]]:
     records = parser_result()
     exceptions: list[dict[str, Any]] = missing_canonical_source_exceptions(sources)
@@ -3694,7 +3828,15 @@ def aggregate_results(
             )
             continue
 
-        if source.parser_name == "parse_printful_pdf":
+        if source.parser_name == "parse_printful_wallet_printout":
+            parsed_records, parsed_exceptions = parser(
+                source,
+                period_start=period_start,
+                period_end=period_end,
+                base_currency=base_currency,
+                card_owners=card_owners,
+            )
+        elif source.parser_name == "parse_printful_pdf":
             parsed_records, parsed_exceptions = parser(
                 source,
                 period_start=period_start,
@@ -4047,6 +4189,7 @@ def main() -> int:
         period_start=period_start,
         period_end=period_end,
         base_currency=base_currency,
+        card_owners=load_wallet_card_owners(company_dir),
     )
     if any(source.parser_name == "parse_woo_tax_summary_csv" for source in sources):
         allocation_path = (

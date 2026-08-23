@@ -358,7 +358,20 @@
         },
         "attributes": {
           "type": "object",
-          "additionalProperties": true
+          "additionalProperties": true,
+          "properties": {
+            "card_last4": {
+              "type": "string",
+              "pattern": "^[0-9]{4}$"
+            },
+            "funding_owner": {
+              "type": "string",
+              "enum": [
+                "company",
+                "reporting_person"
+              ]
+            }
+          }
         },
         "source_refs": {
           "type": "array",

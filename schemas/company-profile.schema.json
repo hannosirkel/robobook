@@ -62,6 +62,20 @@
         "type": "string"
       }
     },
+    "wallet_card_owners": {
+      "description": "Reviewed card suffix to funding owner; a card with no entry blocks parsing rather than defaulting.",
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[0-9]{4}$"
+      },
+      "additionalProperties": {
+        "type": "string",
+        "enum": [
+          "company",
+          "reporting_person"
+        ]
+      }
+    },
     "policy_refs": {
       "type": "array",
       "items": {

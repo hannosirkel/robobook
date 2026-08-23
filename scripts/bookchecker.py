@@ -534,6 +534,51 @@ def evaluate_duplicates(action_batch: dict[str, Any]) -> list[dict[str, Any]]:
     return findings
 
 
+def evaluate_processor_settlement(action_batch: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every part of an allocated processor settlement must add back up to its group total.
+
+    Splitting one processor's month across several invoices is a presentation choice; the
+    cash it moves is not, so the parts are checked against the total they came from.
+    """
+    findings: list[dict[str, Any]] = []
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for action in action_batch.get("actions") or []:
+        payload = action.get("payload") or {}
+        if str(payload.get("settlement_family") or "") != "processor-held":
+            continue
+        if payload.get("settlement_group_total") is None:
+            continue
+        key = (str(payload.get("processor_hint") or ""), str(payload.get("currency") or ""))
+        groups.setdefault(key, []).append(action)
+
+    for (processor, currency), actions in sorted(groups.items()):
+        total = decimal_value((actions[0].get("payload") or {}).get("settlement_group_total"))
+        allocated = sum(decimal_value((action.get("payload") or {}).get("amount")) for action in actions)
+        if allocated != total:
+            findings.append(
+                make_finding(
+                    section="arithmetic_consistency",
+                    severity="error",
+                    summary=(
+                        f"Processor {processor} {currency} settlement parts total "
+                        f"{allocated}, not the {total} the sales evidence settles."
+                    ),
+                    action_id=action_label(actions[0]),
+                )
+            )
+    return findings
+
+
+def _processor_held_expected(
+    paired_records: list[tuple[str, dict[str, Any]]], *, document_type: str
+) -> Decimal:
+    """What the processor actually took in, or deducted, for the rows it settled."""
+    field = "gross_amount" if document_type == "incoming" else "fee_amount"
+    return sum(
+        abs(decimal_value(record.get(field))) for category, record in paired_records if category == "sales"
+    )
+
+
 def evaluate_arithmetic(
     *,
     action: dict[str, Any],
@@ -601,7 +646,26 @@ def evaluate_arithmetic(
 
     if draft_schema == "cash_settlement_v1":
         document_type = str(payload.get("document_type") or "")
-        if physical_expected_amount is not None:
+        settlement_family = str(payload.get("settlement_family") or "")
+        if settlement_family == "processor-held":
+            # The customer paid the processor, so the money never touched the bank. The
+            # sales rows the processor settled are the only evidence there is. A receipt
+            # allocated across several invoices carries its group total instead, and the
+            # parts are summed against that total in evaluate_processor_settlement.
+            expected_amount = _processor_held_expected(paired_records, document_type=document_type)
+            physical_bank_records = []
+            payout_records = []
+            if payload.get("settlement_group_total") is not None:
+                compare_amount(
+                    findings=findings,
+                    section="arithmetic_consistency",
+                    action=action,
+                    label="Processor settlement group total",
+                    expected=expected_amount,
+                    actual=decimal_value(payload.get("settlement_group_total")),
+                )
+                return findings
+        elif physical_expected_amount is not None:
             expected_amount = physical_expected_amount
             physical_bank_records = [
                 item["record"]
@@ -643,7 +707,12 @@ def evaluate_arithmetic(
                 expected=expected_amount,
                 actual=decimal_value(payload.get("amount")),
             )
-        if document_type == "incoming" and not payout_records and not physical_bank_records:
+        if (
+            document_type == "incoming"
+            and settlement_family != "processor-held"
+            and not payout_records
+            and not physical_bank_records
+        ):
             findings.append(
                 make_finding(
                     section="arithmetic_consistency",
@@ -661,7 +730,11 @@ def evaluate_arithmetic(
                     action_id=action_label(action),
                 )
             )
-        if document_type == "payment" and "bank_transactions" not in categories:
+        if (
+            document_type == "payment"
+            and settlement_family != "processor-held"
+            and "bank_transactions" not in categories
+        ):
             findings.append(
                 make_finding(
                     section="arithmetic_consistency",
@@ -2981,6 +3054,7 @@ def evaluate_action_batch(
 
     assigned_cash_amounts: dict[str, Decimal] = {}
     findings.extend(evaluate_duplicates(action_batch))
+    findings.extend(evaluate_processor_settlement(action_batch))
     findings.extend(
         evaluate_bank_statement_completeness(
             action_batch,

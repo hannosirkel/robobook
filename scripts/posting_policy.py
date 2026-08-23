@@ -631,7 +631,8 @@ def action_policy_errors(action: dict[str, Any], policy: dict[str, Any]) -> list
         role = "sales"
         label = str(payload.get("counterparty_hint") or "")
     elif action_type == "create_incoming_summary" or (
-        action_type == "create_purchase_summary" and slugify(str(payload.get("vendor_hint") or "")) in {"paypal", "stripe"}
+        action_type in {"create_purchase_summary", "create_payment_summary"}
+        and slugify(str(payload.get("vendor_hint") or "")) in {"paypal", "stripe"}
     ):
         role = "processors"
         label = str(payload.get("counterparty_hint") or payload.get("vendor_hint") or "")

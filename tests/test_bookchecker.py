@@ -2322,3 +2322,99 @@ class DuplicateBindingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def processor_held_action(*, document_type: str, amount: float) -> dict:
+    endpoint = "incomings/create" if document_type == "incoming" else "payments/create"
+    return {
+        "idempotency_key": f"example-2024-01-settle-{document_type}",
+        "period": "2024-01",
+        "action_type": "create_incoming_summary" if document_type == "incoming" else "create_payment_summary",
+        "method": "POST",
+        "endpoint": endpoint,
+        "payload": {
+            "draft_schema": "cash_settlement_v1",
+            "document_type": document_type,
+            "settlement_family": "processor-held",
+            "currency": "EUR",
+            "counterparty": {"contact_id": "63", "display_name_hint": "paypal"},
+            "counterparty_hint": "paypal",
+            "bank_account_id": "6",
+            "amount": amount,
+            "record_count": 1,
+        },
+        "source_refs": [{"path": "companies/example/artifacts/normalized/2024-01.json",
+                         "record_ref": "pp:1", "note": None}],
+        "reason": "test", "confidence": "high", "depends_on": [],
+        "expected_effect": "settle", "review_notes": [],
+        "executed_at": None, "response_status": None, "response_body": None, "inserted_id": None,
+    }
+
+
+PROCESSOR_HELD_SOURCE = [{
+    "category": "sales",
+    "source_kind": "processor",
+    "record": {"record_id": "pp:1", "channel": "paypal", "gross_amount": 35.82,
+               "fee_amount": 1.57, "currency": "EUR"},
+}]
+
+
+class ProcessorHeldSettlementCheckTests(unittest.TestCase):
+    """A processor-held settlement is proved by the sales it settles, not by a bank row.
+
+    The money never touched the bank, so demanding a payout or statement row would fail
+    every one of these actions.
+    """
+
+    def test_a_processor_receipt_is_measured_against_the_sales_gross(self) -> None:
+        findings = bookchecker.evaluate_arithmetic(
+            action=processor_held_action(document_type="incoming", amount=35.82),
+            resolved_sources=PROCESSOR_HELD_SOURCE,
+        )
+
+        self.assertEqual([f["summary"] for f in findings], [])
+
+    def test_a_wrong_processor_receipt_amount_is_still_caught(self) -> None:
+        findings = bookchecker.evaluate_arithmetic(
+            action=processor_held_action(document_type="incoming", amount=30.00),
+            resolved_sources=PROCESSOR_HELD_SOURCE,
+        )
+
+        self.assertTrue(any("Cash settlement amount" in f["summary"] for f in findings))
+
+    def test_a_processor_fee_payment_is_measured_against_the_fee_amounts(self) -> None:
+        findings = bookchecker.evaluate_arithmetic(
+            action=processor_held_action(document_type="payment", amount=1.57),
+            resolved_sources=PROCESSOR_HELD_SOURCE,
+        )
+
+        self.assertEqual([f["summary"] for f in findings], [])
+
+    def test_a_wrong_processor_fee_amount_is_still_caught(self) -> None:
+        findings = bookchecker.evaluate_arithmetic(
+            action=processor_held_action(document_type="payment", amount=9.99),
+            resolved_sources=PROCESSOR_HELD_SOURCE,
+        )
+
+        self.assertTrue(any("Cash settlement amount" in f["summary"] for f in findings))
+
+
+class ProcessorSettlementGroupTotalTests(unittest.TestCase):
+    """Splitting a processor's month across invoices must not change the cash it moves."""
+
+    def batch(self, *amounts: float) -> dict:
+        return {"actions": [
+            {"idempotency_key": f"example-2024-04-settle-paypal-{i}",
+             "payload": {"draft_schema": "cash_settlement_v1", "document_type": "incoming",
+                         "settlement_family": "processor-held", "processor_hint": "paypal",
+                         "currency": "EUR", "amount": amount, "settlement_group_total": 69.27}}
+            for i, amount in enumerate(amounts)
+        ]}
+
+    def test_parts_that_add_up_to_the_group_total_pass(self) -> None:
+        self.assertEqual(bookchecker.evaluate_processor_settlement(self.batch(62.70, 6.57)), [])
+
+    def test_parts_that_do_not_add_up_are_reported(self) -> None:
+        findings = bookchecker.evaluate_processor_settlement(self.batch(62.70, 5.00))
+
+        self.assertTrue(any("settlement parts total" in f["summary"] for f in findings))

@@ -561,3 +561,47 @@ class NonInventoryEventTypeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProcessorFeePaymentContactTests(unittest.TestCase):
+    """A processor fee payment is owed to the processor, not to a generic supplier.
+
+    `create_purchase_summary` already routes a processor vendor to the processors role;
+    the payment that settles it must resolve the same contact or no batch can pass.
+    """
+
+    def policy(self) -> dict:
+        return {
+            "schema_version": "1.0",
+            "company_slug": "example",
+            "bank_accounts": {},
+            "contacts": {"sales": {}, "processors": {"paypal": "63"}, "suppliers": {}},
+            "mappings": {},
+            "supplier_aliases": {},
+        }
+
+    def payment(self) -> dict:
+        return {
+            "action_type": "create_payment_summary",
+            "payload": {
+                "draft_schema": "cash_settlement_v1",
+                "settlement_family": "processor-held",
+                "vendor_hint": "paypal",
+                "counterparty_hint": "paypal",
+                "counterparty": {"contact_id": "63"},
+                "bank_account_id": "6",
+            },
+        }
+
+    def test_a_processor_fee_payment_resolves_the_processor_contact(self) -> None:
+        errors = posting_policy.action_policy_errors(self.payment(), self.policy())
+
+        self.assertEqual([e for e in errors if "contact" in e.lower()], [])
+
+    def test_a_mismatched_processor_contact_is_still_reported(self) -> None:
+        action = self.payment()
+        action["payload"]["counterparty"]["contact_id"] = "999"
+
+        errors = posting_policy.action_policy_errors(action, self.policy())
+
+        self.assertTrue(any("999" in e for e in errors))

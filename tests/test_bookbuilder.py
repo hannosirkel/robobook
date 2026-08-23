@@ -209,9 +209,9 @@ def manual_allocation(*, row: dict, disposition: str, target: dict | None = None
 STATEMENT_IMPORT_CASH_POSTING = {
     "mode": "statement_import",
     "bank_income_account_ids": ["3"],
-    "processor_income_account_ids": {"paypal": "6"},
+    "processor_income_account_ids": {"paypal": "6", "stripe": "7"},
     "bank_financial_accounts": {"EE123": {"EUR": "10"}},
-    "clearing_provider_roles": {"paypal": "paypal"},
+    "clearing_provider_roles": {"paypal": "paypal", "stripe": "stripe_clearing"},
     "financial_accounts": {
         "bank": "10",
         "stripe_clearing": "30",
@@ -2578,7 +2578,11 @@ def warehouse_routing_policy(**routing: object) -> dict:
         "distributor_warehouse_id": None,
         **routing,
     }
-    policy["contacts"] = {"sales": {"woo": "42", "direct-sale": "42"}, "processors": {}, "suppliers": {}}
+    policy["contacts"] = {
+        "sales": {"woo": "42", "direct-sale": "42"},
+        "processors": {"paypal": "63", "stripe": "29"},
+        "suppliers": {},
+    }
     policy["mappings"] = {
         **policy["mappings"],
         "woo-taxable": {
@@ -3119,3 +3123,129 @@ class TransferEvidencePathTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def processor_settlement_policy() -> dict:
+    """Statement-import policy where PayPal and Stripe hold separate reviewed accounts."""
+    cash = json.loads(json.dumps(STATEMENT_IMPORT_CASH_POSTING))
+    cash["processor_income_account_ids"] = {"paypal": "6", "stripe": "7"}
+    cash["clearing_provider_roles"] = {"paypal": "paypal", "stripe": "stripe_clearing"}
+    policy = dict(direct_sale_policy(), cash_posting=cash)
+    policy["contacts"] = {
+        "sales": {"woo": "42", "direct-sale": "42"},
+        "processors": {"paypal": "63", "stripe": "29"},
+        "suppliers": {},
+    }
+    policy["mappings"]["woo-taxable"] = {
+        "income_account_id": "107", "shipping_income_account_id": "253",
+        "vat_type_id": "25", "shipping_vat_type_id": "24", "warehouse_id": "6",
+    }
+    return policy
+
+
+def processor_settlement_normalized() -> dict:
+    """One month whose Woo invoice is settled partly by PayPal and partly by Stripe."""
+    normalized = base_normalized("2024-01")
+    woo = record(record_id="woo:2024-01", source_system="woo", event_type="woo_monthly_sales",
+                 gross_amount=137.46, vat_amount=24.79, shipping_amount=17.46, channel="woo")
+    woo["event_date"] = "2024-01-31"
+    paypal = record(record_id="pp:1", source_system="paypal", event_type="paypal_website_payment",
+                    gross_amount=35.82, fee_amount=1.57, channel="paypal")
+    stripe = record(record_id="st:1", source_system="stripe", event_type="stripe_charge",
+                    gross_amount=101.64, fee_amount=2.03, channel="stripe")
+    normalized["records"]["sales"] = [woo, paypal, stripe]
+    return normalized
+
+
+class ProcessorSettlementTests(unittest.TestCase):
+    """A processor-held sale is settled inside the processor account, never by the bank.
+
+    The bank statement only ever shows the net payout, so no imported bank row can pay a
+    gross sales invoice. Without these actions the monthly invoice stays open forever.
+    """
+
+    def batch(self) -> dict:
+        return build_batch_with_policy(processor_settlement_normalized(), processor_settlement_policy())
+
+    def test_each_processor_receives_its_own_gross_into_its_own_account(self) -> None:
+        receipts = {
+            action["payload"]["bank_account_id"]: action["payload"]["amount"]
+            for action in actions_of_type(self.batch(), "create_incoming_summary")
+        }
+
+        self.assertEqual(receipts, {"6": 35.82, "7": 101.64})
+
+    def test_each_processor_fee_is_paid_out_of_the_same_account(self) -> None:
+        payments = {
+            action["payload"]["bank_account_id"]: action["payload"]["amount"]
+            for action in actions_of_type(self.batch(), "create_payment_summary")
+        }
+
+        self.assertEqual(payments, {"6": 1.57, "7": 2.03})
+
+    def test_processor_settlement_is_not_prohibited_bank_cash(self) -> None:
+        policy = processor_settlement_policy()
+        batch = self.batch()
+        cash = [a for a in batch["actions"]
+                if a["action_type"] in ("create_incoming_summary", "create_payment_summary")]
+
+        self.assertTrue(cash)
+        for action in cash:
+            self.assertFalse(posting_policy.prohibited_bank_cash_action(action, policy))
+
+    def test_a_processor_without_a_reviewed_account_raises_rather_than_guessing(self) -> None:
+        policy = processor_settlement_policy()
+        del policy["cash_posting"]["processor_income_account_ids"]["stripe"]
+
+        with self.assertRaisesRegex(bookbuilder.SimplbooksError, "stripe"):
+            build_batch_with_policy(processor_settlement_normalized(), policy)
+
+    def test_legacy_api_cash_posting_generates_no_processor_settlement(self) -> None:
+        # Without a cash_posting section the policy is legacy API mode, which settles from
+        # the bank side. Emitting a processor receipt there would double the cash.
+        batch = build_batch_with_policy(processor_settlement_normalized(), direct_sale_policy())
+
+        self.assertEqual(actions_of_type(batch, "create_incoming_summary"), [])
+        self.assertEqual(actions_of_type(batch, "create_payment_summary"), [])
+
+    def test_the_fee_payment_keeps_the_processor_contact(self) -> None:
+        # apply_posting_policy re-resolves every contact; a processor fee payment must not
+        # fall through to the suppliers role, which would blank the contact it was given.
+        payments = actions_of_type(self.batch(), "create_payment_summary")
+
+        self.assertEqual(
+            {a["payload"]["counterparty_hint"]: a["payload"]["counterparty"]["contact_id"] for a in payments},
+            {"paypal": "63", "stripe": "29"},
+        )
+
+    def test_a_receipt_carries_the_invoice_customer_not_the_processor(self) -> None:
+        # The processor decides which cash account the money sits in; the invoice decides
+        # whose receivable is being cleared. A receipt against the processor's own contact
+        # can never settle a customer invoice.
+        receipts = actions_of_type(self.batch(), "create_incoming_summary")
+
+        self.assertEqual({a["payload"]["counterparty"]["contact_id"] for a in receipts}, {"42"})
+
+    def test_each_receipt_links_to_the_invoice_it_settles(self) -> None:
+        batch = self.batch()
+        invoice_key = actions_of_type(batch, "create_invoice_summary")[0]["idempotency_key"]
+        receipts = actions_of_type(batch, "create_incoming_summary")
+
+        self.assertEqual({a["payload"]["linked_invoice_action"] for a in receipts}, {invoice_key})
+
+    def test_distributor_invoices_are_not_settled_out_of_a_processor_account(self) -> None:
+        # A distributor pays by bank transfer, so its invoice must never absorb money the
+        # card processors are holding.
+        normalized = processor_settlement_normalized()
+        distributor = record(record_id="qm:1", source_system="quartermaster",
+                             event_type="quartermaster_sales", gross_amount=792.12,
+                             channel="quartermaster")
+        distributor["event_date"] = "2024-01-31"
+        normalized["records"]["sales"].append(distributor)
+
+        receipts = actions_of_type(
+            build_batch_with_policy(normalized, processor_settlement_policy()),
+            "create_incoming_summary",
+        )
+
+        self.assertEqual(sum(a["payload"]["amount"] for a in receipts), 137.46)

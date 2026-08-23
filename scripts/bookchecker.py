@@ -1830,6 +1830,33 @@ def _inventory_group_label(record: dict[str, Any]) -> str:
     )
 
 
+def residual_quantity_derivation_errors(record: dict[str, Any]) -> list[str]:
+    """Re-check a derived residual quantity instead of trusting the arithmetic that made it."""
+    derivation = (record.get("attributes") or {}).get("quantity_derivation")
+    if not isinstance(derivation, dict):
+        return []
+    try:
+        summary = decimal_value(derivation.get("summary_quantity"))
+        allocated = decimal_value(derivation.get("allocated_quantity"))
+        residual = decimal_value(derivation.get("residual_quantity"))
+        quantity = decimal_value(record.get("quantity"))
+    except SimplbooksError as exc:
+        return [f"Residual quantity derivation is not numeric: {exc}"]
+    errors: list[str] = []
+    if summary - allocated != residual:
+        errors.append(
+            f"Residual quantity derivation does not equal its inputs: "
+            f"{summary} - {allocated} != {residual}."
+        )
+    if quantity != residual:
+        errors.append(
+            f"Residual record quantity {quantity} does not match its derived residual {residual}."
+        )
+    if residual <= 0:
+        errors.append("Residual quantity derivation must be positive.")
+    return errors
+
+
 def _allocated_order_components(line: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """Index the reviewed order components a VAT-allocated line declares, by order."""
     return {
@@ -1995,6 +2022,7 @@ def evaluate_inventory_quantities(
                     source_quantity = Decimal("0")  # noqa: FURB157
                 if source_quantity <= 0 or source_quantity != quantity:
                     problems.append(f"Inventory quantity contributor {record_id} does not match normalized quantity.")
+                problems.extend(residual_quantity_derivation_errors(record))
             elif source == "reviewed_allocation_target":
                 allocation = reviewed_allocations.get(record_id)
                 target = allocation.get("target") if isinstance(allocation, dict) else None

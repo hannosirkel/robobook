@@ -2256,5 +2256,45 @@ class AllocatedOrderProofTests(unittest.TestCase):
         self.assertTrue(self.findings(self.action(proof=proof)))
 
 
+class ResidualDerivationCheckTests(unittest.TestCase):
+    def record(self, *, summary: float, allocated: float, residual: float, quantity: float) -> dict:
+        return {
+            "record_id": "woo:2024-04:zero-rated-residual",
+            "quantity": quantity,
+            "attributes": {"quantity_derivation": {
+                "summary_quantity": summary,
+                "allocated_quantity": allocated,
+                "residual_quantity": residual,
+            }},
+        }
+
+    def test_a_sound_derivation_is_accepted(self) -> None:
+        self.assertEqual(
+            bookchecker.residual_quantity_derivation_errors(
+                self.record(summary=4, allocated=2, residual=2, quantity=2)
+            ),
+            [],
+        )
+
+    def test_a_subtraction_that_does_not_hold_is_rejected(self) -> None:
+        errors = bookchecker.residual_quantity_derivation_errors(
+            self.record(summary=4, allocated=2, residual=3, quantity=3)
+        )
+
+        self.assertTrue(any("does not equal" in e for e in errors), errors)
+
+    def test_a_quantity_that_disagrees_with_its_own_derivation_is_rejected(self) -> None:
+        errors = bookchecker.residual_quantity_derivation_errors(
+            self.record(summary=4, allocated=2, residual=2, quantity=5)
+        )
+
+        self.assertTrue(any("does not match" in e for e in errors), errors)
+
+    def test_a_record_without_a_derivation_is_left_alone(self) -> None:
+        self.assertEqual(
+            bookchecker.residual_quantity_derivation_errors({"record_id": "x", "quantity": 1}), []
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

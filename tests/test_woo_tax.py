@@ -658,5 +658,30 @@ class AllocationQuantityPassthroughTests(unittest.TestCase):
         self.assertIsNone(woo_tax.allocation_component_quantity({"order_id": "763", "quantity": 0}))
 
 
+class ResidualQuantityDerivationTests(unittest.TestCase):
+    def derive(self, summary: object, allocated: list[object]) -> dict | None:
+        return woo_tax.residual_quantity_derivation(summary, allocated)
+
+    def test_the_residual_is_the_summary_less_the_reviewed_orders(self) -> None:
+        derivation = self.derive(4, [1, 1])
+
+        self.assertEqual(derivation["residual_quantity"], 2.0)
+        self.assertEqual(derivation["summary_quantity"], 4.0)
+        self.assertEqual(derivation["allocated_quantity"], 2.0)
+
+    def test_a_summary_fully_accounted_for_leaves_no_residual_quantity(self) -> None:
+        self.assertIsNone(self.derive(2, [1, 1]))
+
+    def test_an_unknown_summary_quantity_derives_nothing(self) -> None:
+        self.assertIsNone(self.derive(None, [1]))
+
+    def test_an_order_without_a_reviewed_quantity_derives_nothing(self) -> None:
+        # Subtracting an incomplete allocation would silently inflate the residual.
+        self.assertIsNone(self.derive(4, [1, None]))
+
+    def test_an_allocation_exceeding_the_summary_derives_nothing(self) -> None:
+        self.assertIsNone(self.derive(2, [2, 1]))
+
+
 if __name__ == "__main__":
     unittest.main()

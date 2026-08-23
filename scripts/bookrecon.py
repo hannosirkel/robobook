@@ -1022,11 +1022,21 @@ def printful_wallet_summary(
 
 
 def build_wallet_funding_check(
-    *, normalized_path_display: str, records: dict[str, list[dict[str, Any]]]
+    *,
+    normalized_path_display: str,
+    records: dict[str, list[dict[str, Any]]],
+    annual_clearing_records: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Reconcile card-funded wallet movements, so an unattributed one cannot pass silently."""
-    rows = _wallet_rows(records.get("clearing_transactions", []))
-    if not rows:
+    """Reconcile card-funded wallet movements, so an unattributed one cannot pass silently.
+
+    The funding and its reversal need not fall in the same month -- a wallet topped up in
+    April can be refunded in July -- so the equation is evaluated over the year's movements
+    where they are available. Judging it a month at a time would fail July for spending
+    April's money.
+    """
+    period_rows = _wallet_rows(records.get("clearing_transactions", []))
+    rows = _wallet_rows(list((annual_clearing_records or {}).values())) or period_rows
+    if not period_rows:
         return make_check(
             check_id="wallet-funding-equation",
             name="Wallet funding equation",
@@ -1062,7 +1072,7 @@ def build_wallet_funding_check(
         rhs_amount=summary["personal"]["refunds"],
         delta=summary["personal"]["liability_change"],
         notes=notes,
-        evidence_refs=[make_artifact_ref(normalized_path_display, record_refs_list=record_refs(rows))],
+        evidence_refs=[make_artifact_ref(normalized_path_display, record_refs_list=record_refs(period_rows))],
     )
 
 
@@ -1776,6 +1786,7 @@ def build_recon_document(
         build_wallet_funding_check(
             normalized_path_display=normalized_path_display,
             records=records,
+            annual_clearing_records=annual_clearing_records,
         ),
         build_woo_sales_vs_processor_check(
             normalized_path_display=normalized_path_display,

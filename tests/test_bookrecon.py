@@ -1349,6 +1349,34 @@ class WalletFundingCheckTests(unittest.TestCase):
         self.assertEqual(result["status"], "fail")
         self.assertIn("refund exceeds", " ".join(result["notes"]).lower())
 
+    def test_a_refund_of_an_earlier_months_funding_is_not_a_failure(self) -> None:
+        # Deposits in April, refunds in July: within July alone the refunds exceed that
+        # month's deposits, but the year's funding covers them.
+        annual = {
+            "d-apr": deposit("45.00", record_id="d-apr"),
+            "r-jul": refund("15.00", record_id="r-jul"),
+        }
+        result = bookrecon.build_wallet_funding_check(
+            normalized_path_display="normalized.json",
+            records={"clearing_transactions": [annual["r-jul"]]},
+            annual_clearing_records=annual,
+        )
+
+        self.assertEqual(result["status"], "pass")
+
+    def test_the_annual_view_still_catches_an_impossible_refund(self) -> None:
+        annual = {
+            "d1": deposit("10.00", record_id="d1"),
+            "r1": refund("11.00", record_id="r1"),
+        }
+        result = bookrecon.build_wallet_funding_check(
+            normalized_path_display="normalized.json",
+            records={"clearing_transactions": [annual["r1"]]},
+            annual_clearing_records=annual,
+        )
+
+        self.assertEqual(result["status"], "fail")
+
     def test_a_row_without_a_reviewed_owner_is_reported_not_blocked(self) -> None:
         # The printout parser already refuses an unknown card; a source with no card data
         # at all is named here rather than blocking a period that predates attribution.

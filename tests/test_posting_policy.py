@@ -407,5 +407,76 @@ class ProcessorCashAccountTests(unittest.TestCase):
         self.assertIn("not one of the explicit posting-policy accounts", " ".join(errors))
 
 
+class DeclaredWarehouseRoutingTests(unittest.TestCase):
+    def policy(self) -> dict:
+        return dict(
+            statement_import_policy_fixture(),
+            contacts={"sales": {"woo": "42"}, "processors": {}, "suppliers": {}},
+            mappings={
+                "woo-taxable": {
+                    "income_account_id": "107",
+                    "vat_type_id": "25",
+                    "warehouse_id": "6",
+                    "article_id": "3",
+                }
+            },
+        )
+
+    def action(self, routing: dict | None, *, warehouse_hint: str) -> dict:
+        summary_scope = {"channel_or_source": "woo", "posting_family": "woo-taxable", "tax_profile": "taxable"}
+        if routing is not None:
+            summary_scope["warehouse_routing"] = routing
+        return {
+            "action_type": "create_invoice_summary",
+            "payload": {
+                "document_date": "2024-01-31",
+                "summary_scope": summary_scope,
+                "posting_policy_family": "woo-taxable",
+                "counterparty": {"contact_id": "42"},
+                "totals": {"vat_amount": 10.0},
+                "line_items": [{
+                    "line_role": "sales_revenue",
+                    "suggested_income_account_id": "107",
+                    "suggested_vat_type_id": "25",
+                    "warehouse_id_hint": warehouse_hint,
+                    "article_id_hint": "3",
+                }],
+            },
+        }
+
+    def test_a_declared_routing_is_accepted_only_when_policy_reproduces_it(self) -> None:
+        routing = {"channel": "woo", "warehouse_id": "1", "order_numbers": [1000, 1001]}
+
+        self.assertEqual(
+            posting_policy.action_policy_errors(self.action(routing, warehouse_hint="1"), self.policy()), []
+        )
+
+    def test_a_routing_the_policy_contradicts_is_rejected(self) -> None:
+        routing = {"channel": "woo", "warehouse_id": "1", "order_numbers": [999]}
+
+        errors = posting_policy.action_policy_errors(self.action(routing, warehouse_hint="1"), self.policy())
+
+        self.assertIn("routes to warehouse '6'", " ".join(errors))
+
+    def test_a_line_that_ignores_its_declared_routing_is_rejected(self) -> None:
+        routing = {"channel": "woo", "warehouse_id": "1", "order_numbers": [1000]}
+
+        errors = posting_policy.action_policy_errors(self.action(routing, warehouse_hint="6"), self.policy())
+
+        self.assertIn("Line warehouse does not match", " ".join(errors))
+
+    def test_a_routing_without_order_numbers_is_rejected(self) -> None:
+        routing = {"channel": "woo", "warehouse_id": "1", "order_numbers": []}
+
+        errors = posting_policy.action_policy_errors(self.action(routing, warehouse_hint="1"), self.policy())
+
+        self.assertIn("order numbers", " ".join(errors))
+
+    def test_an_unrouted_action_still_uses_the_family_mapping(self) -> None:
+        self.assertEqual(
+            posting_policy.action_policy_errors(self.action(None, warehouse_hint="6"), self.policy()), []
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

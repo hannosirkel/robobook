@@ -34,6 +34,8 @@ from posting_policy import (
     resolve_contact,
     resolve_mapping,
     resolve_sales_vat_profile,
+    resolve_sales_warehouse,
+    validated_warehouse_routing,
 )
 from reference_artifacts import ReferenceArtifactError, bind_file, validate_discovery, verify_file_binding
 from simplbooks_api import SimplbooksError, resolve_company_id, resolve_company_name
@@ -901,6 +903,69 @@ def taxable_profile(record: dict[str, Any]) -> str:
     return "taxable" if abs(decimal_value(record.get("vat_amount"))) > 0 else "non_taxable"
 
 
+def sales_order_number(record: dict[str, Any]) -> int | None:
+    """Return the exact order number of one sales contributor, or None when it has none."""
+    raw = (record.get("attributes") or {}).get("order_id")
+    digits = re.sub(r"[^0-9]", "", str(raw or ""))
+    return int(digits) if digits else None
+
+
+BOUND_WAREHOUSE_CHANNELS = frozenset({"distributor"})
+
+
+def prove_warehouse_transfer_evidence(
+    warehouse_id: str, *, evidence: list[dict[str, Any]] | None
+) -> None:
+    """Refuse a distributor document until a completed transfer proves stock is there.
+
+    Selling from a warehouse nothing was moved into would post a sale against stock the
+    ledger never received, so the proof is required before the document, not after.
+    """
+    matching = [
+        item
+        for item in evidence or []
+        if isinstance(item, dict)
+        and str(item.get("action_type") or "") == "warehouse_transfer"
+        and str(item.get("destination_warehouse_id") or "") == str(warehouse_id)
+        and str(item.get("status") or "") == "complete"
+    ]
+    if not matching:
+        raise SimplbooksError(
+            f"Sales into warehouse {warehouse_id} require bound warehouse transfer evidence "
+            "proving the stock was moved there first."
+        )
+
+
+def routed_sales_warehouse(
+    policy: dict[str, Any] | None, *, group_label: str, record: dict[str, Any]
+) -> str | None:
+    """Resolve the reviewed warehouse for one contributor, or None when policy routes no rule here.
+
+    A channel the policy routes must produce an exact warehouse for every contributor;
+    a missing order number raises rather than falling back to the channel's mapping.
+    """
+    if policy is None:
+        return None
+    try:
+        routing = validated_warehouse_routing(policy)
+        channel = slugify(group_label)
+        if channel not in routing["channels"] and channel not in BOUND_WAREHOUSE_CHANNELS:
+            return None
+        return resolve_sales_warehouse(policy, channel=channel, order_number=sales_order_number(record))
+    except PostingPolicyError as exc:
+        raise SimplbooksError(str(exc)) from exc
+
+
+def routed_warehouse_groups(
+    policy: dict[str, Any] | None, *, group_label: str, records: list[dict[str, Any]]
+) -> dict[str | None, list[dict[str, Any]]]:
+    """Partition contributors by reviewed warehouse so no line spans a routing boundary."""
+    grouped: dict[str | None, list[dict[str, Any]]] = defaultdict(list)
+    for record in records:
+        grouped[routed_sales_warehouse(policy, group_label=group_label, record=record)].append(record)
+    return dict(grouped)
+
+
 def maybe_single_warehouse(records: list[dict[str, Any]]) -> str | None:
     values = summarize_warehouses(records)
     if len(values) == 1:
@@ -1491,6 +1556,8 @@ def build_sales_actions(
     entity_map: dict[str, Any] | None,
     mapping_hints: dict[str, tuple[str | None, list[str]]],
     forced_note: str | None,
+    posting_policy: dict[str, Any] | None = None,
+    inventory_transfer_evidence: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[tuple[str, str], str], dict[str, list[str]]]:
     actions: list[dict[str, Any]] = []
     action_ids: dict[tuple[str, str], str] = {}
@@ -1514,11 +1581,26 @@ def build_sales_actions(
         split_profiles = len(nonempty_profiles) > 1
         matched_processor_labels = matched_processors.get((group_label, currency), [])
 
+        routed_profiles: list[tuple[str, str | None, list[dict[str, Any]]]] = []
         for profile_name in nonempty_profiles or ["non_taxable"]:
-            profile_records = grouped_by_profile.get(profile_name) or list(group_records)
-            if not profile_records:
+            candidate_records = grouped_by_profile.get(profile_name) or list(group_records)
+            if not candidate_records:
                 continue
+            # Contributors on opposite sides of a routing boundary relieve different
+            # warehouses, so they cannot share an inventory line.
+            for warehouse_id, routed_records in sorted(
+                routed_warehouse_groups(
+                    posting_policy, group_label=group_label, records=candidate_records
+                ).items(),
+                key=lambda item: item[0] or "",
+            ):
+                if warehouse_id is not None and slugify(group_label) in BOUND_WAREHOUSE_CHANNELS:
+                    prove_warehouse_transfer_evidence(
+                        warehouse_id, evidence=inventory_transfer_evidence
+                    )
+                routed_profiles.append((profile_name, warehouse_id, routed_records))
 
+        for profile_name, routed_warehouse_id, profile_records in routed_profiles:
             profile_mapping_hints = mapping_hints
             online_sales_override_applied = False
             if slugify(group_label) in ONLINE_SALES_CHANNELS:
@@ -1565,11 +1647,16 @@ def build_sales_actions(
                 review_notes.append(forced_note)
             review_notes.append(record_count_note(profile_records))
 
+            suffix_parts = [profile_name.replace("_", "-")] if split_profiles else []
+            if routed_warehouse_id is not None:
+                for line in lines:
+                    line["warehouse_id_hint"] = routed_warehouse_id
+                suffix_parts.append(f"wh{routed_warehouse_id}")
             action_key_suffix = idempotency_suffix(
                 group_label=group_label,
                 currency=currency,
                 repeated_labels=repeated_sales_labels,
-                extra_suffix=profile_name.replace("_", "-") if split_profiles else None,
+                extra_suffix="-".join(suffix_parts) or None,
             )
             idempotency_key = f"{company_slug}-{period}-sales-{action_key_suffix}"
             payload = {
@@ -1595,6 +1682,18 @@ def build_sales_actions(
             }
             if split_profiles:
                 payload["summary_scope"]["tax_profile"] = profile_name
+            if routed_warehouse_id is not None:
+                # Checker and sender recompute the routing from these facts rather than
+                # trusting the warehouse the builder chose.
+                payload["summary_scope"]["warehouse_routing"] = {
+                    "channel": slugify(group_label),
+                    "warehouse_id": routed_warehouse_id,
+                    "order_numbers": sorted(
+                        number
+                        for number in (sales_order_number(item) for item in profile_records)
+                        if number is not None
+                    ),
+                }
             confidence = review_confidence(
                 open_issues=unresolved_review_issues(review_notes),
                 required_ids=[profile_mapping_hints["revenue_account"][0]],
@@ -2596,8 +2695,11 @@ def build_direct_sale_actions(
             if target.get(field) not in (None, "") and str(target[field]) != expected:
                 raise SimplbooksError(f"Direct-sale target {field} for {record_id} does not match posting policy.")
         profile_period = f"{profile['start']}/{profile['end'] or 'open'}"
+        # One invoice per physical receipt: the immutable statement identity is part of
+        # the key, so each imported statement row matches exactly one document.
         group_key = (
             period,
+            statement_identity(record),
             record_currency(record, base_currency),
             contact_id,
             vat_profile_name,
@@ -2625,6 +2727,7 @@ def build_direct_sale_actions(
     for group_key, entries in sorted(grouped.items(), key=lambda item: repr(item[0])):
         (
             _group_period,
+            _statement_id,
             currency,
             contact_id,
             vat_profile_name,
@@ -3327,7 +3430,14 @@ def apply_posting_policy(
                 line["suggested_vat_type_id"] = resolve_mapping(
                     posting_policy, family=family, field_name=vat_field
                 )
-                if family_values.get("warehouse_id") not in (None, ""):
+                routed_warehouse = str(
+                    ((payload.get("summary_scope") or {}).get("warehouse_routing") or {}).get("warehouse_id") or ""
+                )
+                if routed_warehouse:
+                    # The reviewed order-number boundary is more specific than the
+                    # channel's single mapping, so it decides which warehouse is relieved.
+                    line["warehouse_id_hint"] = routed_warehouse
+                elif family_values.get("warehouse_id") not in (None, ""):
                     line["warehouse_id_hint"] = resolve_mapping(
                         posting_policy, family=family, field_name="warehouse_id"
                     )
@@ -3430,6 +3540,7 @@ def build_action_batch(
     discovery_overview: dict[str, Any] | None = None,
     discovery_overviews: list[dict[str, Any]] | None = None,
     bank_allocations: dict[tuple[str, str, str], dict[str, Any]] | None = None,
+    inventory_transfer_evidence: list[dict[str, Any]] | None = None,
     force: bool = False,
 ) -> dict[str, Any]:
     if normalized_payload.get("period") != recon_payload.get("period"):
@@ -3506,6 +3617,8 @@ def build_action_batch(
         entity_map=entity_map,
         mapping_hints=mapping_hints,
         forced_note=forced_note,
+        posting_policy=posting_policy,
+        inventory_transfer_evidence=inventory_transfer_evidence,
     )
     fee_actions, _fee_action_ids = build_fee_actions(
         company_slug=company_slug,

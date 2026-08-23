@@ -565,6 +565,35 @@ def prohibited_bank_cash_action(action: dict[str, Any], policy: dict[str, Any]) 
     return str(payload.get("bank_account_id") or "") in bank_income_account_ids(policy)
 
 
+def recomputed_sales_routing(
+    payload: dict[str, Any], policy: dict[str, Any]
+) -> tuple[str | None, list[str]]:
+    """Recompute a declared warehouse routing from policy rather than trusting the batch."""
+    declared = (payload.get("summary_scope") or {}).get("warehouse_routing")
+    if not isinstance(declared, dict):
+        return None, []
+    channel = str(declared.get("channel") or "")
+    warehouse_id = str(declared.get("warehouse_id") or "")
+    order_numbers = declared.get("order_numbers")
+    if not channel or not warehouse_id or not isinstance(order_numbers, list) or not order_numbers:
+        return None, ["Declared warehouse routing requires a channel, warehouse, and order numbers."]
+    errors: list[str] = []
+    for order_number in order_numbers:
+        if isinstance(order_number, bool) or not isinstance(order_number, int):
+            errors.append(f"Declared warehouse routing order number {order_number!r} is not an exact integer.")
+            continue
+        try:
+            expected = resolve_sales_warehouse(policy, channel=channel, order_number=order_number)
+        except PostingPolicyError as exc:
+            errors.append(str(exc))
+            continue
+        if expected != warehouse_id:
+            errors.append(
+                f"Order {order_number} routes to warehouse {expected!r}, not the declared {warehouse_id!r}."
+            )
+    return (None, errors) if errors else (warehouse_id, [])
+
+
 def action_policy_errors(action: dict[str, Any], policy: dict[str, Any]) -> list[str]:
     """Independently compare every submit-capable ID in an action with explicit policy."""
     payload = action.get("payload") or {}
@@ -630,6 +659,9 @@ def action_policy_errors(action: dict[str, Any], policy: dict[str, Any]) -> list
     if not isinstance(family_values, dict):
         errors.append(f"Posting family {family!r} is absent from the explicit posting policy.")
         return errors
+
+    routed_warehouse_id, routing_errors = recomputed_sales_routing(payload, policy)
+    errors.extend(routing_errors)
     if str(payload.get("posting_policy_family") or "") != family:
         errors.append(f"Action is not bound to posting-policy family {family!r}.")
 
@@ -662,6 +694,8 @@ def action_policy_errors(action: dict[str, Any], policy: dict[str, Any]) -> list
         if str(line.get("suggested_vat_type_id") or "") != expected_vat:
             errors.append(f"Line VAT type does not match policy family {family!r}.")
         expected_warehouse = family_values.get("warehouse_id") if role == "sales" else line_values.get("warehouse_id")
+        if role == "sales" and routed_warehouse_id is not None:
+            expected_warehouse = routed_warehouse_id
         actual_warehouse = line.get("warehouse_id_hint")
         if str(actual_warehouse or "") != str(expected_warehouse or ""):
             errors.append(f"Line warehouse does not match policy family {family!r}.")

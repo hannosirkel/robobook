@@ -2478,5 +2478,62 @@ class WalletPrintoutDetectionTests(unittest.TestCase):
             )
 
 
+class ParserSupersessionTests(unittest.TestCase):
+    def source(self, name: str, parser: str, source_type: str, root: Path) -> bookprep.SourceDescriptor:
+        path = root / name
+        path.write_text("x", encoding="utf-8")
+        return bookprep.SourceDescriptor(
+            path=path, rel_path=name, source_id=name, source_type=source_type,
+            source_system="printful", covered_from=date(2024, 1, 1), covered_until=date(2024, 12, 31),
+            canonical_group=bookprep.canonical_group_for_path(path), parser_name=parser, canonical=True,
+        )
+
+    def sources(self, root: Path) -> list[bookprep.SourceDescriptor]:
+        return [
+            self.source("Wallet_2024_H1.csv", "parse_printful_wallet_csv", "csv", root),
+            self.source("Wallet_2024_H2.csv", "parse_printful_wallet_csv", "csv", root),
+            self.source("wallet-printout.txt", "parse_printful_wallet_printout", "other", root),
+        ]
+
+    def test_the_richer_wallet_source_supersedes_the_thinner_ones(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sources = self.sources(Path(tmp))
+
+            bookprep.apply_parser_supersession(sources)
+
+            canonical = {s.rel_path for s in sources if s.canonical}
+            self.assertEqual(canonical, {"wallet-printout.txt"})
+
+    def test_the_superseding_source_records_what_it_replaced(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sources = self.sources(Path(tmp))
+
+            bookprep.apply_parser_supersession(sources)
+
+            winner = next(s for s in sources if s.canonical)
+            self.assertEqual(sorted(winner.preferred_over), ["Wallet_2024_H1.csv", "Wallet_2024_H2.csv"])
+            superseded = next(s for s in sources if not s.canonical)
+            self.assertTrue(any("Superseded" in note for note in superseded.parser_notes))
+
+    def test_the_csv_stays_canonical_when_no_printout_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sources = [s for s in self.sources(Path(tmp)) if s.parser_name == "parse_printful_wallet_csv"]
+
+            bookprep.apply_parser_supersession(sources)
+
+            self.assertTrue(all(s.canonical for s in sources))
+
+    def test_an_unrelated_source_is_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sources = [*self.sources(root),
+                       self.source("Orders_2024_H1.csv", "parse_printful_orders_csv", "csv", root)]
+
+            bookprep.apply_parser_supersession(sources)
+
+            orders = next(s for s in sources if s.parser_name == "parse_printful_orders_csv")
+            self.assertTrue(orders.canonical)
+
+
 if __name__ == "__main__":
     unittest.main()

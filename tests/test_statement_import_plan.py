@@ -566,5 +566,51 @@ class DirectSaleTargetTests(unittest.TestCase):
             build(allocation_payload=allocations([FEE_ALLOCATION, broken]))
 
 
+class RatePathResolutionTests(unittest.TestCase):
+    def test_the_company_rate_cache_is_found_without_being_named(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            company_dir = Path(raw)
+            reference = company_dir / "artifacts" / "reference"
+            reference.mkdir(parents=True)
+            cache = reference / "ecb-rates-2024.json"
+            cache.write_text("{}", encoding="utf-8")
+
+            self.assertEqual(
+                statement_import_plan.resolve_rate_paths(company_dir=company_dir, year=2024, override=None),
+                [cache],
+            )
+
+    def test_another_years_cache_is_not_picked_up(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            company_dir = Path(raw)
+            reference = company_dir / "artifacts" / "reference"
+            reference.mkdir(parents=True)
+            (reference / "ecb-rates-2025.json").write_text("{}", encoding="utf-8")
+
+            self.assertEqual(
+                statement_import_plan.resolve_rate_paths(company_dir=company_dir, year=2024, override=None), []
+            )
+
+    def test_an_explicit_override_wins(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            company_dir = Path(raw)
+            reference = company_dir / "artifacts" / "reference"
+            reference.mkdir(parents=True)
+            (reference / "ecb-rates-2024.json").write_text("{}", encoding="utf-8")
+            chosen = company_dir / "elsewhere.json"
+            chosen.write_text("{}", encoding="utf-8")
+
+            self.assertEqual(
+                statement_import_plan.resolve_rate_paths(company_dir=company_dir, year=2024, override=[chosen]),
+                [chosen],
+            )
+
+    def test_a_company_with_no_cache_resolves_to_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            self.assertEqual(
+                statement_import_plan.resolve_rate_paths(company_dir=Path(raw), year=2024, override=None), []
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

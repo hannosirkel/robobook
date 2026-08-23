@@ -660,6 +660,15 @@ def _rate_bindings(paths: list[Path]) -> list[dict[str, Any]]:
     ]
 
 
+def resolve_rate_paths(
+    *, company_dir: Path, year: int, override: list[Path] | None
+) -> list[Path]:
+    """Find the year's ECB rate caches, so a caller never has to name them to be correct."""
+    if override:
+        return sorted(override)
+    return sorted((company_dir / "artifacts" / "reference").glob(f"ecb-rates-{year}*.json"))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Build the canonical annual statement-import plan.")
     parser.add_argument("--company-dir", required=True, type=Path)
@@ -691,7 +700,9 @@ def main(argv: list[str] | None = None) -> int:
             normalized_payloads=[_load_json(path) for path in normalized_paths],
             allocation_payload=allocation_payload,
             policy=_load_json(policy_path),
-            rate_bindings=_rate_bindings(sorted(args.rates or [])),
+            rate_bindings=_rate_bindings(
+                resolve_rate_paths(company_dir=company_dir, year=args.year, override=args.rates)
+            ),
         )
         result = write_plan_artifacts(plan, output_dir=output_dir)
     except (BankAllocationError, StatementImportPlanError, PostingPolicyError) as exc:

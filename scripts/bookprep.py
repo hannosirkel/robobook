@@ -783,6 +783,32 @@ def inspect_purchase_note_markdown(
     return descriptors
 
 
+# One logical stream can be described by more than one file. Filename-based grouping
+# cannot see that, and source-type priority would pick the thinner description, so the
+# richer-description relationship is declared here.
+PARSER_SUPERSEDES: dict[str, tuple[str, ...]] = {
+    "parse_printful_wallet_printout": ("parse_printful_wallet_csv",),
+}
+
+
+def apply_parser_supersession(sources: list[SourceDescriptor]) -> None:
+    """Drop a thinner description of a stream another canonical source already describes.
+
+    Without this the wallet CSV and the wallet printout both stay canonical and the same
+    movement is counted twice, once from each.
+    """
+    for winner in [s for s in sources if s.canonical and s.parser_name in PARSER_SUPERSEDES]:
+        superseded_parsers = PARSER_SUPERSEDES[winner.parser_name]
+        for entry in sources:
+            if entry is winner or not entry.canonical or entry.parser_name not in superseded_parsers:
+                continue
+            if entry.source_system != winner.source_system:
+                continue
+            entry.canonical = False
+            entry.parser_notes.append(f"Superseded by richer canonical source {winner.source_id}.")
+            winner.preferred_over.append(entry.source_id)
+
+
 def choose_canonical_sources(sources: list[SourceDescriptor]) -> list[SourceDescriptor]:
     grouped: dict[str, list[SourceDescriptor]] = {}
     for source in sources:
@@ -805,6 +831,8 @@ def choose_canonical_sources(sources: list[SourceDescriptor]) -> list[SourceDesc
             for entry in entries:
                 entry.canonical = False
                 entry.parser_notes.append("Reference-only source group; no canonical machine-readable input available.")
+
+    apply_parser_supersession(sources)
     return sources
 
 

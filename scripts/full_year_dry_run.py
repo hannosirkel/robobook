@@ -8,6 +8,7 @@ import json
 import subprocess
 import sys
 from collections import defaultdict
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -41,31 +42,88 @@ PHASES = (
     "statement_import_pending",
     "ledger_evidence_pending",
     "inventory_audit_pending",
+    "fx_revaluation_pending",
     "final_checks_ready",
 )
 
 
-def resolve_run_phase(
-    *,
-    statement_import_mode: bool,
-    master_data_resolved: bool,
-    documents_ready: bool,
-    ledger_evidence_status: str | None,
-    inventory_audit_status: str | None,
-) -> str:
+def fx_revaluation_state(evidence: dict[str, Any] | None) -> dict[str, Any]:
+    """Answer both halves of the year-end FX question: is it needed, and was it done?
+
+    Revaluing a held foreign-currency balance is a journal entry, and the published API
+    has no endpoint for one, so it stays a manual step. A manual step with no record is
+    indistinguishable from one nobody did, which is why absent evidence reads as
+    unanswered rather than as settled.
+    """
+    if not evidence:
+        return {
+            "verdict": "unknown",
+            "settled": False,
+            "reason": "No year-end FX revaluation evidence exists, so it is unknown whether one is needed.",
+        }
+    balances = evidence.get("balances") or {}
+    has_foreign_balance = any(
+        Decimal(str(amount)) != 0 for amount in balances.values() if str(amount).strip()
+    )
+    required = bool(evidence.get("required"))
+    status = str(evidence.get("status") or "")
+
+    if has_foreign_balance and not required:
+        return {
+            "verdict": "contradictory",
+            "settled": False,
+            "reason": (
+                "Evidence claims no revaluation is required while reporting a non-zero "
+                f"foreign-currency balance: {balances}."
+            ),
+        }
+    if not required and not has_foreign_balance:
+        return {
+            "verdict": "not_required",
+            "settled": True,
+            "reason": "No foreign-currency balance remained at year end, so no revaluation is due.",
+        }
+    if status == "posted":
+        return {
+            "verdict": "posted",
+            "settled": True,
+            "reason": "The year-end FX revaluation entry is recorded as posted.",
+        }
+    return {
+        "verdict": "pending",
+        "settled": False,
+        "reason": f"A year-end FX revaluation is required for {sorted(balances)} and is not yet posted.",
+    }
+
+
+@dataclass(frozen=True)
+class YearGates:
+    """What a year's evidence currently proves. Each field is one gate on the way to done."""
+
+    statement_import_mode: bool
+    master_data_resolved: bool
+    documents_ready: bool
+    ledger_evidence_status: str | None
+    inventory_audit_status: str | None
+    fx_revaluation_settled: bool
+
+
+def resolve_run_phase(gates: YearGates) -> str:
     """Report the furthest phase the year's evidence actually supports."""
-    if not master_data_resolved:
+    if not gates.master_data_resolved:
         return "source_ready"
-    if not documents_ready:
+    if not gates.documents_ready:
         return "master_data_ready"
-    if not statement_import_mode:
+    if not gates.statement_import_mode:
         return "documents_ready"
-    if ledger_evidence_status is None:
+    if gates.ledger_evidence_status is None:
         return "statement_import_pending"
-    if ledger_evidence_status != "pass":
+    if gates.ledger_evidence_status != "pass":
         return "ledger_evidence_pending"
-    if inventory_audit_status != "pass":
+    if gates.inventory_audit_status != "pass":
         return "inventory_audit_pending"
+    if not gates.fx_revaluation_settled:
+        return "fx_revaluation_pending"
     return "final_checks_ready"
 
 
@@ -665,12 +723,18 @@ def run_phase_from_evidence(
     inventory_audit = load_optional_json(
         company_dir / "artifacts" / "audits" / f"{year}-inventory-equation.json"
     )
+    fx_revaluation = load_optional_json(
+        company_dir / "artifacts" / "audits" / f"{year}-fx-revaluation.json"
+    )
     return resolve_run_phase(
-        statement_import_mode=statement_import_mode,
-        master_data_resolved=master_data_resolved,
-        documents_ready=documents_ready,
-        ledger_evidence_status=str(ledger_evidence.get("status")) if ledger_evidence else None,
-        inventory_audit_status=str(inventory_audit.get("status")) if inventory_audit else None,
+        YearGates(
+            statement_import_mode=statement_import_mode,
+            master_data_resolved=master_data_resolved,
+            documents_ready=documents_ready,
+            ledger_evidence_status=str(ledger_evidence.get("status")) if ledger_evidence else None,
+            inventory_audit_status=str(inventory_audit.get("status")) if inventory_audit else None,
+            fx_revaluation_settled=fx_revaluation_state(fx_revaluation or None)["settled"],
+        )
     )
 
 

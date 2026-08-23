@@ -238,5 +238,35 @@ class StockEquationTests(unittest.TestCase):
         self.assertIn("no selected closing count", " ".join(result["errors"]))
 
 
+REMNANT_ACTION = {"article_id": "3", "warehouse_id": "9"}
+
+
+class RemnantParsingTests(unittest.TestCase):
+
+    def test_a_warehouse_that_never_held_the_article_reads_as_zero(self) -> None:
+        # SimplBooks returns an empty list, not 0, for an article with no stock rows.
+        self.assertEqual(
+            inventory_verification.remnant_value(REMNANT_ACTION, {"data": {"3": []}}), Decimal(0)
+        )
+
+    def test_a_warehouse_emptied_to_zero_still_reads_as_zero(self) -> None:
+        self.assertEqual(
+            inventory_verification.remnant_value(REMNANT_ACTION, {"data": {"3": {"9": 0}}}), Decimal(0)
+        )
+
+    def test_an_actual_quantity_is_read_exactly(self) -> None:
+        self.assertEqual(
+            inventory_verification.remnant_value(REMNANT_ACTION, {"data": {"3": {"9": 640}}}), Decimal(640)
+        )
+
+    def test_an_unknown_article_is_still_a_lookup_failure(self) -> None:
+        with self.assertRaisesRegex(inventory_verification.SimplbooksError, "did not contain"):
+            inventory_verification.remnant_value(REMNANT_ACTION, {"data": {"5": {"9": 1}}})
+
+    def test_an_unknown_warehouse_is_still_a_lookup_failure(self) -> None:
+        with self.assertRaisesRegex(inventory_verification.SimplbooksError, "did not contain"):
+            inventory_verification.remnant_value(REMNANT_ACTION, {"data": {"3": {"1": 972}}})
+
+
 if __name__ == "__main__":
     unittest.main()

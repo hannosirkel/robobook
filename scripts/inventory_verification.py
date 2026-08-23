@@ -256,9 +256,22 @@ def load_manual_inventory_actions(path: Path) -> dict[str, Any]:
 
 
 def remnant_value(action: dict[str, Any], remnant_response: dict[str, Any]) -> Decimal:
+    """Read one dated remnant, treating "no stock rows at all" as the zero it is.
+
+    SimplBooks answers an article with no stock anywhere with an empty list rather than
+    a zero. Left unhandled that is indistinguishable from a genuine lookup failure, so a
+    warehouse that has simply never held the article would look like a wrong ID.
+    """
     try:
         data = remnant_response["data"]
         article = data[str(action["article_id"])]
+    except (KeyError, TypeError) as exc:
+        raise SimplbooksError("Dated inventory remnant response did not contain the requested article and warehouse.") from exc
+    if isinstance(article, list):
+        if article:
+            raise SimplbooksError("Dated inventory remnant response has an unexpected article payload.")
+        return Decimal(0)
+    try:
         value = article[str(action["warehouse_id"])]
     except (KeyError, TypeError) as exc:
         raise SimplbooksError("Dated inventory remnant response did not contain the requested article and warehouse.") from exc

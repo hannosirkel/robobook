@@ -1184,9 +1184,10 @@ class RunPhaseTests(unittest.TestCase):
             "documents_ready": True,
             "ledger_evidence_status": None,
             "inventory_audit_status": None,
+            "fx_revaluation_settled": False,
         }
         kwargs.update(overrides)
-        return full_year_dry_run.resolve_run_phase(**kwargs)
+        return full_year_dry_run.resolve_run_phase(full_year_dry_run.YearGates(**kwargs))
 
     def test_every_phase_it_can_return_is_a_declared_phase(self) -> None:
         phases = {
@@ -1215,7 +1216,92 @@ class RunPhaseTests(unittest.TestCase):
 
     def test_everything_proven_reaches_the_final_checks(self) -> None:
         self.assertEqual(
-            self.resolve(ledger_evidence_status="pass", inventory_audit_status="pass"), "final_checks_ready"
+            self.resolve(
+                ledger_evidence_status="pass",
+                inventory_audit_status="pass",
+                fx_revaluation_settled=True,
+            ),
+            "final_checks_ready",
+        )
+
+    def test_an_unanswered_fx_revaluation_holds_an_otherwise_proven_year(self) -> None:
+        self.assertEqual(
+            self.resolve(ledger_evidence_status="pass", inventory_audit_status="pass"),
+            "fx_revaluation_pending",
+        )
+
+
+class FxRevaluationGateTests(unittest.TestCase):
+    def status(self, **overrides: object) -> dict:
+        evidence = {
+            "year": 2024,
+            "required": True,
+            "status": "pending",
+            "balances": {"USD": "4670.50"},
+        }
+        evidence.update(overrides)
+        return full_year_dry_run.fx_revaluation_state(evidence)
+
+    def test_a_year_with_no_foreign_balance_needs_no_revaluation(self) -> None:
+        state = self.status(required=False, balances={}, status="not_required")
+
+        self.assertEqual(state["verdict"], "not_required")
+        self.assertTrue(state["settled"])
+
+    def test_a_required_but_unposted_revaluation_is_not_settled(self) -> None:
+        state = self.status()
+
+        self.assertEqual(state["verdict"], "pending")
+        self.assertFalse(state["settled"])
+
+    def test_a_posted_revaluation_settles_the_year(self) -> None:
+        state = self.status(status="posted")
+
+        self.assertEqual(state["verdict"], "posted")
+        self.assertTrue(state["settled"])
+
+    def test_absent_evidence_is_treated_as_unanswered_not_as_done(self) -> None:
+        state = full_year_dry_run.fx_revaluation_state(None)
+
+        self.assertEqual(state["verdict"], "unknown")
+        self.assertFalse(state["settled"])
+
+    def test_a_foreign_balance_with_a_not_required_claim_is_contradictory(self) -> None:
+        state = self.status(required=False, status="not_required")
+
+        self.assertEqual(state["verdict"], "contradictory")
+        self.assertFalse(state["settled"])
+
+
+class FxRevaluationPhaseTests(unittest.TestCase):
+    def resolve(self, **overrides: object) -> str:
+        kwargs: dict = {
+            "statement_import_mode": True,
+            "master_data_resolved": True,
+            "documents_ready": True,
+            "ledger_evidence_status": "pass",
+            "inventory_audit_status": "pass",
+            "fx_revaluation_settled": True,
+        }
+        kwargs.update(overrides)
+        return full_year_dry_run.resolve_run_phase(full_year_dry_run.YearGates(**kwargs))
+
+    def test_an_unsettled_revaluation_holds_the_year_open(self) -> None:
+        self.assertEqual(self.resolve(fx_revaluation_settled=False), "fx_revaluation_pending")
+
+    def test_a_settled_revaluation_reaches_the_final_checks(self) -> None:
+        self.assertEqual(self.resolve(), "final_checks_ready")
+
+    def test_the_revaluation_gate_sits_after_the_inventory_audit(self) -> None:
+        phases = full_year_dry_run.PHASES
+
+        self.assertLess(phases.index("inventory_audit_pending"), phases.index("fx_revaluation_pending"))
+        self.assertLess(phases.index("fx_revaluation_pending"), phases.index("final_checks_ready"))
+
+    def test_an_earlier_gate_still_wins_over_the_revaluation_gate(self) -> None:
+        self.assertEqual(
+            self.resolve(inventory_audit_status="fail", fx_revaluation_settled=False),
+            "inventory_audit_pending",
         )
 
 

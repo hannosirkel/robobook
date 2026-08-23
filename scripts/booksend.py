@@ -1413,9 +1413,12 @@ def execute_batch(
         if isinstance(dependency, dict)
         and str(dependency.get("kind") or "") == "manual_statement_import_financial_transaction"
     ]
+    statement_import_batch = str(action_batch.get("cash_posting_mode") or "") == "statement_import"
     discovery_payloads: list[dict[str, Any]] = []
     discovery_errors: list[str] = []
-    if manual_dependencies and cwd is not None:
+    if manual_dependencies and cwd is not None and not statement_import_batch:
+        # In statement-import mode no live per-row cash transaction is expected to exist
+        # yet, so there is nothing for a discovery lookup to find.
         discovery_payloads, discovery_errors = load_bound_discovery_payloads(
             action_batch, cwd=cwd, expected_company_id=expected_company_id,
         )
@@ -1425,7 +1428,7 @@ def execute_batch(
             DependencyCheckContext(
                 cwd=cwd, expected_company_id=expected_company_id,
                 require_typed_context=True, discovery_payloads=discovery_payloads,
-                statement_import_mode=str(action_batch.get("cash_posting_mode") or "") == "statement_import",
+                statement_import_mode=statement_import_batch,
             ),
         )
         dependency_errors.extend(discovery_errors)
@@ -1435,6 +1438,10 @@ def execute_batch(
                 f"{dependency.get('record_id') or '<unknown>'}: {dependency_errors[0]}"
             )
         proof = dependency.get("statement_import_proof") or {}
+        if statement_import_batch:
+            # The annual plan assigns this row and post-import ledger evidence proves it.
+            # The API sends no cash for it, so a pending proof stops nothing here.
+            continue
         if dependency.get("blocking") is not False or proof.get("status") != "verified":
             raise SimplbooksError(
                 "Action batch contains a pending manual statement-import financial dependency; "

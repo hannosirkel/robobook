@@ -1564,7 +1564,8 @@ class StatementImportSenderTests(unittest.TestCase):
         }
 
     def statement_batch(self, **overrides: object) -> dict:
-        batch = make_batch(actions=[incoming_action()])
+        batch = make_batch(actions=[incoming_action()],
+                           unresolved_dependencies=overrides.pop("unresolved_dependencies", None))
         batch["cash_posting_mode"] = "statement_import"
         batch.update(overrides)
         return batch
@@ -1631,6 +1632,50 @@ class StatementImportSenderTests(unittest.TestCase):
             )
 
         self.assertEqual(client.calls, [])
+
+    def manual_dependency(self, *, blocking: bool = False) -> dict:
+        return {
+            "kind": "manual_statement_import_financial_transaction",
+            "blocking": blocking,
+            "record_id": "bank:3",
+            "statement_id": "archive:a",
+            "disposition": "bank_fee_payment",
+            "date": "2024-01-10",
+            "iban": "EE123",
+            "currency": "EUR",
+            "physical_signed_amount": -2.0,
+            "reason": "Assigned by the annual statement-import plan.",
+            "reviewed_rationale": "Reviewed bank fee.",
+            "source_ref": {
+                "path": "companies/example/artifacts/normalized/2024-01.json",
+                "record_ref": "bank:3", "note": None, "source_kind": "physical_bank",
+            },
+            "target": {"document_type": "financial_transaction", "transaction_family": "bank-fee"},
+            "split_parts": [],
+            "split_proof": None,
+            "statement_import_proof": {"status": "pending", "required_evidence": "live_discovery_or_audit"},
+        }
+
+    def test_import_mode_does_not_demand_live_proof_for_a_planned_row(self) -> None:
+        action = invoice_action()
+        action["depends_on"] = []
+        batch = self.statement_batch(actions=[action],
+                                     unresolved_dependencies=[self.manual_dependency()])
+
+        # The plan carries this row and the API sends no cash for it, so a dry run proceeds.
+        _updated, summary = booksend.execute_batch(action_batch=batch, mode="dry-run", client=None)
+
+        self.assertEqual(summary["mode"], "dry-run")
+
+    def test_api_cash_mode_still_refuses_a_pending_dependency(self) -> None:
+        action = invoice_action()
+        action["depends_on"] = []
+        batch = make_batch(actions=[action],
+                           unresolved_dependencies=[self.manual_dependency(blocking=True)])
+        batch["cash_posting_mode"] = "api"
+
+        with self.assertRaisesRegex(SimplbooksError, "pending manual statement-import"):
+            booksend.execute_batch(action_batch=batch, mode="dry-run", client=None)
 
     def test_sender_still_settles_a_reviewed_processor_account_in_statement_import_mode(self) -> None:
         action = incoming_action()

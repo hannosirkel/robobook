@@ -738,6 +738,43 @@ def run_phase_from_evidence(
     )
 
 
+def normalize_all_periods(
+    *,
+    periods: list[str],
+    command_for: Any,
+    cwd: Path,
+    continue_on_error: bool,
+) -> None:
+    """Normalize every period before anything derived from the normalized data is built."""
+    for period in periods:
+        run = subprocess.run(command_for(period), cwd=cwd, capture_output=True, text=True)  # noqa: PLW1510
+        if run.returncode != 0 and not continue_on_error:
+            raise SimplbooksError(
+                f"Normalization failed for {period} before the annual plan could be built: "
+                + (run.stderr or run.stdout or "unknown error").strip()
+            )
+
+
+def normalize_then_plan(
+    *,
+    periods: list[str],
+    command_for: Any,
+    plan: Any,
+    cwd: Path,
+    continue_on_error: bool,
+) -> dict[str, Any]:
+    """Normalize every period, then build the annual plan from what that produced.
+
+    The plan is derived from the normalized artifacts, so building it first would describe
+    the previous run's normalization -- and on a fresh company there would be nothing to
+    describe at all.
+    """
+    normalize_all_periods(
+        periods=periods, command_for=command_for, cwd=cwd, continue_on_error=continue_on_error,
+    )
+    return plan()
+
+
 def generate_annual_statement_plan(
     *,
     company_dir: Path,
@@ -788,11 +825,21 @@ def run_full_year_dry_run(
     overall_success = True
 
     statement_import_mode = statement_import_year(company_dir)
+    target_periods = periods_for_year(year)
+
     plan_step = (
-        generate_annual_statement_plan(
-            company_dir=company_dir,
-            year=year,
-            python_executable=python_executable,
+        normalize_then_plan(
+            periods=target_periods,
+            command_for=lambda period: build_step_command(
+                python_executable=python_executable, company_dir=company_dir, period=period,
+                step_name="bookprep", script_name="bookprep.py", source_dir=source_dir,
+                force_build=force_build, woo_tax_allocation=woo_tax_allocation,
+                bank_allocations=bank_allocations,
+            ),
+            plan=lambda: generate_annual_statement_plan(
+                company_dir=company_dir, year=year, python_executable=python_executable,
+                cwd=cwd, continue_on_error=continue_on_error,
+            ),
             cwd=cwd,
             continue_on_error=continue_on_error,
         )
@@ -801,7 +848,6 @@ def run_full_year_dry_run(
     )
     overall_success = overall_success and (plan_step is None or plan_step["ok"])
 
-    target_periods = periods_for_year(year)
     for period in target_periods:
         submission_state = submitted_month_state(company_dir=company_dir, period=period)
         if submission_state == "submitted":
@@ -814,7 +860,13 @@ def run_full_year_dry_run(
             )
         step_results: list[dict[str, Any]] = []
         month_success = True
-        for step_name, script_name in STEP_SPECS:
+        month_steps = [
+            (step_name, script_name)
+            for step_name, script_name in STEP_SPECS
+            # Normalization already ran for every month before the annual plan was built.
+            if not (statement_import_mode and step_name == "bookprep")
+        ]
+        for step_name, script_name in month_steps:
             cmd = build_step_command(
                 python_executable=python_executable,
                 company_dir=company_dir,

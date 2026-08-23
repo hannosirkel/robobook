@@ -1021,6 +1021,51 @@ def printful_wallet_summary(
     }
 
 
+def build_wallet_funding_check(
+    *, normalized_path_display: str, records: dict[str, list[dict[str, Any]]]
+) -> dict[str, Any]:
+    """Reconcile card-funded wallet movements, so an unattributed one cannot pass silently."""
+    rows = _wallet_rows(records.get("clearing_transactions", []))
+    if not rows:
+        return make_check(
+            check_id="wallet-funding-equation",
+            name="Wallet funding equation",
+            status="skipped",
+            notes=["No wallet movements were normalized for this period."],
+        )
+    summary = printful_wallet_summary(rows)
+    # Attribution is enforced where the source can supply it: the printout parser refuses an
+    # unknown card outright. A source that carries no card at all -- a plain wallet export --
+    # is reported here rather than blocking, while the funding equation itself still fails.
+    errors = [e for e in summary["errors"] if "no reviewed funding owner" not in e]
+    unattributed = [e for e in summary["errors"] if "no reviewed funding owner" in e]
+    notes = [
+        (
+            f"Personal card: deposits {decimal_text(summary['personal']['deposits'])}, "
+            f"refunds {decimal_text(summary['personal']['refunds'])}, "
+            f"liability change {decimal_text(summary['personal']['liability_change'])}."
+        ),
+        (
+            f"Company card: deposits {decimal_text(summary['company']['deposits'])}, "
+            f"refunds {decimal_text(summary['company']['refunds'])}."
+        ),
+        *errors,
+        *unattributed,
+    ]
+    return make_check(
+        check_id="wallet-funding-equation",
+        name="Wallet funding equation",
+        status="fail" if errors else "pass",
+        lhs_label="Personal deposits",
+        lhs_amount=summary["personal"]["deposits"],
+        rhs_label="Personal refunds",
+        rhs_amount=summary["personal"]["refunds"],
+        delta=summary["personal"]["liability_change"],
+        notes=notes,
+        evidence_refs=[make_artifact_ref(normalized_path_display, record_refs_list=record_refs(rows))],
+    )
+
+
 def build_clearing_continuity_checks(
     *,
     normalized_path_display: str,
@@ -1728,6 +1773,10 @@ def build_recon_document(
     checks: list[dict[str, Any]] = [
         physical_bank_check,
         *clearing_checks,
+        build_wallet_funding_check(
+            normalized_path_display=normalized_path_display,
+            records=records,
+        ),
         build_woo_sales_vs_processor_check(
             normalized_path_display=normalized_path_display,
             records=records,

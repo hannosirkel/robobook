@@ -1,5 +1,6 @@
 from __future__ import annotations  # noqa: I001
 
+import json
 import tempfile
 import hashlib
 import sys
@@ -3068,6 +3069,52 @@ class ForeignCurrencyPilotGateTests(unittest.TestCase):
         self.assertEqual(
             bookbuilder.build_foreign_currency_payment_pilot_dependencies(
                 records=records, allocations=allocations, posting_policy=None), [])
+
+
+class TransferEvidencePathTests(unittest.TestCase):
+    def test_the_default_path_sits_with_the_other_company_artifacts(self) -> None:
+        path = bookbuilder.resolve_inventory_transfer_evidence_path(
+            company_dir=Path("companies/example"), normalized_path=Path("x"), period="2024-11", override=None,
+        )
+
+        self.assertEqual(path, Path("companies/example/artifacts/actions/2024-inventory-transfers.json"))
+
+    def test_an_explicit_override_wins(self) -> None:
+        path = bookbuilder.resolve_inventory_transfer_evidence_path(
+            company_dir=Path("companies/example"), normalized_path=Path("x"),
+            period="2024-11", override="elsewhere.json",
+        )
+
+        self.assertEqual(path, Path("elsewhere.json"))
+
+    def test_a_missing_file_loads_as_no_evidence_rather_than_failing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(
+                bookbuilder.load_inventory_transfer_evidence(Path(tmp) / "absent.json"), []
+            )
+
+    def test_a_single_reviewed_transfer_loads_as_one_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.json"
+            path.write_text(json.dumps({
+                "action_type": "warehouse_transfer", "destination_warehouse_id": "9",
+                "source_warehouse_id": "1", "article_id": "3", "status": "complete",
+            }), encoding="utf-8")
+
+            evidence = bookbuilder.load_inventory_transfer_evidence(path)
+
+            self.assertEqual(len(evidence), 1)
+            self.assertEqual(evidence[0]["destination_warehouse_id"], "9")
+
+    def test_a_list_of_transfers_loads_whole(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.json"
+            path.write_text(json.dumps([
+                {"action_type": "warehouse_transfer", "destination_warehouse_id": "9"},
+                {"action_type": "warehouse_transfer", "destination_warehouse_id": "7"},
+            ]), encoding="utf-8")
+
+            self.assertEqual(len(bookbuilder.load_inventory_transfer_evidence(path)), 2)
 
 
 if __name__ == "__main__":

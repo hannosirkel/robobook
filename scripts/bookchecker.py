@@ -1174,12 +1174,16 @@ def _generated_settlement_contact_errors(
     return errors
 
 
-def _reference_binding(action_batch: dict[str, Any], kind: str) -> dict[str, Any] | None:
-    bindings = [
+def _reference_bindings(action_batch: dict[str, Any], kind: str) -> list[dict[str, Any]]:
+    return [
         item
         for item in action_batch.get("reference_artifacts") or []
         if isinstance(item, dict) and str(item.get("kind") or "") == kind
     ]
+
+
+def _reference_binding(action_batch: dict[str, Any], kind: str) -> dict[str, Any] | None:
+    bindings = _reference_bindings(action_batch, kind)
     return bindings[0] if len(bindings) == 1 else None
 
 
@@ -1288,9 +1292,18 @@ def evaluate_ledger_export_evidence(
     is not blocked by evidence that cannot exist yet. Once one is bound it must hold:
     a stale or unsupported file is worse than none, because it looks like proof.
     """
-    binding = _reference_binding(action_batch, "ledger_export_evidence")
-    if binding is None:
+    bindings = _reference_bindings(action_batch, "ledger_export_evidence")
+    if len(bindings) > 1:
+        # Duplicated bindings must not read as "nothing bound"; that would turn a second
+        # binding into a way of skipping the check entirely.
+        return [make_finding(
+            section="ledger_export_evidence",
+            severity="error",
+            summary=f"Batch binds more than one ledger export ({len(bindings)}); exactly one is required.",
+        )]
+    if not bindings:
         return []
+    binding = bindings[0]
     try:
         load_ledger_export(binding, cwd=cwd)
     except (LedgerEvidenceError, OSError) as exc:

@@ -1330,5 +1330,43 @@ class EmptyMonthInventoryTests(unittest.TestCase):
         self.assertEqual(check["status"], "skipped")
 
 
+class WalletFundingCheckTests(unittest.TestCase):
+    def check(self, rows: list[dict]) -> dict:
+        return bookrecon.build_wallet_funding_check(
+            normalized_path_display="normalized.json",
+            records={"clearing_transactions": rows},
+        )
+
+    def test_a_period_with_no_wallet_rows_is_skipped(self) -> None:
+        self.assertEqual(self.check([])["status"], "skipped")
+
+    def test_balanced_personal_funding_passes(self) -> None:
+        self.assertEqual(self.check([deposit("10.00"), refund("10.00")])["status"], "pass")
+
+    def test_a_refund_exceeding_its_funding_fails(self) -> None:
+        result = self.check([deposit("10.00"), refund("11.00")])
+
+        self.assertEqual(result["status"], "fail")
+        self.assertIn("refund exceeds", " ".join(result["notes"]).lower())
+
+    def test_a_row_without_a_reviewed_owner_is_reported_not_blocked(self) -> None:
+        # The printout parser already refuses an unknown card; a source with no card data
+        # at all is named here rather than blocking a period that predates attribution.
+        row = deposit("10.00")
+        del row["attributes"]["funding_owner"]
+
+        result = self.check([row])
+
+        self.assertEqual(result["status"], "pass")
+        self.assertIn("no reviewed funding owner", " ".join(result["notes"]))
+
+    def test_the_check_reports_each_term_separately(self) -> None:
+        result = self.check([deposit("45.00"), refund("15.00")])
+
+        notes = " ".join(result["notes"])
+        self.assertIn("45", notes)
+        self.assertIn("15", notes)
+
+
 if __name__ == "__main__":
     unittest.main()

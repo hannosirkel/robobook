@@ -2521,7 +2521,10 @@ def parse_printful_wallet_printout(
                 )
             attributes["card_last4"] = card_last4
             attributes["funding_owner"] = owner
-        elif event_type in WALLET_ACTIONS.values():  # pragma: no cover - defensive
+        elif normalized_action in WALLET_ACTIONS:
+            # A deposit or withdrawal moves money between a card and the wallet, so it must
+            # say which card. Comparing the event type to the action map's values compared a
+            # string with tuples and never fired.
             raise SimplbooksError(
                 f"Wallet printout row {line_no} funds the wallet but names no card."
             )

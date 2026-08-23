@@ -2296,5 +2296,29 @@ class ResidualDerivationCheckTests(unittest.TestCase):
         )
 
 
+class DuplicateBindingTests(unittest.TestCase):
+    def batch(self, count: int) -> dict:
+        return {
+            "company_slug": "example", "period": "2024-01", "cash_posting_mode": "statement_import",
+            "reference_artifacts": [
+                {"kind": "ledger_export_evidence", "path": f"l{i}.csv", "sha256": "a" * 64}
+                for i in range(count)
+            ],
+            "actions": [],
+        }
+
+    def test_no_binding_is_nothing_to_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(
+                bookchecker.evaluate_ledger_export_evidence(self.batch(0), cwd=Path(tmp)), []
+            )
+
+    def test_a_duplicated_binding_is_an_error_not_a_bypass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            findings = bookchecker.evaluate_ledger_export_evidence(self.batch(2), cwd=Path(tmp))
+
+            self.assertTrue(any("more than one" in f["summary"] for f in findings), findings)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1461,9 +1461,11 @@ def build_sales_lines(
                         raise SimplbooksError(
                             "Woo VAT allocation requires per-order component rounding evidence for multiple orders."
                         )
+                    # The single-order fallback has no per-order evidence to read, so the
+                    # record's own quantity is the only exact figure available for it.
                     entries = [{
                         "order_id": order_ids[0],
-                        "quantity": allocation.get("quantity"),
+                        "quantity": record.get("quantity"),
                         gross_field: allocation.get(gross_field),
                         vat_field: allocation.get(vat_field),
                     }]
@@ -3962,6 +3964,37 @@ def resolve_bank_allocations_path(*, company_dir: Path | None, normalized_path: 
     return (artifacts_dir / "bank" / f"{period[:4]}-allocations.json") if artifacts_dir is not None else None
 
 
+def resolve_inventory_transfer_evidence_path(
+    *, company_dir: Path | None, normalized_path: Path, period: str, override: str | None
+) -> Path | None:
+    if override:
+        return Path(override)
+    filename = f"{period[:4]}-inventory-transfers.json"
+    if company_dir is not None:
+        return company_dir / "artifacts" / "actions" / filename
+    artifacts_dir = inferred_artifacts_dir(normalized_path)
+    return (artifacts_dir / "actions" / filename) if artifacts_dir is not None else None
+
+
+def load_inventory_transfer_evidence(path: Path | None) -> list[dict[str, Any]]:
+    """Load reviewed warehouse transfers, treating absence as no evidence rather than an error.
+
+    A company with no distributor warehouse has no transfers to record, and must still be
+    able to build. A company that does have one is stopped by the transfer-evidence gate
+    instead, which says exactly what is missing.
+    """
+    if path is None or not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SimplbooksError(f"Reviewed inventory transfer evidence {path} is unreadable: {exc}") from exc
+    entries = payload if isinstance(payload, list) else [payload]
+    if not all(isinstance(entry, dict) for entry in entries):
+        raise SimplbooksError(f"Reviewed inventory transfer evidence {path} must contain objects.")
+    return entries
+
+
 def resolve_statement_import_plan_path(
     *, company_dir: Path | None, normalized_path: Path, period: str, override: str | None
 ) -> Path | None:
@@ -4010,6 +4043,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--bank-allocations", help="Reviewed annual bank allocation artifact")
     parser.add_argument("--statement-import-plan", help="Annual statement-import plan artifact")
+    parser.add_argument("--inventory-transfers", help="Reviewed warehouse transfer evidence JSON")
     parser.add_argument("--output", help="Optional output path for actions YAML")
     parser.add_argument("--force", action="store_true", help="Allow draft generation even when recon does not approve the month")
     return parser
@@ -4057,6 +4091,12 @@ def main() -> int:
         normalized_path=normalized_path,
         period=args.period,
         override=args.bank_allocations,
+    )
+    inventory_transfer_evidence_path = resolve_inventory_transfer_evidence_path(
+        company_dir=company_dir,
+        normalized_path=normalized_path,
+        period=args.period,
+        override=args.inventory_transfers,
     )
     statement_import_plan_path = resolve_statement_import_plan_path(
         company_dir=company_dir,
@@ -4138,6 +4178,7 @@ def main() -> int:
         discovery_overview=discovery_overview,
         discovery_overviews=discovery_overviews,
         bank_allocations=bank_allocations,
+        inventory_transfer_evidence=load_inventory_transfer_evidence(inventory_transfer_evidence_path),
         force=args.force,
     )
     bound_paths = [

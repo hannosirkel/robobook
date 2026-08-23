@@ -121,7 +121,16 @@ def load_ledger_export(binding: dict[str, Any], *, cwd: Path) -> dict[str, Any]:
             f"Bound ledger export SHA-256 does not match: expected {expected!r}, found {digest!r}"
         )
 
-    reader = csv.DictReader(path.read_text(encoding="utf-8").splitlines())
+    # Read as a file with newline="" so a quoted multi-line field keeps its newlines,
+    # the same way the wallet printout is read.
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        return _ledger_export_rows(reader, binding=binding, digest=digest)
+
+
+def _ledger_export_rows(
+    reader: csv.DictReader, *, binding: dict[str, Any], digest: str
+) -> dict[str, Any]:
     columns = {name.strip() for name in reader.fieldnames or []}
     missing = sorted(REQUIRED_COLUMNS - columns)
     if missing:

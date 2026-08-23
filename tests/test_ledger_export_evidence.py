@@ -365,5 +365,22 @@ class AnnualEvidenceSummaryTests(unittest.TestCase):
             self.assertNotEqual(summary["errors"], [])
 
 
+class MultiLineFieldTests(unittest.TestCase):
+    def test_a_quoted_newline_in_a_description_does_not_split_the_row(self) -> None:
+        rows = [
+            '42,2024,32,C32,t1,2024-01-15,EUR,12.50,0.00,"Fee\nsecond line",',
+            "42,2024,10,C10,t1,2024-01-15,EUR,0.00,12.50,Fee,",
+        ]
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            export = ledger_export_evidence.load_ledger_export(
+                written_export(root, export_text(rows)), cwd=root
+            )
+
+            self.assertEqual(len(export["rows"]), 2)
+            # The embedded newline survives rather than being silently swallowed.
+            self.assertEqual(export["rows"][0]["description"], "Fee\nsecond line")
+
+
 if __name__ == "__main__":
     unittest.main()

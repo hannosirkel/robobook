@@ -263,10 +263,9 @@ class BookauditTests(unittest.TestCase):
         )
 
         evaluation, _, _ = bookaudit.evaluate_audit(
-            source_payloads=[normalized],
+            sources=bookaudit.AuditSources(payloads=[normalized]),
             live_state=live_state(invoice_total=20.0, output_vat=4.0),
             scope=bookaudit.parse_scope("2024-01"),
-            policy_text=None,
         )
 
         self.assertEqual(evaluation["result"], "fail")
@@ -290,14 +289,15 @@ class BookauditTests(unittest.TestCase):
         )
 
         evaluation, _, _ = bookaudit.evaluate_audit(
-            source_payloads=[normalized],
+            sources=bookaudit.AuditSources(
+                payloads=[normalized], policy_text="Warehouse identity matters materially."
+            ),
             live_state=live_state(
                 invoice_total=24.0,
                 output_vat=4.0,
                 invoice_rows=[{"vat_type_id": "vat-std", "article_id": None, "warehouse_id": None}],
             ),
             scope=bookaudit.parse_scope("2024-01"),
-            policy_text="Warehouse identity matters materially.",
         )
 
         self.assertEqual(evaluation["result"], "warn")
@@ -520,6 +520,54 @@ class LedgerEvidenceAuditTests(unittest.TestCase):
         self.assertTrue(findings)
         for finding in findings:
             self.assertIn(finding["section"], bookaudit.SECTIONS)
+
+
+class AuditEnforcementTests(unittest.TestCase):
+    """The audit must actually run the reviews it declares, not merely define them."""
+
+    def audit(self, **kwargs: object) -> dict:
+        report, _live, _prev = bookaudit.evaluate_audit(
+            sources=bookaudit.AuditSources(payloads=[base_normalized()]),
+            live_state=live_state(invoice_total=0.0, output_vat=0.0),
+            scope=bookaudit.parse_scope("2024-01"),
+            post_import=bookaudit.PostImportEvidence(**kwargs),
+        )
+        return report
+
+    def test_a_statement_import_year_fails_without_ledger_evidence(self) -> None:
+        report = self.audit(statement_import_mode=True)
+
+        self.assertTrue(any("post-import ledger evidence" in f["summary"] for f in report["findings"]))
+        self.assertEqual(report["result"], "fail")
+
+    def test_an_api_cash_year_is_not_asked_for_ledger_evidence(self) -> None:
+        report = self.audit(statement_import_mode=False)
+
+        self.assertFalse(any("post-import ledger evidence" in f["summary"] for f in report["findings"]))
+
+    def test_a_failing_stock_equation_reaches_the_report(self) -> None:
+        from decimal import Decimal
+        equation = {
+            "article_id": "3", "warehouses": {},
+            "aggregate": {"closing": Decimal(10), "selected": Decimal(8), "difference": Decimal(-2)},
+            "errors": [], "instruction": None,
+        }
+
+        report = self.audit(stock_equation=equation)
+
+        self.assertTrue(any("differs from the selected count" in f["summary"] for f in report["findings"]))
+
+    def test_a_reconciling_stock_equation_adds_nothing(self) -> None:
+        from decimal import Decimal
+        equation = {
+            "article_id": "3", "warehouses": {},
+            "aggregate": {"closing": Decimal(10), "selected": Decimal(10), "difference": Decimal(0)},
+            "errors": [], "instruction": None,
+        }
+
+        report = self.audit(stock_equation=equation)
+
+        self.assertFalse(any("differs from the selected count" in f["summary"] for f in report["findings"]))
 
 
 if __name__ == "__main__":

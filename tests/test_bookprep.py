@@ -2614,5 +2614,24 @@ class CanonicalGroupScopeTests(unittest.TestCase):
             self.assertEqual(self.group("kontovv_2024.csv", Path(tmp)), "kontovv-2024")
 
 
+class WalletCardlessFundingTests(unittest.TestCase):
+    def test_a_wallet_funding_row_with_no_card_is_refused(self) -> None:
+        # "Deposit to Wallet" must name the card that funded it; without one the movement
+        # has no reviewable owner and must not be normalized.
+        text = WALLET_PRINTOUT.replace(
+            '"Deposit to Wallet\n000000********1111"', '"Deposit to Wallet\nwallet"'
+        )
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(
+            bookprep.SimplbooksError, "names no card"
+        ):
+            parse_wallet(Path(tmp), text)
+
+    def test_a_wallet_funded_order_row_is_still_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = parse_wallet(Path(tmp))[0]["clearing_transactions"]
+
+            self.assertTrue(any(r["event_type"] == "printful_wallet_consumption" for r in rows))
+
+
 if __name__ == "__main__":
     unittest.main()

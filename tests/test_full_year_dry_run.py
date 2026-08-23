@@ -1305,5 +1305,51 @@ class FxRevaluationPhaseTests(unittest.TestCase):
         )
 
 
+class PlanOrderingTests(unittest.TestCase):
+    def test_every_month_is_normalized_before_the_annual_plan_is_built(self) -> None:
+        called: list[str] = []
+
+        def fake_run(cmd: list[str], cwd: Path, capture_output: bool, text: bool) -> SimpleNamespace:
+            del capture_output, text
+            script = Path(cmd[1]).name
+            called.append(script)
+            if script == "bookrecon.py":
+                write_bound_recon(company_dir, cmd[cmd.index("--period") + 1], cwd=cwd)
+            if script == "bookbuilder.py":
+                write_action_bound_to_recon(company_dir, cmd[cmd.index("--period") + 1], cwd=cwd)
+            payload = {"result": "pass"} if script == "bookchecker.py" else {"ok": True}
+            return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            company_dir = Path(tmp) / "companies" / "example"
+            (company_dir / "artifacts").mkdir(parents=True)
+            (company_dir / "artifacts" / "posting_policy.json").write_text(
+                json.dumps(STATEMENT_IMPORT_POLICY), encoding="utf-8")
+            original_run = full_year_dry_run.subprocess.run
+            original_periods = full_year_dry_run.periods_for_year
+            original_resolve = full_year_dry_run.resolve_company_name
+            try:
+                full_year_dry_run.subprocess.run = fake_run
+                full_year_dry_run.periods_for_year = lambda _y: ["2024-01", "2024-02"]
+                full_year_dry_run.resolve_company_name = lambda company_dir: "Example Company OU"
+                full_year_dry_run.run_full_year_dry_run(
+                    company_dir=company_dir, year=2024, source_dir=None,
+                    python_executable="python3", continue_on_error=True,
+                    force_build=False, cwd=Path.cwd(),
+                )
+            finally:
+                full_year_dry_run.subprocess.run = original_run
+                full_year_dry_run.periods_for_year = original_periods
+                full_year_dry_run.resolve_company_name = original_resolve
+
+        plan_at = called.index("statement_import_plan.py")
+        # The plan is derived from the normalized artifacts, so every month must be
+        # normalized before it is built -- otherwise it describes the previous run.
+        # Once per month, all before the plan, and not repeated inside the month loop.
+        self.assertEqual(called.count("bookprep.py"), 2)
+        self.assertLess(plan_at, called.index("bookbuilder.py"))
+        self.assertEqual([s for s in called[:plan_at] if s == "bookprep.py"], ["bookprep.py"] * 2)
+
+
 if __name__ == "__main__":
     unittest.main()

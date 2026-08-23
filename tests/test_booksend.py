@@ -1582,13 +1582,24 @@ class StatementImportSenderTests(unittest.TestCase):
 
         self.assertEqual(client.calls, [])
 
-    def test_sender_refuses_a_statement_import_batch_with_no_policy_to_prove_it(self) -> None:
+    def test_sender_refuses_a_statement_import_write_with_no_policy_to_prove_it(self) -> None:
         client = FakeClient(responses=[])
 
         with self.assertRaisesRegex(SimplbooksError, "statement-import mode"):
             booksend.execute_batch(action_batch=self.statement_batch(), mode="write", client=client)
 
         self.assertEqual(client.calls, [])
+
+    def test_a_dry_run_without_a_bound_policy_is_still_allowed(self) -> None:
+        action = incoming_action()
+        action["depends_on"] = []
+        batch = self.statement_batch(actions=[action])
+
+        updated, summary = booksend.execute_batch(action_batch=batch, mode="dry-run", client=None)
+
+        # A dry run sends nothing, so an unprovable prohibition is not a reason to stop it.
+        self.assertEqual(summary["mode"], "dry-run")
+        self.assertEqual(updated["actions"][0]["response_status"], 0)
 
     def test_sender_rejects_a_batch_whose_declared_mode_disagrees_with_its_policy(self) -> None:
         client = FakeClient(responses=[])

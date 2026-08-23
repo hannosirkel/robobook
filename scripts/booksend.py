@@ -1303,16 +1303,18 @@ def verify_submission_reference_artifacts(
 
 
 def prove_no_prohibited_bank_cash(
-    action_batch: dict[str, Any], posting_policy: dict[str, Any] | None
+    action_batch: dict[str, Any], posting_policy: dict[str, Any] | None, *, mode: str = "write"
 ) -> None:
     """Refuse a statement-import batch that would move cash the import already moves.
 
     This runs before translation and before any client call, so a prohibited action
-    cannot reach SimplBooks even partially.
+    cannot reach SimplBooks even partially. With no policy bound there is nothing to
+    prove the prohibition against, which is fatal for a write and merely unprovable for
+    a dry run — a dry run sends nothing, so it is allowed to proceed.
     """
     declared = str(action_batch.get("cash_posting_mode") or "api")
     if posting_policy is None:
-        if declared == "statement_import":
+        if declared == "statement_import" and mode == "write":
             raise SimplbooksError(
                 "Batch declares statement-import mode but no posting policy is bound to prove "
                 "which accounts the statement-import mode forbids."
@@ -1355,7 +1357,7 @@ def execute_batch(
     cwd: Path | None = None,
     expected_company_id: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    prove_no_prohibited_bank_cash(action_batch, posting_policy)
+    prove_no_prohibited_bank_cash(action_batch, posting_policy, mode=mode)
     inventory_actions = [
         action for action in action_batch.get("actions") or []
         if any(
@@ -1682,6 +1684,10 @@ def run_submission(
             if posting_policy_path is not None and posting_policy_path.exists()
             else None
         )
+
+    # Before the token is read and the client exists: a batch that must not be sent
+    # should not even reach for the credentials it would be sent with.
+    prove_no_prohibited_bank_cash(action_batch, posting_policy, mode=mode)
 
     if mode == "write" and client is None:
         resolved_company_id = resolve_company_id(company_id, company_dir=str(company_dir) if company_dir else None)

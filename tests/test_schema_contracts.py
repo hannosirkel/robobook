@@ -130,6 +130,37 @@ class SchemaContractTests(unittest.TestCase):
         artifact = json.loads((ROOT / "templates/posting-policy.template.json").read_text(encoding="utf-8"))
         self.assert_artifact_valid(schema_name="posting-policy.schema.json", artifact=artifact)
 
+    def test_posting_policy_schema_accepts_statement_import_cash_posting(self) -> None:
+        artifact = json.loads((ROOT / "templates/posting-policy.template.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(artifact["cash_posting"]["mode"], "statement_import")
+        self.assertEqual(
+            sorted(artifact["cash_posting"]["financial_accounts"]),
+            [
+                "bank_fees",
+                "fx_gain",
+                "fx_loss",
+                "paypal",
+                "platform_prepayment",
+                "reporting_person_payable",
+                "stripe_clearing",
+            ],
+        )
+        self.assert_artifact_valid(schema_name="posting-policy.schema.json", artifact=artifact)
+
+    def test_posting_policy_schema_rejects_unknown_financial_account_role(self) -> None:
+        artifact = json.loads((ROOT / "templates/posting-policy.template.json").read_text(encoding="utf-8"))
+        artifact["cash_posting"]["financial_accounts"]["bank_fee"] = "99"
+
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="posting-policy.schema.json", artifact=artifact)
+
+    def test_posting_policy_schema_accepts_unbound_distributor_warehouse(self) -> None:
+        artifact = json.loads((ROOT / "templates/posting-policy.template.json").read_text(encoding="utf-8"))
+        artifact["warehouse_routing"]["distributor_warehouse_id"] = None
+
+        self.assert_artifact_valid(schema_name="posting-policy.schema.json", artifact=artifact)
+
     def test_posting_policy_schema_accepts_currency_qualified_bank_account(self) -> None:
         artifact = json.loads((ROOT / "templates/posting-policy.template.json").read_text(encoding="utf-8"))
         artifact["bank_accounts"] = {"EE123": {"EUR": "3", "USD": "4"}}

@@ -38,6 +38,36 @@ def posting_policy_fixture_with_profiles() -> dict:
     }
 
 
+def statement_import_policy_fixture() -> dict:
+    return {
+        "schema_version": "1.0",
+        "company_slug": "example",
+        "bank_accounts": {"EE001234567890": {"EUR": "3", "USD": "3"}},
+        "contacts": {},
+        "mappings": {},
+        "supplier_aliases": {},
+        "cash_posting": {
+            "mode": "statement_import",
+            "bank_income_account_ids": ["3"],
+            "processor_income_account_ids": {"paypal": "6", "stripe": "7"},
+            "financial_accounts": {
+                "stripe_clearing": "30",
+                "paypal": "31",
+                "bank_fees": "32",
+                "reporting_person_payable": "33",
+                "platform_prepayment": "34",
+                "fx_gain": "35",
+                "fx_loss": "36",
+            },
+        },
+        "warehouse_routing": {
+            "woo": {"before_order": 1000, "before_warehouse_id": "6", "from_warehouse_id": "1"},
+            "direct_sale_warehouse_id": "1",
+            "distributor_warehouse_id": "9",
+        },
+    }
+
+
 class PostingPolicyTests(unittest.TestCase):
     def test_linked_invoice_receipt_uses_sales_contact_role(self) -> None:
         policy = {
@@ -155,6 +185,128 @@ class PostingPolicyTests(unittest.TestCase):
 
         self.assertEqual(posting_policy.resolve_supplier_alias(policy, "Omniva"), "as-eesti-post")
         self.assertEqual(posting_policy.resolve_supplier_alias(policy, "Unknown Supplier"), "unknown-supplier")
+
+
+class StatementImportPolicyTests(unittest.TestCase):
+    def test_statement_import_policy_requires_bank_and_financial_accounts(self) -> None:
+        policy = statement_import_policy_fixture()
+
+        posting_policy.validate_posting_policy(policy)
+
+        self.assertEqual(posting_policy.cash_posting_mode(policy), "statement_import")
+        resolved = posting_policy.statement_import_policy(policy)
+        self.assertEqual(resolved["bank_income_account_ids"], ["3"])
+        self.assertEqual(resolved["processor_income_account_ids"], {"paypal": "6", "stripe": "7"})
+        self.assertEqual(resolved["financial_accounts"]["bank_fees"], "32")
+
+    def test_cash_posting_mode_defaults_to_api_when_section_is_absent(self) -> None:
+        policy = statement_import_policy_fixture()
+        del policy["cash_posting"]
+
+        posting_policy.validate_posting_policy(policy)
+
+        self.assertEqual(posting_policy.cash_posting_mode(policy), "api")
+
+    def test_statement_import_policy_rejects_api_mode(self) -> None:
+        policy = statement_import_policy_fixture()
+        policy["cash_posting"] = {"mode": "api"}
+
+        posting_policy.validate_posting_policy(policy)
+
+        with self.assertRaisesRegex(posting_policy.PostingPolicyError, "statement_import"):
+            posting_policy.statement_import_policy(policy)
+
+    def test_unknown_cash_posting_mode_is_rejected(self) -> None:
+        policy = statement_import_policy_fixture()
+        policy["cash_posting"]["mode"] = "manual"
+
+        with self.assertRaisesRegex(posting_policy.PostingPolicyError, "mode"):
+            posting_policy.validate_posting_policy(policy)
+
+    def test_missing_financial_account_role_is_rejected(self) -> None:
+        policy = statement_import_policy_fixture()
+        del policy["cash_posting"]["financial_accounts"]["fx_loss"]
+
+        with self.assertRaisesRegex(posting_policy.PostingPolicyError, "fx_loss"):
+            posting_policy.validate_posting_policy(policy)
+
+    def test_unknown_financial_account_role_is_rejected(self) -> None:
+        policy = statement_import_policy_fixture()
+        policy["cash_posting"]["financial_accounts"]["bank_fee"] = "99"
+
+        with self.assertRaisesRegex(posting_policy.PostingPolicyError, "bank_fee"):
+            posting_policy.validate_posting_policy(policy)
+
+    def test_non_numeric_financial_account_id_is_rejected(self) -> None:
+        policy = statement_import_policy_fixture()
+        policy["cash_posting"]["financial_accounts"]["bank_fees"] = "5350-fees"
+
+        with self.assertRaises(posting_policy.PostingPolicyError):
+            posting_policy.validate_posting_policy(policy)
+
+    def test_empty_bank_income_account_ids_is_rejected(self) -> None:
+        policy = statement_import_policy_fixture()
+        policy["cash_posting"]["bank_income_account_ids"] = []
+
+        with self.assertRaisesRegex(posting_policy.PostingPolicyError, "bank_income_account_ids"):
+            posting_policy.validate_posting_policy(policy)
+
+    def test_bank_and_processor_income_accounts_must_be_disjoint(self) -> None:
+        policy = statement_import_policy_fixture()
+        policy["cash_posting"]["processor_income_account_ids"]["stripe"] = "3"
+
+        with self.assertRaisesRegex(posting_policy.PostingPolicyError, "disjoint"):
+            posting_policy.validate_posting_policy(policy)
+
+
+class SalesWarehouseRoutingTests(unittest.TestCase):
+    def test_woo_warehouse_boundary_is_inclusive(self) -> None:
+        policy = statement_import_policy_fixture()
+
+        self.assertEqual(posting_policy.resolve_sales_warehouse(policy, channel="woo", order_number=999), "6")
+        self.assertEqual(posting_policy.resolve_sales_warehouse(policy, channel="woo", order_number=1000), "1")
+
+    def test_woo_routing_requires_an_exact_order_number(self) -> None:
+        policy = statement_import_policy_fixture()
+
+        with self.assertRaisesRegex(posting_policy.PostingPolicyError, "order number"):
+            posting_policy.resolve_sales_warehouse(policy, channel="woo", order_number=None)
+
+    def test_direct_sale_uses_the_reviewed_warehouse(self) -> None:
+        policy = statement_import_policy_fixture()
+
+        self.assertEqual(
+            posting_policy.resolve_sales_warehouse(policy, channel="direct-sale", order_number=None), "1"
+        )
+
+    def test_bound_distributor_warehouse_resolves(self) -> None:
+        policy = statement_import_policy_fixture()
+
+        self.assertEqual(
+            posting_policy.resolve_sales_warehouse(policy, channel="distributor", order_number=None), "9"
+        )
+
+    def test_unbound_distributor_warehouse_is_rejected(self) -> None:
+        policy = statement_import_policy_fixture()
+        policy["warehouse_routing"]["distributor_warehouse_id"] = None
+
+        posting_policy.validate_posting_policy(policy)
+
+        with self.assertRaisesRegex(posting_policy.PostingPolicyError, "distributor"):
+            posting_policy.resolve_sales_warehouse(policy, channel="distributor", order_number=None)
+
+    def test_unknown_sales_channel_is_rejected(self) -> None:
+        policy = statement_import_policy_fixture()
+
+        with self.assertRaisesRegex(posting_policy.PostingPolicyError, "channel"):
+            posting_policy.resolve_sales_warehouse(policy, channel="amazon", order_number=1)
+
+    def test_incomplete_woo_routing_rule_is_rejected(self) -> None:
+        policy = statement_import_policy_fixture()
+        del policy["warehouse_routing"]["woo"]["before_warehouse_id"]
+
+        with self.assertRaisesRegex(posting_policy.PostingPolicyError, "before_warehouse_id"):
+            posting_policy.validate_posting_policy(policy)
 
 
 if __name__ == "__main__":

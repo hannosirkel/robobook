@@ -45,10 +45,73 @@
       "type": "object",
       "propertyNames": {"pattern": "^[0-9]{4}$"},
       "additionalProperties": {"$ref": "#/$defs/year_expectation"}
-    }
+    },
+    "cash_posting": {"$ref": "#/$defs/cash_posting"},
+    "warehouse_routing": {"$ref": "#/$defs/warehouse_routing"}
   },
   "$defs": {
     "id": {"type": ["string", "null"], "pattern": "^[0-9]+$"},
+    "required_id": {"type": "string", "pattern": "^[0-9]+$"},
+    "cash_posting": {
+      "type": "object",
+      "description": "Cash-posting mode plus the accounts statement-import mode needs; absent means legacy API cash posting.",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": {"enum": ["api", "statement_import"]},
+        "bank_income_account_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/required_id"}
+        },
+        "processor_income_account_ids": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/$defs/required_id"}
+        },
+        "financial_accounts": {
+          "type": "object",
+          "description": "Reviewed financial-account roles; role names stay generic and company IDs live in the values.",
+          "additionalProperties": false,
+          "required": [
+            "stripe_clearing", "paypal", "bank_fees", "reporting_person_payable",
+            "platform_prepayment", "fx_gain", "fx_loss"
+          ],
+          "properties": {
+            "stripe_clearing": {"$ref": "#/$defs/required_id"},
+            "paypal": {"$ref": "#/$defs/required_id"},
+            "bank_fees": {"$ref": "#/$defs/required_id"},
+            "reporting_person_payable": {"$ref": "#/$defs/required_id"},
+            "platform_prepayment": {"$ref": "#/$defs/required_id"},
+            "fx_gain": {"$ref": "#/$defs/required_id"},
+            "fx_loss": {"$ref": "#/$defs/required_id"},
+            "customer_receivable": {"$ref": "#/$defs/required_id"},
+            "supplier_payable": {"$ref": "#/$defs/required_id"},
+            "inventory_change": {"$ref": "#/$defs/required_id"}
+          }
+        }
+      }
+    },
+    "warehouse_routing_rule": {
+      "type": "object",
+      "description": "Inclusive order-number boundary between two reviewed fulfilment warehouses.",
+      "additionalProperties": false,
+      "required": ["before_order", "before_warehouse_id", "from_warehouse_id"],
+      "properties": {
+        "before_order": {"type": "integer", "minimum": 1},
+        "before_warehouse_id": {"$ref": "#/$defs/required_id"},
+        "from_warehouse_id": {"$ref": "#/$defs/required_id"}
+      }
+    },
+    "warehouse_routing": {
+      "type": "object",
+      "description": "Reviewed sales-warehouse routing; an unbound distributor warehouse stays null until it exists.",
+      "additionalProperties": false,
+      "properties": {
+        "woo": {"$ref": "#/$defs/warehouse_routing_rule"},
+        "direct_sale_warehouse_id": {"$ref": "#/$defs/id"},
+        "distributor_warehouse_id": {"$ref": "#/$defs/id"}
+      }
+    },
     "sales_vat_profile": {
       "type": "object",
       "additionalProperties": false,

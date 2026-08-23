@@ -61,5 +61,27 @@
         {"kind": "contact_mapping", "label": "paypal", "family": ""}
       ]
     }
+  },
+  "cash_posting": {
+    "mode": "statement_import",
+    "bank_income_account_ids": ["3"],
+    "processor_income_account_ids": {
+      "paypal": "6",
+      "stripe": "7"
+    },
+    "financial_accounts": {
+      "stripe_clearing": "30",
+      "paypal": "31",
+      "bank_fees": "32",
+      "reporting_person_payable": "33",
+      "platform_prepayment": "34",
+      "fx_gain": "35",
+      "fx_loss": "36"
+    }
+  },
+  "warehouse_routing": {
+    "woo": {"before_order": 1000, "before_warehouse_id": "6", "from_warehouse_id": "1"},
+    "direct_sale_warehouse_id": "1",
+    "distributor_warehouse_id": "9"
   }
 }

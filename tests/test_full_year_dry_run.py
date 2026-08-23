@@ -1353,3 +1353,52 @@ class PlanOrderingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProcessorSettlementAccountTests(unittest.TestCase):
+    """A reviewed processor account is a legitimate cash target, not a policy mismatch.
+
+    The narrow bank_accounts map names only real bank accounts, so a settlement posted
+    into PayPal or Stripe would otherwise be counted as a mismatch on every month.
+    """
+
+    def summary_for(self, bank_account_id: str) -> dict:
+        with tempfile.TemporaryDirectory() as tmp:
+            company_dir = Path(tmp) / "companies" / "example"
+            actions_dir = company_dir / "artifacts" / "actions"
+            actions_dir.mkdir(parents=True)
+            (company_dir / "artifacts" / "posting_policy.json").write_text(
+                json.dumps({
+                    "bank_accounts": {"EE123": "3"},
+                    "cash_posting": {
+                        "mode": "statement_import",
+                        "bank_income_account_ids": ["3"],
+                        "processor_income_account_ids": {"paypal": "6", "stripe": "7"},
+                        "bank_financial_accounts": {"EE123": {"EUR": "2"}},
+                        "clearing_provider_roles": {"paypal": "paypal"},
+                        "financial_accounts": {
+                            "bank": "2", "stripe_clearing": "263", "paypal": "260",
+                            "bank_fees": "141", "reporting_person_payable": "232",
+                            "platform_prepayment": "256", "customer_receivable": "5",
+                            "supplier_payable": "52", "fx_gain": "113", "fx_loss": "184",
+                        },
+                    },
+                }),
+                encoding="utf-8",
+            )
+            (actions_dir / "2024-01.yaml").write_text(
+                json.dumps({"actions": [{
+                    "action_type": "create_incoming_summary",
+                    "payload": {"currency": "EUR", "settlement_family": "processor-held",
+                                "counterparty_hint": "stripe", "bank_account_id": bank_account_id},
+                    "source_refs": [],
+                }]}),
+                encoding="utf-8",
+            )
+            return full_year_dry_run.summarize_action_artifacts(company_dir=company_dir, year=2024)
+
+    def test_a_reviewed_processor_account_is_not_a_mismatch(self) -> None:
+        self.assertEqual(self.summary_for("7")["policy_mapping_mismatch_count"], 0)
+
+    def test_an_unreviewed_cash_account_is_still_a_mismatch(self) -> None:
+        self.assertEqual(self.summary_for("99")["policy_mapping_mismatch_count"], 1)

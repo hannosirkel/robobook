@@ -527,15 +527,24 @@ def validate_statement_import_plan(plan: dict[str, Any]) -> None:
 # --- rendering -------------------------------------------------------------
 
 
+def _reference_name(reference: dict[str, Any]) -> str:
+    exact = (
+        _text(reference.get("simplbooks_id"))
+        or _text(reference.get("action_key"))
+        or _text(reference.get("idempotency_key"))
+        or _text(reference.get("action_id"))
+    )
+    if exact:
+        return exact
+    # A direct sale's invoice carries no identifier until the API creates it, so the
+    # physical receipt it was generated for is the only exact name it has.
+    generated_for = _text(reference.get("generated_for_statement_id"))
+    return f"generated for {generated_for}" if generated_for else ""
+
+
 def _document_ref_text(row: dict[str, Any]) -> str:
     return "; ".join(
-        f"{_text(reference.get('document_type'))} "
-        + (
-            _text(reference.get("simplbooks_id"))
-            or _text(reference.get("action_key"))
-            or _text(reference.get("idempotency_key"))
-            or _text(reference.get("action_id"))
-        )
+        f"{_text(reference.get('document_type'))} {_reference_name(reference)}".strip()
         for reference in row.get("document_refs") or []
     )
 

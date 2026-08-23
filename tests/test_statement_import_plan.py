@@ -473,6 +473,23 @@ class PlanRenderingTests(unittest.TestCase):
 
         self.assertIn("invoice 58", markdown)
 
+    def direct_sale_plan(self) -> dict[str, Any]:
+        return DirectSaleTargetTests().direct_sale()
+
+    def test_markdown_names_the_row_a_generated_direct_sale_invoice_belongs_to(self) -> None:
+        # The invoice does not exist until the API creates it, so the only exact name it
+        # has is the physical receipt it was generated for. A bare "invoice" is not an
+        # instruction anybody can follow in the UI.
+        markdown = statement_import_plan.render_markdown(self.direct_sale_plan())
+
+        self.assertIn("invoice generated for archive:d", markdown)
+        self.assertNotIn("match invoice \n", markdown)
+
+    def test_csv_names_the_row_a_generated_direct_sale_invoice_belongs_to(self) -> None:
+        csv_text = statement_import_plan.render_csv(self.direct_sale_plan())
+
+        self.assertIn("invoice generated for archive:d", csv_text)
+
 
 class PlanArtifactTests(unittest.TestCase):
     def test_writing_artifacts_reports_paths_hashes_and_counts(self) -> None:

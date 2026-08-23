@@ -12,7 +12,7 @@ from collections import Counter, defaultdict
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from bank_allocations import (
     BankAllocationError,
@@ -29,6 +29,7 @@ from posting_policy import (
     PostingPolicyError,
     bank_income_account_ids,
     cash_posting_mode,
+    validated_cash_posting,
     load_posting_policy,
     resolve_bank_account,
     resolve_contact,
@@ -2067,6 +2068,259 @@ def build_fee_actions(
     return actions, action_ids
 
 
+class DraftContext(NamedTuple):
+    """The period-level facts every draft builder needs to stamp on an action."""
+
+    company_slug: str
+    period: str
+    period_end: date
+    normalized_path_display: str
+    forced_note: str | None
+
+
+class BuiltActionKeys(NamedTuple):
+    """The drafts already built for this period that a settlement has to attach to."""
+
+    sales_actions: list[dict[str, Any]]
+    fees_by_processor: dict[tuple[str, str], str]
+
+
+class SettlementTarget(NamedTuple):
+    """One invoice a processor receipt can be applied to, and how much of it is open."""
+
+    action_key: str
+    contact_id: str
+    channel: str
+    open_amount: Decimal
+
+
+class ProcessorGroup(NamedTuple):
+    """One processor's settled sales for one currency, with its reviewed posting targets."""
+
+    processor: str
+    currency: str
+    sale_records: list[dict[str, Any]]
+    fee_records: list[dict[str, Any]]
+    account_id: str
+    contact_id: str
+
+
+def _processor_sales_groups(
+    records: dict[str, list[dict[str, Any]]], base_currency: str
+) -> tuple[dict[tuple[str, str], list[dict[str, Any]]], dict[tuple[str, str], list[dict[str, Any]]]]:
+    sales: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    fees: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for record in records.get("sales", []):
+        processor = infer_processor(record)
+        if not processor:
+            continue
+        key = (processor, record_currency(record, base_currency))
+        sales[key].append(record)
+        if decimal_value(record.get("fee_amount")) != 0:
+            fees[key].append(record)
+    return sales, fees
+
+
+def _settlement_targets(sales_actions: list[dict[str, Any]], currency: str) -> list[SettlementTarget]:
+    """The period's processor-settled invoices, in stable key order.
+
+    A distributor invoice is excluded: that customer pays by bank transfer, so its
+    receivable must never be cleared out of a card processor's balance.
+    """
+    targets: list[SettlementTarget] = []
+    for action in sales_actions:
+        if str(action.get("action_type") or "") != "create_invoice_summary":
+            continue
+        payload = action.get("payload") or {}
+        if str(payload.get("currency") or "") != currency:
+            continue
+        channel = str((payload.get("summary_scope") or {}).get("channel_or_source") or "")
+        if slugify(channel) in FULFILLMENT_KEYWORDS:
+            continue
+        targets.append(
+            SettlementTarget(
+                action_key=str(action.get("idempotency_key") or ""),
+                contact_id=str((payload.get("counterparty") or {}).get("contact_id") or ""),
+                channel=channel,
+                open_amount=decimal_value((payload.get("totals") or {}).get("gross_amount")),
+            )
+        )
+    return sorted(targets, key=lambda target: target.action_key)
+
+
+def _settlement_notes(ctx: DraftContext, source_records: list[dict[str, Any]]) -> list[str]:
+    notes = [record_count_note(source_records)]
+    if ctx.forced_note:
+        notes.append(ctx.forced_note)
+    return notes
+
+
+def _processor_receipt_action(
+    ctx: DraftContext, group: ProcessorGroup, target: SettlementTarget, total: Decimal
+) -> dict[str, Any]:
+    """Bring processor-held money into the processor account against the invoice it pays.
+
+    The processor decides which cash account the money sits in; the invoice decides whose
+    receivable is cleared, so the receipt carries the invoice's customer, not the processor.
+    """
+    notes = _settlement_notes(ctx, group.sale_records)
+    notes.append(
+        f"Allocated to {target.action_key} by deterministic fill in invoice-key order, "
+        "not by per-order processor evidence."
+    )
+    return make_action(
+        period=ctx.period,
+        idempotency_key=(
+            f"{ctx.company_slug}-{ctx.period}-settle-{slugify(group.processor)}"
+            f"-{slugify(target.action_key.removeprefix(f'{ctx.company_slug}-{ctx.period}-'))}"
+            f"-{slugify(group.currency)}"
+        ),
+        action_type="create_incoming_summary",
+        endpoint="incomings/create",
+        payload={
+            "draft_schema": "cash_settlement_v1",
+            "document_type": "incoming",
+            "document_date": ctx.period_end.isoformat(),
+            "currency": group.currency,
+            "counterparty": {
+                "contact_id": target.contact_id,
+                "display_name_hint": f"{group.processor} settlement summary",
+            },
+            "counterparty_hint": target.channel,
+            "settlement_family": "processor-held",
+            "processor_hint": group.processor,
+            "bank_account_id": group.account_id,
+            "amount": decimal_number(total),
+            "settlement_group_total": decimal_number(sum_amount(group.sale_records, "gross_amount")),
+            "linked_invoice_action": target.action_key,
+            "record_count": len(group.sale_records),
+        },
+        source_refs=source_refs_for_records(ctx.normalized_path_display, group.sale_records),
+        reason=(
+            f"Settle the {group.processor} sales gross into the reviewed {group.processor} account; "
+            "the bank statement only ever shows the later net payout."
+        ),
+        confidence=review_confidence(
+            open_issues=unresolved_review_issues(notes),
+            required_ids=[group.account_id, target.contact_id],
+        ),
+        depends_on=[target.action_key],
+        expected_effect=f"Create a draft receipt into the {group.processor} account in Simplbooks.",
+        review_notes=notes,
+    )
+
+
+def _processor_fee_payment_action(
+    ctx: DraftContext, group: ProcessorGroup, depends_on: list[str]
+) -> dict[str, Any]:
+    """Pay the processor fee out of the same account the processor deducted it from."""
+    total = sum(abs(decimal_value(record.get("fee_amount"))) for record in group.fee_records)
+    notes = _settlement_notes(ctx, group.fee_records)
+    return make_action(
+        period=ctx.period,
+        idempotency_key=(
+            f"{ctx.company_slug}-{ctx.period}-settle-fee-{slugify(group.processor)}-{slugify(group.currency)}"
+        ),
+        action_type="create_payment_summary",
+        endpoint="payments/create",
+        payload={
+            "draft_schema": "cash_settlement_v1",
+            "document_type": "payment",
+            "document_date": ctx.period_end.isoformat(),
+            "currency": group.currency,
+            "counterparty": {
+                "contact_id": group.contact_id,
+                "display_name_hint": f"{group.processor} fee settlement",
+            },
+            "counterparty_hint": group.processor,
+            "vendor_hint": group.processor,
+            "settlement_family": "processor-held",
+            "bank_account_id": group.account_id,
+            "amount": decimal_number(total),
+            "record_count": len(group.fee_records),
+        },
+        source_refs=source_refs_for_records(ctx.normalized_path_display, group.fee_records),
+        reason=f"Pay the {group.processor} fee purchase from the {group.processor} account.",
+        confidence=review_confidence(
+            open_issues=unresolved_review_issues(notes),
+            required_ids=[group.account_id, group.contact_id],
+        ),
+        depends_on=depends_on,
+        expected_effect=f"Create a draft payment from the {group.processor} account in Simplbooks.",
+        review_notes=notes,
+    )
+
+
+def build_processor_settlement_actions(
+    *,
+    ctx: DraftContext,
+    records: dict[str, list[dict[str, Any]]],
+    base_currency: str,
+    posting_policy: dict[str, Any] | None,
+    built: BuiltActionKeys,
+) -> list[dict[str, Any]]:
+    """Settle processor-held sales inside the processor account: gross in, fees out.
+
+    A card customer pays the processor, not the bank. The money sits there, the fee is
+    deducted, and only the net is swept later, so no imported bank row can ever settle a
+    gross sales invoice. Without these actions the monthly invoice never closes and the
+    processor account is only ever credited by the sweep.
+    """
+    if posting_policy is None:
+        return []
+    cash = validated_cash_posting(posting_policy)
+    if cash["mode"] != "statement_import":
+        # Legacy API cash posting settles from the bank side; only statement-import mode
+        # leaves the processor account as the one cash account the API may still touch.
+        return []
+    processor_accounts = cash["processor_income_account_ids"]
+    grouped_sales, grouped_fees = _processor_sales_groups(records, base_currency)
+    targets_by_currency: dict[str, list[SettlementTarget]] = {}
+
+    actions: list[dict[str, Any]] = []
+    for (processor, currency), sale_records in sorted(grouped_sales.items()):
+        if sum_amount(sale_records, "gross_amount") == 0:
+            continue
+        account_id = str(processor_accounts.get(processor) or "")
+        if not account_id:
+            raise SimplbooksError(
+                f"Processor {processor!r} settles sales in {currency} but "
+                "cash_posting.processor_income_account_ids names no reviewed account for it."
+            )
+        group = ProcessorGroup(
+            processor=processor,
+            currency=currency,
+            sale_records=sale_records,
+            fee_records=grouped_fees.get((processor, currency), []),
+            account_id=account_id,
+            contact_id=resolve_contact(posting_policy, role="processors", label=processor),
+        )
+        remaining = sum_amount(sale_records, "gross_amount")
+        for target in targets_by_currency.setdefault(currency, _settlement_targets(built.sales_actions, currency)):
+            if remaining <= 0 or target.open_amount <= 0:
+                continue
+            applied = min(remaining, target.open_amount)
+            actions.append(_processor_receipt_action(ctx, group, target, applied))
+            remaining -= applied
+            targets_by_currency[currency] = [
+                t._replace(open_amount=t.open_amount - applied) if t.action_key == target.action_key else t
+                for t in targets_by_currency[currency]
+            ]
+        if remaining > 0:
+            raise SimplbooksError(
+                f"Processor {processor!r} settles {decimal_number(remaining)} {currency} more than the "
+                f"period's invoices account for; the sales evidence and the drafted invoices disagree."
+            )
+        if group.fee_records:
+            fee_key = (processor, currency)
+            actions.append(
+                _processor_fee_payment_action(
+                    ctx, group, [built.fees_by_processor[fee_key]] if fee_key in built.fees_by_processor else []
+                )
+            )
+    return actions
+
+
 def build_purchase_actions(
     *,
     company_slug: str,
@@ -3495,7 +3749,10 @@ def apply_posting_policy(
         ):
             role = "sales"
             label = str(payload.get("counterparty_hint") or "")
-        elif action_type in {"create_incoming_summary"} or action_type == "create_purchase_summary" and str(payload.get("vendor_hint")) in PROCESSOR_KEYWORDS:
+        elif action_type in {"create_incoming_summary"} or (
+            action_type in {"create_purchase_summary", "create_payment_summary"}
+            and str(payload.get("vendor_hint")) in PROCESSOR_KEYWORDS
+        ):
             role = "processors"
             label = str(payload.get("counterparty_hint") or payload.get("vendor_hint") or "")
         elif action_type in {"create_purchase_summary", "create_purchase_credit_summary", "create_payment_summary"}:
@@ -3832,7 +4089,32 @@ def build_action_batch(
         forced_note=forced_note,
     )
 
-    actions = sales_actions + fee_actions + purchase_actions + purchase_credit_actions + direct_sale_actions + cash_actions
+    processor_settlement_actions = build_processor_settlement_actions(
+        ctx=DraftContext(
+            company_slug=company_slug,
+            period=period,
+            period_end=period_end,
+            normalized_path_display=normalized_path_display,
+            forced_note=forced_note,
+        ),
+        records=records,
+        base_currency=base_currency,
+        posting_policy=posting_policy,
+        built=BuiltActionKeys(
+            sales_actions=sales_actions,
+            fees_by_processor=_fee_action_ids,
+        ),
+    )
+
+    actions = (
+        sales_actions
+        + fee_actions
+        + purchase_actions
+        + purchase_credit_actions
+        + direct_sale_actions
+        + processor_settlement_actions
+        + cash_actions
+    )
     unresolved_dependencies = apply_posting_policy(actions, posting_policy=posting_policy)
     unresolved_dependencies.extend(
         build_manual_financial_dependencies(

@@ -482,6 +482,14 @@ def summarize_action_artifacts(
     expected_woo_contact = ((posting_policy.get("contacts") or {}).get("sales") or {}).get("woo")
     stripe_contact = ((posting_policy.get("contacts") or {}).get("processors") or {}).get("stripe")
     allowed_bank_accounts = {str(value) for value in (posting_policy.get("bank_accounts") or {}).values()}
+    # A reviewed processor account is the one cash target statement-import mode still
+    # allows the API, so it belongs beside the bank accounts rather than counting as a
+    # mismatch on every settled month.
+    allowed_bank_accounts |= {
+        str(value)
+        for value in ((posting_policy.get("cash_posting") or {}).get("processor_income_account_ids") or {}).values()
+        if str(value)
+    }
 
     actions_dir = company_dir / "artifacts" / "actions"
     manual_action_path = actions_dir / f"{year}-inventory-manual.json"

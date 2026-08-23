@@ -547,7 +547,9 @@ def inventory_quantity_proof_errors(action: dict[str, Any], line: dict[str, Any]
         if record_id in seen:
             return ["contributor record IDs must be unique"]
         seen.add(record_id)
-        if contributor.get("quantity_source") not in {"normalized_record", "reviewed_allocation_target"}:
+        if contributor.get("quantity_source") not in {
+            "normalized_record", "reviewed_allocation_target", "reviewed_woo_tax_allocation",
+        }:
             return ["contributor quantity_source is invalid"]
         if not re.fullmatch(r"[a-f0-9]{64}", str(contributor.get("record_sha256") or "")):
             return ["contributor record SHA-256 is invalid"]
@@ -566,6 +568,8 @@ def inventory_quantity_proof_errors(action: dict[str, Any], line: dict[str, Any]
         if scope_kind == "normalized_sales_group"
         else {"kind", "period", "record_category", "statement_id"}
         if scope_kind == "reviewed_direct_sale_allocation"
+        else {"kind", "period", "record_category", "group_label", "order_id"}
+        if scope_kind == "reviewed_allocated_order"
         else set()
     )
     if not expected_scope_fields or set(scope) != expected_scope_fields:
@@ -584,10 +588,11 @@ def inventory_quantity_proof_errors(action: dict[str, Any], line: dict[str, Any]
         return ["contributor count is invalid"]
     if canonical(ordered) != str(proof.get("contributor_set_sha256") or ""):
         return ["contributor set hash is invalid"]
-    required_source = (
-        "normalized_record" if scope_kind == "normalized_sales_group"
-        else "reviewed_allocation_target"
-    )
+    required_source = {
+        "normalized_sales_group": "normalized_record",
+        "reviewed_direct_sale_allocation": "reviewed_allocation_target",
+        "reviewed_allocated_order": "reviewed_woo_tax_allocation",
+    }.get(str(scope_kind or ""), "reviewed_allocation_target")
     if any(item.get("quantity_source") != required_source for item in contributors):
         return ["contributor quantity source does not match semantic scope"]
     contract_error = inventory_quantity_action_contract_error(action, line)

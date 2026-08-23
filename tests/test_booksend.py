@@ -1,6 +1,7 @@
 from __future__ import annotations  # noqa: I001
 
 import copy
+import hashlib
 import json
 import sys
 import tempfile
@@ -1693,6 +1694,49 @@ class StatementImportSenderTests(unittest.TestCase):
 
         self.assertEqual(len(client.calls), 1)
         self.assertEqual(batch["actions"][0]["inserted_id"], 900)
+
+
+class AllocatedOrderProofSenderTests(unittest.TestCase):
+    def line(self, *, quantity: float = 2.0, order: str = "763") -> dict:
+        contributor = {
+            "record_id": order, "quantity": quantity,
+            "quantity_source": "reviewed_woo_tax_allocation",
+            "record_sha256": "a" * 64,
+        }
+        scope = {"kind": "reviewed_allocated_order", "period": "2024-01",
+                 "record_category": "sales", "group_label": "woo", "order_id": order}
+        canonical = lambda v: hashlib.sha256(
+            json.dumps(v, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        ).hexdigest()
+        return {
+            "line_role": "sales_revenue", "article_id_hint": "3", "quantity": quantity,
+            "inventory_quantity_proof": {
+                "status": "exact", "quantity": quantity, "scope": scope,
+                "scope_sha256": canonical(scope), "contributor_count": 1,
+                "contributor_set_sha256": canonical([contributor]), "contributors": [contributor],
+            },
+        }
+
+    def action(self, line: dict) -> dict:
+        return {"idempotency_key": "k", "action_type": "create_invoice_summary",
+                "payload": {"document_type": "invoice", "line_items": [line]}}
+
+    def test_an_allocated_order_proof_is_accepted(self) -> None:
+        line = self.line()
+
+        self.assertEqual(booksend.inventory_quantity_proof_errors(self.action(line), line), [])
+
+    def test_a_mismatched_contributor_total_is_still_refused(self) -> None:
+        line = self.line()
+        line["quantity"] = 3.0
+
+        self.assertTrue(booksend.inventory_quantity_proof_errors(self.action(line), line))
+
+    def test_an_unknown_quantity_source_is_still_refused(self) -> None:
+        line = self.line()
+        line["inventory_quantity_proof"]["contributors"][0]["quantity_source"] = "guessed"
+
+        self.assertTrue(booksend.inventory_quantity_proof_errors(self.action(line), line))
 
 
 if __name__ == "__main__":

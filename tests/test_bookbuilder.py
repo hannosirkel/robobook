@@ -3023,5 +3023,52 @@ class NonInventoryRefundTests(unittest.TestCase):
                 self.assertIn(event_type, {"paypal_chargeback", "paypal_dispute_fee"})
 
 
+class ForeignCurrencyPilotGateTests(unittest.TestCase):
+    def inputs(self) -> tuple[dict, dict]:
+        row = bank_row(record_id="fx1", amount=-30.2, event_date="2024-11-01")
+        item = manual_allocation(row=row, disposition="generated_purchase_payment")
+        item["target"] = {
+            "document_type": "purchase",
+            "action_key": "example-2024-10-purchase-distributor",
+            "foreign_currency_pilot_required": True,
+            "target_currency": "USD",
+            "pilot_requirements": ["applied_ecb_rate"],
+        }
+        records = {"bank_transactions": [row]}
+        allocations = {(item["statement_id"], item["iban"], item["currency"]): item}
+        return records, allocations
+
+    def deps(self, policy: dict | None) -> list[dict]:
+        records, allocations = self.inputs()
+        return bookbuilder.build_foreign_currency_payment_pilot_dependencies(
+            records=records, allocations=allocations, posting_policy=policy,
+        )
+
+    def test_a_pilot_is_required_when_no_policy_says_otherwise(self) -> None:
+        self.assertEqual([d["blocking"] for d in self.deps(None)], [True])
+
+    def test_api_cash_mode_still_requires_the_pilot(self) -> None:
+        self.assertEqual([d["blocking"] for d in self.deps(api_cash_policy())], [True])
+
+    def test_import_mode_does_not_require_a_pilot_for_a_payment_it_never_posts(self) -> None:
+        # The API creates no payment for this row; the imported statement settles it.
+        self.assertEqual(self.deps(statement_import_policy()), [])
+
+    def test_a_row_on_an_unmanaged_account_still_requires_the_pilot(self) -> None:
+        policy = statement_import_policy()
+        policy["cash_posting"] = dict(policy["cash_posting"], bank_income_account_ids=["999"])
+
+        self.assertEqual([d["blocking"] for d in self.deps(policy)], [True])
+
+    def test_a_row_without_the_reviewed_flag_needs_no_pilot(self) -> None:
+        records, allocations = self.inputs()
+        for item in allocations.values():
+            item["target"].pop("foreign_currency_pilot_required")
+
+        self.assertEqual(
+            bookbuilder.build_foreign_currency_payment_pilot_dependencies(
+                records=records, allocations=allocations, posting_policy=None), [])
+
+
 if __name__ == "__main__":
     unittest.main()

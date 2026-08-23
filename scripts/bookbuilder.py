@@ -2694,12 +2694,32 @@ def build_foreign_currency_payment_pilot_dependencies(
     *,
     records: dict[str, list[dict[str, Any]]],
     allocations: dict[tuple[str, str, str], dict[str, Any]],
+    posting_policy: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    """Require a live pilot before the API first pays a foreign-currency document.
+
+    The pilot exists because SimplBooks' behaviour on such a payment is unverified. Where
+    the imported statement settles the row instead, the API makes no such payment, so
+    there is no unverified API behaviour to pilot; the same rate, balance and realized-FX
+    questions are answered by the post-import ledger evidence for that row.
+    """
     dependencies: list[dict[str, Any]] = []
     for record, allocation in _approved_bank_allocations(records=records, allocations=allocations):
         target = allocation.get("target") or {}
         if not target.get("foreign_currency_pilot_required"):
             continue
+        if posting_policy is not None:
+            try:
+                bank_account_id = resolve_bank_account(
+                    posting_policy,
+                    customer_account=bank_ledger_key(record)[0],
+                    currency=record_currency(record, "EUR"),
+                    allow_legacy_single_currency=True,
+                )
+            except (BankAllocationError, PostingPolicyError):
+                bank_account_id = None
+            if statement_import_owns_bank_cash(posting_policy, bank_account_id=bank_account_id):
+                continue
         dependencies.append({
             "kind": "foreign_currency_payment_pilot",
             "blocking": True,
@@ -3826,6 +3846,7 @@ def build_action_batch(
         build_foreign_currency_payment_pilot_dependencies(
             records=records,
             allocations=bank_allocations or {},
+            posting_policy=posting_policy,
         )
     )
     apply_exchange_rate_provenance(

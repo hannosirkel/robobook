@@ -922,12 +922,15 @@ def apply_allocation_to_monthly_summary(
             f"Woo monthly summary component evidence does not reconcile for {label}."
         )
 
+    # Snapshot before the taxable half is rewritten: the residual is the part of the
+    # original month the allocation does not name, so it must see the original counts.
+    residual_source = copy.deepcopy(sale)
     set_allocated_sale_components(sale, items, allocation, components)
     sale_attributes = sale.get("attributes")
     if isinstance(sale_attributes, dict):
         sale_attributes["orders"] = len(items)
     return build_zero_rated_residual(
-        sale, items, residual_product_gross, residual_shipping_gross, label,
+        residual_source, items, residual_product_gross, residual_shipping_gross, label,
     )
 
 

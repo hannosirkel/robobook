@@ -683,5 +683,37 @@ class ResidualQuantityDerivationTests(unittest.TestCase):
         self.assertIsNone(self.derive(2, [2, 1]))
 
 
+class ResidualOrderCountTests(unittest.TestCase):
+    def test_the_residual_keeps_the_orders_the_allocation_did_not_name(self) -> None:
+        sale = {
+            "record_id": "woo:2024-04", "description": "Woo monthly summary",
+            "external_ref": "2024-04", "gross_amount": 135.54, "net_amount": 135.54,
+            "vat_amount": 13.14, "shipping_amount": 0.0, "quantity": 4,
+            "attributes": {"orders": 4},
+        }
+        items = [
+            {"order_id": "774", "quantity": 1, "source_row_id": "r1"},
+            {"order_id": "777", "quantity": 1, "source_row_id": "r2"},
+        ]
+
+        residual = woo_tax.build_zero_rated_residual(
+            sale, items, Decimal("62.70"), Decimal(0), "2024-04"
+        )
+
+        # Four orders in the month, two named by the allocation: two are left over.
+        self.assertEqual(residual["attributes"]["orders"], 2)
+
+    def test_an_allocation_naming_more_orders_than_the_month_had_is_refused(self) -> None:
+        sale = {
+            "record_id": "woo:x", "description": "s", "external_ref": "x",
+            "gross_amount": 10.0, "net_amount": 10.0, "vat_amount": 0.0,
+            "shipping_amount": 0.0, "quantity": 1, "attributes": {"orders": 1},
+        }
+        items = [{"order_id": "1", "quantity": 1}, {"order_id": "2", "quantity": 1}]
+
+        with self.assertRaises(woo_tax.WooTaxError):
+            woo_tax.build_zero_rated_residual(sale, items, Decimal(5), Decimal(0), "x")
+
+
 if __name__ == "__main__":
     unittest.main()

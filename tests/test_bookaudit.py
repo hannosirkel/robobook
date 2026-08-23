@@ -391,5 +391,75 @@ class BookauditTests(unittest.TestCase):
         self.assertEqual(snapshot["input_vat_total"], Decimal("0"))  # noqa: FURB157
 
 
+class StockEquationAuditTests(unittest.TestCase):
+    def equation(self, **overrides: object) -> dict:
+        result = {
+            "article_id": "3",
+            "warehouses": {
+                "1": {"closing": Decimal(900), "selected": Decimal(900), "difference": Decimal(0)},
+                "9": {"closing": Decimal(176), "selected": Decimal(176), "difference": Decimal(0)},
+            },
+            "aggregate": {
+                "closing": Decimal(1076), "selected": Decimal(1076), "difference": Decimal(0),
+            },
+            "errors": [],
+            "instruction": None,
+        }
+        result.update(overrides)
+        return result
+
+    def test_a_reconciled_equation_has_no_finding(self) -> None:
+        self.assertEqual(bookaudit.evaluate_stock_equation_review(self.equation()), [])
+
+    def test_an_aggregate_difference_is_an_error(self) -> None:
+        equation = self.equation(
+            aggregate={"closing": Decimal(1076), "selected": Decimal(1070), "difference": Decimal(-6)}
+        )
+
+        findings = bookaudit.evaluate_stock_equation_review(equation)
+
+        self.assertEqual([item["severity"] for item in findings], ["error"])
+        self.assertIn("differs from the selected count", findings[0]["summary"])
+
+    def test_offsetting_warehouse_differences_are_still_an_error(self) -> None:
+        equation = self.equation(
+            warehouses={
+                "1": {"closing": Decimal(900), "selected": Decimal(890), "difference": Decimal(-10)},
+                "9": {"closing": Decimal(176), "selected": Decimal(186), "difference": Decimal(10)},
+            }
+        )
+
+        findings = bookaudit.evaluate_stock_equation_review(equation)
+
+        # Both warehouses are named: the aggregate is zero, so neither would be found otherwise.
+        self.assertEqual([item["severity"] for item in findings], ["error", "error"])
+        self.assertIn("warehouse 1", " ".join(item["summary"] for item in findings))
+        self.assertIn("warehouse 9", " ".join(item["summary"] for item in findings))
+
+    def test_equation_errors_are_reported_as_findings(self) -> None:
+        equation = self.equation(errors=["Warehouse 9 has no selected closing count to reconcile against."])
+
+        findings = bookaudit.evaluate_stock_equation_review(equation)
+
+        self.assertTrue(any("no selected closing count" in item["summary"] for item in findings))
+
+    def test_a_pending_adjustment_instruction_is_surfaced_for_approval(self) -> None:
+        equation = self.equation(
+            aggregate={"closing": Decimal(1076), "selected": Decimal(1070), "difference": Decimal(-6)},
+            instruction={
+                "action_type": "year_end_adjustment", "direction": "decrease",
+                "quantity": Decimal(6), "warehouse_id": "9", "article_id": "3",
+                "expense_account_id": "115", "status": "requires_separate_approval",
+            },
+        )
+
+        findings = bookaudit.evaluate_stock_equation_review(equation)
+
+        self.assertTrue(any("separate approval" in " ".join(item["evidence"]) for item in findings))
+
+    def test_no_equation_evidence_yields_no_finding(self) -> None:
+        self.assertEqual(bookaudit.evaluate_stock_equation_review(None), [])
+
+
 if __name__ == "__main__":
     unittest.main()

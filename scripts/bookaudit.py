@@ -927,6 +927,55 @@ def evaluate_vat_review(source: dict[str, Any], live: dict[str, Any]) -> list[di
     return findings
 
 
+def evaluate_stock_equation_review(equation: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Fail the audit unless posted stock reconciles, per warehouse and in aggregate.
+
+    Both are checked because they fail independently: two offsetting warehouse errors
+    leave the aggregate at zero, and an aggregate difference can hide inside warehouses
+    that each look plausible on their own.
+    """
+    if not equation:
+        return []
+    findings = [
+        make_finding(section="inventory_review", severity="error", summary=message)
+        for message in equation.get("errors") or []
+    ]
+    aggregate = equation.get("aggregate") or {}
+    if decimal_value(aggregate.get("difference")) != 0:
+        findings.append(
+            make_finding(
+                section="inventory_review",
+                severity="error",
+                summary="Posted inventory closing differs from the selected count.",
+                evidence=[
+                    f"Computed closing: {decimal_text(decimal_value(aggregate.get('closing')))}",
+                    f"Selected closing: {decimal_text(decimal_value(aggregate.get('selected')))}",
+                ],
+            )
+        )
+    for warehouse_id, item in sorted((equation.get("warehouses") or {}).items()):
+        if decimal_value(item.get("difference")) == 0:
+            continue
+        findings.append(
+            make_finding(
+                section="inventory_review",
+                severity="error",
+                summary=f"Posted inventory in warehouse {warehouse_id} differs from the selected count.",
+                evidence=[
+                    f"Computed closing: {decimal_text(decimal_value(item.get('closing')))}",
+                    f"Selected closing: {decimal_text(decimal_value(item.get('selected')))}",
+                ],
+            )
+        )
+    instruction = equation.get("instruction")
+    if findings and isinstance(instruction, dict):
+        findings[-1]["evidence"].append(
+            f"Proposed {instruction.get('direction')} of {decimal_text(decimal_value(instruction.get('quantity')))} "
+            f"in warehouse {instruction.get('warehouse_id')} requires separate approval before it is executed."
+        )
+    return findings
+
+
 def evaluate_inventory_review(source: dict[str, Any], live: dict[str, Any]) -> list[dict[str, Any]]:
     if not source["inventory_expected"]:
         return []

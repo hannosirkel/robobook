@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import bookchecker  # noqa: E402, I001
 import bookbuilder  # noqa: E402
 import examine_simplbooks_year  # noqa: E402
+import inventory_verification  # noqa: E402
 import statement_import_plan  # noqa: E402
 
 
@@ -434,6 +435,14 @@ class SchemaContractTests(unittest.TestCase):
     def test_manual_inventory_action_template_matches_strict_schema(self) -> None:
         artifact = json.loads((ROOT / "templates/manual-inventory-action.template.json").read_text(encoding="utf-8"))
         self.assert_artifact_valid(schema_name="manual-inventory-action.schema.json", artifact=artifact)
+        inventory_verification.validate_manual_inventory_action(artifact)
+
+    def test_manual_inventory_action_schema_requires_transfer_remnants(self) -> None:
+        artifact = json.loads((ROOT / "templates/manual-inventory-action.template.json").read_text(encoding="utf-8"))
+        del artifact["remnant_after"]
+
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="manual-inventory-action.schema.json", artifact=artifact)
 
     def test_manual_inventory_action_schema_rejects_nonpositive_quantity(self) -> None:
         artifact = json.loads((ROOT / "templates/manual-inventory-action.template.json").read_text(encoding="utf-8"))

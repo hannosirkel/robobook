@@ -137,13 +137,16 @@ class SchemaContractTests(unittest.TestCase):
         self.assertEqual(
             sorted(artifact["cash_posting"]["financial_accounts"]),
             [
+                "bank",
                 "bank_fees",
+                "customer_receivable",
                 "fx_gain",
                 "fx_loss",
                 "paypal",
                 "platform_prepayment",
                 "reporting_person_payable",
                 "stripe_clearing",
+                "supplier_payable",
             ],
         )
         self.assert_artifact_valid(schema_name="posting-policy.schema.json", artifact=artifact)

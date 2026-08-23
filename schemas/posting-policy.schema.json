@@ -52,6 +52,14 @@
   "$defs": {
     "id": {"type": ["string", "null"], "pattern": "^[0-9]+$"},
     "required_id": {"type": "string", "pattern": "^[0-9]+$"},
+    "financial_account_role": {
+      "type": "string",
+      "enum": [
+        "bank", "stripe_clearing", "paypal", "bank_fees", "reporting_person_payable",
+        "platform_prepayment", "customer_receivable", "supplier_payable", "fx_gain",
+        "fx_loss", "inventory_change"
+      ]
+    },
     "cash_posting": {
       "type": "object",
       "description": "Cash-posting mode plus the accounts statement-import mode needs; absent means legacy API cash posting.",
@@ -68,24 +76,42 @@
           "type": "object",
           "additionalProperties": {"$ref": "#/$defs/required_id"}
         },
+        "bank_financial_accounts": {
+          "type": "object",
+          "description": "Ledger account behind each imported statement account, optionally per currency.",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": ["string", "object"],
+            "pattern": "^[0-9]+$",
+            "minProperties": 1,
+            "propertyNames": {"pattern": "^[A-Z]{3}$"},
+            "additionalProperties": {"$ref": "#/$defs/required_id"}
+          }
+        },
+        "clearing_provider_roles": {
+          "type": "object",
+          "description": "Reviewed clearing provider to financial-account role; never inferred from description text.",
+          "additionalProperties": {"$ref": "#/$defs/financial_account_role"}
+        },
         "financial_accounts": {
           "type": "object",
           "description": "Reviewed financial-account roles; role names stay generic and company IDs live in the values.",
           "additionalProperties": false,
           "required": [
-            "stripe_clearing", "paypal", "bank_fees", "reporting_person_payable",
-            "platform_prepayment", "fx_gain", "fx_loss"
+            "bank", "stripe_clearing", "paypal", "bank_fees", "reporting_person_payable",
+            "platform_prepayment", "customer_receivable", "supplier_payable", "fx_gain", "fx_loss"
           ],
           "properties": {
+            "bank": {"$ref": "#/$defs/required_id"},
             "stripe_clearing": {"$ref": "#/$defs/required_id"},
             "paypal": {"$ref": "#/$defs/required_id"},
             "bank_fees": {"$ref": "#/$defs/required_id"},
             "reporting_person_payable": {"$ref": "#/$defs/required_id"},
             "platform_prepayment": {"$ref": "#/$defs/required_id"},
-            "fx_gain": {"$ref": "#/$defs/required_id"},
-            "fx_loss": {"$ref": "#/$defs/required_id"},
             "customer_receivable": {"$ref": "#/$defs/required_id"},
             "supplier_payable": {"$ref": "#/$defs/required_id"},
+            "fx_gain": {"$ref": "#/$defs/required_id"},
+            "fx_loss": {"$ref": "#/$defs/required_id"},
             "inventory_change": {"$ref": "#/$defs/required_id"}
           }
         }

@@ -16,22 +16,32 @@ class PostingPolicyError(RuntimeError):
 CASH_POSTING_MODES = frozenset({"api", "statement_import"})
 
 CASH_POSTING_KEYS = frozenset(
-    {"mode", "bank_income_account_ids", "processor_income_account_ids", "financial_accounts"}
+    {
+        "mode",
+        "bank_income_account_ids",
+        "processor_income_account_ids",
+        "bank_financial_accounts",
+        "clearing_provider_roles",
+        "financial_accounts",
+    }
 )
 
 REQUIRED_FINANCIAL_ACCOUNT_ROLES = frozenset(
     {
+        "bank",
         "stripe_clearing",
         "paypal",
         "bank_fees",
         "reporting_person_payable",
         "platform_prepayment",
+        "customer_receivable",
+        "supplier_payable",
         "fx_gain",
         "fx_loss",
     }
 )
 
-OPTIONAL_FINANCIAL_ACCOUNT_ROLES = frozenset({"customer_receivable", "supplier_payable", "inventory_change"})
+OPTIONAL_FINANCIAL_ACCOUNT_ROLES = frozenset({"inventory_change"})
 
 KNOWN_FINANCIAL_ACCOUNT_ROLES = REQUIRED_FINANCIAL_ACCOUNT_ROLES | OPTIONAL_FINANCIAL_ACCOUNT_ROLES
 
@@ -229,6 +239,57 @@ def _cash_posting_financial_accounts(section: dict[str, Any], *, required: bool)
     return resolved
 
 
+def _cash_posting_bank_financial_accounts(section: dict[str, Any], *, required: bool) -> dict[str, Any]:
+    value = section.get("bank_financial_accounts")
+    if value is None and not required:
+        return {}
+    if not isinstance(value, dict) or not value:
+        raise PostingPolicyError(
+            "cash_posting.bank_financial_accounts must map each imported statement account to its ledger account."
+        )
+    for account, mapping in value.items():
+        field = f"cash_posting.bank_financial_accounts[{account!r}]"
+        if not str(account).strip():
+            raise PostingPolicyError("cash_posting.bank_financial_accounts keys cannot be empty.")
+        if isinstance(mapping, dict):
+            if not mapping:
+                raise PostingPolicyError(f"{field} requires at least one currency mapping.")
+            for currency, account_id in mapping.items():
+                if not re.fullmatch(r"[A-Z]{3}", str(currency or "").strip()):
+                    raise PostingPolicyError(f"{field} has invalid currency {currency!r}.")
+                normalize_id(account_id, field_name=f"{field}[{currency!r}]")
+        else:
+            normalize_id(mapping, field_name=field)
+    return value
+
+
+def _cash_posting_clearing_provider_roles(
+    section: dict[str, Any], *, required: bool, accounts: dict[str, str]
+) -> dict[str, str]:
+    value = section.get("clearing_provider_roles")
+    if value is None and not required:
+        return {}
+    if not isinstance(value, dict):
+        raise PostingPolicyError("cash_posting.clearing_provider_roles must be an object.")
+    resolved: dict[str, str] = {}
+    for provider, role in value.items():
+        label = slugify(provider)
+        if not label:
+            raise PostingPolicyError("cash_posting.clearing_provider_roles keys cannot be empty.")
+        role_name = str(role or "").strip()
+        if role_name not in KNOWN_FINANCIAL_ACCOUNT_ROLES:
+            raise PostingPolicyError(
+                f"cash_posting.clearing_provider_roles[{provider!r}] names unknown role {role_name!r}."
+            )
+        if role_name not in accounts:
+            raise PostingPolicyError(
+                f"cash_posting.clearing_provider_roles[{provider!r}] names role {role_name!r}, "
+                "which has no bound financial account."
+            )
+        resolved[label] = role_name
+    return resolved
+
+
 def validated_cash_posting(policy: dict[str, Any]) -> dict[str, Any]:
     """Normalize the optional cash-posting section; an absent section means legacy API cash posting."""
     section = policy.get("cash_posting")
@@ -250,6 +311,8 @@ def validated_cash_posting(policy: dict[str, Any]) -> dict[str, Any]:
     bank_ids = _cash_posting_bank_ids(section, required=required)
     processors = _cash_posting_processor_ids(section, required=required)
     accounts = _cash_posting_financial_accounts(section, required=required)
+    bank_ledgers = _cash_posting_bank_financial_accounts(section, required=required)
+    clearing_roles = _cash_posting_clearing_provider_roles(section, required=required, accounts=accounts)
 
     shared = sorted(set(bank_ids) & set(processors.values()))
     if shared:
@@ -260,6 +323,8 @@ def validated_cash_posting(policy: dict[str, Any]) -> dict[str, Any]:
         "mode": mode,
         "bank_income_account_ids": bank_ids,
         "processor_income_account_ids": processors,
+        "bank_financial_accounts": bank_ledgers,
+        "clearing_provider_roles": clearing_roles,
         "financial_accounts": accounts,
     }
 
@@ -366,6 +431,47 @@ def load_posting_policy(path: Path) -> dict[str, Any]:
     return payload
 
 
+def resolve_account_mapping(
+    mappings: Any,
+    *,
+    customer_account: str,
+    currency: str | None,
+    field: str,
+    allow_legacy_single_currency: bool = False,
+) -> str:
+    """Resolve one `(source account[, currency])` mapping to an exact Simplbooks ID.
+
+    `field` names the policy path the mapping lives at, so a failure points at the
+    exact key to fix rather than at a prose description of it.
+    """
+    source_account = re.sub(r"\s+", "", str(customer_account or "")).upper()
+    normalized_mappings = {
+        re.sub(r"\s+", "", str(key)).upper(): value
+        for key, value in (mappings or {}).items()
+    }
+    if source_account not in normalized_mappings:
+        raise PostingPolicyError(f"No exact {field} mapping exists for source account {customer_account!r}.")
+    account_mapping = normalized_mappings[source_account]
+    if isinstance(account_mapping, dict):
+        normalized_currency = str(currency or "").strip().upper()
+        if not re.fullmatch(r"[A-Z]{3}", normalized_currency):
+            raise PostingPolicyError(f"{field} mapping for {customer_account!r} requires a three-letter currency.")
+        currency_mappings = {str(key).strip().upper(): value for key, value in account_mapping.items()}
+        if normalized_currency not in currency_mappings:
+            raise PostingPolicyError(
+                f"No exact {field} mapping exists for source account {customer_account!r} and currency {normalized_currency}."
+            )
+        return normalize_id(
+            currency_mappings[normalized_currency],
+            field_name=f"{field}[{customer_account!r}][{normalized_currency!r}]",
+        )
+    if currency is not None and not allow_legacy_single_currency:
+        raise PostingPolicyError(
+            f"{field} mapping for {customer_account!r} must specify currency {str(currency).upper()!r}."
+        )
+    return normalize_id(account_mapping, field_name=f"{field}[{customer_account!r}]")
+
+
 def resolve_bank_account(
     policy: dict[str, Any],
     *,
@@ -373,33 +479,32 @@ def resolve_bank_account(
     currency: str | None = None,
     allow_legacy_single_currency: bool = False,
 ) -> str:
-    source_account = re.sub(r"\s+", "", str(customer_account or "")).upper()
-    mappings = policy.get("bank_accounts") or {}
-    normalized_mappings = {
-        re.sub(r"\s+", "", str(key)).upper(): value
-        for key, value in mappings.items()
-    }
-    if source_account not in normalized_mappings:
-        raise PostingPolicyError(f"No exact bank-account mapping exists for source account {customer_account!r}.")
-    account_mapping = normalized_mappings[source_account]
-    if isinstance(account_mapping, dict):
-        normalized_currency = str(currency or "").strip().upper()
-        if not re.fullmatch(r"[A-Z]{3}", normalized_currency):
-            raise PostingPolicyError(f"Bank-account mapping for {customer_account!r} requires a three-letter currency.")
-        currency_mappings = {str(key).strip().upper(): value for key, value in account_mapping.items()}
-        if normalized_currency not in currency_mappings:
-            raise PostingPolicyError(
-                f"No exact bank-account mapping exists for source account {customer_account!r} and currency {normalized_currency}."
-            )
-        return normalize_id(
-            currency_mappings[normalized_currency],
-            field_name=f"bank_accounts[{customer_account!r}][{normalized_currency!r}]",
-        )
-    if currency is not None and not allow_legacy_single_currency:
-        raise PostingPolicyError(
-            f"Bank-account mapping for {customer_account!r} must specify currency {str(currency).upper()!r}."
-        )
-    return normalize_id(account_mapping, field_name=f"bank_accounts[{customer_account!r}]")
+    return resolve_account_mapping(
+        policy.get("bank_accounts"),
+        customer_account=customer_account,
+        currency=currency,
+        field="bank_accounts",
+        allow_legacy_single_currency=allow_legacy_single_currency,
+    )
+
+
+def resolve_bank_financial_account(policy: dict[str, Any], *, iban: str, currency: str) -> str:
+    """Resolve the ledger account behind one imported statement account, never a similar one."""
+    return resolve_account_mapping(
+        statement_import_policy(policy)["bank_financial_accounts"],
+        customer_account=iban,
+        currency=currency,
+        field="cash_posting.bank_financial_accounts",
+    )
+
+
+def resolve_clearing_account(policy: dict[str, Any], *, provider: str) -> tuple[str, str]:
+    """Resolve one reviewed clearing provider to its `(role, account ID)` pair."""
+    resolved = statement_import_policy(policy)
+    role = resolved["clearing_provider_roles"].get(slugify(provider))
+    if role is None:
+        raise PostingPolicyError(f"No reviewed financial-account role exists for clearing provider {provider!r}.")
+    return role, resolved["financial_accounts"][role]
 
 
 def resolve_contact(policy: dict[str, Any], *, role: str, label: str) -> str:

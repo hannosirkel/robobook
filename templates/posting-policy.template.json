@@ -69,12 +69,23 @@
       "paypal": "6",
       "stripe": "7"
     },
+    "bank_financial_accounts": {
+      "EE001234567890": {"EUR": "10", "USD": "11"}
+    },
+    "clearing_provider_roles": {
+      "paypal": "paypal",
+      "stripe": "stripe_clearing",
+      "print-partner": "platform_prepayment"
+    },
     "financial_accounts": {
+      "bank": "10",
       "stripe_clearing": "30",
       "paypal": "31",
       "bank_fees": "32",
       "reporting_person_payable": "33",
       "platform_prepayment": "34",
+      "customer_receivable": "37",
+      "supplier_payable": "38",
       "fx_gain": "35",
       "fx_loss": "36"
     }

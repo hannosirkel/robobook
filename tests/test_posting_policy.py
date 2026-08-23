@@ -50,6 +50,8 @@ def statement_import_policy_fixture() -> dict:
             "mode": "statement_import",
             "bank_income_account_ids": ["3"],
             "processor_income_account_ids": {"paypal": "6", "stripe": "7"},
+            "bank_financial_accounts": {"EE001234567890": {"EUR": "10", "USD": "11"}},
+            "clearing_provider_roles": {"paypal": "paypal", "stripe": "stripe_clearing"},
             "financial_accounts": {
                 "stripe_clearing": "30",
                 "paypal": "31",
@@ -58,6 +60,9 @@ def statement_import_policy_fixture() -> dict:
                 "platform_prepayment": "34",
                 "fx_gain": "35",
                 "fx_loss": "36",
+                "customer_receivable": "37",
+                "supplier_payable": "38",
+                "bank": "10",
             },
         },
         "warehouse_routing": {
@@ -306,6 +311,70 @@ class SalesWarehouseRoutingTests(unittest.TestCase):
         del policy["warehouse_routing"]["woo"]["before_warehouse_id"]
 
         with self.assertRaisesRegex(posting_policy.PostingPolicyError, "before_warehouse_id"):
+            posting_policy.validate_posting_policy(policy)
+
+
+class StatementImportAccountBindingTests(unittest.TestCase):
+    def test_statement_import_requires_receivable_and_payable_roles(self) -> None:
+        policy = statement_import_policy_fixture()
+        del policy["cash_posting"]["financial_accounts"]["supplier_payable"]
+
+        with self.assertRaisesRegex(posting_policy.PostingPolicyError, "supplier_payable"):
+            posting_policy.validate_posting_policy(policy)
+
+    def test_statement_import_requires_bank_financial_accounts(self) -> None:
+        policy = statement_import_policy_fixture()
+        del policy["cash_posting"]["bank_financial_accounts"]
+
+        with self.assertRaisesRegex(posting_policy.PostingPolicyError, "bank_financial_accounts"):
+            posting_policy.validate_posting_policy(policy)
+
+    def test_bank_financial_account_resolves_per_currency(self) -> None:
+        policy = statement_import_policy_fixture()
+
+        self.assertEqual(
+            posting_policy.resolve_bank_financial_account(policy, iban="EE00 1234 5678 90", currency="EUR"), "10"
+        )
+        self.assertEqual(
+            posting_policy.resolve_bank_financial_account(policy, iban="EE001234567890", currency="USD"), "11"
+        )
+
+    def test_unmapped_bank_iban_has_no_financial_account(self) -> None:
+        policy = statement_import_policy_fixture()
+
+        with self.assertRaisesRegex(posting_policy.PostingPolicyError, "bank_financial_accounts"):
+            posting_policy.resolve_bank_financial_account(policy, iban="EE999", currency="EUR")
+
+    def test_unmapped_bank_currency_has_no_financial_account(self) -> None:
+        policy = statement_import_policy_fixture()
+
+        with self.assertRaisesRegex(posting_policy.PostingPolicyError, "GBP"):
+            posting_policy.resolve_bank_financial_account(policy, iban="EE001234567890", currency="GBP")
+
+    def test_clearing_provider_resolves_to_a_reviewed_role_and_account(self) -> None:
+        policy = statement_import_policy_fixture()
+
+        self.assertEqual(posting_policy.resolve_clearing_account(policy, provider="PayPal"), ("paypal", "31"))
+        self.assertEqual(posting_policy.resolve_clearing_account(policy, provider="stripe"), ("stripe_clearing", "30"))
+
+    def test_unreviewed_clearing_provider_is_rejected(self) -> None:
+        policy = statement_import_policy_fixture()
+
+        with self.assertRaisesRegex(posting_policy.PostingPolicyError, "clearing provider"):
+            posting_policy.resolve_clearing_account(policy, provider="wise")
+
+    def test_clearing_provider_role_must_name_a_bound_financial_account(self) -> None:
+        policy = statement_import_policy_fixture()
+        policy["cash_posting"]["clearing_provider_roles"]["wise"] = "inventory_change"
+
+        with self.assertRaisesRegex(posting_policy.PostingPolicyError, "inventory_change"):
+            posting_policy.validate_posting_policy(policy)
+
+    def test_clearing_provider_role_must_be_a_known_role(self) -> None:
+        policy = statement_import_policy_fixture()
+        policy["cash_posting"]["clearing_provider_roles"]["wise"] = "wise_clearing"
+
+        with self.assertRaisesRegex(posting_policy.PostingPolicyError, "wise_clearing"):
             posting_policy.validate_posting_policy(policy)
 
 

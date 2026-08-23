@@ -240,7 +240,7 @@ def _contra_account(disposition: str, target: dict[str, Any], policy: dict[str, 
     return role, accounts[role]
 
 
-def _document_refs(disposition: str, target: dict[str, Any]) -> list[dict[str, str]]:
+def _document_refs(disposition: str, target: dict[str, Any], *, statement_id: str) -> list[dict[str, str]]:
     kind = DOCUMENT_KIND[disposition]
     if _text(target.get("document_type")) != kind:
         raise StatementImportPlanError(
@@ -249,9 +249,13 @@ def _document_refs(disposition: str, target: dict[str, Any]) -> list[dict[str, s
     reference = {
         field: _text(target.get(field)) for field in TARGET_ID_FIELDS if _text(target.get(field))
     }
-    if not reference:
-        raise StatementImportPlanError(f"A {disposition} row requires an exact document target identifier.")
-    return [{"document_type": kind, **reference}]
+    if reference:
+        return [{"document_type": kind, **reference}]
+    if disposition == "direct_sale_receipt":
+        # A direct sale creates exactly one invoice for exactly one physical receipt, so
+        # the statement identity names the document without inventing an identifier for it.
+        return [{"document_type": kind, "generated_for_statement_id": statement_id}]
+    raise StatementImportPlanError(f"A {disposition} row requires an exact document target identifier.")
 
 
 def _direction(signed: Decimal, *, bank: tuple[str, str], contra: tuple[str, str]) -> dict[str, dict[str, str]]:
@@ -301,6 +305,7 @@ def _ecb_block(
 def _part_rows(
     allocation: dict[str, Any], *, bank: tuple[str, str], policy: dict[str, Any]
 ) -> list[dict[str, Any]]:
+    statement_id = allocation_key(allocation)[0]
     parts = allocation.get("parts")
     if not isinstance(parts, list) or not parts:
         raise StatementImportPlanError("A reviewed split requires at least one part.")
@@ -321,7 +326,11 @@ def _part_rows(
                 "disposition": disposition,
                 "family": MANUAL_FAMILY.get(disposition, "document_settlement"),
                 **_direction(amount, bank=bank, contra=contra),
-                "document_refs": _document_refs(disposition, target) if disposition in DOCUMENT_FAMILY else [],
+                "document_refs": (
+                    _document_refs(disposition, target, statement_id=statement_id)
+                    if disposition in DOCUMENT_FAMILY
+                    else []
+                ),
             }
         )
     return resolved
@@ -360,7 +369,11 @@ def _plan_row(
         document_refs: list[dict[str, str]] = []
     else:
         direction = _direction(signed, bank=bank, contra=_contra_account(disposition, target, policy))
-        document_refs = _document_refs(disposition, target) if disposition in DOCUMENT_FAMILY else []
+        document_refs = (
+            _document_refs(disposition, target, statement_id=statement_id)
+            if disposition in DOCUMENT_FAMILY
+            else []
+        )
 
     return {
         "statement_id": statement_id,

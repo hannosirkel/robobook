@@ -82,6 +82,7 @@
       "properties": {
         "document_type": {"type": "string", "enum": ["invoice", "purchase"]},
         "simplbooks_id": {"type": "string", "minLength": 1},
+        "generated_for_statement_id": {"type": "string", "minLength": 1},
         "action_key": {"type": "string", "minLength": 1},
         "idempotency_key": {"type": "string", "minLength": 1},
         "action_id": {"type": "string", "minLength": 1}

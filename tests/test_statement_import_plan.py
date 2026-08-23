@@ -514,5 +514,57 @@ class PlanDecimalTests(unittest.TestCase):
         self.assertEqual(Decimal(row["signed_amount"]), Decimal("-12.50"))
 
 
+class DirectSaleTargetTests(unittest.TestCase):
+    def direct_sale(self, target_extra: dict[str, Any] | None = None) -> dict[str, Any]:
+        record = bank_record(record_id="rec-d", archive="d", event_date="2024-06-04", amount="60.00")
+        target = {
+            "document_type": "invoice",
+            "contact_label": "direct-sale",
+            "posting_family": "direct-sale-taxable",
+            "vat_profile": "taxable",
+            "product_description": "Reviewed direct sale",
+            "quantity": 1,
+            "gross_amount": 60.0,
+            "warehouse_id": "1",
+            "article_id": "3",
+        }
+        target.update(target_extra or {})
+        item = allocation(
+            statement_id="archive:d", record_id="rec-d", period="2024-06", amount="60.00",
+            disposition="direct_sale_receipt", target=target,
+        )
+        return build(
+            normalized_payloads=[normalized("2024-06", [record])],
+            allocation_payload=allocations([item]),
+        )
+
+    def test_a_direct_sale_names_the_invoice_generated_for_its_own_row(self) -> None:
+        # One invoice is created per physical receipt, so the statement identity names it.
+        row = self.direct_sale()["rows"][0]
+
+        self.assertEqual(
+            row["document_refs"],
+            [{"document_type": "invoice", "generated_for_statement_id": "archive:d"}],
+        )
+        self.assertEqual(row["ui_action"], "match_document")
+
+    def test_a_direct_sale_still_settles_the_customer_receivable(self) -> None:
+        row = self.direct_sale()["rows"][0]
+
+        self.assertEqual(row["financial_accounts"], {"debit": "10", "credit": "37"})
+
+    def test_an_explicit_direct_sale_target_id_wins(self) -> None:
+        row = self.direct_sale({"simplbooks_id": "512"})["rows"][0]
+
+        self.assertEqual(row["document_refs"], [{"document_type": "invoice", "simplbooks_id": "512"}])
+
+    def test_a_generated_receipt_without_an_action_key_still_blocks(self) -> None:
+        broken = dict(RECEIPT_ALLOCATION, disposition="generated_invoice_receipt",
+                      target={"document_type": "invoice"})
+
+        with self.assertRaisesRegex(statement_import_plan.StatementImportPlanError, "document target"):
+            build(allocation_payload=allocations([FEE_ALLOCATION, broken]))
+
+
 if __name__ == "__main__":
     unittest.main()

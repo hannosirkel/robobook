@@ -1830,6 +1830,37 @@ def _inventory_group_label(record: dict[str, Any]) -> str:
     )
 
 
+def _allocated_order_components(line: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Index the reviewed order components a VAT-allocated line declares, by order."""
+    return {
+        str(item.get("order_id") or ""): item
+        for item in line.get("vat_allocation_component_evidence") or []
+        if isinstance(item, dict) and str(item.get("order_id") or "")
+    }
+
+
+def _expected_allocated_order_contributors(line: dict[str, Any]) -> list[dict[str, Any]]:
+    """Rebuild the contributor set a VAT-allocated goods line must carry."""
+    expected: list[dict[str, Any]] = []
+    for order_id, item in _allocated_order_components(line).items():
+        try:
+            quantity = decimal_value(item.get("quantity"))
+        except SimplbooksError:
+            continue
+        if quantity <= 0:
+            continue
+        expected.append({
+            "record_id": order_id,
+            "quantity": decimal_number(quantity),
+            "quantity_source": "reviewed_woo_tax_allocation",
+            "record_sha256": _canonical_value_sha256(
+                {"order_id": order_id, "source_row_id": str(item.get("source_row_id") or "")}
+            ),
+        })
+    expected.sort(key=lambda item: (item["record_id"], item["record_sha256"]))
+    return expected
+
+
 def _inventory_scope_records(
     scope: dict[str, Any], *, normalized_payloads: list[dict[str, Any]],
     reviewed_allocations: dict[str, dict[str, Any]],
@@ -1947,12 +1978,15 @@ def evaluate_inventory_quantities(
                 problems.append("Inventory quantity contributor must be positive.")
                 continue
             contributor_total += quantity
-            record = records.get(record_id)
-            if not isinstance(record, dict):
-                problems.append(f"Inventory quantity contributor {record_id} is not an action source.")
-                continue
-            if _canonical_record_sha256(record) != str(contributor.get("record_sha256") or ""):
-                problems.append(f"Inventory quantity contributor {record_id} SHA-256 does not match its source record.")
+            if contributor.get("quantity_source") != "reviewed_woo_tax_allocation":
+                record = records.get(record_id)
+                if not isinstance(record, dict):
+                    problems.append(f"Inventory quantity contributor {record_id} is not an action source.")
+                    continue
+                if _canonical_record_sha256(record) != str(contributor.get("record_sha256") or ""):
+                    problems.append(
+                        f"Inventory quantity contributor {record_id} SHA-256 does not match its source record."
+                    )
             source = contributor.get("quantity_source")
             if source == "normalized_record":
                 try:
@@ -1970,6 +2004,16 @@ def evaluate_inventory_quantities(
                     allocated_quantity = Decimal("0")  # noqa: FURB157
                 if not isinstance(target, dict) or allocated_quantity <= 0 or allocated_quantity != quantity:
                     problems.append(f"Inventory quantity contributor {record_id} does not match reviewed allocation target.")
+            elif source == "reviewed_woo_tax_allocation":
+                component = _allocated_order_components(line).get(record_id)
+                try:
+                    allocated_quantity = decimal_value((component or {}).get("quantity"))
+                except SimplbooksError:
+                    allocated_quantity = Decimal("0")  # noqa: FURB157
+                if not isinstance(component, dict) or allocated_quantity <= 0 or allocated_quantity != quantity:
+                    problems.append(
+                        f"Inventory quantity contributor {record_id} does not match its reviewed allocation component."
+                    )
             else:
                 problems.append(f"Inventory quantity contributor {record_id} has unsupported quantity source.")
         try:
@@ -1984,7 +2028,19 @@ def evaluate_inventory_quantities(
             if isinstance(payload, dict) and id(payload) not in seen_payload_ids:
                 normalized_payloads.append(payload)
                 seen_payload_ids.add(id(payload))
-        if isinstance(proof, dict) and isinstance(proof.get("scope"), dict):
+        if (
+            isinstance(proof, dict)
+            and isinstance(proof.get("scope"), dict)
+            and proof["scope"].get("kind") == "reviewed_allocated_order"
+        ):
+            expected_contributors = _expected_allocated_order_contributors(line)
+            if (
+                contributors != expected_contributors
+                or int(proof.get("contributor_count") or -1) != len(expected_contributors)
+                or str(proof.get("contributor_set_sha256") or "") != _canonical_value_sha256(expected_contributors)
+            ):
+                problems.append("Inventory proof does not contain the complete contributor set for its semantic scope.")
+        elif isinstance(proof, dict) and isinstance(proof.get("scope"), dict):
             expected_records, quantity_source = _inventory_scope_records(
                 proof["scope"], normalized_payloads=normalized_payloads,
                 reviewed_allocations=reviewed_allocations,

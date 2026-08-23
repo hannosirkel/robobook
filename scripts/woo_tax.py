@@ -697,6 +697,18 @@ def apply_allocation_to_sale(
     set_allocated_sale_components(sale, items, allocation, components)
 
 
+def allocation_component_quantity(item: dict[str, Any]) -> float | None:
+    """Return one order's reviewed goods quantity, or None when it has none.
+
+    Absent means unknown, never one: a defaulted quantity would silently move stock.
+    """
+    raw = item.get("quantity")
+    if raw in (None, ""):
+        return None
+    quantity = decimal_value(raw)
+    return decimal_number(quantity) if quantity > 0 else None
+
+
 def set_allocated_sale_components(
     sale: dict[str, Any],
     items: list[dict[str, Any]],
@@ -753,6 +765,7 @@ def set_allocated_sale_components(
         "component_vat_evidence": [
             {
                 "order_id": str(item["order_id"]),
+                "quantity": allocation_component_quantity(item),
                 "event_date": str(item.get("event_date") or ""),
                 "source_row_id": str(item.get("source_row_id") or ""),
                 "processor_ref": str(item.get("processor_ref") or ""),

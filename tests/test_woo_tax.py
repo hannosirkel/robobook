@@ -645,5 +645,18 @@ class WooTaxTests(unittest.TestCase):
         self.assertIn("canonical", stderr.getvalue())
 
 
+class AllocationQuantityPassthroughTests(unittest.TestCase):
+    def test_a_reviewed_order_quantity_reaches_the_component_evidence(self) -> None:
+        entries = [{"order_id": "763", "quantity": 2}]
+
+        self.assertEqual(woo_tax.allocation_component_quantity(entries[0]), 2.0)
+
+    def test_an_absent_quantity_stays_absent_rather_than_defaulting(self) -> None:
+        self.assertIsNone(woo_tax.allocation_component_quantity({"order_id": "763"}))
+
+    def test_a_zero_quantity_is_not_treated_as_a_quantity(self) -> None:
+        self.assertIsNone(woo_tax.allocation_component_quantity({"order_id": "763", "quantity": 0}))
+
+
 if __name__ == "__main__":
     unittest.main()

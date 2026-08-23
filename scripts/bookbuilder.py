@@ -192,6 +192,37 @@ def inventory_proof_envelope(
     }
 
 
+def allocated_order_quantity_proof(
+    evidence: dict[str, Any], *, group_label: str, direction: str
+) -> dict[str, Any] | None:
+    """Prove one allocated order's quantity from the reviewed allocation that names it.
+
+    A monthly summary carries no per-order quantity, so the reviewed VAT allocation is
+    where an exact one can live. An order without a positive reviewed quantity yields no
+    proof at all rather than a defaulted one.
+    """
+    quantity = decimal_value(evidence.get("quantity") or 0)
+    order_id = str(evidence.get("order_id") or "")
+    if quantity <= 0 or not order_id:
+        return None
+    contributor = {
+        "record_id": order_id,
+        "quantity": decimal_number(quantity),
+        "quantity_source": "reviewed_woo_tax_allocation",
+        "record_sha256": canonical_value_sha256(
+            {"order_id": order_id, "source_row_id": str(evidence.get("source_row_id") or "")}
+        ),
+    }
+    scope = {
+        "kind": "reviewed_allocated_order",
+        "period": str(evidence.get("event_date") or "")[:7],
+        "record_category": "sales" if direction == "sales" else "refunds",
+        "group_label": group_label,
+        "order_id": order_id,
+    }
+    return inventory_proof_envelope(scope=scope, contributors=[contributor], quantity=quantity)
+
+
 def normalized_inventory_quantity_proof(
     records: list[dict[str, Any]], *, group_label: str, direction: str,
 ) -> dict[str, Any] | None:
@@ -943,12 +974,21 @@ def period_order_numbers(records: dict[str, list[dict[str, Any]]]) -> list[int]:
     up do, so the period's own evidence can still say which side of a routing boundary
     the summary sits on.
     """
-    numbers = {
-        number
-        for rows in records.values()
-        for row in rows or []
-        if isinstance(row, dict) and (number := sales_order_number(row)) is not None
-    }
+    numbers: set[int] = set()
+    for rows in records.values():
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            own = sales_order_number(row)
+            if own is not None:
+                numbers.add(own)
+            # The reviewed VAT allocation names the orders it split, which is a stronger
+            # statement of order identity than a processor charge that happens to carry one.
+            allocation = (row.get("attributes") or {}).get("vat_allocation") or {}
+            for order_id in allocation.get("allocated_order_ids") or []:
+                digits = re.sub(r"[^0-9]", "", str(order_id or ""))
+                if digits:
+                    numbers.add(int(digits))
     return sorted(numbers)
 
 
@@ -1417,6 +1457,7 @@ def build_sales_lines(
                         )
                     entries = [{
                         "order_id": order_ids[0],
+                        "quantity": allocation.get("quantity"),
                         gross_field: allocation.get(gross_field),
                         vat_field: allocation.get(vat_field),
                     }]
@@ -1428,6 +1469,7 @@ def build_sales_lines(
                     evidence.append(
                         {
                             "order_id": str(entry["order_id"]),
+                            "quantity": entry.get("quantity"),
                             "event_date": str(entry.get("event_date") or ""),
                             "gross_amount": decimal_number(abs(decimal_value(entry.get(gross_field)))),
                             "vat_amount": decimal_number(abs(decimal_value(entry.get(vat_field)))),
@@ -1459,6 +1501,12 @@ def build_sales_lines(
                         raise SimplbooksError("Woo VAT allocation cannot carry VAT on a zero-gross component.")
                     continue
                 binding = evidence.pop("vat_evidence_binding")
+                order_quantity = decimal_value(evidence.get("quantity") or 0)
+                allocation_proof = (
+                    allocated_order_quantity_proof(evidence, group_label=group_label, direction=direction)
+                    if component == "goods" and order_quantity > 0
+                    else None
+                )
                 lines.append({
                     "line_role": line_role,
                     "description": f"{description} - order {evidence['order_id']}",
@@ -1469,6 +1517,8 @@ def build_sales_lines(
                     "suggested_vat_type_id": vat_type_id,
                     "warehouse_id_hint": maybe_single_warehouse(allocated_records) or default_warehouse_id,
                     "record_count": 1,
+                    "quantity": decimal_number(order_quantity) if allocation_proof else None,
+                    "inventory_quantity_proof": allocation_proof,
                     "vat_allocation_component": component,
                     "vat_allocation_component_evidence": [evidence],
                     "vat_evidence_binding": binding,

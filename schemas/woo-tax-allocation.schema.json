@@ -124,6 +124,11 @@
         "corrected_rate": {"type": "number", "minimum": 0},
         "original_order_tax": {"$ref": "#/$defs/money"},
         "original_shipping_tax": {"$ref": "#/$defs/money"},
+        "quantity": {
+          "description": "Exact reviewed goods quantity for this order. Absent means unknown, never one.",
+          "type": "number",
+          "minimum": 0.01
+        },
         "fixed_product_gross": {"$ref": "#/$defs/money"},
         "fixed_shipping_gross": {"$ref": "#/$defs/money"},
         "corrected_product_vat": {"$ref": "#/$defs/money"},

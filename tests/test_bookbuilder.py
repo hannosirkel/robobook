@@ -2844,6 +2844,13 @@ class AggregateSalesRoutingTests(unittest.TestCase):
             self.assertTrue(routing["order_numbers"], "declared routing must name the orders it used")
             self.assertEqual(routing["warehouse_id"], "6")
 
+    def test_the_reviewed_vat_allocation_also_names_orders(self) -> None:
+        sale = record(record_id="woo:1", source_system="woo", event_type="woo_monthly_sales",
+                      gross_amount=30.0, channel="woo",
+                      attributes={"vat_allocation": {"allocated_order_ids": ["763", "765"]}})
+
+        self.assertEqual(bookbuilder.period_order_numbers({"sales": [sale]}), [763, 765])
+
     def test_the_period_order_numbers_are_gathered_from_every_category(self) -> None:
         records = {
             "sales": [self.aggregate(), woo_sale(record_id="stripe:1", order_id=762)],
@@ -2886,6 +2893,80 @@ class StatementImportDependencyTests(unittest.TestCase):
         deps = self.deps(api_cash_policy())
 
         self.assertTrue(all(d["kind"] == "manual_statement_import_financial_transaction" for d in deps))
+
+
+def allocated_order_sale(*, quantity: float | None) -> dict:
+    """A monthly Woo summary whose VAT allocation names one order, optionally with a quantity."""
+    sale = record(record_id="woo:2024-01", source_system="woo", event_type="woo_monthly_sales",
+                  gross_amount=35.82, vat_amount=6.46, shipping_amount=5.82, channel="woo",
+                  attributes={"is_monthly_summary": True, "orders": 1})
+    sale["event_date"] = "2024-01-31"
+    entry = {
+        "order_id": "763", "event_date": "2024-01-08",
+        "fixed_product_gross": 30.0, "product_vat": 5.41,
+        "fixed_shipping_gross": 5.82, "shipping_vat": 1.05,
+        "source_row_id": "woo-tax:2", "source_refs": [],
+    }
+    if quantity is not None:
+        entry["quantity"] = quantity
+    sale["attributes"]["vat_allocation"] = {
+        "fixed_product_gross": 30.0, "fixed_shipping_gross": 5.82,
+        "product_vat": 5.41, "shipping_vat": 1.05,
+        "allocation_path": "companies/example/artifacts/vat/2024-woo-tax-allocation.json",
+        "allocated_order_ids": ["763"],
+        "component_vat_evidence": [entry],
+    }
+    return sale
+
+
+class AllocatedOrderQuantityTests(unittest.TestCase):
+    def goods_line(self, *, quantity: float | None) -> dict:
+        normalized = base_normalized("2024-01")
+        normalized["records"]["sales"] = [allocated_order_sale(quantity=quantity)]
+        batch = build_batch_with_policy(normalized, warehouse_routing_policy())
+        action = actions_of_type(batch, "create_invoice_summary")[0]
+        return next(
+            line for line in action["payload"]["line_items"]
+            if line.get("vat_allocation_component") == "goods"
+        )
+
+    def test_a_reviewed_order_quantity_reaches_the_goods_line(self) -> None:
+        line = self.goods_line(quantity=2)
+
+        self.assertEqual(line["quantity"], 2.0)
+
+    def test_the_goods_line_carries_an_exact_proof_naming_the_order(self) -> None:
+        proof = self.goods_line(quantity=2)["inventory_quantity_proof"]
+
+        self.assertEqual(proof["status"], "exact")
+        self.assertEqual(proof["quantity"], 2.0)
+        self.assertEqual(proof["contributor_count"], 1)
+        self.assertEqual(proof["contributors"][0]["record_id"], "763")
+        self.assertEqual(proof["contributors"][0]["quantity_source"], "reviewed_woo_tax_allocation")
+
+    def test_an_order_without_a_reviewed_quantity_gets_no_proof(self) -> None:
+        line = self.goods_line(quantity=None)
+
+        self.assertIsNone(line.get("quantity"))
+        self.assertIsNone(line.get("inventory_quantity_proof"))
+
+    def test_a_zero_quantity_is_refused_rather_than_treated_as_one(self) -> None:
+        line = self.goods_line(quantity=0)
+
+        self.assertIsNone(line.get("inventory_quantity_proof"))
+
+    def test_the_shipping_line_never_claims_a_quantity(self) -> None:
+        normalized = base_normalized("2024-01")
+        normalized["records"]["sales"] = [allocated_order_sale(quantity=2)]
+        batch = build_batch_with_policy(normalized, warehouse_routing_policy())
+        action = actions_of_type(batch, "create_invoice_summary")[0]
+        shipping = next(
+            line for line in action["payload"]["line_items"]
+            if line.get("vat_allocation_component") == "shipping"
+        )
+
+        self.assertIsNone(shipping.get("quantity"))
+        self.assertIsNone(shipping.get("inventory_quantity_proof"))
 
 
 if __name__ == "__main__":

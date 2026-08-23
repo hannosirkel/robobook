@@ -170,6 +170,19 @@ class SchemaContractTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self.assert_artifact_valid(schema_name="ledger-export-evidence.schema.json", artifact=artifact)
 
+    def test_woo_tax_allocation_schema_accepts_a_reviewed_order_quantity(self) -> None:
+        artifact = json.loads((ROOT / "templates/woo-tax-allocation.template.json").read_text(encoding="utf-8"))
+        artifact["allocations"][0]["quantity"] = 2
+
+        self.assert_artifact_valid(schema_name="woo-tax-allocation.schema.json", artifact=artifact)
+
+    def test_woo_tax_allocation_schema_rejects_a_zero_quantity(self) -> None:
+        artifact = json.loads((ROOT / "templates/woo-tax-allocation.template.json").read_text(encoding="utf-8"))
+        artifact["allocations"][0]["quantity"] = 0
+
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="woo-tax-allocation.schema.json", artifact=artifact)
+
     def test_posting_policy_template_matches_strict_schema(self) -> None:
         artifact = json.loads((ROOT / "templates/posting-policy.template.json").read_text(encoding="utf-8"))
         self.assert_artifact_valid(schema_name="posting-policy.schema.json", artifact=artifact)

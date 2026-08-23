@@ -2184,5 +2184,77 @@ class PendingProofBlockingTests(unittest.TestCase):
         self.assertEqual(self.errors(blocking=True, statement_import_mode=True), [])
 
 
+class AllocatedOrderProofTests(unittest.TestCase):
+    ORDER = "763"
+
+    def proof(self, *, quantity: float = 2.0, order: str | None = None) -> dict:
+        order_id = order or self.ORDER
+        contributor = {
+            "record_id": order_id,
+            "quantity": quantity,
+            "quantity_source": "reviewed_woo_tax_allocation",
+            "record_sha256": bookchecker._canonical_value_sha256(
+                {"order_id": order_id, "source_row_id": "woo-tax:2"}
+            ),
+        }
+        scope = {
+            "kind": "reviewed_allocated_order", "period": "2024-01",
+            "record_category": "sales", "group_label": "woo", "order_id": order_id,
+        }
+        return {
+            "status": "exact", "quantity": quantity, "scope": scope,
+            "scope_sha256": bookchecker._canonical_value_sha256(scope),
+            "contributor_count": 1,
+            "contributor_set_sha256": bookchecker._canonical_value_sha256([contributor]),
+            "contributors": [contributor],
+        }
+
+    def action(self, *, proof: dict, evidence_quantity: float = 2.0) -> dict:
+        return {
+            "idempotency_key": "example-2024-01-sales-woo-wh6",
+            "action_type": "create_invoice_summary",
+            "payload": {
+                "document_type": "invoice",
+                "line_items": [{
+                    "line_role": "sales_revenue",
+                    "article_id_hint": "3",
+                    "quantity": proof["quantity"],
+                    "inventory_quantity_proof": proof,
+                    "vat_allocation_component": "goods",
+                    "vat_allocation_component_evidence": [
+                        {"order_id": self.ORDER, "quantity": evidence_quantity, "source_row_id": "woo-tax:2"}
+                    ],
+                }],
+            },
+        }
+
+    def findings(self, action: dict) -> list[str]:
+        return [
+            f["summary"] for f in bookchecker.evaluate_inventory_quantities(
+                action=action, resolved_sources=[], reviewed_allocations={}
+            )
+        ]
+
+    def test_a_matching_allocated_order_proof_passes(self) -> None:
+        self.assertEqual(self.findings(self.action(proof=self.proof())), [])
+
+    def test_a_quantity_the_allocation_does_not_support_is_rejected(self) -> None:
+        found = self.findings(self.action(proof=self.proof(quantity=2.0), evidence_quantity=1.0))
+
+        self.assertTrue(any("reviewed allocation" in f for f in found), found)
+
+    def test_an_order_absent_from_the_line_evidence_is_rejected(self) -> None:
+        found = self.findings(self.action(proof=self.proof(order="999")))
+
+        self.assertTrue(any("reviewed allocation" in f for f in found), found)
+
+    def test_a_tampered_contributor_hash_is_rejected(self) -> None:
+        proof = self.proof()
+        proof["contributors"][0]["record_sha256"] = "0" * 64
+        proof["contributor_set_sha256"] = bookchecker._canonical_value_sha256(proof["contributors"])
+
+        self.assertTrue(self.findings(self.action(proof=proof)))
+
+
 if __name__ == "__main__":
     unittest.main()

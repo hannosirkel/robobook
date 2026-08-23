@@ -2375,29 +2375,56 @@ def parse_printful_wallet_csv(
     return result, exceptions
 
 
-WALLET_PRINTOUT_HEADINGS = ("printful wallet", "transaction history")
+WALLET_PRINTOUT_COLUMNS = ("payment", "status", "amount", "date", "id")
 
-WALLET_PRINTOUT_LINE = re.compile(
-    r"^(?P<date>\d{4}-\d{2}-\d{2})\s+"
-    r"(?P<action>.+?)\s{2,}"
-    r"(?P<instrument>.+?)\s{2,}"
-    r"(?P<amount>-?[\d.,]+)\s*$"
-)
+# A masked instrument such as "000000********1111": mostly digits and masking stars,
+# ending in the four digits that identify the card.
+MASKED_CARD = re.compile(r"^[0-9*\s]{8,}?(?P<last4>[0-9]{4})$")
 
-CARD_SUFFIX = re.compile(r"(\d{4})\s*$")
+WALLET_ACTIONS = {
+    "deposit to wallet": ("printful_wallet_deposit", -1),
+    "withdrawal from wallet": ("printful_wallet_withdrawal", 1),
+}
 
 
 def is_wallet_printout(path: Path) -> bool:
-    """Detect the reviewed wallet printout by its stable headings, not by its extension.
+    """Detect the reviewed wallet printout by its stable column headings.
 
-    Without this an arbitrary text file dropped into the source pack would be read as
-    wallet evidence, which is exactly the kind of guess this pipeline must not make.
+    Keying on the headings rather than the extension keeps an unrelated text file
+    dropped into the source pack from being read as wallet evidence.
     """
     try:
-        head = normalize_ascii(path.read_text(encoding="utf-8", errors="replace")[:2000]).lower()
-    except OSError:
+        header = path.read_text(encoding="utf-8", errors="replace").splitlines()[:1]
+    except (OSError, IndexError):
         return False
-    return all(heading in head for heading in WALLET_PRINTOUT_HEADINGS)
+    if not header:
+        return False
+    names = {slugify(name) for name in header[0].split("\t")}
+    return all(column in names for column in WALLET_PRINTOUT_COLUMNS)
+
+
+def parse_wallet_printout_date(value: str) -> date:
+    """Parse the printout's `Mon D, YYYY` date, refusing anything else."""
+    try:
+        return datetime.strptime(normalize_ascii(value).strip(), "%b %d, %Y").date()  # noqa: DTZ007
+    except ValueError as exc:
+        raise SimplbooksError(f"Wallet printout date {value!r} is not in 'Mon D, YYYY' form.") from exc
+
+
+def wallet_payment_instrument(payment: str) -> tuple[str, str | None]:
+    """Split the payment cell into its action and the card that funded it, if any.
+
+    The cell holds the action on one line and the instrument on the next. A masked card
+    number means the movement was funded by that card; anything else means it came from
+    the wallet balance and funds nothing.
+    """
+    lines = [line.strip() for line in str(payment or "").splitlines() if line.strip()]
+    if not lines:
+        return "", None
+    if len(lines) < 2:
+        return lines[0], None
+    match = MASKED_CARD.match(lines[1].replace(" ", ""))
+    return lines[0], (match.group("last4") if match else None)
 
 
 def parse_printful_wallet_printout(
@@ -2414,70 +2441,59 @@ def parse_printful_wallet_printout(
     exceptions: list[dict[str, Any]] = []
     seen_dates: list[date] = []
 
-    for line_no, line in enumerate(source.path.read_text(encoding="utf-8").splitlines(), start=1):
-        match = WALLET_PRINTOUT_LINE.match(normalize_ascii(line).rstrip())
-        if match is None:
+    with source.path.open("r", encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+
+    for line_no, row in enumerate(rows, start=2):
+        payment = str(row.get("Payment") or "")
+        if not payment.strip():
             continue
-        event_date = parse_date_value(match.group("date"))
+        event_date = parse_wallet_printout_date(str(row.get("Date") or ""))
         if event_date < period_start or event_date > period_end:
             continue
 
-        action = match.group("action").strip().lower()
-        if "deposit to wallet" in action:
-            event_type, sign = "printful_wallet_deposit", -1
-        elif "withdrawal from wallet" in action:
-            event_type, sign = "printful_wallet_withdrawal", 1
-        else:
-            exceptions.append(
-                make_exception(
-                    source=source,
-                    exception_id=f"{source.source_id}:action:{line_no}",
-                    severity="warn",
-                    reason=f"Skipped wallet printout row with unrecognized action {action!r}.",
-                    blocking=False,
-                    row_ref=f"line:{line_no}",
-                    suggested_follow_up="Extend the wallet printout parser if this action affects bookkeeping.",
+        action, card_last4 = wallet_payment_instrument(payment)
+        amount, currency = parse_money_cell(row.get("Amount"), default_currency=base_currency)
+        external_ref = str(row.get("ID") or "").strip()
+        normalized_action = normalize_ascii(action).lower()
+        event_type, sign = WALLET_ACTIONS.get(normalized_action, ("printful_wallet_consumption", -1))
+
+        attributes: dict[str, Any] = {
+            "action": action,
+            "status": str(row.get("Status") or "").strip(),
+            "payment_instrument": "card" if card_last4 else "wallet",
+            "clearing_provider": "printful",
+            "clearing_account": "printful_wallet",
+        }
+        if card_last4 is not None:
+            owner = owners.get(card_last4)
+            if owner is None:
+                raise SimplbooksError(
+                    f"Wallet printout card {card_last4} has no reviewed owner; add it to the company profile."
                 )
-            )
-            continue
-
-        instrument = match.group("instrument").strip()
-        suffix_match = CARD_SUFFIX.search(instrument)
-        if suffix_match is None:
+            attributes["card_last4"] = card_last4
+            attributes["funding_owner"] = owner
+        elif event_type in WALLET_ACTIONS.values():  # pragma: no cover - defensive
             raise SimplbooksError(
-                f"Wallet printout row {line_no} names no card suffix; funding ownership cannot be reviewed."
-            )
-        card_last4 = suffix_match.group(1)
-        owner = owners.get(card_last4)
-        if owner is None:
-            raise SimplbooksError(
-                f"Wallet printout card {card_last4} has no reviewed owner; add it to the company profile."
+                f"Wallet printout row {line_no} funds the wallet but names no card."
             )
 
-        amount, currency = parse_money_cell(match.group("amount"), default_currency=base_currency)
         signed_amount = sign * abs(amount)
         seen_dates.append(event_date)
         category, record = make_record(
             source=source,
             category="clearing_transactions",
-            record_id=f"{source.source_id}:wallet:{line_no}",
+            record_id=f"{source.source_id}:wallet:{external_ref or line_no}",
             event_type=event_type,
             event_date=event_date,
             settlement_date=event_date,
-            description=f"Printful wallet {'funding' if sign < 0 else 'refund'} via {instrument}",
+            description=f"Printful wallet {action}",
             currency=currency or base_currency,
             gross_amount=signed_amount,
             net_amount=signed_amount,
-            external_ref=f"{slugify(action)}:{line_no}",
+            external_ref=external_ref or f"{slugify(action)}:{line_no}",
             channel="printful",
-            attributes={
-                "action": match.group("action").strip(),
-                "payment_instrument": instrument,
-                "card_last4": card_last4,
-                "funding_owner": owner,
-                "clearing_provider": "printful",
-                "clearing_account": "printful_wallet",
-            },
+            attributes=attributes,
             row_ref=f"line:{line_no}",
         )
         result[category].append(record)

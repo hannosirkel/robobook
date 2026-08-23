@@ -478,5 +478,86 @@ class DeclaredWarehouseRoutingTests(unittest.TestCase):
         )
 
 
+class NonInventoryEventTypeTests(unittest.TestCase):
+    def policy(self, value: object) -> dict:
+        return dict(statement_import_policy_fixture(), non_inventory_event_types=value)
+
+    def test_a_reviewed_list_is_accepted(self) -> None:
+        policy = self.policy(["paypal_chargeback", "paypal_dispute_fee"])
+
+        posting_policy.validate_posting_policy(policy)
+
+        self.assertEqual(
+            posting_policy.non_inventory_event_types(policy),
+            frozenset({"paypal_chargeback", "paypal_dispute_fee"}),
+        )
+
+    def test_an_absent_list_means_every_event_may_bear_inventory(self) -> None:
+        policy = statement_import_policy_fixture()
+
+        self.assertEqual(posting_policy.non_inventory_event_types(policy), frozenset())
+
+    def test_a_non_list_is_rejected(self) -> None:
+        with self.assertRaisesRegex(posting_policy.PostingPolicyError, "non_inventory_event_types"):
+            posting_policy.validate_posting_policy(self.policy("paypal_chargeback"))
+
+    def action(self, *, event_types: list[str] | None, article: str | None) -> dict:
+        line = {
+            "line_role": "refund_revenue",
+            "suggested_income_account_id": "109",
+            "suggested_vat_type_id": "12",
+            "warehouse_id_hint": "6",
+            "article_id_hint": article,
+        }
+        if event_types is not None:
+            line["contributor_event_types"] = event_types
+        return {
+            "action_type": "create_credit_invoice_summary",
+            "payload": {
+                "document_date": "2024-05-31",
+                "summary_scope": {"channel_or_source": "woo", "posting_family": "woo-non-taxable"},
+                "posting_policy_family": "woo-non-taxable",
+                "counterparty": {"contact_id": "42"},
+                "totals": {"vat_amount": 0.0},
+                "line_items": [line],
+            },
+        }
+
+    def mapped_policy(self) -> dict:
+        return dict(
+            self.policy(["paypal_chargeback"]),
+            contacts={"sales": {"woo": "42"}, "processors": {}, "suppliers": {}},
+            mappings={"woo-non-taxable": {
+                "income_account_id": "109", "vat_type_id": "12",
+                "warehouse_id": "6", "article_id": "3",
+            }},
+        )
+
+    def test_a_declared_cash_reversal_may_carry_no_article(self) -> None:
+        errors = posting_policy.action_policy_errors(
+            self.action(event_types=["paypal_chargeback"], article=None), self.mapped_policy()
+        )
+
+        self.assertEqual([e for e in errors if "article" in e], [])
+
+    def test_a_declared_cash_reversal_must_not_carry_one_either(self) -> None:
+        errors = posting_policy.action_policy_errors(
+            self.action(event_types=["paypal_chargeback"], article="3"), self.mapped_policy()
+        )
+
+        self.assertTrue([e for e in errors if "article" in e])
+
+    def test_an_ordinary_line_still_requires_the_family_article(self) -> None:
+        errors = posting_policy.action_policy_errors(
+            self.action(event_types=None, article=None), self.mapped_policy()
+        )
+
+        self.assertTrue([e for e in errors if "article" in e])
+
+    def test_an_empty_entry_is_rejected(self) -> None:
+        with self.assertRaisesRegex(posting_policy.PostingPolicyError, "non_inventory_event_types"):
+            posting_policy.validate_posting_policy(self.policy(["paypal_chargeback", " "]))
+
+
 if __name__ == "__main__":
     unittest.main()

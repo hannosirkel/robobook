@@ -182,6 +182,7 @@ def validate_posting_policy(payload: dict[str, Any]) -> None:
         validated_sales_vat_profiles(payload)
     validated_cash_posting(payload)
     validated_warehouse_routing(payload)
+    non_inventory_event_types(payload)
 
 
 def _cash_posting_bank_ids(section: dict[str, Any], *, required: bool) -> list[str]:
@@ -366,6 +367,25 @@ def _warehouse_routing_rule(rule: Any, *, path: str) -> dict[str, Any]:
         "before_warehouse_id": normalize_id(rule["before_warehouse_id"], field_name=f"{path}.before_warehouse_id"),
         "from_warehouse_id": normalize_id(rule["from_warehouse_id"], field_name=f"{path}.from_warehouse_id"),
     }
+
+
+def non_inventory_event_types(policy: dict[str, Any]) -> frozenset[str]:
+    """Event types a reviewer has declared never to bear inventory.
+
+    A chargeback reverses cash without returning goods, and a dispute fee is not goods at
+    all. Neither should attract an article, and neither should be held back waiting for a
+    quantity that will never exist. Which events those are is a reviewed decision, not
+    something to read off an event name.
+    """
+    values = policy.get("non_inventory_event_types")
+    if values is None:
+        return frozenset()
+    if not isinstance(values, list):
+        raise PostingPolicyError("non_inventory_event_types must be an array of event types.")
+    resolved = {str(value).strip() for value in values}
+    if not all(resolved) or len(resolved) != len(values):
+        raise PostingPolicyError("non_inventory_event_types entries must be unique and non-empty.")
+    return frozenset(resolved)
 
 
 def validated_warehouse_routing(policy: dict[str, Any]) -> dict[str, Any]:
@@ -699,8 +719,12 @@ def action_policy_errors(action: dict[str, Any], policy: dict[str, Any]) -> list
         actual_warehouse = line.get("warehouse_id_hint")
         if str(actual_warehouse or "") != str(expected_warehouse or ""):
             errors.append(f"Line warehouse does not match policy family {family!r}.")
+        declared_event_types = line.get("contributor_event_types")
+        declared_non_inventory = bool(declared_event_types) and set(declared_event_types) <= non_inventory_event_types(policy)
         expected_article = (
-            None if role == "sales" and line_role.endswith("_shipping")
+            # A reviewed cash reversal or processor fee moves no stock, so its line
+            # legitimately carries no article and must not carry one.
+            None if declared_non_inventory or (role == "sales" and line_role.endswith("_shipping"))
             else family_values.get("article_id") if role == "sales"
             else line_values.get("article_id")
         )

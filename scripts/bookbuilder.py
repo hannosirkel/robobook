@@ -35,6 +35,7 @@ from posting_policy import (
     resolve_mapping,
     resolve_sales_vat_profile,
     resolve_sales_warehouse,
+    non_inventory_event_types,
     validated_warehouse_routing,
 )
 from reference_artifacts import ReferenceArtifactError, bind_file, validate_discovery, verify_file_binding
@@ -221,6 +222,11 @@ def allocated_order_quantity_proof(
         "order_id": order_id,
     }
     return inventory_proof_envelope(scope=scope, contributors=[contributor], quantity=quantity)
+
+
+def contributor_event_types(records: list[dict[str, Any]]) -> list[str]:
+    """Report the event types a line was built from, so policy can judge them."""
+    return sorted({str(record.get("event_type") or "") for record in records if record.get("event_type")})
 
 
 def normalized_inventory_quantity_proof(
@@ -1561,6 +1567,7 @@ def build_sales_lines(
                 "warehouse_id_hint": maybe_single_warehouse(records) or default_warehouse_id,
                 "quantity": decimal_number(sum((decimal_value(record.get("quantity") or 0) for record in records), Decimal("0"))) or None,  # noqa: FURB157
                 "inventory_quantity_proof": inventory_proof,
+                "contributor_event_types": contributor_event_types(records),
                 "record_count": len(records),
             }
         )
@@ -1601,6 +1608,7 @@ def build_sales_lines(
                     "warehouse_id_hint": maybe_single_warehouse(profile_records) or default_warehouse_id,
                     "quantity": decimal_number(sum((decimal_value(record.get("quantity") or 0) for record in profile_records), Decimal("0"))) or None,  # noqa: FURB157
                     "inventory_quantity_proof": inventory_proof,
+                    "contributor_event_types": contributor_event_types(profile_records),
                     "record_count": len(profile_records),
                 }
             )
@@ -3558,7 +3566,14 @@ def apply_posting_policy(
                     )
                 else:
                     line["warehouse_id_hint"] = None
-                if not is_shipping and family_values.get("article_id") not in (None, ""):
+                declared_non_inventory = bool(line.get("contributor_event_types")) and set(
+                    line.get("contributor_event_types") or []
+                ) <= non_inventory_event_types(posting_policy)
+                if declared_non_inventory:
+                    # A reviewed cash reversal or processor fee moves no stock, so it takes
+                    # no article and is not held back waiting for a quantity.
+                    line["article_id_hint"] = None
+                elif not is_shipping and family_values.get("article_id") not in (None, ""):
                     proof = line.get("inventory_quantity_proof")
                     exact_quantity = decimal_value(line.get("quantity"))
                     proof_quantity = decimal_value(proof.get("quantity")) if isinstance(proof, dict) else Decimal("0")  # noqa: FURB157

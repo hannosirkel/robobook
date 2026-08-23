@@ -46,6 +46,12 @@
       "propertyNames": {"pattern": "^[0-9]{4}$"},
       "additionalProperties": {"$ref": "#/$defs/year_expectation"}
     },
+    "non_inventory_event_types": {
+      "description": "Reviewed event types that never bear inventory, such as a chargeback or a dispute fee.",
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
     "cash_posting": {"$ref": "#/$defs/cash_posting"},
     "warehouse_routing": {"$ref": "#/$defs/warehouse_routing"}
   },

@@ -2969,5 +2969,59 @@ class AllocatedOrderQuantityTests(unittest.TestCase):
         self.assertIsNone(shipping.get("inventory_quantity_proof"))
 
 
+class NonInventoryRefundTests(unittest.TestCase):
+    def normalized(self) -> dict:
+        normalized = base_normalized("2024-05")
+        normalized["records"]["refunds"] = [
+            record(record_id="pp:chargeback", source_system="paypal", event_type="paypal_chargeback",
+                   gross_amount=-32.85, channel="woo"),
+            record(record_id="pp:disputefee", source_system="paypal", event_type="paypal_dispute_fee",
+                   gross_amount=-14.0, channel="woo"),
+        ]
+        return normalized
+
+    def policy(self, *, declared: bool) -> dict:
+        policy = warehouse_routing_policy()
+        policy["mappings"]["woo-non-taxable"] = {
+            "income_account_id": "109", "vat_type_id": "12", "warehouse_id": "6", "article_id": "3",
+        }
+        if declared:
+            policy["non_inventory_event_types"] = ["paypal_chargeback", "paypal_dispute_fee"]
+        return policy
+
+    def refund_lines(self, *, declared: bool) -> list[dict]:
+        batch = build_batch_with_policy(self.normalized(), self.policy(declared=declared))
+        actions = [a for a in batch["actions"] if "refund" in a["idempotency_key"]]
+        return [line for a in actions for line in a["payload"]["line_items"]]
+
+    def test_a_declared_cash_reversal_takes_no_article(self) -> None:
+        for line in self.refund_lines(declared=True):
+            self.assertIsNone(line.get("article_id_hint"))
+
+    def test_a_declared_cash_reversal_raises_no_quantity_dependency(self) -> None:
+        batch = build_batch_with_policy(self.normalized(), self.policy(declared=True))
+        quantity_blocks = [
+            d for d in batch["unresolved_dependencies"] if d.get("kind") == "inventory_quantity"
+        ]
+
+        self.assertEqual(quantity_blocks, [])
+
+    def test_an_undeclared_event_still_blocks_on_its_missing_quantity(self) -> None:
+        batch = build_batch_with_policy(self.normalized(), self.policy(declared=False))
+        quantity_blocks = [
+            d for d in batch["unresolved_dependencies"] if d.get("kind") == "inventory_quantity"
+        ]
+
+        self.assertTrue(quantity_blocks)
+
+    def test_the_line_records_the_event_types_it_was_built_from(self) -> None:
+        lines = self.refund_lines(declared=True)
+
+        self.assertTrue(any(line.get("contributor_event_types") for line in lines))
+        for line in lines:
+            for event_type in line.get("contributor_event_types") or []:
+                self.assertIn(event_type, {"paypal_chargeback", "paypal_dispute_fee"})
+
+
 if __name__ == "__main__":
     unittest.main()

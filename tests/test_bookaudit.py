@@ -460,6 +460,67 @@ class StockEquationAuditTests(unittest.TestCase):
     def test_no_equation_evidence_yields_no_finding(self) -> None:
         self.assertEqual(bookaudit.evaluate_stock_equation_review(None), [])
 
+    def test_stock_equation_findings_land_in_a_rendered_section(self) -> None:
+        equation = self.equation(
+            aggregate={"closing": Decimal(1076), "selected": Decimal(1070), "difference": Decimal(-6)}
+        )
+
+        for finding in bookaudit.evaluate_stock_equation_review(equation):
+            self.assertIn(finding["section"], bookaudit.SECTIONS)
+
+
+class LedgerEvidenceAuditTests(unittest.TestCase):
+    def summary(self, **overrides: object) -> dict:
+        result = {
+            "schema_version": "1.0",
+            "company_slug": "example",
+            "company_id": "42",
+            "year": 2024,
+            "binding": {"path": "ledger.csv", "sha256": "a" * 64},
+            "planned_row_count": 1,
+            "ledger_row_count": 2,
+            "movement": {"10|EUR": "-12.50", "32|EUR": "12.50"},
+            "errors": [],
+            "status": "pass",
+        }
+        result.update(overrides)
+        return result
+
+    def test_a_passing_summary_has_no_finding(self) -> None:
+        self.assertEqual(bookaudit.evaluate_ledger_evidence_review(self.summary()), [])
+
+    def test_missing_evidence_is_an_error_at_audit_time(self) -> None:
+        findings = bookaudit.evaluate_ledger_evidence_review(None)
+
+        self.assertEqual([item["severity"] for item in findings], ["error"])
+        self.assertIn("no post-import ledger evidence", findings[0]["summary"])
+
+    def test_every_evidence_error_becomes_a_finding(self) -> None:
+        summary = self.summary(
+            status="fail",
+            errors=["archive:a has no ledger posting for debit account 32 of -12.50 EUR on 2024-01-15."],
+        )
+
+        findings = bookaudit.evaluate_ledger_evidence_review(summary)
+
+        self.assertTrue(any("no ledger posting" in item["summary"] for item in findings))
+        self.assertTrue(all(item["severity"] == "error" for item in findings))
+
+    def test_a_failing_status_without_listed_errors_is_still_an_error(self) -> None:
+        findings = bookaudit.evaluate_ledger_evidence_review(self.summary(status="fail"))
+
+        self.assertEqual([item["severity"] for item in findings], ["error"])
+
+    def test_every_finding_lands_in_a_section_the_report_renders(self) -> None:
+        findings = [
+            *bookaudit.evaluate_ledger_evidence_review(None),
+            *bookaudit.evaluate_ledger_evidence_review(self.summary(status="fail", errors=["boom"])),
+        ]
+
+        self.assertTrue(findings)
+        for finding in findings:
+            self.assertIn(finding["section"], bookaudit.SECTIONS)
+
 
 if __name__ == "__main__":
     unittest.main()

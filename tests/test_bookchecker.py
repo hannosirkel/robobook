@@ -2083,5 +2083,75 @@ class StatementPlanCoverageTests(unittest.TestCase):
             self.assertTrue(any("also claimed by an API cash action" in item["summary"] for item in findings))
 
 
+class LedgerEvidenceCheckerTests(unittest.TestCase):
+    HEADER = (
+        "company_id,period,account_id,account_code,transaction_id,business_date,"
+        "currency,debit,credit,description,document_ref"
+    )
+
+    def write_export(self, tmp: Path, rows: list[str]) -> Path:
+        path = tmp / "ledger.csv"
+        path.write_text("\n".join([self.HEADER, *rows]) + "\n", encoding="utf-8")
+        return path
+
+    def batch(self, tmp: Path, *, bind: bool = True, rows: list[str] | None = None) -> dict:
+        default = [
+            "42,2024,32,C32,t1,2024-01-15,EUR,12.50,0.00,Fee,",
+            "42,2024,10,C10,t1,2024-01-15,EUR,0.00,12.50,Fee,",
+        ]
+        export_path = self.write_export(tmp, default if rows is None else rows)
+        artifacts = []
+        if bind:
+            artifacts.append({
+                "kind": "ledger_export_evidence",
+                "path": str(export_path),
+                "sha256": hashlib.sha256(export_path.read_bytes()).hexdigest(),
+            })
+        return {
+            "company_slug": "example",
+            "period": "2024-01",
+            "cash_posting_mode": "statement_import",
+            "reference_artifacts": artifacts,
+            "actions": [],
+        }
+
+    def test_an_unbound_export_yields_no_finding_before_import(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+
+            self.assertEqual(
+                bookchecker.evaluate_ledger_export_evidence(self.batch(tmp, bind=False), cwd=tmp), []
+            )
+
+    def test_a_changed_export_is_an_error(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            batch = self.batch(tmp)
+            (tmp / "ledger.csv").write_text("tampered\n", encoding="utf-8")
+
+            findings = bookchecker.evaluate_ledger_export_evidence(batch, cwd=tmp)
+
+            self.assertTrue(any("SHA" in item["summary"] for item in findings))
+            self.assertTrue(all(item["severity"] == "error" for item in findings))
+
+    def test_an_unsupported_export_format_is_an_error(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            batch = self.batch(tmp, rows=[])
+            path = tmp / "ledger.csv"
+            path.write_text("not,a,ledger\n", encoding="utf-8")
+            batch["reference_artifacts"][0]["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+
+            findings = bookchecker.evaluate_ledger_export_evidence(batch, cwd=tmp)
+
+            self.assertTrue(any("column" in item["summary"] for item in findings))
+
+    def test_a_bound_and_readable_export_yields_no_finding(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+
+            self.assertEqual(bookchecker.evaluate_ledger_export_evidence(self.batch(tmp), cwd=tmp), [])
+
+
 if __name__ == "__main__":
     unittest.main()

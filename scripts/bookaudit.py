@@ -927,6 +927,32 @@ def evaluate_vat_review(source: dict[str, Any], live: dict[str, Any]) -> list[di
     return findings
 
 
+def evaluate_ledger_evidence_review(summary: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Fail the audit unless the posted ledger matches the plan that produced it.
+
+    Absent evidence is an error here rather than a warning: at audit time the import has
+    happened, and "we did not check" is not a passing result.
+    """
+    section = "bank_and_processor_completeness"
+    if not summary:
+        return [make_finding(
+            section=section,
+            severity="error",
+            summary="Audit has no post-import ledger evidence to prove the imported statement posted as planned.",
+        )]
+    findings = [
+        make_finding(section=section, severity="error", summary=message)
+        for message in summary.get("errors") or []
+    ]
+    if str(summary.get("status") or "") != "pass" and not findings:
+        findings.append(make_finding(
+            section=section,
+            severity="error",
+            summary="Post-import ledger evidence did not pass.",
+        ))
+    return findings
+
+
 def evaluate_stock_equation_review(equation: dict[str, Any] | None) -> list[dict[str, Any]]:
     """Fail the audit unless posted stock reconciles, per warehouse and in aggregate.
 

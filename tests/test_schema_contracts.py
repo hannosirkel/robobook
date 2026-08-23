@@ -155,6 +155,21 @@ class SchemaContractTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self.assert_artifact_valid(schema_name="statement-import-plan.schema.json", artifact=artifact)
 
+    def test_ledger_export_evidence_template_matches_strict_schema(self) -> None:
+        artifact = json.loads(
+            (ROOT / "templates/ledger-export-evidence.template.json").read_text(encoding="utf-8")
+        )
+        self.assert_artifact_valid(schema_name="ledger-export-evidence.schema.json", artifact=artifact)
+
+    def test_ledger_export_evidence_schema_rejects_an_unknown_status(self) -> None:
+        artifact = json.loads(
+            (ROOT / "templates/ledger-export-evidence.template.json").read_text(encoding="utf-8")
+        )
+        artifact["status"] = "probably_fine"
+
+        with self.assertRaises(AssertionError):
+            self.assert_artifact_valid(schema_name="ledger-export-evidence.schema.json", artifact=artifact)
+
     def test_posting_policy_template_matches_strict_schema(self) -> None:
         artifact = json.loads((ROOT / "templates/posting-policy.template.json").read_text(encoding="utf-8"))
         self.assert_artifact_valid(schema_name="posting-policy.schema.json", artifact=artifact)

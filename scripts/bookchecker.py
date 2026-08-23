@@ -32,6 +32,7 @@ from posting_policy import (
     resolve_bank_account,
     resolve_sales_vat_profile,
 )
+from ledger_export_evidence import LedgerEvidenceError, load_ledger_export
 from statement_import_plan import StatementImportPlanError, validate_statement_import_plan
 from reference_artifacts import (
     ReferenceArtifactError,
@@ -1275,6 +1276,29 @@ def _double_claimed_plan_rows(
                     action_id=action_label(action),
                 ))
     return findings
+
+
+def evaluate_ledger_export_evidence(
+    action_batch: dict[str, Any], *, cwd: Path
+) -> list[dict[str, Any]]:
+    """Check a bound post-import ledger export is present, unchanged, and readable.
+
+    An export is optional before the statement is imported, so a document-only dry run
+    is not blocked by evidence that cannot exist yet. Once one is bound it must hold:
+    a stale or unsupported file is worse than none, because it looks like proof.
+    """
+    binding = _reference_binding(action_batch, "ledger_export_evidence")
+    if binding is None:
+        return []
+    try:
+        load_ledger_export(binding, cwd=cwd)
+    except (LedgerEvidenceError, OSError) as exc:
+        return [make_finding(
+            section="ledger_export_evidence",
+            severity="error",
+            summary=f"Bound ledger export is not usable evidence: {exc}",
+        )]
+    return []
 
 
 def evaluate_statement_plan_coverage(
@@ -2851,6 +2875,7 @@ def evaluate_action_batch(
         )
     )
     findings.extend(evaluate_statement_import_mode(action_batch, posting_policy))
+    findings.extend(evaluate_ledger_export_evidence(action_batch, cwd=cwd))
     findings.extend(evaluate_posting_policy(action_batch, posting_policy))
     findings.extend(evaluate_vat_profiles(action_batch.get("actions") or [], posting_policy))
     findings.extend(

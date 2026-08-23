@@ -14,6 +14,7 @@ from typing import Any
 
 from bookbuilder import write_yaml
 from bookchecker import (
+    DependencyCheckContext,
     evaluate_action_batch,
     evaluate_bank_statement_completeness,
     evaluate_inventory_quantities,
@@ -1420,8 +1421,12 @@ def execute_batch(
         )
     for dependency in manual_dependencies:
         dependency_errors = manual_financial_dependency_errors(
-            dependency, cwd=cwd, expected_company_id=expected_company_id,
-            require_typed_context=True, discovery_payloads=discovery_payloads,
+            dependency,
+            DependencyCheckContext(
+                cwd=cwd, expected_company_id=expected_company_id,
+                require_typed_context=True, discovery_payloads=discovery_payloads,
+                statement_import_mode=str(action_batch.get("cash_posting_mode") or "") == "statement_import",
+            ),
         )
         dependency_errors.extend(discovery_errors)
         if dependency_errors:

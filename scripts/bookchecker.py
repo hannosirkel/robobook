@@ -9,6 +9,7 @@ import subprocess
 import sys
 import unicodedata
 from collections import Counter, defaultdict  # noqa: F401
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
@@ -2051,11 +2052,26 @@ def load_reviewed_allocation_index(
         )]
 
 
+@dataclass(frozen=True)
+class DependencyCheckContext:
+    """What a manual statement dependency is being checked against."""
+
+    cwd: Path | None = None
+    expected_company_id: str | None = None
+    require_typed_context: bool = False
+    discovery_payloads: tuple[dict[str, Any], ...] | list[dict[str, Any]] | None = None
+    statement_import_mode: bool = False
+
+
 def manual_financial_dependency_errors(
-    dependency: dict[str, Any], *, cwd: Path | None = None,
-    expected_company_id: str | None = None, require_typed_context: bool = False,
-    discovery_payloads: list[dict[str, Any]] | None = None,
+    dependency: dict[str, Any], context: DependencyCheckContext | None = None
 ) -> list[str]:
+    context = context or DependencyCheckContext()
+    cwd = context.cwd
+    expected_company_id = context.expected_company_id
+    require_typed_context = context.require_typed_context
+    discovery_payloads = context.discovery_payloads
+    statement_import_mode = context.statement_import_mode
     errors: list[str] = []
     allowed_top_level_dispositions = {
         "bank_fee_payment",
@@ -2131,9 +2147,19 @@ def manual_financial_dependency_errors(
         or set(proof.get("evidence_binding") or {}) != {"path", "sha256"}
     ):
         errors.append("Verified statement import proof requires a SimplBooks transaction ID and evidence binding.")
-    elif proof.get("status") == "pending" and dependency.get("blocking") is not True:
+    elif (
+        proof.get("status") == "pending"
+        and dependency.get("blocking") is not True
+        and not statement_import_mode
+    ):
+        # In statement-import mode the API posts no cash for this row, so a pending proof
+        # does not hold back the documents; the annual plan carries the row instead.
         errors.append("Pending statement import proof must remain blocking.")
-    elif dependency.get("blocking") is False and proof.get("status") != "verified":
+    elif (
+        dependency.get("blocking") is False
+        and proof.get("status") != "verified"
+        and not statement_import_mode
+    ):
         errors.append("Only verified statement import proof may be non-blocking.")
 
     split_parts = dependency.get("split_parts")
@@ -2342,8 +2368,12 @@ def evaluate_unresolved_dependencies(
     for dependency in action_batch.get("unresolved_dependencies") or []:
         if str(dependency.get("kind") or "") == "manual_statement_import_financial_transaction":
             dependency_errors = manual_financial_dependency_errors(
-                dependency, cwd=cwd, expected_company_id=expected_company_id,
-                require_typed_context=True, discovery_payloads=discovery_payloads,
+                dependency,
+                DependencyCheckContext(
+                    cwd=cwd, expected_company_id=expected_company_id,
+                    require_typed_context=True, discovery_payloads=discovery_payloads,
+                    statement_import_mode=str(action_batch.get("cash_posting_mode") or "") == "statement_import",
+                ),
             )
             dependency_errors.extend(discovery_errors)
             if action_path is not None and cwd is not None:

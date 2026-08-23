@@ -2153,5 +2153,36 @@ class LedgerEvidenceCheckerTests(unittest.TestCase):
             self.assertEqual(bookchecker.evaluate_ledger_export_evidence(self.batch(tmp), cwd=tmp), [])
 
 
+class PendingProofBlockingTests(unittest.TestCase):
+    def dependency(self, *, blocking: bool) -> dict:
+        return {
+            "kind": "manual_statement_import_financial_transaction",
+            "blocking": blocking,
+            "disposition": "bank_fee_payment",
+            "statement_import_proof": {"status": "pending", "required_evidence": "live_discovery_or_audit"},
+        }
+
+    def errors(self, *, blocking: bool, statement_import_mode: bool) -> list[str]:
+        return [
+            e for e in bookchecker.manual_financial_dependency_errors(
+                self.dependency(blocking=blocking),
+                bookchecker.DependencyCheckContext(statement_import_mode=statement_import_mode),
+            ) if "blocking" in e
+        ]
+
+    def test_api_cash_mode_still_demands_a_pending_proof_blocks(self) -> None:
+        self.assertTrue(self.errors(blocking=False, statement_import_mode=False))
+
+    def test_api_cash_mode_accepts_a_blocking_pending_proof(self) -> None:
+        self.assertEqual(self.errors(blocking=True, statement_import_mode=False), [])
+
+    def test_statement_import_mode_accepts_a_non_blocking_pending_proof(self) -> None:
+        # The API posts no cash for this row; the annual plan carries it.
+        self.assertEqual(self.errors(blocking=False, statement_import_mode=True), [])
+
+    def test_statement_import_mode_still_accepts_a_blocking_one(self) -> None:
+        self.assertEqual(self.errors(blocking=True, statement_import_mode=True), [])
+
+
 if __name__ == "__main__":
     unittest.main()

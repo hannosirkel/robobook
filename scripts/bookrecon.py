@@ -1489,6 +1489,25 @@ def build_purchase_credit_checks(
     return checks
 
 
+INVENTORY_ACTIVITY_CATEGORIES = (
+    "sales",
+    "refunds",
+    "purchase_expenses",
+    "inventory_movements",
+    "manual_adjustments",
+)
+
+
+def has_inventory_activity(records: dict[str, list[dict[str, Any]]]) -> bool:
+    """Report whether the period contains anything that could move stock.
+
+    Records without a quantity still count: a sale that should carry one and does not
+    is exactly what the warning is for. What does not count is company configuration —
+    having warehouses says nothing about whether this month had activity.
+    """
+    return any(records.get(category) for category in INVENTORY_ACTIVITY_CATEGORIES)
+
+
 def build_inventory_check(
     *,
     normalized_path_display: str,
@@ -1567,6 +1586,20 @@ def build_inventory_check(
         )
 
     if inventory_expected:
+        if not has_inventory_activity(records):
+            return make_check(
+                check_id="inventory-quantity-evidence",
+                name="Inventory quantity evidence",
+                status="pass",
+                threshold=quantity_threshold,
+                notes=[
+                    (
+                        "Inventory is relevant to this company, but the period has no "
+                        "inventory-affecting activity to reconcile."
+                    )
+                ],
+                evidence_refs=evidence,
+            )
         return make_check(
             check_id="inventory-quantity-evidence",
             name="Inventory quantity evidence",

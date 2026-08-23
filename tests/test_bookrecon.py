@@ -1276,5 +1276,59 @@ class WalletEquationTests(unittest.TestCase):
         self.assertEqual(bookrecon.physical_statement_rows(rows), [])
 
 
+EMPTY_RECORDS = {
+    "sales": [], "refunds": [], "fees": [], "payouts": [], "bank_transactions": [],
+    "clearing_transactions": [], "bank_balances": [], "purchase_expenses": [],
+    "purchase_credits": [], "inventory_movements": [], "manual_adjustments": [], "other": [],
+}
+
+
+def inventory_check(records: dict, *, inventory_expected: bool = True) -> dict:
+    return bookrecon.build_inventory_check(
+        normalized_path_display="normalized.json",
+        records=records,
+        inventory_expected=inventory_expected,
+        quantity_threshold=Decimal(0),
+    )
+
+
+class EmptyMonthInventoryTests(unittest.TestCase):
+    def test_an_inventory_relevant_company_has_no_warning_in_an_empty_month(self) -> None:
+        check = inventory_check(dict(EMPTY_RECORDS))
+
+        self.assertEqual(check["status"], "pass")
+
+    def test_a_sale_without_quantity_proof_still_warns(self) -> None:
+        records = dict(EMPTY_RECORDS, sales=[{"record_id": "s1", "gross_amount": 10.0, "quantity": None}])
+
+        check = inventory_check(records)
+
+        self.assertEqual(check["status"], "warn")
+
+    def test_a_purchase_without_quantity_proof_still_warns(self) -> None:
+        records = dict(
+            EMPTY_RECORDS, purchase_expenses=[{"record_id": "p1", "gross_amount": 10.0, "quantity": None}]
+        )
+
+        self.assertEqual(inventory_check(records)["status"], "warn")
+
+    def test_an_inventory_movement_without_quantity_proof_still_warns(self) -> None:
+        records = dict(
+            EMPTY_RECORDS, inventory_movements=[{"record_id": "m1", "gross_amount": 0.0, "quantity": None}]
+        )
+
+        self.assertEqual(inventory_check(records)["status"], "warn")
+
+    def test_warehouse_configuration_alone_is_not_activity(self) -> None:
+        check = inventory_check(dict(EMPTY_RECORDS))
+
+        self.assertIn("no inventory-affecting activity", " ".join(check["notes"]))
+
+    def test_a_company_without_inventory_still_skips_an_empty_month(self) -> None:
+        check = inventory_check(dict(EMPTY_RECORDS), inventory_expected=False)
+
+        self.assertEqual(check["status"], "skipped")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -17,6 +17,7 @@ from inventory_verification import evaluate_inventory_action, load_manual_invent
 import bookprep
 import woo_tax
 from booksend import action_successfully_submitted, load_yaml, normalized_endpoint
+from posting_policy import PostingPolicyError, cash_posting_mode, prohibited_bank_cash_action
 from reference_artifacts import ReferenceArtifactError, file_sha256, verify_file_binding
 
 
@@ -29,6 +30,82 @@ STEP_SPECS = (
     ("bookchecker", "bookchecker.py"),
     ("booksend", "booksend.py"),
 )
+
+# The run advances through these in order. The first three are states reached; the next
+# three name what the run is waiting on, each of which is a person doing something in
+# the SimplBooks UI that the published API cannot do.
+PHASES = (
+    "source_ready",
+    "master_data_ready",
+    "documents_ready",
+    "statement_import_pending",
+    "ledger_evidence_pending",
+    "inventory_audit_pending",
+    "final_checks_ready",
+)
+
+
+def resolve_run_phase(
+    *,
+    statement_import_mode: bool,
+    master_data_resolved: bool,
+    documents_ready: bool,
+    ledger_evidence_status: str | None,
+    inventory_audit_status: str | None,
+) -> str:
+    """Report the furthest phase the year's evidence actually supports."""
+    if not master_data_resolved:
+        return "source_ready"
+    if not documents_ready:
+        return "master_data_ready"
+    if not statement_import_mode:
+        return "documents_ready"
+    if ledger_evidence_status is None:
+        return "statement_import_pending"
+    if ledger_evidence_status != "pass":
+        return "ledger_evidence_pending"
+    if inventory_audit_status != "pass":
+        return "inventory_audit_pending"
+    return "final_checks_ready"
+
+
+def load_optional_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def statement_import_year(company_dir: Path) -> bool:
+    policy = load_optional_json(company_dir / "artifacts" / "posting_policy.json")
+    try:
+        return cash_posting_mode(policy) == "statement_import"
+    except PostingPolicyError:
+        return False
+
+
+def count_bank_api_cash_actions(company_dir: Path, *, year: int) -> int:
+    """Count actions that would move bank cash the imported statement already moves."""
+    policy = load_optional_json(company_dir / "artifacts" / "posting_policy.json")
+    actions_dir = company_dir / "artifacts" / "actions"
+    if not actions_dir.exists():
+        return 0
+    total = 0
+    for path in sorted(actions_dir.glob(f"{year}-*.yaml")):
+        try:
+            batch = load_yaml(path)
+        except (OSError, SimplbooksError):
+            continue
+        for action in (batch or {}).get("actions") or []:
+            try:
+                if isinstance(action, dict) and prohibited_bank_cash_action(action, policy):
+                    total += 1
+            except PostingPolicyError:
+                continue
+    return total
 
 
 def periods_for_year(year: int) -> list[str]:
@@ -573,6 +650,61 @@ def build_step_command(
     return cmd
 
 
+def run_phase_from_evidence(
+    *,
+    company_dir: Path,
+    year: int,
+    statement_import_mode: bool,
+    master_data_resolved: bool,
+    documents_ready: bool,
+) -> str:
+    """Read the year's post-import evidence and report the phase it supports."""
+    ledger_evidence = load_optional_json(
+        company_dir / "artifacts" / "ledger" / f"{year}-ledger-evidence.json"
+    )
+    inventory_audit = load_optional_json(
+        company_dir / "artifacts" / "audits" / f"{year}-inventory-equation.json"
+    )
+    return resolve_run_phase(
+        statement_import_mode=statement_import_mode,
+        master_data_resolved=master_data_resolved,
+        documents_ready=documents_ready,
+        ledger_evidence_status=str(ledger_evidence.get("status")) if ledger_evidence else None,
+        inventory_audit_status=str(inventory_audit.get("status")) if inventory_audit else None,
+    )
+
+
+def generate_annual_statement_plan(
+    *,
+    company_dir: Path,
+    year: int,
+    python_executable: str,
+    cwd: Path,
+    continue_on_error: bool,
+) -> dict[str, Any]:
+    """Build the annual plan before any month, so no batch is built against a stale one."""
+    command = [
+        python_executable,
+        str(Path("scripts") / "statement_import_plan.py"),
+        "--company-dir",
+        str(company_dir),
+        "--year",
+        str(year),
+    ]
+    run = subprocess.run(command, cwd=cwd, capture_output=True, text=True)  # noqa: PLW1510
+    if run.returncode != 0 and not continue_on_error:
+        raise SimplbooksError(
+            "Annual statement-import plan generation failed; no month is built against a stale plan: "
+            + (run.stderr or run.stdout or "unknown error").strip()
+        )
+    return {
+        "step": "statement_import_plan",
+        "ok": run.returncode == 0,
+        "returncode": run.returncode,
+        "summary": parse_json_output(run.stdout),
+    }
+
+
 def run_full_year_dry_run(
     *,
     company_dir: Path,
@@ -590,6 +722,20 @@ def run_full_year_dry_run(
     api_calls: list[dict[str, Any]] = []
     successful_period_states: dict[str, str] = {}
     overall_success = True
+
+    statement_import_mode = statement_import_year(company_dir)
+    plan_step = (
+        generate_annual_statement_plan(
+            company_dir=company_dir,
+            year=year,
+            python_executable=python_executable,
+            cwd=cwd,
+            continue_on_error=continue_on_error,
+        )
+        if statement_import_mode
+        else None
+    )
+    overall_success = overall_success and (plan_step is None or plan_step["ok"])
 
     target_periods = periods_for_year(year)
     for period in target_periods:
@@ -668,6 +814,13 @@ def run_full_year_dry_run(
     if len(months) != len(target_periods):
         acceptance_issues.append(f"Expected {len(target_periods)} processed months, found {len(months)}.")
     overall_success = overall_success and not acceptance_issues
+    phase = run_phase_from_evidence(
+        company_dir=company_dir,
+        year=year,
+        statement_import_mode=statement_import_mode,
+        master_data_resolved=not unprocessed_periods,
+        documents_ready=overall_success,
+    )
     return {
         "company_dir": str(company_dir),
         "company_name": company_name,
@@ -684,6 +837,10 @@ def run_full_year_dry_run(
         "reference_summary": reference_summary,
         "bank_reconciliation_summary": bank_reconciliation_summary,
         "acceptance_issues": acceptance_issues,
+        "cash_posting_mode": "statement_import" if statement_import_mode else "api",
+        "phase": phase,
+        "statement_import_plan_step": plan_step,
+        "bank_api_cash_action_count": count_bank_api_cash_actions(company_dir, year=year),
         "api_calls": api_calls,
         "months": months,
     }

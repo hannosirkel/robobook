@@ -13,6 +13,7 @@ from typing import Any, Callable  # noqa: UP035
 import booksend
 from bank_allocations import BankAllocationError, load_bank_allocations, period_allocations
 from full_year_dry_run import parse_json_output, submitted_month_state
+from posting_policy import load_posting_policy, posting_scope_first_period
 from reference_artifacts import ReferenceArtifactError, verify_file_binding
 from simplbooks_api import SimplbooksError
 from simplbooks_api import resolve_company_id
@@ -132,6 +133,14 @@ def _required_discovery_years(
                 + ", ".join(f"{kind}:{item_id}" for item_id, kind in missing)
             )
     return sorted(years)
+
+
+def _posting_scope_first_period(company_dir: Path) -> str | None:
+    """Read the declared posting scope, so an out-of-scope year cannot enter the chain."""
+    policy_path = company_dir / "artifacts" / "posting_policy.json"
+    if not policy_path.exists():
+        return None
+    return posting_scope_first_period(load_posting_policy(policy_path))
 
 
 def _load_live_allocations(*, company_dir: Path, period: str) -> list[dict[str, Any]]:
@@ -272,7 +281,11 @@ def run_live_month(
     if state == "partial_submission":
         raise SimplbooksError(f"Period {period} has a partial submission; resume it without regeneration.")
     if action_path.exists():
-        booksend.validate_predecessor_submission(action_path=action_path, period=period)
+        booksend.validate_predecessor_submission(
+            action_path=action_path,
+            period=period,
+            first_period=_posting_scope_first_period(company_dir),
+        )
 
     live_allocations = _load_live_allocations(company_dir=company_dir, period=period)
     discovery_years = _required_discovery_years(
@@ -315,7 +328,11 @@ def run_live_month(
         discovery_paths=discovery_paths,
         cwd=cwd,
     )
-    booksend.validate_predecessor_submission(action_path=action_path, period=period)
+    booksend.validate_predecessor_submission(
+        action_path=action_path,
+        period=period,
+        first_period=_posting_scope_first_period(company_dir),
+    )
 
     checker_command = [
         python_executable, "scripts/bookchecker.py", "--company-dir", str(company_dir),

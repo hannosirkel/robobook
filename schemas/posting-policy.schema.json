@@ -52,6 +52,15 @@
       "uniqueItems": true,
       "items": {"type": "string", "minLength": 1}
     },
+    "posting_scope": {
+      "type": "object",
+      "description": "Where this company's posting chain begins. Batches for earlier periods may stay on disk for reference; they are excluded from the predecessor sequence and refused for writing.",
+      "additionalProperties": false,
+      "required": ["first_period"],
+      "properties": {
+        "first_period": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}$"}
+      }
+    },
     "cash_posting": {"$ref": "#/$defs/cash_posting"},
     "warehouse_routing": {"$ref": "#/$defs/warehouse_routing"}
   },

@@ -224,6 +224,12 @@ class SchemaContractTests(unittest.TestCase):
         }
         self.assert_artifact_valid(schema_name="posting-policy.schema.json", artifact=artifact)
 
+    def test_posting_policy_schema_accepts_a_declared_posting_scope(self) -> None:
+        """A company states where its posting chain begins, rather than implying it."""
+        artifact = json.loads((ROOT / "templates/posting-policy.template.json").read_text(encoding="utf-8"))
+        artifact["posting_scope"] = {"first_period": "2024-01"}
+        self.assert_artifact_valid(schema_name="posting-policy.schema.json", artifact=artifact)
+
     def test_posting_policy_schema_rejects_unknown_financial_account_role(self) -> None:
         artifact = json.loads((ROOT / "templates/posting-policy.template.json").read_text(encoding="utf-8"))
         artifact["cash_posting"]["financial_accounts"]["bank_fee"] = "99"

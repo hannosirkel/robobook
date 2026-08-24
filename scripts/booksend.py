@@ -27,6 +27,7 @@ from bookchecker import (
 from exchange_rates import ExchangeRateError, lookup_rate
 from posting_policy import (
     PostingPolicyError,
+    accepted_checker_warnings,
     action_policy_errors,
     cash_posting_mode,
     posting_scope_first_period,
@@ -989,6 +990,27 @@ def find_value_by_key(payload: Any, target_key: str) -> str | int | None:
     return None
 
 
+def unreviewed_checker_findings(
+    evaluation: dict[str, Any], *, accepted: list[str]
+) -> list[dict[str, Any]]:
+    """Findings that must stop a write: every error, and any warning nobody declared.
+
+    Mirrors the live runner's gate. A company declares permanently-true warnings in
+    `accepted_checker_warnings`, matched as substrings; an error is never excusable
+    that way. Narrowing this in only one of the two places would leave the
+    declaration useless, since the runner would accept a warning the sender refuses.
+    """
+    blocking: list[dict[str, Any]] = []
+    for item in evaluation.get("findings") or []:
+        severity = str((item or {}).get("severity") or "")
+        summary = str((item or {}).get("summary") or "")
+        if severity == "error" or (
+            severity == "warn" and not any(pattern in summary for pattern in accepted)
+        ):
+            blocking.append(item)
+    return blocking
+
+
 def extract_inserted_id(response_body: dict[str, Any]) -> str | int | None:
     for key in ("inserted_id", "invoice_id", "purchase_id", "payment_id", "incoming_id", "id"):
         found = find_value_by_key(response_body, key)
@@ -1688,11 +1710,13 @@ def run_submission(
             posting_policy=posting_policy,
             expected_company_id=resolved_company_id,
         )
-        if evaluation["error_count"] or evaluation["warning_count"]:
-            first_finding = (evaluation.get("findings") or [{}])[0]
+        unreviewed = unreviewed_checker_findings(
+            evaluation, accepted=accepted_checker_warnings(posting_policy)
+        )
+        if unreviewed:
             raise SimplbooksError(
                 "Write mode full checker prevalidation failed before any API call: "
-                + str(first_finding.get("summary") or "unknown checker finding")
+                + str(unreviewed[0].get("summary") or "unknown checker finding")
             )
 
     company_slug = str(

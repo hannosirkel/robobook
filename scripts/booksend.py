@@ -665,7 +665,12 @@ def translate_purchase_payload(action: dict[str, Any], *, credit: bool = False) 
     purchase = compact_dict(
         {
             "client_id": api_id(counterparty.get("contact_id"), field_name=f"{action_id(action)} client_id"),
+            # Simplbooks refuses a purchase without both of these. A monthly aggregate has
+            # no supplier invoice number, so the stable per-period key stands in and keeps
+            # reruns idempotent; a declared external_ref is the real document and wins.
+            "number": str(payload.get("external_ref") or action_id(action)),
             "created": document_date,
+            "due": document_date,
             "transaction_date": document_date,
             "currency_name": currency,
             "currency_rate": reviewed_currency_rate(payload),

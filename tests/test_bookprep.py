@@ -1988,7 +1988,10 @@ class BookprepTests(unittest.TestCase):
             self.assertEqual(expense["gross_amount"], 8.21)
             self.assertEqual(expense["net_amount"], 6.84)
             self.assertEqual(expense["vat_amount"], 1.37)
-            self.assertEqual(expense["warehouse_id"], "GB")
+            # Printful reports GB for this shipment, but it fulfils from Latvia; the
+            # reported country is provenance, not a warehouse.
+            self.assertEqual(expense["warehouse_id"], "LV")
+            self.assertEqual(expense["attributes"]["shipped_from"], "GB")
             self.assertEqual(expense["external_ref"], "107531681")
             self.assertFalse(exceptions)
             self.assertEqual(len(records["purchase_credits"]), 1)
@@ -2667,3 +2670,135 @@ class WalletCardlessFundingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PrintfulWarehouseIsAlwaysLatviaTests(unittest.TestCase):
+    """Printful fulfils from Latvia; the CSV's country is not a warehouse.
+
+    When stock runs out Printful books the order against whichever facility it
+    routed through, so `Shipped from` reports US or GB for shipments that are
+    still fulfilled from LV. Those fees are refunded in a later period. Routing
+    stock on that field would relieve a warehouse the goods never sat in, so the
+    reported country is kept as provenance and the warehouse is always LV.
+    """
+
+    def _records(self, csv_body: str, period: str) -> list[dict]:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "Orders.csv"
+            csv_path.write_text(
+                "Date,Order,Printful ID,Shipped from,Shipped to,State,Payment Instrument,"
+                "Status,Products,Discount,Shipping,Digitization,Branding,Fulfillment fees,Tax,VAT,Total\n"
+                + csv_body,
+                encoding="utf-8",
+            )
+            period_start, period_end = bookprep.parse_period(period)
+            source = bookprep.inspect_source_file(
+                path=csv_path, root_dir=root, period_start=period_start, period_end=period_end
+            )
+            assert source is not None
+            records, _ = bookprep.parse_printful_orders_csv(
+                source, period_start=period_start, period_end=period_end, base_currency="EUR"
+            )
+            return [r for rows in records.values() for r in rows]
+
+    def test_a_us_shipment_is_still_warehoused_in_latvia(self) -> None:
+        rows = self._records(
+            '"May 29, 2024","Order 782",106673238,US,"United States",California,'
+            '"Printful Wallet",Completed,€0.00,€0.00,€4.39,€0.00,€0.00,€2.66,-,-,€7.05\n',
+            "2024-05",
+        )
+
+        self.assertEqual([r["warehouse_id"] for r in rows], ["LV"])
+
+    def test_the_reported_country_survives_as_provenance(self) -> None:
+        rows = self._records(
+            '"May 29, 2024","Order 782",106673238,US,"United States",California,'
+            '"Printful Wallet",Completed,€0.00,€0.00,€4.39,€0.00,€0.00,€2.66,-,-,€7.05\n',
+            "2024-05",
+        )
+
+        self.assertEqual(rows[0]["attributes"]["shipped_from"], "US")
+
+    def test_a_refund_of_a_us_shipment_also_warehouses_in_latvia(self) -> None:
+        """The credit must land in the same warehouse as the charge it reverses."""
+        rows = self._records(
+            '"July 12, 2024","Refund to wallet 782",106673238,US,"United States",California,'
+            '"Printful Wallet",Refunded,€0.00,€0.00,-€4.39,€0.00,€0.00,-€2.66,-,-,-€7.05\n',
+            "2024-07",
+        )
+
+        self.assertEqual([r["warehouse_id"] for r in rows], ["LV"])
+
+    def test_a_refund_keeps_its_positive_credit_magnitude(self) -> None:
+        """The minus sign in the CSV becomes a credit, not a negative expense."""
+        rows = self._records(
+            '"July 12, 2024","Refund to wallet 782",106673238,US,"United States",California,'
+            '"Printful Wallet",Refunded,€0.00,€0.00,-€4.39,€0.00,€0.00,-€2.66,-,-,-€7.05\n',
+            "2024-07",
+        )
+
+        self.assertEqual(rows[0]["gross_amount"], 7.05)
+        self.assertEqual(rows[0]["attributes"]["source_gross_amount"], -7.05)
+
+
+class PaypalCarriesWooOrderIdentityTests(unittest.TestCase):
+    """PayPal-settled Woo orders must keep their order number.
+
+    The export carries the Woo identity twice -- `Invoice Number` as WC-nnn and
+    `Custom Number` as a JSON blob with order_id and order_key -- and both were
+    being discarded. Without it a PayPal sale cannot be warehouse-routed by
+    order, because the routing rule has no order number to compare.
+    """
+
+    HEADER = (
+        '"Date","Time","TimeZone","Name","Type","Status","Currency","Gross","Fee","Net",'
+        '"From Email Address","To Email Address","Transaction ID","Shipping Address",'
+        '"Address Status","Item Title","Item ID","Shipping and Handling Amount",'
+        '"Insurance Amount","Sales Tax","Option 1 Name","Option 1 Value","Option 2 Name",'
+        '"Option 2 Value","Reference Txn ID","Invoice Number","Custom Number","Quantity","Receipt ID",\n'
+    )
+
+    def _sale(self, invoice: str, custom: str) -> dict:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "paypal.CSV"
+            csv_path.write_text(
+                self.HEADER
+                + f'"14/04/2024","10:00:00","PDT","Example Buyer","Website Payment","Completed","EUR",'
+                f'"32.85","0.00","32.85","buyer@example.com","shop@example.com","TXN1","","",'
+                f'"Lunar Base card game","","0.00","","0.00","","","","","","{invoice}","{custom}","1",""\n',
+                encoding="utf-8",
+            )
+            period_start, period_end = bookprep.parse_period("2024-04")
+            source = bookprep.inspect_source_file(
+                path=csv_path, root_dir=root, period_start=period_start, period_end=period_end
+            )
+            assert source is not None
+            records, _ = bookprep.parse_paypal_csv(
+                source, period_start=period_start, period_end=period_end, base_currency="EUR"
+            )
+            flat = [r for rows in records.values() for r in rows]
+            assert flat, "expected one parsed PayPal row"
+            return flat[0]
+
+    def test_the_order_id_is_read_from_the_custom_number_json(self) -> None:
+        record = self._sale("WC-901", '{""order_id"":901,""order_key"":""wc_order_EXAMPLEKEY""}')
+
+        self.assertEqual(record["attributes"]["order_id"], "901")
+
+    def test_the_order_key_is_kept_too(self) -> None:
+        record = self._sale("WC-901", '{""order_id"":901,""order_key"":""wc_order_EXAMPLEKEY""}')
+
+        self.assertEqual(record["attributes"]["order_key"], "wc_order_EXAMPLEKEY")
+
+    def test_the_invoice_number_is_the_fallback(self) -> None:
+        """Older rows carry only WC-nnn, so the prefix is stripped."""
+        record = self._sale("WC-901", "")
+
+        self.assertEqual(record["attributes"]["order_id"], "901")
+
+    def test_a_row_without_either_field_is_left_without_an_order_id(self) -> None:
+        record = self._sale("", "")
+
+        self.assertIsNone(record["attributes"].get("order_id"))

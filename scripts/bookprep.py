@@ -1450,6 +1450,33 @@ def paypal_category(
     return "sales"
 
 
+def paypal_woo_order_identity(row: dict[str, Any]) -> dict[str, Any]:
+    """Recover the WooCommerce order identity a PayPal row carries.
+
+    `Custom Number` holds a JSON blob with order_id and order_key; older rows
+    carry only `Invoice Number` as WC-nnn. Neither is required, so a row with
+    neither simply yields nothing rather than an exception.
+    """
+    identity: dict[str, Any] = {}
+    custom = str(row.get("Custom Number") or "").strip()
+    if custom.startswith("{"):
+        try:
+            parsed = json.loads(custom)
+        except json.JSONDecodeError:
+            parsed = {}
+        if isinstance(parsed, dict):
+            if str(parsed.get("order_id") or "").strip():
+                identity["order_id"] = str(parsed["order_id"]).strip()
+            if str(parsed.get("order_key") or "").strip():
+                identity["order_key"] = str(parsed["order_key"]).strip()
+    if "order_id" not in identity:
+        invoice = str(row.get("Invoice Number") or "").strip()
+        match = re.fullmatch(r"WC-(\d+)", invoice)
+        if match:
+            identity["order_id"] = match.group(1)
+    return identity
+
+
 def parse_paypal_csv(
     source: SourceDescriptor,
     *,
@@ -1551,6 +1578,9 @@ def parse_paypal_csv(
             "quantity": row.get("Quantity"),
             "reference_transaction_id": row.get("Reference Txn ID"),
         }
+        # The Woo identity travels in two columns. Without it a PayPal-settled sale
+        # carries no order number, so warehouse routing has nothing to match on.
+        attributes.update(paypal_woo_order_identity(row))
         if category == "clearing_transactions":
             attributes.update({
                 "clearing_provider": "paypal",
@@ -2166,6 +2196,14 @@ def parse_bank_csv(
     return result, []
 
 
+# Printful fulfils this company from Latvia. When stock runs out it books the order
+# against whichever facility it routed through, so "Shipped from" reports US or GB for
+# shipments still fulfilled from LV, and those fees are refunded in a later period.
+# Routing stock on that field would relieve a warehouse the goods never sat in, so the
+# reported country is kept as provenance in `shipped_from` and never used as a warehouse.
+PRINTFUL_WAREHOUSE = "LV"
+
+
 def parse_printful_orders_csv(
     source: SourceDescriptor,
     *,
@@ -2276,7 +2314,7 @@ def parse_printful_orders_csv(
                     vat_amount=vat_amount,
                     shipping_amount=abs(group["components"]["Shipping"]),
                     external_ref=group_key,
-                    warehouse_id=origin,
+                    warehouse_id=PRINTFUL_WAREHOUSE,
                     channel="printful",
                     attributes={
                         "vendor_name": "Printful Inc.",
@@ -2334,7 +2372,7 @@ def parse_printful_orders_csv(
             vat_amount=vat_amount,
             shipping_amount=group["components"]["Shipping"],
             external_ref=group_key,
-            warehouse_id=origin,
+            warehouse_id=PRINTFUL_WAREHOUSE,
             channel="printful",
             attributes=attributes,
             row_ref=f"csv:{group['line_nos'][0]}",

@@ -2378,6 +2378,16 @@ def build_purchase_actions(
                         description,
                         warehouse_profile,
                     )
+                elif "service_charge" in haystack:
+                    # A fulfillment service is acquired VAT-free, while the storage fee
+                    # bears the warehouse country's VAT. One line cannot carry both
+                    # treatments, so the policy needs them apart.
+                    bucket = (
+                        printful_storage_account_id or expense_account_id or "",
+                        printful_storage_vat_type_id or zero_vat_type_id or "",
+                        "Warehousing and fulfillment services",
+                        "",
+                    )
                 else:
                     bucket = (
                         printful_storage_account_id or expense_account_id or "",
@@ -3726,10 +3736,27 @@ def apply_exchange_rate_provenance(
         )
 
 
+def vat_type_is_zero_rated(entity_map: dict[str, Any] | None, vat_type_id: Any) -> bool:
+    """Whether a VAT type carries no rate at all, so no VAT may be booked against it.
+
+    A missing percentage is as rateless as an explicit zero: "Ei ole kaive" declares no
+    rate, and a line booked under it must not claim tax it never became entitled to.
+    """
+    if not entity_map or vat_type_id in (None, ""):
+        return False
+    for vat_type in entity_map.get("vat_types") or []:
+        if str(vat_type.get("id") or "") != str(vat_type_id):
+            continue
+        percent = (vat_type.get("extra") or {}).get("vat_percent")
+        return percent in (None, 0) or decimal_value(percent) == 0
+    return False
+
+
 def apply_posting_policy(
     actions: list[dict[str, Any]],
     *,
     posting_policy: dict[str, Any] | None,
+    entity_map: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     if posting_policy is None:
         return []
@@ -3737,6 +3764,7 @@ def apply_posting_policy(
     for action in actions:
         payload = action.get("payload") or {}
         action_type = str(action.get("action_type") or "")
+        non_deductible_vat = Decimal(0)
         if action_type in {"create_invoice_summary", "create_credit_invoice_summary"}:
             role = "sales"
             label = str((payload.get("summary_scope") or {}).get("channel_or_source") or "")
@@ -3909,6 +3937,27 @@ def apply_posting_policy(
                     ) from exc
                 warehouse_id = line_values.get("warehouse_id")
                 line["warehouse_id_hint"] = str(warehouse_id) if warehouse_id not in (None, "") else None
+                if line_values.get("vat_deductible") is False:
+                    # Foreign VAT the company cannot reclaim is part of the cost. The gross
+                    # stays on the expense line; only the reclaimable share drops to zero.
+                    non_deductible_vat += decimal_value(line.get("vat_amount_hint"))
+                    line["vat_amount_hint"] = decimal_number(Decimal(0))
+                    line["vat_deductible"] = False
+                elif vat_type_is_zero_rated(entity_map, line.get("suggested_vat_type_id")) and decimal_value(
+                    line.get("vat_amount_hint")
+                ):
+                    raise SimplbooksError(
+                        f"Posting family {family!r} line {line_key!r} carries VAT "
+                        f"{decimal_value(line.get('vat_amount_hint'))} under zero-rated VAT type "
+                        f"{line.get('suggested_vat_type_id')!r}. Either map a rated VAT type or declare the line "
+                        '"vat_deductible": false so the VAT is expensed.'
+                    )
+        if non_deductible_vat:
+            totals = payload.get("totals")
+            if isinstance(totals, dict):
+                totals["vat_amount"] = decimal_number(
+                    decimal_value(totals.get("vat_amount")) - non_deductible_vat
+                )
         review_notes = list(action.get("review_notes") or [])
         required_ids: list[str | None] = [str((payload.get("counterparty") or {}).get("contact_id") or "")]
         for line in payload.get("line_items") or []:
@@ -4115,7 +4164,7 @@ def build_action_batch(
         + processor_settlement_actions
         + cash_actions
     )
-    unresolved_dependencies = apply_posting_policy(actions, posting_policy=posting_policy)
+    unresolved_dependencies = apply_posting_policy(actions, posting_policy=posting_policy, entity_map=entity_map)
     unresolved_dependencies.extend(
         build_manual_financial_dependencies(
             statement_import_mode=(

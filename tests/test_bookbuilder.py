@@ -361,6 +361,86 @@ def purchase_summary_action(
     }
 
 
+ZERO_RATE_VAT_TYPES = {
+    "vat_types": [
+        {"id": "11", "name": "0% Teenuste uhendusesisene soetamine",
+         "extra": {"is_purchase": True, "vat_percent": 0, "reverse_vat_percent": 0}},
+        {"id": "18", "name": "Ei ole kaive",
+         "extra": {"is_purchase": True, "vat_percent": None, "reverse_vat_percent": 0}},
+        {"id": "26", "name": "22% Eesti",
+         "extra": {"is_purchase": True, "vat_percent": 22, "reverse_vat_percent": 0}},
+    ]
+}
+
+
+def storage_fee_action(*, vat_amount: float = 31.5, gross: float = 181.5) -> dict:
+    action = purchase_summary_action(
+        period="2024-01", key="example-2024-01-purchase-printful",
+        vendor_hint="printful", amount=gross,
+    )
+    payload = action["payload"]
+    payload["totals"] = {"gross_amount": gross, "vat_amount": vat_amount}
+    payload["line_items"][0]["description"] = "Storage fee for warehoused products"
+    payload["line_items"][0]["vat_amount_hint"] = vat_amount
+    return action
+
+
+def printful_policy(*, vat_type_id: str, vat_deductible: bool | None = None) -> dict:
+    line: dict = {"expense_account_id": "258", "vat_type_id": vat_type_id}
+    if vat_deductible is not None:
+        line["vat_deductible"] = vat_deductible
+    return {
+        "contacts": {"sales": {}, "processors": {}, "suppliers": {"printful": "41"}},
+        "mappings": {"purchase-printful": {
+            "expense_account_id": "258", "vat_type_id": vat_type_id,
+            "lines": {"storage-fee-for-warehoused-products": line},
+        }},
+    }
+
+
+class NonDeductibleVatTests(unittest.TestCase):
+    """Foreign VAT a company cannot reclaim is part of the cost, not a receivable."""
+
+    def test_a_non_deductible_line_expenses_its_vat_instead_of_reclaiming_it(self) -> None:
+        action = storage_fee_action()
+
+        bookbuilder.apply_posting_policy(
+            [action],
+            posting_policy=printful_policy(vat_type_id="18", vat_deductible=False),
+            entity_map=ZERO_RATE_VAT_TYPES,
+        )
+
+        line = action["payload"]["line_items"][0]
+        self.assertEqual(line["vat_amount_hint"], 0.0)
+        self.assertEqual(line["gross_amount"], 181.5)
+        self.assertEqual(action["payload"]["totals"]["vat_amount"], 0.0)
+        self.assertEqual(action["payload"]["totals"]["gross_amount"], 181.5)
+
+    def test_a_zero_rated_vat_type_may_not_carry_a_vat_amount(self) -> None:
+        """The defect this guards: a line declared 0% intra-Community services while
+        carrying real foreign VAT, which both misdeclares the return and reclaims tax."""
+        action = storage_fee_action()
+
+        with self.assertRaisesRegex(bookbuilder.SimplbooksError, "zero-rated VAT type"):
+            bookbuilder.apply_posting_policy(
+                [action],
+                posting_policy=printful_policy(vat_type_id="11"),
+                entity_map=ZERO_RATE_VAT_TYPES,
+            )
+
+    def test_a_rated_vat_type_still_carries_its_vat(self) -> None:
+        action = storage_fee_action()
+
+        bookbuilder.apply_posting_policy(
+            [action],
+            posting_policy=printful_policy(vat_type_id="26"),
+            entity_map=ZERO_RATE_VAT_TYPES,
+        )
+
+        self.assertEqual(action["payload"]["line_items"][0]["vat_amount_hint"], 31.5)
+        self.assertEqual(action["payload"]["totals"]["vat_amount"], 31.5)
+
+
 class BookbuilderTests(unittest.TestCase):
     def test_review_confidence_uses_open_issues_not_informational_notes(self) -> None:
         self.assertEqual(
@@ -2179,6 +2259,60 @@ class BookbuilderTests(unittest.TestCase):
                 "example-2024-01-purchase-printful-eur",
                 "example-2024-01-purchase-printful-usd",
             ],
+        )
+
+    def test_a_storage_fee_and_a_fulfillment_service_get_separate_lines(self) -> None:
+        """They are taxed differently -- a Latvian storage fee bears Latvian VAT while a
+        fulfillment service is acquired VAT-free -- so one policy line cannot serve both."""
+        normalized = base_normalized()
+        storage = record(
+            record_id="printful:storage:1",
+            source_system="printful",
+            event_type="printful_other_charge",
+            gross_amount=181.5,
+            description="Printful Custom Product Keeping",
+            channel="printful",
+        )
+        storage["vat_amount"] = 31.5
+        service = record(
+            record_id="printful:service:1",
+            source_system="printful",
+            event_type="printful_service_charge",
+            gross_amount=306.32,
+            description="Printful Warehousing & Fulfillment Stock Removal",
+            channel="printful",
+        )
+        normalized["records"]["purchase_expenses"].extend([storage, service])
+        entity_map = {
+            "financial_accounts": [
+                {"id": "257", "name": "Imported transport", "code": "5521", "status": None},
+                {"id": "258", "name": "Imported services", "code": "5201", "status": None},
+            ],
+            "vat_types": [
+                {"id": "11", "name": "0% Imported services", "extra": {"is_purchase": True, "vat_percent": 0}},
+            ],
+            "contacts": [{"id": "41", "name": "Printful, Inc.", "status": None}],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            batch = bookbuilder.build_action_batch(
+                normalized_payload=normalized,
+                recon_payload=base_recon(),
+                normalized_path=Path(tmp) / "normalized.json",
+                recon_path=Path(tmp) / "recon.json",
+                repo_root=Path(tmp),
+                entity_map=entity_map,
+            )
+
+        purchase = next(
+            action for action in batch["actions"]
+            if action["action_type"] == "create_purchase_summary"
+            and "printful" in action["idempotency_key"]
+        )
+        descriptions = sorted(line["description"] for line in purchase["payload"]["line_items"])
+        self.assertEqual(
+            descriptions,
+            ["Storage fee for warehoused products", "Warehousing and fulfillment services"],
         )
 
     def test_builder_uses_omniva_alias_for_eesti_post_contact(self) -> None:

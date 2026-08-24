@@ -1845,3 +1845,71 @@ class PurchaseNumberAndDueTests(unittest.TestCase):
         purchase = request["payload"]["Purchase"]
         self.assertTrue(str(purchase.get("number") or "").strip())
         self.assertTrue(str(purchase.get("due") or "").strip())
+
+
+class WritePrevalidationAcceptedWarningTests(unittest.TestCase):
+    """The write engine enforces the same no-warnings policy as the live runner.
+
+    Narrowing it in only one of the two places leaves the declaration useless:
+    the runner accepts a reviewed warning and the sender then refuses it, so no
+    month can post at all.
+    """
+
+    def _evaluation(self, findings: list[tuple[str, str]]) -> dict:
+        return {
+            "error_count": sum(1 for severity, _ in findings if severity == "error"),
+            "warning_count": sum(1 for severity, _ in findings if severity == "warn"),
+            "findings": [
+                {"section": "recon_alignment", "severity": severity, "summary": summary}
+                for severity, summary in findings
+            ],
+        }
+
+    def test_a_clean_evaluation_has_nothing_unreviewed(self) -> None:
+        self.assertEqual(booksend.unreviewed_checker_findings(self._evaluation([]), accepted=[]), [])
+
+    def test_a_declared_warning_does_not_block(self) -> None:
+        evaluation = self._evaluation([("warn", "Recon still carries 4 warning check(s).")])
+
+        self.assertEqual(
+            booksend.unreviewed_checker_findings(evaluation, accepted=["Recon still carries"]), []
+        )
+
+    def test_an_undeclared_warning_blocks(self) -> None:
+        evaluation = self._evaluation([("warn", "A brand new problem")])
+
+        unreviewed = booksend.unreviewed_checker_findings(
+            evaluation, accepted=["Recon still carries"]
+        )
+
+        self.assertEqual([item["summary"] for item in unreviewed], ["A brand new problem"])
+
+    def test_an_error_blocks_even_when_its_text_is_declared(self) -> None:
+        """A declaration accepts a reviewed warning, never an error."""
+        evaluation = self._evaluation([("error", "Recon still carries 4 warning check(s).")])
+
+        unreviewed = booksend.unreviewed_checker_findings(
+            evaluation, accepted=["Recon still carries"]
+        )
+
+        self.assertEqual(len(unreviewed), 1)
+
+    def test_the_first_unreviewed_finding_is_reported_not_the_first_finding(self) -> None:
+        """The error should name what actually blocks, not a warning that was accepted."""
+        evaluation = self._evaluation([
+            ("warn", "Recon still carries 4 warning check(s)."),
+            ("warn", "A brand new problem"),
+        ])
+
+        unreviewed = booksend.unreviewed_checker_findings(
+            evaluation, accepted=["Recon still carries"]
+        )
+
+        self.assertEqual(unreviewed[0]["summary"], "A brand new problem")
+
+    def test_no_declaration_keeps_every_warning_blocking(self) -> None:
+        evaluation = self._evaluation([("warn", "Recon still carries 4 warning check(s).")])
+
+        self.assertEqual(
+            len(booksend.unreviewed_checker_findings(evaluation, accepted=[])), 1
+        )

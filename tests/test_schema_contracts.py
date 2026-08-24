@@ -208,6 +208,22 @@ class SchemaContractTests(unittest.TestCase):
         )
         self.assert_artifact_valid(schema_name="posting-policy.schema.json", artifact=artifact)
 
+    def test_posting_policy_schema_accepts_a_non_deductible_line(self) -> None:
+        """Foreign VAT that cannot be reclaimed is declared on the line that bears it."""
+        artifact = json.loads((ROOT / "templates/posting-policy.template.json").read_text(encoding="utf-8"))
+        artifact["mappings"]["purchase-foreign-storage"] = {
+            "expense_account_id": "258",
+            "vat_type_id": "18",
+            "lines": {
+                "storage-fee-for-warehoused-products": {
+                    "expense_account_id": "258",
+                    "vat_type_id": "18",
+                    "vat_deductible": False,
+                }
+            },
+        }
+        self.assert_artifact_valid(schema_name="posting-policy.schema.json", artifact=artifact)
+
     def test_posting_policy_schema_rejects_unknown_financial_account_role(self) -> None:
         artifact = json.loads((ROOT / "templates/posting-policy.template.json").read_text(encoding="utf-8"))
         artifact["cash_posting"]["financial_accounts"]["bank_fee"] = "99"

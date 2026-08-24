@@ -163,7 +163,11 @@
       "properties": {
         "expense_account_id": {"$ref": "#/$defs/id"},
         "vat_type_id": {"$ref": "#/$defs/id"},
-        "warehouse_id": {"$ref": "#/$defs/id"}
+        "warehouse_id": {"$ref": "#/$defs/id"},
+        "vat_deductible": {
+          "type": "boolean",
+          "description": "False when the VAT charged on this line cannot be reclaimed, such as another member state's VAT on a service taxed where it was supplied. The gross stays on the expense line and no input VAT is claimed. Absent means deductible."
+        }
       }
     },
     "posting_family": {

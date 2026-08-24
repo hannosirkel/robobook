@@ -2374,11 +2374,11 @@ def parse_printful_wallet_csv(
         action = normalize_ascii(str(row.get("Action") or "")).lower()
         payment_instrument = str(row.get("Payment Instrument") or "").strip()
         if "deposit to wallet" in action:
-            signed_amount = -abs(amount)
+            signed_amount = abs(amount)
             event_type = "printful_wallet_deposit"
             description = f"Printful wallet funding via {payment_instrument or 'wallet'}"
         elif "withdrawal from wallet" in action:
-            signed_amount = abs(amount)
+            signed_amount = -abs(amount)
             event_type = "printful_wallet_withdrawal"
             description = f"Printful wallet refund via {payment_instrument or 'wallet'}"
         else:
@@ -2429,9 +2429,12 @@ WALLET_PRINTOUT_COLUMNS = ("payment", "status", "amount", "date", "id")
 # ending in the four digits that identify the card.
 MASKED_CARD = re.compile(r"^[0-9*\s]{8,}?(?P<last4>[0-9]{4})$")
 
+# A wallet row records what the row did to the wallet's own balance, which is how
+# Printful's export signs it and how PayPal clearing evidence is signed in this model:
+# money in is positive, money out is negative.
 WALLET_ACTIONS = {
-    "deposit to wallet": ("printful_wallet_deposit", -1),
-    "withdrawal from wallet": ("printful_wallet_withdrawal", 1),
+    "deposit to wallet": ("printful_wallet_deposit", 1),
+    "withdrawal from wallet": ("printful_wallet_withdrawal", -1),
 }
 
 
@@ -2504,7 +2507,12 @@ def parse_printful_wallet_printout(
         amount, currency = parse_money_cell(row.get("Amount"), default_currency=base_currency)
         external_ref = str(row.get("ID") or "").strip()
         normalized_action = normalize_ascii(action).lower()
-        event_type, sign = WALLET_ACTIONS.get(normalized_action, ("printful_wallet_consumption", -1))
+        if normalized_action.startswith("refund"):
+            # A refund returns an order's money to the wallet. Letting it fall through to
+            # the consumption default charged the wallet a second time for the same order.
+            event_type, sign = "printful_wallet_refund", 1
+        else:
+            event_type, sign = WALLET_ACTIONS.get(normalized_action, ("printful_wallet_consumption", -1))
 
         attributes: dict[str, Any] = {
             "action": action,

@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from unittest import mock
 
@@ -2027,7 +2028,9 @@ class BookprepTests(unittest.TestCase):
             self.assertEqual(len(records["clearing_transactions"]), 3)
             amounts = [record["gross_amount"] for record in records["clearing_transactions"]]
             currencies = [record["currency"] for record in records["clearing_transactions"]]
-            self.assertEqual(amounts, [-8.21, 3.55, -306.32])
+            # The wallet's own balance change: the export's +8.21 deposit raises it and
+            # its -3.55 withdrawal lowers it, matching the printout parser.
+            self.assertEqual(amounts, [8.21, -3.55, 306.32])
             self.assertEqual(currencies, ["EUR", "EUR", "USD"])
             self.assertEqual(records["clearing_transactions"][0]["attributes"]["clearing_provider"], "printful")
 
@@ -2331,6 +2334,14 @@ WALLET_PRINTOUT = (
     '"Warehousing storage fee, Riga\n000000********2222"\tCompleted\t\u20ac1.20\tJul 12, 2024\t105\t\n'
 )
 
+WALLET_ROUNDTRIP = (
+    "Payment\tStatus\tAmount\tDate\tID\tDocuments\n"
+    '"Deposit to Wallet\n000000********1111"\tCompleted\t\u20ac7.90\tApr 10, 2024\t201\t\n'
+    '"Order #771\nwallet"\tCompleted\t\u20ac7.90\tApr 11, 2024\t202\t\n'
+    '"Refund #771\nwallet"\tRefunded\t\u20ac7.90\tMay 2, 2024\t203\t\n'
+    '"Withdrawal from Wallet\n000000********1111"\tRefunded\t\u20ac7.90\tMay 3, 2024\t204\t\n'
+)
+
 CARD_OWNERS = {"1111": "reporting_person", "2222": "company"}
 
 
@@ -2381,16 +2392,37 @@ class WalletPrintoutTests(unittest.TestCase):
             self.assertEqual({row["attributes"]["funding_owner"] for row in company}, {"company"})
             self.assertEqual(len(rows), 5)
 
-    def test_wallet_deposits_and_refunds_carry_opposite_signs(self) -> None:
+    def test_a_deposit_raises_and_a_withdrawal_lowers_the_wallet_balance(self) -> None:
+        """Printful's own export signs a deposit + and a withdrawal -, and so does PayPal
+        clearing evidence in this same model. A wallet row is the wallet's balance change."""
         with tempfile.TemporaryDirectory() as tmp:
             rows = self.rows(Path(tmp))
 
             deposits = [row for row in rows if row["event_type"] == "printful_wallet_deposit"]
-            refunds = [row for row in rows if row["event_type"] == "printful_wallet_withdrawal"]
-            self.assertTrue(all(row["gross_amount"] < 0 for row in deposits))
-            self.assertTrue(all(row["gross_amount"] > 0 for row in refunds))
+            withdrawals = [row for row in rows if row["event_type"] == "printful_wallet_withdrawal"]
+            self.assertTrue(all(row["gross_amount"] > 0 for row in deposits))
+            self.assertTrue(all(row["gross_amount"] < 0 for row in withdrawals))
             self.assertEqual(len(deposits), 2)
-            self.assertEqual(len(refunds), 1)
+            self.assertEqual(len(withdrawals), 1)
+
+    def test_a_refund_credits_the_wallet_instead_of_charging_it_again(self) -> None:
+        """A `Refund #N` row returns an order's money to the wallet. Falling through to the
+        consumption default recorded it as a second charge, so the money left twice."""
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = self.rows(Path(tmp), text=WALLET_ROUNDTRIP)
+
+            refund = next(row for row in rows if "Refund #771" in row["description"])
+
+            self.assertGreater(refund["gross_amount"], 0)
+            self.assertEqual(refund["gross_amount"], 7.90)
+
+    def test_a_funded_order_and_its_refund_leave_the_wallet_flat(self) -> None:
+        """Deposit, spend, refund, withdraw is a closed loop: it must net to exactly zero."""
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = self.rows(Path(tmp), text=WALLET_ROUNDTRIP)
+
+            self.assertEqual(len(rows), 4)
+            self.assertEqual(sum(Decimal(str(row["gross_amount"])) for row in rows), Decimal(0))
 
     def test_a_wallet_funded_row_carries_no_card_and_is_consumption(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1790,3 +1790,58 @@ class AllocatedOrderProofSenderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PurchaseNumberAndDueTests(unittest.TestCase):
+    """Simplbooks refuses a purchase without both a number and a due date.
+
+    The defect this guards: `purchases/create` returns HTTP 400 with
+    "Ostuarve number on kohustuslik" and "Ostuarve maksetähtaeg peab olema
+    määratud". No dry run can catch it, because a dry run never POSTs, so every
+    purchase in a year can report success and still be unpostable.
+    """
+
+    def test_a_purchase_carries_a_document_number(self) -> None:
+        request = booksend.translate_purchase_payload(purchase_action())
+
+        self.assertTrue(str(request["payload"]["Purchase"].get("number") or "").strip())
+
+    def test_a_purchase_carries_a_due_date(self) -> None:
+        request = booksend.translate_purchase_payload(purchase_action())
+
+        self.assertTrue(str(request["payload"]["Purchase"].get("due") or "").strip())
+
+    def test_the_number_falls_back_to_the_idempotency_key(self) -> None:
+        """Monthly aggregates have no supplier invoice number, so the stable
+        per-period key stands in and keeps reruns idempotent."""
+        action = purchase_action(key="example-2024-01-purchase-printful")
+
+        request = booksend.translate_purchase_payload(action)
+
+        self.assertEqual(
+            request["payload"]["Purchase"]["number"], "example-2024-01-purchase-printful"
+        )
+
+    def test_a_declared_external_ref_wins_over_the_key(self) -> None:
+        action = purchase_action()
+        action["payload"]["external_ref"] = "EE24111268"
+
+        request = booksend.translate_purchase_payload(action)
+
+        self.assertEqual(request["payload"]["Purchase"]["number"], "EE24111268")
+
+    def test_the_due_date_defaults_to_the_document_date(self) -> None:
+        action = purchase_action()
+
+        request = booksend.translate_purchase_payload(action)
+
+        self.assertEqual(request["payload"]["Purchase"]["due"], "2024-01-31")
+
+    def test_a_purchase_credit_also_carries_both(self) -> None:
+        action = purchase_action(key="example-2024-01-purchase-credit-printful")
+
+        request = booksend.translate_purchase_payload(action, credit=True)
+
+        purchase = request["payload"]["Purchase"]
+        self.assertTrue(str(purchase.get("number") or "").strip())
+        self.assertTrue(str(purchase.get("due") or "").strip())

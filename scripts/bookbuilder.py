@@ -2322,6 +2322,18 @@ def build_processor_settlement_actions(
     return actions
 
 
+def printful_vat_origin(record: dict[str, Any]) -> str:
+    """Where a Printful shipment left from, which decides its VAT treatment.
+
+    Stock always sits in Latvia, so `warehouse_id` is LV for every record. VAT is
+    a different question: a shipment routed through GB carries UK VAT this company
+    expenses rather than reclaims, and the policy expresses that per origin. Older
+    records without a reported origin fall back to the warehouse.
+    """
+    reported = str((record.get("attributes") or {}).get("shipped_from") or "").strip()
+    return (reported or str(record.get("warehouse_id") or "")).upper()
+
+
 def build_purchase_actions(
     *,
     company_slug: str,
@@ -2369,7 +2381,7 @@ def build_purchase_actions(
             haystack = record_haystack(record)
             if group_label == "printful":
                 if any(keyword in haystack for keyword in ("order_charge", "shipping", "fullfil")):
-                    warehouse_profile = str(record.get("warehouse_id") or "").upper()
+                    warehouse_profile = printful_vat_origin(record)
                     description = "Orders shipping and fullfilment"
                     if warehouse_profile:
                         description += f" {warehouse_profile}"

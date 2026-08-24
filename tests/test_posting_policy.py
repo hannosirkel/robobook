@@ -788,3 +788,46 @@ class DatedPurchaseVatGuardTests(unittest.TestCase):
         )
 
         self.assertTrue([e for e in errors if "VAT" in e], f"expected a VAT error, got {errors}")
+
+
+class AcceptedCheckerWarningTests(unittest.TestCase):
+    """A reviewed, permanently-true warning must be declarable, not silently bypassed.
+
+    The live runner refuses to write while any checker warning is unresolved. Some
+    of this company's warnings are structural — no clearing account carries
+    normalized opening/closing balances, so continuity is provable nowhere — and
+    will never clear. Declaring them keeps the gate meaningful: a warning nobody
+    reviewed still stops the run.
+    """
+
+    def _policy(self, accepted: object) -> dict:
+        policy = posting_policy_fixture_with_profiles()
+        policy["accepted_checker_warnings"] = accepted
+        return policy
+
+    def test_a_declared_list_is_accepted(self) -> None:
+        posting_policy.validate_posting_policy(
+            self._policy(["Recon still carries", "Action confidence is medium"])
+        )
+
+    def test_the_declaration_is_optional(self) -> None:
+        policy = posting_policy_fixture_with_profiles()
+
+        self.assertEqual(posting_policy.accepted_checker_warnings(policy), [])
+
+    def test_declared_entries_are_returned_in_order(self) -> None:
+        policy = self._policy(["Recon still carries", "Policy memo suggests"])
+
+        self.assertEqual(
+            posting_policy.accepted_checker_warnings(policy),
+            ["Recon still carries", "Policy memo suggests"],
+        )
+
+    def test_an_empty_entry_is_rejected(self) -> None:
+        """A blank pattern would match every warning and silently disable the gate."""
+        with self.assertRaises(posting_policy.PostingPolicyError):
+            posting_policy.validate_posting_policy(self._policy(["Recon still carries", "  "]))
+
+    def test_a_non_list_is_rejected(self) -> None:
+        with self.assertRaises(posting_policy.PostingPolicyError):
+            posting_policy.validate_posting_policy(self._policy("Recon still carries"))

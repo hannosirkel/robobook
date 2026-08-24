@@ -52,6 +52,12 @@
       "uniqueItems": true,
       "items": {"type": "string", "minLength": 1}
     },
+    "accepted_checker_warnings": {
+      "description": "Checker warning texts this company has reviewed and accepted as permanently true, matched as substrings. A live run still refuses on any warning that matches none of these, so declaring one narrows the gate rather than removing it. An empty string is rejected because it would match every warning.",
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
     "posting_scope": {
       "type": "object",
       "description": "Where this company's posting chain begins. Batches for earlier periods may stay on disk for reference; they are excluded from the predecessor sequence and refused for writing.",

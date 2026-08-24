@@ -3408,6 +3408,9 @@ def main() -> int:
         "result": evaluation["result"],
         "error_count": evaluation["error_count"],
         "warning_count": evaluation["warning_count"],
+        # The live runner reconciles these against the company's reviewed
+        # declarations, so the texts have to travel with the count.
+        "warnings": [item for item in evaluation["findings"] if item["severity"] == "warn"],
     }
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0

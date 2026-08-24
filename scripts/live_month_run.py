@@ -13,7 +13,13 @@ from typing import Any, Callable  # noqa: UP035
 import booksend
 from bank_allocations import BankAllocationError, load_bank_allocations, period_allocations
 from full_year_dry_run import parse_json_output, submitted_month_state
-from posting_policy import PostingPolicyError, cash_posting_mode, load_posting_policy, posting_scope_first_period
+from posting_policy import (
+    PostingPolicyError,
+    accepted_checker_warnings,
+    cash_posting_mode,
+    load_posting_policy,
+    posting_scope_first_period,
+)
 from reference_artifacts import ReferenceArtifactError, verify_file_binding
 from simplbooks_api import SimplbooksError
 from simplbooks_api import resolve_company_id
@@ -41,12 +47,37 @@ def _run_step(*, command: list[str], cwd: Path, runner: CommandRunner, label: st
     return payload
 
 
-def _verify_checker_summary(summary: dict[str, Any], *, label: str) -> None:
+def _verify_checker_summary(
+    summary: dict[str, Any], *, label: str, accepted: list[str] | None = None
+) -> None:
+    """Refuse to proceed on a warning nobody has reviewed.
+
+    Some warnings are structural and never clear, so the company declares those in
+    `accepted_checker_warnings` and they are matched as substrings. Anything else
+    still stops the run: this narrows the gate, it does not remove it.
+    """
     if summary.get("result") != "pass" or int(summary.get("error_count") or 0):
         raise SimplbooksError(f"{label} did not pass without errors.")
     warning_count = int(summary.get("warning_count") or 0)
-    if warning_count:
-        raise SimplbooksError(f"{label} returned {warning_count} unresolved warning(s).")
+    if not warning_count:
+        return
+    warnings = summary.get("warnings")
+    if not isinstance(warnings, list) or len(warnings) != warning_count:
+        # Fail closed: without the texts a reviewed warning cannot be told apart
+        # from one nobody has seen.
+        raise SimplbooksError(
+            f"{label} reported {warning_count} warning(s) without their texts; cannot reconcile."
+        )
+    declared = accepted or []
+    unreviewed = [
+        str((item or {}).get("summary") or "")
+        for item in warnings
+        if not any(pattern in str((item or {}).get("summary") or "") for pattern in declared)
+    ]
+    if unreviewed:
+        raise SimplbooksError(
+            f"{label} returned {len(unreviewed)} unreviewed warning(s): " + "; ".join(unreviewed)
+        )
 
 
 def _verify_check_binding(*, action_path: Path, check_path: Path) -> None:
@@ -146,6 +177,17 @@ def _posting_scope_first_period(company_dir: Path) -> str | None:
     if not policy_path.exists():
         return None
     return posting_scope_first_period(load_posting_policy(policy_path))
+
+
+def _accepted_checker_warnings(company_dir: Path) -> list[str]:
+    """Warning texts this company has reviewed. Fail closed: unreadable policy accepts none."""
+    policy_path = company_dir / "artifacts" / "posting_policy.json"
+    if not policy_path.exists():
+        return []
+    try:
+        return accepted_checker_warnings(load_posting_policy(policy_path))
+    except (PostingPolicyError, SimplbooksError, ValueError, OSError):
+        return []
 
 
 def _statement_import_company(company_dir: Path) -> bool:
@@ -363,8 +405,9 @@ def run_live_month(
         "--bank-allocations", str(allocation_path),
     ]
     commands.append(checker_command)
+    reviewed_warnings = _accepted_checker_warnings(company_dir)
     first_check = _run_step(command=checker_command, cwd=cwd, runner=runner, label="Initial checker")
-    _verify_checker_summary(first_check, label="Initial checker")
+    _verify_checker_summary(first_check, label="Initial checker", accepted=reviewed_warnings)
     _verify_check_binding(action_path=action_path, check_path=check_path)
 
     before_approval = booksend.load_yaml(action_path)
@@ -381,7 +424,7 @@ def run_live_month(
 
     commands.append(checker_command)
     final_check = _run_step(command=checker_command, cwd=cwd, runner=runner, label="Approved checker rerun")
-    _verify_checker_summary(final_check, label="Approved checker rerun")
+    _verify_checker_summary(final_check, label="Approved checker rerun", accepted=reviewed_warnings)
     _verify_check_binding(action_path=action_path, check_path=check_path)
     booksend.validate_run_preconditions(
         action_batch=approved_batch,

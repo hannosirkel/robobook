@@ -753,3 +753,69 @@ class StatementImportModeGateTests(unittest.TestCase):
         }
 
         self.assertFalse(live_month_run._dependencies_are_resolved(batch))
+
+
+class CheckerWarningGateTests(unittest.TestCase):
+    """An undeclared warning must stop the run; a reviewed one must not.
+
+    The gate exists so nobody writes past a warning they have not looked at.
+    Some of this pipeline's warnings are structural and never clear, so refusing
+    on any warning at all blocks every month forever. Declaring the reviewed ones
+    keeps the gate doing its job.
+    """
+
+    def _summary(self, warnings: list[str]) -> dict:
+        return {
+            "result": "pass",
+            "error_count": 0,
+            "warning_count": len(warnings),
+            "warnings": [{"section": "recon", "summary": w, "action_id": None} for w in warnings],
+        }
+
+    def test_no_warnings_passes(self) -> None:
+        live_month_run._verify_checker_summary(
+            self._summary([]), label="Initial checker", accepted=[]
+        )
+
+    def test_an_undeclared_warning_stops_the_run(self) -> None:
+        with self.assertRaisesRegex(live_month_run.SimplbooksError, "unreviewed"):
+            live_month_run._verify_checker_summary(
+                self._summary(["Something nobody has looked at"]),
+                label="Initial checker",
+                accepted=["Recon still carries"],
+            )
+
+    def test_a_declared_warning_is_allowed(self) -> None:
+        live_month_run._verify_checker_summary(
+            self._summary(["Recon still carries 4 warning check(s)."]),
+            label="Initial checker",
+            accepted=["Recon still carries"],
+        )
+
+    def test_the_offending_warning_is_named(self) -> None:
+        with self.assertRaises(live_month_run.SimplbooksError) as caught:
+            live_month_run._verify_checker_summary(
+                self._summary(["Recon still carries 4 warning check(s).", "A brand new problem"]),
+                label="Initial checker",
+                accepted=["Recon still carries"],
+            )
+
+        self.assertIn("A brand new problem", str(caught.exception))
+
+    def test_a_failing_checker_still_stops_regardless_of_declarations(self) -> None:
+        summary = self._summary(["Recon still carries 4 warning check(s)."])
+        summary["result"] = "fail"
+
+        with self.assertRaisesRegex(live_month_run.SimplbooksError, "did not pass"):
+            live_month_run._verify_checker_summary(
+                summary, label="Initial checker", accepted=["Recon still carries"]
+            )
+
+    def test_a_summary_without_warning_texts_fails_closed(self) -> None:
+        """An older checker that reports only a count cannot be reconciled, so block."""
+        with self.assertRaises(live_month_run.SimplbooksError):
+            live_month_run._verify_checker_summary(
+                {"result": "pass", "error_count": 0, "warning_count": 2},
+                label="Initial checker",
+                accepted=["Recon still carries"],
+            )

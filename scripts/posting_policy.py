@@ -186,6 +186,7 @@ def validate_posting_policy(payload: dict[str, Any]) -> None:
     validated_cash_posting(payload)
     validated_warehouse_routing(payload)
     non_inventory_event_types(payload)
+    accepted_checker_warnings(payload)
 
 
 def _cash_posting_bank_ids(section: dict[str, Any], *, required: bool) -> list[str]:
@@ -335,6 +336,31 @@ def validated_cash_posting(policy: dict[str, Any]) -> dict[str, Any]:
 
 def cash_posting_mode(policy: dict[str, Any]) -> str:
     return validated_cash_posting(policy)["mode"]
+
+
+def accepted_checker_warnings(policy: dict[str, Any] | None) -> list[str]:
+    """Warning texts this company has reviewed and accepted as permanently true.
+
+    A live run refuses to write while any checker warning is unresolved. Some
+    warnings are structural and will never clear, so they are declared here and
+    matched as substrings. An undeclared warning still stops the run, which is the
+    whole point: this narrows the gate, it does not remove it.
+    """
+    declared = (policy or {}).get("accepted_checker_warnings")
+    if declared is None:
+        return []
+    if not isinstance(declared, list):
+        raise PostingPolicyError("accepted_checker_warnings must be an array of warning texts.")
+    accepted: list[str] = []
+    for index, entry in enumerate(declared):
+        text = entry.strip() if isinstance(entry, str) else ""
+        if not text:
+            # A blank pattern is a substring of every warning and would disable the gate.
+            raise PostingPolicyError(
+                f"accepted_checker_warnings[{index}] must be a non-empty warning text."
+            )
+        accepted.append(text)
+    return accepted
 
 
 def posting_scope_first_period(policy: dict[str, Any] | None) -> str | None:

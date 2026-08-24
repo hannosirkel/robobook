@@ -3446,7 +3446,17 @@ def article_line(*, order: str, article: str | None, gross: float, vat: float, q
         "record_count": 1,
         "quantity": qty,
         "inventory_quantity_proof": (
-            {"status": "exact", "quantity": qty, "contributors": [{"order_id": order}]}
+            {
+                "status": "exact",
+                "quantity": qty,
+                "scope": {"kind": "reviewed_allocated_order"},
+                "contributors": [{
+                    "record_id": order,
+                    "quantity": qty,
+                    "quantity_source": "reviewed_woo_tax_allocation",
+                    "record_sha256": bookbuilder.canonical_value_sha256({"order_id": order}),
+                }],
+            }
             if qty is not None else None
         ),
         "vat_allocation_component": "goods" if article else "shipping",
@@ -3546,3 +3556,119 @@ class UniqueArticlePerInvoiceTests(unittest.TestCase):
 
         with self.assertRaises(bookbuilder.SimplbooksError):
             bookbuilder.merge_same_article_invoice_lines(action)
+
+
+class MergedArticleLineEvidenceTests(unittest.TestCase):
+    """A merged line's inventory proof must still prove itself.
+
+    The checker rebuilds the expected contributor set from the line's own
+    component evidence, then compares contributors, count and hash. Summing the
+    contributors while leaving the count and hash stale makes the proof
+    self-inconsistent, which is what broke 2024-01 after the first merge.
+    """
+
+    def _line(self, *, order: str, qty: float) -> dict:
+        proof = bookbuilder.inventory_proof_envelope(
+            scope={"kind": "reviewed_allocated_order"},
+            contributors=[{
+                "record_id": order,
+                "quantity": qty,
+                "quantity_source": "reviewed_woo_tax_allocation",
+                "record_sha256": bookbuilder.canonical_value_sha256({"order_id": order}),
+            }],
+            quantity=Decimal(str(qty)),
+        )
+        return {
+            "line_role": "sales_revenue",
+            "description": f"woo allocated sales revenue summary - order {order}",
+            "gross_amount": 30.0 * qty,
+            "vat_amount_hint": 5.41 * qty,
+            "article_id_hint": "3",
+            "record_count": 1,
+            "quantity": qty,
+            "inventory_quantity_proof": proof,
+            "vat_allocation_component_evidence": [{"order_id": order}],
+        }
+
+    def test_the_merged_proof_recounts_and_rehashes_its_contributors(self) -> None:
+        action = woo_invoice_action([
+            self._line(order="765", qty=1.0),
+            self._line(order="762", qty=2.0),
+        ])
+
+        bookbuilder.merge_same_article_invoice_lines(action)
+
+        proof = action["payload"]["line_items"][0]["inventory_quantity_proof"]
+        expected = bookbuilder.inventory_proof_envelope(
+            scope={"kind": "reviewed_allocated_order"},
+            contributors=[
+                {
+                    "record_id": order,
+                    "quantity": qty,
+                    "quantity_source": "reviewed_woo_tax_allocation",
+                    "record_sha256": bookbuilder.canonical_value_sha256({"order_id": order}),
+                }
+                for order, qty in (("765", 1.0), ("762", 2.0))
+            ],
+            quantity=Decimal(3),
+        )
+        self.assertEqual(proof["contributor_count"], expected["contributor_count"])
+        self.assertEqual(proof["contributor_set_sha256"], expected["contributor_set_sha256"])
+        self.assertEqual(proof["contributors"], expected["contributors"])
+
+    def test_the_merged_contributors_are_sorted_not_concatenated(self) -> None:
+        """Order 762 was added second; the proof must still list it first."""
+        action = woo_invoice_action([
+            self._line(order="765", qty=1.0),
+            self._line(order="762", qty=2.0),
+        ])
+
+        bookbuilder.merge_same_article_invoice_lines(action)
+
+        proof = action["payload"]["line_items"][0]["inventory_quantity_proof"]
+        self.assertEqual([c["record_id"] for c in proof["contributors"]], ["762", "765"])
+
+
+class MergeRefusesUnfaithfulRoundingTests(unittest.TestCase):
+    """Merging is only faithful when the rate applied to the merged gross agrees.
+
+    Simplbooks recomputes each row's VAT from its rate. Four orders of 0.03 at
+    24% carry 0.04 of VAT between them but yield 0.02 on a merged 0.12 row, so
+    merging them would post a document contradicting its own evidence.
+    """
+
+    def _line(self, *, order: str, gross: float, vat: float, rate: int) -> dict:
+        return {
+            "line_role": "sales_revenue",
+            "description": f"woo allocated sales revenue summary - order {order}",
+            "gross_amount": gross,
+            "vat_amount_hint": vat,
+            "article_id_hint": "3",
+            "record_count": 1,
+            "quantity": 1.0,
+            "vat_profile_rate": rate,
+            "inventory_quantity_proof": None,
+            "vat_allocation_component_evidence": [{"order_id": order}],
+        }
+
+    def test_merging_is_refused_when_rounding_would_shift(self) -> None:
+        action = woo_invoice_action([
+            self._line(order=f"EXAMPLE-{index}", gross=0.03, vat=0.01, rate=24)
+            for index in range(1, 5)
+        ])
+
+        with self.assertRaisesRegex(bookbuilder.SimplbooksError, "rounding"):
+            bookbuilder.merge_same_article_invoice_lines(action)
+
+    def test_merging_proceeds_when_rounding_agrees(self) -> None:
+        action = woo_invoice_action([
+            self._line(order="762", gross=60.0, vat=10.82, rate=22),
+            self._line(order="763", gross=30.0, vat=5.41, rate=22),
+            self._line(order="765", gross=30.0, vat=5.41, rate=22),
+        ])
+
+        bookbuilder.merge_same_article_invoice_lines(action)
+
+        lines = action["payload"]["line_items"]
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0]["vat_amount_hint"], 21.64)

@@ -1952,6 +1952,28 @@ def _allocated_order_components(line: dict[str, Any]) -> dict[str, dict[str, Any
     }
 
 
+def _merged_components_round_consistently(
+    line: dict[str, Any], profile: dict[str, Any]
+) -> bool:
+    """Whether a merged line's VAT survives Simplbooks recomputing it from the rate.
+
+    Simplbooks derives each invoice row's VAT from its rate and gross. Merging several
+    orders onto one row is only faithful when that derivation equals the sum of the
+    per-order amounts the evidence carries; otherwise the posted document and the
+    evidence disagree by the rounding difference.
+    """
+    try:
+        rate = Decimal(str(profile["rate"]))
+        gross = abs(decimal_value(line.get("gross_amount")))
+        vat = abs(decimal_value(line.get("vat_amount_hint")))
+    except (InvalidOperation, KeyError, SimplbooksError, TypeError, ValueError):
+        return False
+    aggregate = (gross * rate / (Decimal("100") + rate)).quantize(  # noqa: FURB157
+        TOLERANCE, rounding=ROUND_HALF_UP
+    )
+    return vat == aggregate
+
+
 def _expected_allocated_order_contributors(line: dict[str, Any]) -> list[dict[str, Any]]:
     """Rebuild the contributor set a VAT-allocated goods line must carry."""
     expected: list[dict[str, Any]] = []
@@ -2725,7 +2747,14 @@ def evaluate_vat_profiles(actions: list[dict[str, Any]], posting_policy: dict[st
                     )
                 )
                 continue
-            if len(evidence) != 1:
+            # A line may carry several order components, because Simplbooks refuses an
+            # invoice that repeats an article and a month's orders of one product must
+            # share a row. That is only safe when per-order rounding agrees with the
+            # rate applied to the merged gross: Simplbooks recomputes each row's VAT
+            # from the rate, so where they disagree the posted document would contradict
+            # the evidence. Four orders of 0.03 at 24% sum to 0.04 of VAT but yield 0.02
+            # on 0.12, and that line must still be refused.
+            if len(evidence) != 1 and not _merged_components_round_consistently(line, profile):
                 findings.append(
                     make_finding(
                         section="account_and_vat_review",

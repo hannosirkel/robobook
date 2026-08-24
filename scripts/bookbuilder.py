@@ -10,7 +10,7 @@ import unicodedata
 from calendar import monthrange
 from collections import Counter, defaultdict
 from datetime import UTC, date, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -3796,8 +3796,35 @@ def merge_same_article_invoice_lines(action: dict[str, Any]) -> None:
             merged.append(line)
             continue
         consumed.update(indexes)
-        merged.append(_combined_article_line([lines[other] for other in indexes]))
+        group = [lines[other] for other in indexes]
+        combined = _combined_article_line(group)
+        _refuse_unfaithful_rounding(combined, action=action)
+        merged.append(combined)
     payload["line_items"] = merged
+
+
+def _refuse_unfaithful_rounding(combined: dict[str, Any], *, action: dict[str, Any]) -> None:
+    """Stop when a merged row's VAT would not survive Simplbooks recomputing it.
+
+    Each invoice row's VAT is derived from its rate and gross. Where per-order
+    rounding does not agree with that derivation, the merged row would contradict
+    its own evidence, so the month needs a human decision rather than a guess.
+    """
+    rate_value = combined.get("vat_profile_rate")
+    if rate_value in (None, ""):
+        return
+    rate = decimal_value(rate_value)
+    gross = abs(decimal_value(combined.get("gross_amount")))
+    vat = abs(decimal_value(combined.get("vat_amount_hint")))
+    aggregate = (gross * rate / (Decimal("100") + rate)).quantize(  # noqa: FURB157
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+    if vat != aggregate:
+        raise SimplbooksError(
+            f"{action.get('idempotency_key')} cannot merge lines sharing an article: per-order VAT "
+            f"{decimal_number(vat)} does not survive rounding on the merged gross "
+            f"{decimal_number(gross)} at {rate_value}% (it becomes {decimal_number(aggregate)})."
+        )
 
 
 def _order_suffix(line: dict[str, Any]) -> str:
@@ -3823,11 +3850,15 @@ def _absorb_article_line(combined: dict[str, Any], sibling: dict[str, Any]) -> N
     combined_proof = combined.get("inventory_quantity_proof")
     sibling_proof = sibling.get("inventory_quantity_proof")
     if isinstance(combined_proof, dict) and isinstance(sibling_proof, dict):
-        combined_proof["quantity"] = decimal_number(
-            decimal_value(combined_proof.get("quantity")) + decimal_value(sibling_proof.get("quantity"))
-        )
-        combined_proof["contributors"] = list(combined_proof.get("contributors") or []) + list(
-            sibling_proof.get("contributors") or []
+        # Rebuild the envelope rather than patching it: the checker re-derives the
+        # expected contributor set from the line's evidence and compares the set,
+        # its count and its hash, so a summed set with a stale count proves nothing.
+        combined["inventory_quantity_proof"] = inventory_proof_envelope(
+            scope=combined_proof.get("scope") or {},
+            contributors=list(combined_proof.get("contributors") or [])
+            + list(sibling_proof.get("contributors") or []),
+            quantity=decimal_value(combined_proof.get("quantity"))
+            + decimal_value(sibling_proof.get("quantity")),
         )
 
 

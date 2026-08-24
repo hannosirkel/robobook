@@ -640,3 +640,116 @@ class LiveMonthRunTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def statement_import_policy() -> dict:
+    """Minimal policy declaring statement-import cash posting."""
+    return {
+        "schema_version": "1.0",
+        "company_slug": "example",
+        "bank_accounts": {"EE001234567890": {"EUR": "3", "USD": "3"}},
+        "contacts": {},
+        "mappings": {},
+        "supplier_aliases": {},
+        "cash_posting": {
+            "mode": "statement_import",
+            "bank_income_account_ids": ["3"],
+            "processor_income_account_ids": {"paypal": "6", "stripe": "7"},
+            "bank_financial_accounts": {"EE001234567890": {"EUR": "10", "USD": "11"}},
+            "clearing_provider_roles": {"paypal": "paypal", "stripe": "stripe_clearing"},
+            "financial_accounts": {
+                "stripe_clearing": "30", "paypal": "31", "bank_fees": "32",
+                "reporting_person_payable": "33", "platform_prepayment": "34",
+                "fx_gain": "35", "fx_loss": "36", "customer_receivable": "37",
+                "supplier_payable": "38", "bank": "10",
+            },
+        },
+    }
+
+
+class StatementImportModeGateTests(unittest.TestCase):
+    """In statement-import mode the API posts no cash for these rows.
+
+    The orchestrator predates that mode (guard added 2026-08-22, mode added
+    2026-08-23) and still demands a verified per-row proof before anything is
+    built, while bookbuilder, bookchecker, booksend and full_year_dry_run all
+    treat a pending proof as non-blocking. That divergence is why every dry run
+    passes while the live run refuses.
+    """
+
+    def _manual_allocation(self) -> dict:
+        return {
+            "statement_id": "archive:fee-1", "record_id": "fee-1", "iban": "EE123",
+            "period": "2024-03", "disposition": "bank_fee_payment", "amount": -7.0,
+            "currency": "EUR", "target": {"financial_transaction_kind": "bank-fee"},
+            "review": {"status": "approved", "rationale": "Reviewed bank fee."},
+        }
+
+    def test_statement_import_mode_does_not_demand_a_verified_proof(self) -> None:
+        calls: list[list[str]] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            company_dir = Path(tmp) / "companies" / "example"
+            write_live_context(company_dir, allocations=[self._manual_allocation()])
+            (company_dir / "artifacts" / "posting_policy.json").write_text(
+                json.dumps(statement_import_policy()), encoding="utf-8"
+            )
+
+            # It must get past the proof gate; whatever it fails on later is not this gate.
+            with self.assertRaises(live_month_run.SimplbooksError) as caught:
+                live_month_run.run_live_month(
+                    company_dir=company_dir, period="2024-03", python_executable="python3",
+                    cwd=ROOT, confirm_write=True,
+                    run_command=lambda cmd, **kwargs: calls.append(cmd),
+                    approval_checkpoint=lambda _path: None,
+                )
+
+        self.assertNotIn("before live discovery/build", str(caught.exception))
+
+    def test_api_mode_still_demands_a_verified_proof(self) -> None:
+        """Fail closed: no policy on disk means API mode, and API mode still blocks."""
+        with tempfile.TemporaryDirectory() as tmp:
+            company_dir = Path(tmp) / "companies" / "example"
+            write_live_context(company_dir, allocations=[self._manual_allocation()])
+
+            with self.assertRaisesRegex(live_month_run.SimplbooksError, "before live discovery/build"):
+                live_month_run.run_live_month(
+                    company_dir=company_dir, period="2024-03", python_executable="python3",
+                    cwd=ROOT, confirm_write=True,
+                    run_command=lambda cmd, **kwargs: None,
+                    approval_checkpoint=lambda _path: None,
+                )
+
+    def test_a_pending_proof_resolves_in_a_statement_import_batch(self) -> None:
+        batch = {
+            "cash_posting_mode": "statement_import",
+            "unresolved_dependencies": [{
+                "kind": "manual_statement_import_financial_transaction",
+                "blocking": False,
+                "statement_import_proof": {"status": "pending"},
+            }],
+        }
+
+        self.assertTrue(live_month_run._dependencies_are_resolved(batch))
+
+    def test_a_pending_proof_still_blocks_an_api_mode_batch(self) -> None:
+        batch = {
+            "unresolved_dependencies": [{
+                "kind": "manual_statement_import_financial_transaction",
+                "blocking": False,
+                "statement_import_proof": {"status": "pending"},
+            }],
+        }
+
+        self.assertFalse(live_month_run._dependencies_are_resolved(batch))
+
+    def test_a_blocking_dependency_stops_a_statement_import_batch_too(self) -> None:
+        batch = {
+            "cash_posting_mode": "statement_import",
+            "unresolved_dependencies": [{
+                "kind": "manual_statement_import_financial_transaction",
+                "blocking": True,
+                "statement_import_proof": {"status": "pending"},
+            }],
+        }
+
+        self.assertFalse(live_month_run._dependencies_are_resolved(batch))

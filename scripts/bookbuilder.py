@@ -3753,6 +3753,94 @@ def vat_type_is_zero_rated(entity_map: dict[str, Any] | None, vat_type_id: Any) 
     return False
 
 
+def merge_same_article_invoice_lines(action: dict[str, Any]) -> None:
+    """Collapse invoice lines that repeat an article, in place.
+
+    Simplbooks refuses an invoice whose rows repeat an article
+    ("Arverea artikkel peab arve piires unikaalne olema"), and a Woo month emits
+    one line per order with the same article on each. Merging preserves the
+    quantity, gross, VAT and every inventory contributor, so the document totals
+    and the stock it relieves are unchanged; only the line granularity differs.
+    The per-order trail stays in the action's source_refs.
+    """
+    payload = action.get("payload") or {}
+    lines = payload.get("line_items") or []
+    grouped: dict[str, list[int]] = {}
+    for index, line in enumerate(lines):
+        article = str((line or {}).get("article_id_hint") or "")
+        if article:
+            grouped.setdefault(article, []).append(index)
+    if not any(len(indexes) > 1 for indexes in grouped.values()):
+        return
+
+    if any(
+        isinstance(ref, dict) and ref.get("source_kind") == "physical_bank"
+        for ref in action.get("source_refs") or []
+    ):
+        # A direct-sale invoice is proved by matching physical source rows to lines
+        # by position. Merging would shift those indices and break the mapping
+        # silently, so refuse rather than guess.
+        raise SimplbooksError(
+            f"{action.get('idempotency_key')} repeats an article across lines that are bound to physical "
+            "bank rows by position; merging them would break that binding."
+        )
+
+    merged: list[dict[str, Any]] = []
+    consumed: set[int] = set()
+    for index, line in enumerate(lines):
+        if index in consumed:
+            continue
+        article = str((line or {}).get("article_id_hint") or "")
+        indexes = grouped.get(article) or [] if article else []
+        if len(indexes) <= 1:
+            merged.append(line)
+            continue
+        consumed.update(indexes)
+        merged.append(_combined_article_line([lines[other] for other in indexes]))
+    payload["line_items"] = merged
+
+
+def _order_suffix(line: dict[str, Any]) -> str:
+    return str(line.get("description") or "").rsplit(" - order ", 1)[-1]
+
+
+def _absorb_article_line(combined: dict[str, Any], sibling: dict[str, Any]) -> None:
+    """Add one sibling's amounts, quantity and evidence into the combined line."""
+    for field in ("gross_amount", "vat_amount_hint"):
+        combined[field] = decimal_number(
+            decimal_value(combined.get(field)) + decimal_value(sibling.get(field))
+        )
+    if combined.get("quantity") is not None or sibling.get("quantity") is not None:
+        combined["quantity"] = decimal_number(
+            decimal_value(combined.get("quantity")) + decimal_value(sibling.get("quantity"))
+        )
+    combined["record_count"] = int(combined.get("record_count") or 0) + int(
+        sibling.get("record_count") or 0
+    )
+    combined["vat_allocation_component_evidence"] = list(
+        combined.get("vat_allocation_component_evidence") or []
+    ) + list(sibling.get("vat_allocation_component_evidence") or [])
+    combined_proof = combined.get("inventory_quantity_proof")
+    sibling_proof = sibling.get("inventory_quantity_proof")
+    if isinstance(combined_proof, dict) and isinstance(sibling_proof, dict):
+        combined_proof["quantity"] = decimal_number(
+            decimal_value(combined_proof.get("quantity")) + decimal_value(sibling_proof.get("quantity"))
+        )
+        combined_proof["contributors"] = list(combined_proof.get("contributors") or []) + list(
+            sibling_proof.get("contributors") or []
+        )
+
+
+def _combined_article_line(group: list[dict[str, Any]]) -> dict[str, Any]:
+    """One line carrying the whole group's quantity, amounts and contributors."""
+    combined = copy.deepcopy(group[0])
+    for sibling in group[1:]:
+        _absorb_article_line(combined, sibling)
+    base = str(group[0].get("description") or "").rsplit(" - order ", 1)[0]
+    combined["description"] = f"{base} - orders {', '.join(_order_suffix(line) for line in group)}"
+    return combined
+
+
 def apply_posting_policy(
     actions: list[dict[str, Any]],
     *,
@@ -3971,6 +4059,10 @@ def apply_posting_policy(
                 totals["vat_amount"] = decimal_number(
                     decimal_value(totals.get("vat_amount")) - non_deductible_vat
                 )
+        if str(payload.get("draft_schema") or "") == "invoice_summary_v1":
+            # Article ids are only known once the family mapping has been applied, so the
+            # rows Simplbooks would reject can only be collapsed here.
+            merge_same_article_invoice_lines(action)
         review_notes = list(action.get("review_notes") or [])
         required_ids: list[str | None] = [str((payload.get("counterparty") or {}).get("contact_id") or "")]
         for line in payload.get("line_items") or []:

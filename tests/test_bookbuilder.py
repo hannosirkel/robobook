@@ -1,5 +1,6 @@
 from __future__ import annotations  # noqa: I001
 
+import copy
 import json
 import tempfile
 import hashlib
@@ -3432,3 +3433,116 @@ class DatedPurchasePinBuilderTests(unittest.TestCase):
                 posting_policy=printful_policy(vat_type_id=bands),
                 entity_map=ZERO_RATE_VAT_TYPES,
             )
+
+
+def article_line(*, order: str, article: str | None, gross: float, vat: float, qty: float | None) -> dict:
+    return {
+        "line_role": "sales_revenue",
+        "description": f"woo allocated sales revenue summary - order {order}",
+        "gross_amount": gross,
+        "vat_amount_hint": vat,
+        "article_id_hint": article,
+        "warehouse_id_hint": "6",
+        "record_count": 1,
+        "quantity": qty,
+        "inventory_quantity_proof": (
+            {"status": "exact", "quantity": qty, "contributors": [{"order_id": order}]}
+            if qty is not None else None
+        ),
+        "vat_allocation_component": "goods" if article else "shipping",
+        "vat_allocation_component_evidence": [{"order_id": order}],
+    }
+
+
+def woo_invoice_action(lines: list[dict], *, physical_bank: bool = False) -> dict:
+    return {
+        "idempotency_key": "example-2024-01-sales-woo-wh6",
+        "action_type": "create_invoice_summary",
+        "payload": {"draft_schema": "invoice_summary_v1", "line_items": lines},
+        "source_refs": (
+            [{"path": "n.json", "record_ref": "r1", "source_kind": "physical_bank"}]
+            if physical_bank else [{"path": "n.json", "record_ref": "r1"}]
+        ),
+    }
+
+
+class UniqueArticlePerInvoiceTests(unittest.TestCase):
+    """Simplbooks rejects an invoice repeating an article across rows.
+
+    The defect this guards: `invoices/create` returns HTTP 400 with
+    "Arverea artikkel peab arve piires unikaalne olema." A Woo month emits one
+    line per order and every goods line carries the same article, so the invoice
+    is unpostable. No dry run catches it, because a dry run never POSTs.
+    """
+
+    def test_lines_sharing_an_article_become_one_line(self) -> None:
+        action = woo_invoice_action([
+            article_line(order="762", article="3", gross=60.0, vat=10.82, qty=2.0),
+            article_line(order="763", article="3", gross=30.0, vat=5.41, qty=1.0),
+            article_line(order="765", article="3", gross=30.0, vat=5.41, qty=1.0),
+        ])
+
+        bookbuilder.merge_same_article_invoice_lines(action)
+
+        lines = action["payload"]["line_items"]
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0]["gross_amount"], 120.0)
+        self.assertEqual(lines[0]["vat_amount_hint"], 21.64)
+        self.assertEqual(lines[0]["quantity"], 4.0)
+
+    def test_the_inventory_proof_keeps_every_contributor(self) -> None:
+        action = woo_invoice_action([
+            article_line(order="762", article="3", gross=60.0, vat=10.82, qty=2.0),
+            article_line(order="763", article="3", gross=30.0, vat=5.41, qty=1.0),
+        ])
+
+        bookbuilder.merge_same_article_invoice_lines(action)
+
+        proof = action["payload"]["line_items"][0]["inventory_quantity_proof"]
+        self.assertEqual(proof["status"], "exact")
+        self.assertEqual(proof["quantity"], 3.0)
+        self.assertEqual(len(proof["contributors"]), 2)
+
+    def test_lines_without_an_article_are_left_alone(self) -> None:
+        action = woo_invoice_action([
+            article_line(order="762", article="3", gross=60.0, vat=10.82, qty=2.0),
+            article_line(order="762", article=None, gross=5.82, vat=1.05, qty=None),
+            article_line(order="763", article=None, gross=5.82, vat=1.05, qty=None),
+        ])
+
+        bookbuilder.merge_same_article_invoice_lines(action)
+
+        lines = action["payload"]["line_items"]
+        self.assertEqual(len(lines), 3)
+        self.assertEqual([line["gross_amount"] for line in lines], [60.0, 5.82, 5.82])
+
+    def test_different_articles_do_not_merge(self) -> None:
+        action = woo_invoice_action([
+            article_line(order="762", article="3", gross=60.0, vat=10.82, qty=2.0),
+            article_line(order="763", article="9", gross=30.0, vat=5.41, qty=1.0),
+        ])
+
+        bookbuilder.merge_same_article_invoice_lines(action)
+
+        self.assertEqual(len(action["payload"]["line_items"]), 2)
+
+    def test_a_single_article_line_is_untouched(self) -> None:
+        action = woo_invoice_action([
+            article_line(order="762", article="3", gross=60.0, vat=10.82, qty=2.0),
+        ])
+        before = copy.deepcopy(action)
+
+        bookbuilder.merge_same_article_invoice_lines(action)
+
+        self.assertEqual(action, before)
+
+    def test_an_index_coupled_invoice_is_refused_not_silently_merged(self) -> None:
+        """A direct-sale invoice maps physical rows to lines by position; merging
+        would shift those indices and break the mapping without saying so."""
+        action = woo_invoice_action([
+            article_line(order="762", article="3", gross=60.0, vat=10.82, qty=2.0),
+            article_line(order="763", article="3", gross=30.0, vat=5.41, qty=1.0),
+        ], physical_bank=True)
+
+        with self.assertRaises(bookbuilder.SimplbooksError):
+            bookbuilder.merge_same_article_invoice_lines(action)

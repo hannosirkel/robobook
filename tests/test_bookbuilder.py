@@ -3789,7 +3789,7 @@ class CashlessSetOffTests(unittest.TestCase):
             Decimal(str(a["payload"]["amount"])) for a in batch["actions"]
             if a["action_type"] == "create_payment_summary"
         )
-        self.assertEqual(received - paid, Decimal("0"))
+        self.assertEqual(received - paid, Decimal(0))
 
     def test_a_setoff_whose_payables_do_not_equal_its_receivable_is_refused(self) -> None:
         unbalanced = setoff_fixture(

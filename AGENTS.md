@@ -45,6 +45,31 @@ removes the rest.
 
 <!-- END MANAGED ARCHITECTURE BASELINE -->
 
+## Work in the checkout, not a worktree
+
+**This repository overrides the worktree rule in the baseline above.** Branch
+inside the main checkout instead. Everything else in that rule still holds:
+never commit to a default branch, branch from `origin/main`, open a pull
+request.
+
+A worktree cannot do this repository's work. `/companies/*` is git-ignored, so
+a fresh worktree has no company workspace at all -- no source packs, no
+artifacts, no posting policy, no entity map. Every script in the pipeline needs
+them, and none of them are coming.
+
+Reaching back into the checkout by absolute path does not rescue it. A record's
+`source_id` is derived from its path relative to the working directory, so the
+same source file read from a worktree yields different IDs, and every reviewed
+allocation bound to the old ones silently stops matching.
+
+The virtualenv is in the checkout too. **Never symlink `.venv` into a
+worktree**: the link resolves to its own location, so checking it out replaces
+a real virtualenv with a link to itself.
+
+The cost of this override is that parallel tasks share one working tree. Run
+one editing task at a time, and prefer read-only agents for anything
+concurrent.
+
 ## What this repository is
 
 Reusable skills, Python scripts, JSON schemas, templates, reference artifacts,

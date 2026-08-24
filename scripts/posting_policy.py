@@ -175,7 +175,10 @@ def validate_posting_policy(payload: dict[str, Any]) -> None:
             if isinstance(child, dict):
                 validate_mapping_ids(child, path=child_path)
             elif str(key).endswith("_id"):
-                normalize_id(child, field_name=child_path)
+                if isinstance(child, list):
+                    normalized_dated_bands(child, value_key=str(key), field_name=child_path)
+                else:
+                    normalize_id(child, field_name=child_path)
 
     validate_mapping_ids(payload["mappings"], path="mappings")
     if "sales_vat_profiles" in payload:
@@ -551,12 +554,68 @@ def resolve_contact(policy: dict[str, Any], *, role: str, label: str) -> str:
     return normalize_id(normalized[key], field_name=f"contacts[{role!r}][{label!r}]")
 
 
-def resolve_mapping(policy: dict[str, Any], *, family: str, field_name: str) -> str:
+def normalized_dated_bands(bands: Any, *, value_key: str, field_name: str) -> list[dict[str, Any]]:
+    """Parse a dated mapping pin into ordered bands, proving the bands never overlap."""
+    if not isinstance(bands, list) or not bands:
+        raise PostingPolicyError(f"{field_name} must be a non-empty array of dated bands.")
+    normalized: list[dict[str, Any]] = []
+    for index, band in enumerate(bands):
+        path = f"{field_name}[{index}]"
+        if not isinstance(band, dict):
+            raise PostingPolicyError(f"{path} must be an object.")
+        start = parse_profile_date(band.get("start"), field_name=f"{path}.start")
+        end_value = band.get("end")
+        end = None if end_value is None else parse_profile_date(end_value, field_name=f"{path}.end")
+        if end is not None and end < start:
+            raise PostingPolicyError(f"{path}.end cannot be before {path}.start.")
+        normalized.append(
+            {
+                "start": start,
+                "end": end,
+                "value": normalize_id(band.get(value_key), field_name=f"{path}.{value_key}"),
+            }
+        )
+    for index, band in enumerate(normalized):
+        for other in normalized[index + 1 :]:
+            band_end = band["end"] or date.max
+            other_end = other["end"] or date.max
+            if band["start"] <= other_end and other["start"] <= band_end:
+                raise PostingPolicyError(f"{field_name} bands must not overlap.")
+    return normalized
+
+
+def resolve_dated_mapping_bands(
+    bands: list[Any], *, value_key: str, field_name: str, event_date: date | None
+) -> str:
+    """Select the single band covering event_date from a dated mapping pin."""
+    if event_date is None:
+        raise PostingPolicyError(f"{field_name} is date-aware and requires an event date to resolve.")
+    normalized = normalized_dated_bands(bands, value_key=value_key, field_name=field_name)
+    matches = [
+        band["value"]
+        for band in normalized
+        if band["start"] <= event_date and (band["end"] is None or event_date <= band["end"])
+    ]
+    if len(matches) != 1:
+        raise PostingPolicyError(
+            f"Expected exactly one {field_name} band for {event_date.isoformat()}, found {len(matches)}."
+        )
+    return matches[0]
+
+
+def resolve_mapping(
+    policy: dict[str, Any], *, family: str, field_name: str, event_date: date | None = None
+) -> str:
     family_mapping = (policy.get("mappings") or {}).get(slugify(family)) or {}
     value = family_mapping.get(field_name)
-    if value in (None, ""):
+    if value in (None, "") or (isinstance(value, list) and not value):
         raise PostingPolicyError(f"Posting family {family!r} has no explicit {field_name!r} mapping.")
-    return normalize_id(value, field_name=f"mappings[{family!r}][{field_name!r}]")
+    located = f"mappings[{family!r}][{field_name!r}]"
+    if isinstance(value, list):
+        return resolve_dated_mapping_bands(
+            value, value_key=field_name, field_name=located, event_date=event_date
+        )
+    return normalize_id(value, field_name=located)
 
 
 def resolve_supplier_alias(policy: dict[str, Any], value: str) -> str:
@@ -722,7 +781,21 @@ def action_policy_errors(action: dict[str, Any], policy: dict[str, Any]) -> list
             line_key = slugify(str(line.get("description") or line_role))
             line_values = (family_values.get("lines") or {}).get(line_key, family_values)
             expected_account = normalize_id(line_values.get("expense_account_id"), field_name=f"mappings[{family}][{line_key}].expense_account_id")
-            expected_vat = normalize_id(line_values.get("vat_type_id"), field_name=f"mappings[{family}][{line_key}].vat_type_id")
+            vat_pin = line_values.get("vat_type_id")
+            vat_field_name = f"mappings[{family}][{line_key}].vat_type_id"
+            if isinstance(vat_pin, list):
+                # A dated pin declares the rate in force on the document date, so a
+                # statutory rate change cannot leave a superseded type on a new document.
+                try:
+                    document_date = parse_profile_date(payload.get("document_date"), field_name="payload.document_date")
+                    expected_vat = resolve_dated_mapping_bands(
+                        vat_pin, value_key="vat_type_id", field_name=vat_field_name, event_date=document_date
+                    )
+                except PostingPolicyError as exc:
+                    errors.append(str(exc))
+                    expected_vat = str(line.get("suggested_vat_type_id") or "")
+            else:
+                expected_vat = normalize_id(vat_pin, field_name=vat_field_name)
             if str(line.get("posting_policy_line_key") or "") != line_key:
                 errors.append(f"Line is not bound to posting-policy key {line_key!r}.")
             if str(line.get("suggested_expense_account_id") or "") != expected_account:

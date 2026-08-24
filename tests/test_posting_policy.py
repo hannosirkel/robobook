@@ -605,3 +605,186 @@ class ProcessorFeePaymentContactTests(unittest.TestCase):
         errors = posting_policy.action_policy_errors(action, self.policy())
 
         self.assertTrue(any("999" in e for e in errors))
+
+
+def dated_purchase_pin_policy() -> dict:
+    """A supplier whose declared VAT rate follows Estonia's statutory changes."""
+    return {
+        "schema_version": "1.0",
+        "company_slug": "example",
+        "bank_accounts": {},
+        "contacts": {},
+        "mappings": {
+            "purchase-dpd-eesti-as": {
+                "expense_account_id": "126",
+                "vat_type_id": [
+                    {"start": "1900-01-01", "end": "2023-12-31", "vat_type_id": "3"},
+                    {"start": "2024-01-01", "end": "2025-06-30", "vat_type_id": "26"},
+                    {"start": "2025-07-01", "end": None, "vat_type_id": "35"},
+                ],
+            },
+            "purchase-barn2": {"expense_account_id": "126", "vat_type_id": "19"},
+        },
+        "supplier_aliases": {},
+    }
+
+
+class DatedPurchaseVatPinTest(unittest.TestCase):
+    def test_a_dated_pin_resolves_the_band_covering_the_event(self) -> None:
+        resolved = posting_policy.resolve_mapping(
+            dated_purchase_pin_policy(),
+            family="purchase-dpd-eesti-as",
+            field_name="vat_type_id",
+            event_date=date(2024, 4, 20),
+        )
+
+        self.assertEqual(resolved, "26")
+
+    def test_a_dated_pin_follows_a_later_statutory_rate_change(self) -> None:
+        resolved = posting_policy.resolve_mapping(
+            dated_purchase_pin_policy(),
+            family="purchase-dpd-eesti-as",
+            field_name="vat_type_id",
+            event_date=date(2025, 9, 12),
+        )
+
+        self.assertEqual(resolved, "35")
+
+    def test_a_scalar_pin_still_resolves_without_an_event_date(self) -> None:
+        resolved = posting_policy.resolve_mapping(
+            dated_purchase_pin_policy(),
+            family="purchase-barn2",
+            field_name="vat_type_id",
+        )
+
+        self.assertEqual(resolved, "19")
+
+    def test_a_dated_pin_without_an_event_date_is_rejected(self) -> None:
+        with self.assertRaises(posting_policy.PostingPolicyError):
+            posting_policy.resolve_mapping(
+                dated_purchase_pin_policy(),
+                family="purchase-dpd-eesti-as",
+                field_name="vat_type_id",
+            )
+
+    def test_an_event_covered_by_no_band_is_rejected(self) -> None:
+        policy = dated_purchase_pin_policy()
+        policy["mappings"]["purchase-dpd-eesti-as"]["vat_type_id"] = [
+            {"start": "2024-01-01", "end": "2024-12-31", "vat_type_id": "26"},
+        ]
+
+        with self.assertRaises(posting_policy.PostingPolicyError):
+            posting_policy.resolve_mapping(
+                policy,
+                family="purchase-dpd-eesti-as",
+                field_name="vat_type_id",
+                event_date=date(2025, 9, 12),
+            )
+
+    def test_overlapping_bands_are_rejected(self) -> None:
+        policy = dated_purchase_pin_policy()
+        policy["mappings"]["purchase-dpd-eesti-as"]["vat_type_id"] = [
+            {"start": "2024-01-01", "end": "2025-12-31", "vat_type_id": "26"},
+            {"start": "2025-07-01", "end": None, "vat_type_id": "35"},
+        ]
+
+        with self.assertRaises(posting_policy.PostingPolicyError):
+            posting_policy.resolve_mapping(
+                policy,
+                family="purchase-dpd-eesti-as",
+                field_name="vat_type_id",
+                event_date=date(2025, 9, 12),
+            )
+
+    def test_a_policy_carrying_a_dated_pin_validates(self) -> None:
+        policy = posting_policy_fixture_with_profiles()
+        policy["mappings"]["purchase-dpd-eesti-as"] = {
+            "expense_account_id": "126",
+            "vat_type_id": [
+                {"start": "2024-01-01", "end": "2025-06-30", "vat_type_id": "26"},
+                {"start": "2025-07-01", "end": None, "vat_type_id": "35"},
+            ],
+        }
+
+        posting_policy.validate_posting_policy(policy)
+
+    def test_a_policy_carrying_overlapping_dated_bands_is_rejected(self) -> None:
+        policy = posting_policy_fixture_with_profiles()
+        policy["mappings"]["purchase-dpd-eesti-as"] = {
+            "expense_account_id": "126",
+            "vat_type_id": [
+                {"start": "2024-01-01", "end": "2025-12-31", "vat_type_id": "26"},
+                {"start": "2025-07-01", "end": None, "vat_type_id": "35"},
+            ],
+        }
+
+        with self.assertRaises(posting_policy.PostingPolicyError):
+            posting_policy.validate_posting_policy(policy)
+
+
+class DatedPurchaseVatGuardTests(unittest.TestCase):
+    """A pinned purchase rate that a statutory change has superseded must be caught.
+
+    Estonia moved to 22% on 2024-01-01 and 24% on 2025-07-01. A static pin keeps
+    declaring the old rate on correct amounts, which no zero-rate check can see.
+    """
+
+    def policy(self) -> dict:
+        return {
+            "schema_version": "1.0",
+            "company_slug": "example",
+            "bank_accounts": {},
+            "contacts": {"suppliers": {"dpd-eesti-as": "77"}},
+            "mappings": {
+                "purchase-dpd-eesti-as": {
+                    "expense_account_id": "126",
+                    "vat_type_id": [
+                        {"start": "1900-01-01", "end": "2023-12-31", "vat_type_id": "3"},
+                        {"start": "2024-01-01", "end": "2025-06-30", "vat_type_id": "26"},
+                        {"start": "2025-07-01", "end": None, "vat_type_id": "35"},
+                    ],
+                }
+            },
+            "supplier_aliases": {},
+        }
+
+    def purchase(self, *, document_date: str, vat_type_id: str) -> dict:
+        return {
+            "action_type": "create_purchase_summary",
+            "payload": {
+                "vendor_hint": "dpd-eesti-as",
+                "counterparty": {"contact_id": "77"},
+                "posting_policy_family": "purchase-dpd-eesti-as",
+                "document_date": document_date,
+                "line_items": [
+                    {
+                        "line_role": "expense",
+                        "description": "courier",
+                        "posting_policy_line_key": "courier",
+                        "suggested_expense_account_id": "126",
+                        "suggested_vat_type_id": vat_type_id,
+                    }
+                ],
+            },
+        }
+
+    def test_the_rate_in_force_on_the_document_date_is_accepted(self) -> None:
+        errors = posting_policy.action_policy_errors(
+            self.purchase(document_date="2024-04-20", vat_type_id="26"), self.policy()
+        )
+
+        self.assertEqual([e for e in errors if "VAT" in e], [])
+
+    def test_a_superseded_rate_on_a_2024_document_is_flagged(self) -> None:
+        errors = posting_policy.action_policy_errors(
+            self.purchase(document_date="2024-04-20", vat_type_id="3"), self.policy()
+        )
+
+        self.assertTrue([e for e in errors if "VAT" in e], f"expected a VAT error, got {errors}")
+
+    def test_the_later_rate_change_is_enforced_too(self) -> None:
+        errors = posting_policy.action_policy_errors(
+            self.purchase(document_date="2025-09-12", vat_type_id="26"), self.policy()
+        )
+
+        self.assertTrue([e for e in errors if "VAT" in e], f"expected a VAT error, got {errors}")

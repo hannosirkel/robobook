@@ -33,6 +33,7 @@ from posting_policy import (
     load_posting_policy,
     resolve_bank_account,
     resolve_contact,
+    resolve_dated_mapping_bands,
     resolve_mapping,
     resolve_sales_vat_profile,
     resolve_sales_warehouse,
@@ -3926,14 +3927,26 @@ def apply_posting_policy(
                 if not isinstance(line_values, dict):
                     raise SimplbooksError(f"Posting family {family!r} line {line_key!r} must be an object.")
                 line["posting_policy_line_key"] = line_key
+                vat_pin = line_values.get("vat_type_id")
                 try:
                     line["suggested_expense_account_id"] = str(
                         int(str(line_values.get("expense_account_id") or ""))
                     )
-                    line["suggested_vat_type_id"] = str(int(str(line_values.get("vat_type_id") or "")))
-                except ValueError as exc:
+                    if isinstance(vat_pin, list):
+                        # A dated pin declares the rate in force on the document date, so a
+                        # statutory rate change cannot leave a superseded type on a new document.
+                        line["suggested_vat_type_id"] = resolve_dated_mapping_bands(
+                            vat_pin,
+                            value_key="vat_type_id",
+                            field_name=f"mappings[{family}][{line_key}].vat_type_id",
+                            event_date=date.fromisoformat(str(payload.get("document_date") or "")),
+                        )
+                    else:
+                        line["suggested_vat_type_id"] = str(int(str(vat_pin or "")))
+                except (ValueError, PostingPolicyError) as exc:
                     raise SimplbooksError(
-                        f"Posting family {family!r} line {line_key!r} requires integer-like expense_account_id and vat_type_id."
+                        f"Posting family {family!r} line {line_key!r} requires integer-like expense_account_id "
+                        f"and a vat_type_id resolvable on the document date: {exc}"
                     ) from exc
                 warehouse_id = line_values.get("warehouse_id")
                 line["warehouse_id_hint"] = str(warehouse_id) if warehouse_id not in (None, "") else None

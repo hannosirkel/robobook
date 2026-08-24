@@ -3383,3 +3383,52 @@ class ProcessorSettlementTests(unittest.TestCase):
         )
 
         self.assertEqual(sum(a["payload"]["amount"] for a in receipts), 137.46)
+
+
+DATED_VAT_BANDS = [
+    {"start": "1900-01-01", "end": "2023-12-31", "vat_type_id": "3"},
+    {"start": "2024-01-01", "end": None, "vat_type_id": "26"},
+]
+
+
+class DatedPurchasePinBuilderTests(unittest.TestCase):
+    """The builder must emit the VAT type in force on the document date.
+
+    A static pin keeps declaring a superseded rate on correct amounts; only the
+    document date can decide which rate a purchase should have carried.
+    """
+
+    def test_a_2024_document_takes_the_rate_that_replaced_the_old_one(self) -> None:
+        action = storage_fee_action()
+
+        bookbuilder.apply_posting_policy(
+            [action],
+            posting_policy=printful_policy(vat_type_id=DATED_VAT_BANDS),
+            entity_map=ZERO_RATE_VAT_TYPES,
+        )
+
+        self.assertEqual(action["payload"]["line_items"][0]["suggested_vat_type_id"], "26")
+
+    def test_a_document_from_before_the_change_still_takes_the_old_rate(self) -> None:
+        action = storage_fee_action()
+        action["payload"]["document_date"] = "2023-11-28"
+
+        bookbuilder.apply_posting_policy(
+            [action],
+            posting_policy=printful_policy(vat_type_id=DATED_VAT_BANDS),
+            entity_map=ZERO_RATE_VAT_TYPES,
+        )
+
+        self.assertEqual(action["payload"]["line_items"][0]["suggested_vat_type_id"], "3")
+
+    def test_a_document_covered_by_no_band_is_refused(self) -> None:
+        action = storage_fee_action()
+        action["payload"]["document_date"] = "2024-01-28"
+        bands = [{"start": "2025-01-01", "end": None, "vat_type_id": "26"}]
+
+        with self.assertRaises(bookbuilder.SimplbooksError):
+            bookbuilder.apply_posting_policy(
+                [action],
+                posting_policy=printful_policy(vat_type_id=bands),
+                entity_map=ZERO_RATE_VAT_TYPES,
+            )

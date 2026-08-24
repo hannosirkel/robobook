@@ -334,6 +334,21 @@ def cash_posting_mode(policy: dict[str, Any]) -> str:
     return validated_cash_posting(policy)["mode"]
 
 
+def posting_scope_first_period(policy: dict[str, Any] | None) -> str | None:
+    """Return the first period this company posts, or None when it declares no scope."""
+    scope = (policy or {}).get("posting_scope")
+    if scope is None:
+        return None
+    if not isinstance(scope, dict):
+        raise PostingPolicyError("posting_scope must be an object.")
+    first_period = str(scope.get("first_period") or "")
+    if not re.fullmatch(r"\d{4}-\d{2}", first_period):
+        raise PostingPolicyError(
+            f"posting_scope.first_period must be a YYYY-MM period, got {first_period!r}."
+        )
+    return first_period
+
+
 def statement_import_policy(policy: dict[str, Any]) -> dict[str, Any]:
     """Return the normalized cash-posting section, refusing any non-`statement_import` policy."""
     resolved = validated_cash_posting(policy)

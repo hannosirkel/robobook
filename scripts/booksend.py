@@ -29,6 +29,7 @@ from posting_policy import (
     PostingPolicyError,
     action_policy_errors,
     cash_posting_mode,
+    posting_scope_first_period,
     load_posting_policy,
     prohibited_bank_cash_action,
 )
@@ -1163,16 +1164,34 @@ def load_existing_submission(
     return existing
 
 
-def validate_predecessor_submission(*, action_path: Path, period: str) -> None:
-    """Require the immediately preceding configured action batch to be immutable and successful."""
+def validate_predecessor_submission(
+    *, action_path: Path, period: str, first_period: str | None = None
+) -> None:
+    """Require the immediately preceding in-scope action batch to be immutable and successful.
+
+    The sequence is the batch files present in the directory, narrowed to the posting
+    scope the company declares. Without that scope a draft kept for reference -- a year
+    already filed elsewhere, say -- would silently enrol itself in the chain and demand a
+    submission that is never going to exist.
+    """
     action_dir = action_path.parent
     configured = sorted(
         path.stem
         for path in action_dir.glob("*.yaml")
         if re.fullmatch(r"\d{4}-\d{2}", path.stem)
     )
+    if first_period:
+        if period < first_period:
+            raise SimplbooksError(
+                f"Period {period} precedes the posting scope declared in posting_policy.json "
+                f"(posting_scope.first_period is {first_period}), so it must not be written."
+            )
+        configured = [item for item in configured if item >= first_period]
     if period not in configured:
-        raise SimplbooksError(f"Current period {period} is absent from the configured action sequence.")
+        raise SimplbooksError(
+            f"Current period {period} has no action batch in {action_dir}; the posting "
+            "sequence is the batch files present there, narrowed to the declared posting scope."
+        )
     position = configured.index(period)
     if position == 0:
         return
@@ -1629,7 +1648,15 @@ def run_submission(
             period=period,
             company_id=resolved_company_id,
         )
-        validate_predecessor_submission(action_path=action_path, period=period)
+        try:
+            posting_policy = load_posting_policy(verified_reference_paths["posting_policy"][0])
+        except PostingPolicyError as exc:
+            raise SimplbooksError(str(exc)) from exc
+        validate_predecessor_submission(
+            action_path=action_path,
+            period=period,
+            first_period=posting_scope_first_period(posting_policy),
+        )
         recon_path = verified_reference_paths["reconciliation"][0]
         normalized_path = verified_reference_paths["normalized_period"][0]
         recon_payload = load_json(recon_path)
@@ -1640,10 +1667,6 @@ def run_submission(
             raise SimplbooksError("Bound normalized period does not match the action batch period.")
         if str(normalized_payload.get("company_slug") or "") != str(action_batch.get("company_slug") or ""):
             raise SimplbooksError("Bound normalized company_slug does not match the action batch.")
-        try:
-            posting_policy = load_posting_policy(verified_reference_paths["posting_policy"][0])
-        except PostingPolicyError as exc:
-            raise SimplbooksError(str(exc)) from exc
         if verified_reference_paths.get("exchange_rates"):
             exchange_rate_cache = load_json(verified_reference_paths["exchange_rates"][0])
         policy_memo_path = company_dir / "artifacts" / "policy_memo.md"

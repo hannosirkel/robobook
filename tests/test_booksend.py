@@ -551,6 +551,55 @@ class BooksendTests(unittest.TestCase):
                     action_path=actions_dir / "2024-02.yaml", period="2024-02"
                 )
 
+    def test_a_period_before_the_declared_scope_is_refused(self) -> None:
+        """A year left as filed must never be written, even though its drafts are on disk."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            actions_dir = Path(tmpdir) / "artifacts" / "actions"
+            actions_dir.mkdir(parents=True)
+            for period in ("2023-12", "2024-01"):
+                batch = make_batch()
+                batch.update({"period": period, "batch_id": f"example-{period}-draft"})
+                booksend.write_yaml(actions_dir / f"{period}.yaml", batch)
+
+            with self.assertRaisesRegex(SimplbooksError, "posting scope"):
+                booksend.validate_predecessor_submission(
+                    action_path=actions_dir / "2023-12.yaml",
+                    period="2023-12",
+                    first_period="2024-01",
+                )
+
+    def test_the_first_in_scope_period_needs_no_predecessor(self) -> None:
+        """Drafts for an out-of-scope earlier year must not chain onto the first real month."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            actions_dir = Path(tmpdir) / "artifacts" / "actions"
+            actions_dir.mkdir(parents=True)
+            for period in ("2023-01", "2023-12", "2024-01"):
+                batch = make_batch()
+                batch.update({"period": period, "batch_id": f"example-{period}-draft"})
+                booksend.write_yaml(actions_dir / f"{period}.yaml", batch)
+
+            booksend.validate_predecessor_submission(
+                action_path=actions_dir / "2024-01.yaml",
+                period="2024-01",
+                first_period="2024-01",
+            )
+
+    def test_a_scope_start_does_not_excuse_a_later_missing_predecessor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            actions_dir = Path(tmpdir) / "artifacts" / "actions"
+            actions_dir.mkdir(parents=True)
+            for period in ("2023-12", "2024-01", "2024-02"):
+                batch = make_batch()
+                batch.update({"period": period, "batch_id": f"example-{period}-draft"})
+                booksend.write_yaml(actions_dir / f"{period}.yaml", batch)
+
+            with self.assertRaisesRegex(SimplbooksError, "previous month"):
+                booksend.validate_predecessor_submission(
+                    action_path=actions_dir / "2024-02.yaml",
+                    period="2024-02",
+                    first_period="2024-01",
+                )
+
     def test_write_accepts_exact_successful_configured_predecessor(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

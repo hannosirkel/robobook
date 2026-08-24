@@ -1402,3 +1402,57 @@ class ProcessorSettlementAccountTests(unittest.TestCase):
 
     def test_an_unreviewed_cash_account_is_still_a_mismatch(self) -> None:
         self.assertEqual(self.summary_for("99")["policy_mapping_mismatch_count"], 1)
+
+
+class SetOffAccountIsNotAMismatchTests(unittest.TestCase):
+    """The set-off account is a reviewed policy value, like a processor account.
+
+    A cashless set-off has no bank row, so it clears through the set-off account. Without
+    that account in the allowlist every set-off month would read as a policy mismatch.
+    """
+
+    def summary_for(self, bank_account_id: str, *, declare_set_off: bool = True) -> dict:
+        with tempfile.TemporaryDirectory() as tmp:
+            company_dir = Path(tmp) / "companies" / "example"
+            actions_dir = company_dir / "artifacts" / "actions"
+            actions_dir.mkdir(parents=True)
+            accounts = {
+                "bank": "2", "stripe_clearing": "263", "paypal": "260",
+                "bank_fees": "141", "reporting_person_payable": "232",
+                "platform_prepayment": "256", "customer_receivable": "5",
+                "supplier_payable": "52", "fx_gain": "113", "fx_loss": "184",
+            }
+            if declare_set_off:
+                accounts["set_off"] = "206"
+            (company_dir / "artifacts" / "posting_policy.json").write_text(
+                json.dumps({
+                    "bank_accounts": {"EE123": "3"},
+                    "cash_posting": {
+                        "mode": "statement_import",
+                        "bank_income_account_ids": ["3"],
+                        "processor_income_account_ids": {"paypal": "6", "stripe": "7"},
+                        "bank_financial_accounts": {"EE123": {"EUR": "2"}},
+                        "clearing_provider_roles": {"paypal": "paypal"},
+                        "financial_accounts": accounts,
+                    },
+                }),
+                encoding="utf-8",
+            )
+            (actions_dir / "2024-01.yaml").write_text(
+                json.dumps({"actions": [{
+                    "action_type": "create_payment_summary",
+                    "payload": {"currency": "EUR", "settlement_family": "cashless-set-off",
+                                "vendor_hint": "supplier", "bank_account_id": bank_account_id},
+                    "source_refs": [],
+                }]}),
+                encoding="utf-8",
+            )
+            return full_year_dry_run.summarize_action_artifacts(company_dir=company_dir, year=2024)
+
+    def test_the_declared_setoff_account_is_not_a_mismatch(self) -> None:
+        self.assertEqual(self.summary_for("206")["policy_mapping_mismatch_count"], 0)
+
+    def test_an_undeclared_account_is_still_a_mismatch(self) -> None:
+        self.assertEqual(
+            self.summary_for("206", declare_set_off=False)["policy_mapping_mismatch_count"], 1
+        )

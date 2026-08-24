@@ -2418,3 +2418,47 @@ class ProcessorSettlementGroupTotalTests(unittest.TestCase):
         findings = bookchecker.evaluate_processor_settlement(self.batch(62.70, 5.00))
 
         self.assertTrue(any("settlement parts total" in f["summary"] for f in findings))
+
+
+def setoff_leg(document_type: str, amount: float) -> dict:
+    return {
+        "idempotency_key": f"example-2025-08-setoff-{document_type}",
+        "action_type": (
+            "create_incoming_summary" if document_type == "incoming" else "create_payment_summary"
+        ),
+        "payload": {
+            "draft_schema": "cash_settlement_v1",
+            "document_type": document_type,
+            "settlement_family": "cashless-set-off",
+            "set_off_id": "example-2025-08-supplier-credit",
+            "bank_account_id": "206",
+            "currency": "USD",
+            "amount": amount,
+        },
+    }
+
+
+class CashlessSetOffArithmeticTests(unittest.TestCase):
+    """A set-off has no statement row, so there is nothing to recompute an amount from."""
+
+    def test_a_setoff_receipt_is_not_required_to_cite_a_bank_row(self) -> None:
+        findings = bookchecker.evaluate_arithmetic(
+            action=setoff_leg("incoming", 9.66), resolved_sources=[]
+        )
+
+        self.assertEqual(findings, [])
+
+    def test_a_setoff_payment_is_not_required_to_cite_a_bank_row(self) -> None:
+        findings = bookchecker.evaluate_arithmetic(
+            action=setoff_leg("payment", 9.26), resolved_sources=[]
+        )
+
+        self.assertEqual(findings, [])
+
+    def test_an_ordinary_cash_payment_still_must_cite_a_bank_row(self) -> None:
+        action = setoff_leg("payment", 9.26)
+        action["payload"]["settlement_family"] = "bank"
+
+        findings = bookchecker.evaluate_arithmetic(action=action, resolved_sources=[])
+
+        self.assertTrue(findings)

@@ -647,6 +647,12 @@ def evaluate_arithmetic(
     if draft_schema == "cash_settlement_v1":
         document_type = str(payload.get("document_type") or "")
         settlement_family = str(payload.get("settlement_family") or "")
+        if settlement_family == "cashless-set-off":
+            # No bank row exists to recompute against: the counterparty withheld what it
+            # owed us and applied it to what we owed them. The reviewed set-off evidence
+            # is the only amount there is, and build_set_off_actions already proved its
+            # legs net to zero on the clearing account before emitting them.
+            return findings
         if settlement_family == "processor-held":
             # The customer paid the processor, so the money never touched the bank. The
             # sales rows the processor settled are the only evidence there is. A receipt

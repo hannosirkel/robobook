@@ -13,7 +13,7 @@ from typing import Any, Callable  # noqa: UP035
 import booksend
 from bank_allocations import BankAllocationError, load_bank_allocations, period_allocations
 from full_year_dry_run import parse_json_output, submitted_month_state
-from posting_policy import load_posting_policy, posting_scope_first_period
+from posting_policy import PostingPolicyError, cash_posting_mode, load_posting_policy, posting_scope_first_period
 from reference_artifacts import ReferenceArtifactError, verify_file_binding
 from simplbooks_api import SimplbooksError
 from simplbooks_api import resolve_company_id
@@ -67,12 +67,17 @@ def _approval_only_change(before: dict[str, Any], after: dict[str, Any]) -> bool
 
 
 def _dependencies_are_resolved(batch: dict[str, Any]) -> bool:
+    # Mirrors booksend.py: in a statement-import batch the API sends no cash for these
+    # rows, so a pending proof stops nothing. The annual plan carries the row instead.
+    statement_import_batch = str(batch.get("cash_posting_mode") or "") == "statement_import"
     for dependency in batch.get("unresolved_dependencies") or []:
         if not isinstance(dependency, dict):
             return False
         if dependency.get("blocking") is True:
             return False
         if dependency.get("kind") == "manual_statement_import_financial_transaction":
+            if statement_import_batch:
+                continue
             proof = dependency.get("statement_import_proof") or {}
             if (
                 dependency.get("blocking") is not False
@@ -143,6 +148,21 @@ def _posting_scope_first_period(company_dir: Path) -> str | None:
     return posting_scope_first_period(load_posting_policy(policy_path))
 
 
+def _statement_import_company(company_dir: Path) -> bool:
+    """Whether this company posts cash by manual statement import.
+
+    Fail closed: an absent or unreadable policy is treated as API mode, which keeps
+    every existing guard in force.
+    """
+    policy_path = company_dir / "artifacts" / "posting_policy.json"
+    if not policy_path.exists():
+        return False
+    try:
+        return cash_posting_mode(load_posting_policy(policy_path)) == "statement_import"
+    except (PostingPolicyError, SimplbooksError, ValueError, OSError):
+        return False
+
+
 def _load_live_allocations(*, company_dir: Path, period: str) -> list[dict[str, Any]]:
     year = period[:4]
     normalized_paths = sorted((company_dir / "artifacts" / "normalized").glob(f"{year}-[0-1][0-9].json"))
@@ -152,6 +172,7 @@ def _load_live_allocations(*, company_dir: Path, period: str) -> list[dict[str, 
         selected = list(period_allocations(payload, period).values())
     except BankAllocationError as exc:
         raise SimplbooksError(f"Live bank allocation preflight failed: {exc}") from exc
+    statement_import = _statement_import_company(company_dir)
     for allocation in selected:
         manual = str(allocation.get("disposition") or "") in {
             "bank_fee_payment", "expense_reimbursement_payment", "clearing_transfer"
@@ -162,7 +183,7 @@ def _load_live_allocations(*, company_dir: Path, period: str) -> list[dict[str, 
             }
             for part in allocation.get("parts") or [] if isinstance(part, dict)
         )
-        if manual:
+        if manual and not statement_import:
             proof = (allocation.get("target") or {}).get("statement_import_proof")
             if not isinstance(proof, dict) or proof.get("status") != "verified":
                 raise SimplbooksError(

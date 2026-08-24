@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 .worktrees/
 .apikey
+.apikey*
 /companies/*
 !/companies/example/
 !/companies/example/**

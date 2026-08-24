@@ -944,7 +944,15 @@ def validate_run_preconditions(
         )
 
 
-def stable_execution_order(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def stable_execution_order(
+    actions: list[dict[str, Any]], *, external_keys: set[str] | None = None
+) -> list[dict[str, Any]]:
+    """Order a batch so every dependency is sent before what needs it.
+
+    A dependency can also live in an earlier period that was already submitted. That
+    imposes no ordering constraint here -- the document exists -- so it is satisfied by
+    membership in external_keys rather than by position in this batch.
+    """
     lookup: dict[str, dict[str, Any]] = {}
     index: dict[str, int] = {}
     reverse_edges: dict[str, list[str]] = defaultdict(list)
@@ -962,6 +970,8 @@ def stable_execution_order(actions: list[dict[str, Any]]) -> list[dict[str, Any]
         key = action_id(action)
         for dependency in action.get("depends_on") or []:
             dep_key = str(dependency)
+            if dep_key in (external_keys or set()) and dep_key not in lookup:
+                continue
             if dep_key not in lookup:
                 raise SimplbooksError(f"Action {key} depends on missing action {dep_key!r}.")
             reverse_edges[dep_key].append(key)
@@ -1514,7 +1524,9 @@ def execute_batch(
                 "Action batch contains a pending manual statement-import financial dependency; "
                 "no API action is translated or sent until live discovery/audit proves the import."
             )
-    ordered_actions = stable_execution_order(list(action_batch.get("actions") or []))
+    ordered_actions = stable_execution_order(
+        list(action_batch.get("actions") or []), external_keys=set(reference_lookup or {})
+    )
     lookup = dict(reference_lookup or {})
     lookup.update(action_lookup(ordered_actions))
     appended_entries: list[dict[str, Any]] = []

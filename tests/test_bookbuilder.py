@@ -3705,3 +3705,184 @@ class PrintfulVatFollowsShippingOriginTests(unittest.TestCase):
         record = self._record(warehouse="LV", shipped_from="gb")
 
         self.assertEqual(bookbuilder.printful_vat_origin(record), "GB")
+
+
+def setoff_fixture(**overrides: object) -> dict:
+    """A cashless set-off: one receivable closed by two payables, no bank row."""
+    setoff = {
+        "setoff_id": "example-2025-08-supplier-credit",
+        "period": "2025-08",
+        "date": "2025-08-09",
+        "currency": "USD",
+        "financial_account_id": "206",
+        "counterparty": {"contact_id": "62", "display_name_hint": "example supplier"},
+        "receivable": {
+            "document_type": "invoice",
+            "action_key": "example-2025-06-sales-supplier",
+            "amount": 9.66,
+        },
+        "payables": [
+            {"document_type": "purchase", "action_key": "example-2025-08-purchase-supplier", "amount": 9.26},
+            {"document_type": "purchase", "action_key": "example-2025-06-fees-supplier", "amount": 0.40},
+        ],
+        "source_records": [
+            {"path": "companies/example/artifacts/normalized/2025-08.json", "record_ref": "purchase:11"},
+        ],
+    }
+    setoff.update(overrides)
+    return setoff
+
+
+def build_with_setoffs(setoffs: list[dict], period: str = "2025-08") -> dict:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        return bookbuilder.build_action_batch(
+            normalized_payload=base_normalized(period),
+            recon_payload=base_recon(period),
+            normalized_path=root / "normalized.json",
+            recon_path=root / "recon.json",
+            repo_root=root,
+            set_off_evidence=setoffs,
+        )
+
+
+class CashlessSetOffTests(unittest.TestCase):
+    """A set-off has no bank row, so it settles through a clearing account instead."""
+
+    def test_a_balanced_setoff_emits_one_incoming_and_one_payment_per_payable(self) -> None:
+        batch = build_with_setoffs([setoff_fixture()])
+
+        actions = {a["idempotency_key"]: a for a in batch["actions"]}
+        incomings = [a for a in actions.values() if a["action_type"] == "create_incoming_summary"]
+        payments = [a for a in actions.values() if a["action_type"] == "create_payment_summary"]
+
+        self.assertEqual(len(incomings), 1)
+        self.assertEqual(len(payments), 2)
+
+        self.assertEqual(incomings[0]["payload"]["amount"], 9.66)
+        self.assertEqual(incomings[0]["payload"]["linked_invoice_action"], "example-2025-06-sales-supplier")
+        self.assertEqual(
+            sorted(p["payload"]["amount"] for p in payments), [0.40, 9.26]
+        )
+        self.assertEqual(
+            {p["payload"]["linked_purchase_action"] for p in payments},
+            {"example-2025-08-purchase-supplier", "example-2025-06-fees-supplier"},
+        )
+
+    def test_every_setoff_leg_posts_to_the_clearing_account_not_a_bank(self) -> None:
+        batch = build_with_setoffs([setoff_fixture()])
+
+        legs = [
+            a for a in batch["actions"]
+            if a["action_type"] in {"create_incoming_summary", "create_payment_summary"}
+        ]
+        self.assertEqual({a["payload"]["bank_account_id"] for a in legs}, {"206"})
+
+    def test_the_clearing_account_nets_to_zero_across_the_setoff(self) -> None:
+        batch = build_with_setoffs([setoff_fixture()])
+
+        received = sum(
+            Decimal(str(a["payload"]["amount"])) for a in batch["actions"]
+            if a["action_type"] == "create_incoming_summary"
+        )
+        paid = sum(
+            Decimal(str(a["payload"]["amount"])) for a in batch["actions"]
+            if a["action_type"] == "create_payment_summary"
+        )
+        self.assertEqual(received - paid, Decimal(0))
+
+    def test_a_setoff_whose_payables_do_not_equal_its_receivable_is_refused(self) -> None:
+        unbalanced = setoff_fixture(
+            payables=[
+                {"document_type": "purchase", "action_key": "example-2025-08-purchase-supplier", "amount": 9.26},
+            ]
+        )
+
+        with self.assertRaises(bookbuilder.SimplbooksError) as caught:
+            build_with_setoffs([unbalanced])
+
+        self.assertIn("example-2025-08-supplier-credit", str(caught.exception))
+
+
+class SetOffEvidenceLoadingTests(unittest.TestCase):
+    """Evidence that is silently not found would leave invoices silently unsettled."""
+
+    def test_the_path_is_year_scoped_beside_the_other_reviewed_evidence(self) -> None:
+        resolved = bookbuilder.resolve_set_off_evidence_path(
+            company_dir=Path("/companies/example"),
+            normalized_path=Path("/companies/example/artifacts/normalized/2025-08.json"),
+            period="2025-08",
+            override=None,
+        )
+
+        self.assertEqual(resolved, Path("/companies/example/artifacts/actions/2025-setoffs.json"))
+
+    def test_an_absent_file_means_no_setoffs_rather_than_an_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(
+                bookbuilder.load_set_off_evidence(Path(tmp) / "missing.json"), []
+            )
+
+    def test_a_file_that_is_not_a_list_of_objects_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "2025-setoffs.json"
+            path.write_text(json.dumps(["not-an-object"]), encoding="utf-8")
+
+            with self.assertRaises(bookbuilder.SimplbooksError):
+                bookbuilder.load_set_off_evidence(path)
+
+    def test_a_reviewed_file_round_trips_into_built_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "2025-setoffs.json"
+            path.write_text(json.dumps([setoff_fixture()]), encoding="utf-8")
+
+            loaded = bookbuilder.load_set_off_evidence(path)
+            batch = build_with_setoffs(loaded)
+
+        self.assertEqual(
+            sum(1 for a in batch["actions"] if a["payload"].get("set_off_id")), 3
+        )
+
+
+class SetOffSourceReferenceTests(unittest.TestCase):
+    """A set-off cites the documents it settles, not a record that does not exist."""
+
+    def test_declared_source_records_are_emitted_on_every_leg(self) -> None:
+        declared = [
+            {"path": "companies/example/artifacts/normalized/2025-08.json", "record_ref": "purchase:11"},
+            {"path": "companies/example/artifacts/normalized/2025-06.json", "record_ref": "sales:2117"},
+        ]
+        batch = build_with_setoffs([setoff_fixture(source_records=declared)])
+
+        legs = [a for a in batch["actions"] if a["payload"].get("set_off_id")]
+        self.assertEqual(len(legs), 3)
+        for leg in legs:
+            self.assertEqual(
+                [(r["path"], r["record_ref"]) for r in leg["source_refs"]],
+                [(r["path"], r["record_ref"]) for r in declared],
+            )
+
+    def test_a_setoff_without_source_records_is_refused(self) -> None:
+        with self.assertRaises(bookbuilder.SimplbooksError) as caught:
+            build_with_setoffs([setoff_fixture(source_records=[])])
+
+        self.assertIn("source_records", str(caught.exception))
+
+
+class SetOffContactHintTests(unittest.TestCase):
+    """Policy resolves the contact from a hint, so a set-off must carry one per role."""
+
+    def test_the_receipt_carries_a_sales_hint_and_the_payments_a_vendor_hint(self) -> None:
+        batch = build_with_setoffs([setoff_fixture()])
+
+        receipt = next(
+            a for a in batch["actions"] if a["action_type"] == "create_incoming_summary"
+        )
+        payments = [
+            a for a in batch["actions"] if a["action_type"] == "create_payment_summary"
+        ]
+
+        self.assertEqual(receipt["payload"]["counterparty_hint"], "example supplier")
+        self.assertEqual(
+            {p["payload"]["vendor_hint"] for p in payments}, {"example supplier"}
+        )

@@ -1916,3 +1916,41 @@ class WritePrevalidationAcceptedWarningTests(unittest.TestCase):
         self.assertEqual(
             len(booksend.unreviewed_checker_findings(evaluation, accepted=[])), 1
         )
+
+
+class CrossPeriodDependencyOrderingTests(unittest.TestCase):
+    """A dependency posted in an earlier month is satisfied, not missing."""
+
+    @staticmethod
+    def _action(key: str, depends_on: list[str] | None = None) -> dict:
+        return {
+            "idempotency_key": key,
+            "action_type": "create_payment_summary",
+            "payload": {},
+            "depends_on": depends_on or [],
+        }
+
+    def test_a_dependency_on_an_already_posted_prior_action_is_accepted(self) -> None:
+        actions = [self._action("m-2025-08-payment", ["m-2025-06-sales"])]
+
+        ordered = booksend.stable_execution_order(
+            actions, external_keys={"m-2025-06-sales"}
+        )
+
+        self.assertEqual([a["idempotency_key"] for a in ordered], ["m-2025-08-payment"])
+
+    def test_a_dependency_on_a_genuinely_unknown_action_is_still_refused(self) -> None:
+        actions = [self._action("m-2025-08-payment", ["m-2025-06-sales"])]
+
+        with self.assertRaises(booksend.SimplbooksError):
+            booksend.stable_execution_order(actions, external_keys=set())
+
+    def test_in_batch_ordering_still_places_a_dependency_first(self) -> None:
+        actions = [
+            self._action("b-second", ["a-first"]),
+            self._action("a-first"),
+        ]
+
+        ordered = booksend.stable_execution_order(actions, external_keys={"x-other"})
+
+        self.assertEqual([a["idempotency_key"] for a in ordered], ["a-first", "b-second"])

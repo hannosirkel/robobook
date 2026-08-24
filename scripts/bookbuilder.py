@@ -4130,6 +4130,161 @@ def apply_posting_policy(
     return unresolved
 
 
+def build_set_off_actions(
+    *,
+    company_slug: str,
+    period: str,
+    normalized_path_display: str,
+    set_off_evidence: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Settle a receivable against payables with no cash, through a clearing account.
+
+    A set-off has no bank row to allocate, so reviewed evidence names the documents
+    directly instead of an allocation naming a statement line. Both legs post to the same
+    clearing account, which therefore nets to zero: the receivable clears into it and the
+    payables are paid out of it.
+    """
+    actions: list[dict[str, Any]] = []
+    for entry in set_off_evidence or []:
+        if not isinstance(entry, dict):
+            raise SimplbooksError("Reviewed set-off evidence must contain objects.")
+        if str(entry.get("period") or "") != period:
+            continue
+        setoff_id = str(entry.get("setoff_id") or "").strip()
+        if not setoff_id:
+            raise SimplbooksError("Reviewed set-off evidence requires a setoff_id.")
+        account_id = str(entry.get("financial_account_id") or "").strip()
+        if not account_id:
+            raise SimplbooksError(f"Set-off {setoff_id} requires a financial_account_id.")
+        document_date = str(entry.get("date") or "").strip()
+        if not document_date:
+            raise SimplbooksError(f"Set-off {setoff_id} requires a date.")
+        currency = str(entry.get("currency") or "EUR")
+        counterparty = entry.get("counterparty") or {}
+        contact_id = str(counterparty.get("contact_id") or "").strip()
+        label = str(counterparty.get("display_name_hint") or setoff_id)
+        receivable = entry.get("receivable") or {}
+        payables = entry.get("payables") or []
+        if not isinstance(payables, list) or not payables:
+            raise SimplbooksError(f"Set-off {setoff_id} requires at least one payable.")
+        receivable_key = str(receivable.get("action_key") or "").strip()
+        if not receivable_key:
+            raise SimplbooksError(f"Set-off {setoff_id} requires a receivable action_key.")
+        receivable_amount = decimal_value(receivable.get("amount"))
+        if receivable_amount <= 0:
+            raise SimplbooksError(f"Set-off {setoff_id} receivable must be positive.")
+        payable_total = Decimal(0)
+        for payable in payables:
+            amount = decimal_value(payable.get("amount"))
+            if amount <= 0:
+                raise SimplbooksError(f"Set-off {setoff_id} payable amounts must be positive.")
+            payable_total += amount
+        if receivable_amount != payable_total:
+            raise SimplbooksError(
+                f"Set-off {setoff_id} does not balance: receivable {receivable_amount} "
+                f"against payables totalling {payable_total}."
+            )
+        declared_sources = entry.get("source_records")
+        if not isinstance(declared_sources, list) or not declared_sources:
+            raise SimplbooksError(
+                f"Set-off {setoff_id} requires source_records naming the documents it settles."
+            )
+        source_refs = []
+        for declared in declared_sources:
+            if not isinstance(declared, dict):
+                raise SimplbooksError(f"Set-off {setoff_id} source_records must be objects.")
+            ref_path = str(declared.get("path") or "").strip()
+            record_ref = str(declared.get("record_ref") or "").strip()
+            if not ref_path or not record_ref:
+                raise SimplbooksError(
+                    f"Set-off {setoff_id} source_records need both a path and a record_ref."
+                )
+            source_refs.append({"path": ref_path, "record_ref": record_ref})
+        notes = [
+            (
+                "Cashless set-off: no bank row exists, so both legs clear through "
+                f"financial account {account_id}, which therefore nets to zero."
+            ),
+        ]
+        required_ids = [value for value in (account_id, contact_id) if value]
+        common_payload = {
+            "draft_schema": "cash_settlement_v1",
+            "document_date": document_date,
+            "currency": currency,
+            "settlement_family": "cashless-set-off",
+            "set_off_id": setoff_id,
+            "bank_account_id": account_id,
+        }
+        actions.append(
+            make_action(
+                period=period,
+                idempotency_key=f"{company_slug}-{period}-setoff-{slugify(setoff_id)}-receipt",
+                action_type="create_incoming_summary",
+                endpoint="incomings/create",
+                payload={
+                    **common_payload,
+                    "document_type": "incoming",
+                    "counterparty": {
+                        "contact_id": contact_id or None,
+                        "display_name_hint": f"{label} set-off receipt",
+                    },
+                    "counterparty_hint": label,
+                    "amount": decimal_number(receivable_amount),
+                    "linked_invoice_action": receivable_key,
+                },
+                source_refs=source_refs,
+                reason=(
+                    f"Clear {receivable_key} without cash; the counterparty withheld the "
+                    "proceeds and applied them to what we owed."
+                ),
+                confidence=review_confidence(
+                    open_issues=unresolved_review_issues(notes), required_ids=required_ids
+                ),
+                depends_on=[receivable_key],
+                expected_effect=f"Create a draft receipt into financial account {account_id}.",
+                review_notes=list(notes),
+            )
+        )
+        for index, payable in enumerate(payables, start=1):
+            payable_key = str(payable.get("action_key") or "").strip()
+            if not payable_key:
+                raise SimplbooksError(f"Set-off {setoff_id} requires a payable action_key.")
+            actions.append(
+                make_action(
+                    period=period,
+                    idempotency_key=(
+                        f"{company_slug}-{period}-setoff-{slugify(setoff_id)}-payment-{index}"
+                    ),
+                    action_type="create_payment_summary",
+                    endpoint="payments/create",
+                    payload={
+                        **common_payload,
+                        "document_type": "payment",
+                        "counterparty": {
+                            "contact_id": contact_id or None,
+                            "display_name_hint": f"{label} set-off payment",
+                        },
+                        "counterparty_hint": label,
+                        "vendor_hint": label,
+                        "amount": decimal_number(decimal_value(payable.get("amount"))),
+                        "linked_purchase_action": payable_key,
+                    },
+                    source_refs=source_refs,
+                    reason=(
+                        f"Pay {payable_key} out of the same set-off account the receivable "
+                        "cleared into."
+                    ),
+                    confidence=review_confidence(
+                        open_issues=unresolved_review_issues(notes), required_ids=required_ids
+                    ),
+                    depends_on=[payable_key],
+                    expected_effect=f"Create a draft payment from financial account {account_id}.",
+                    review_notes=list(notes),
+                )
+            )
+    return actions
+
+
 def build_action_batch(
     *,
     normalized_payload: dict[str, Any],
@@ -4147,6 +4302,7 @@ def build_action_batch(
     discovery_overviews: list[dict[str, Any]] | None = None,
     bank_allocations: dict[tuple[str, str, str], dict[str, Any]] | None = None,
     inventory_transfer_evidence: list[dict[str, Any]] | None = None,
+    set_off_evidence: list[dict[str, Any]] | None = None,
     force: bool = False,
 ) -> dict[str, Any]:
     if normalized_payload.get("period") != recon_payload.get("period"):
@@ -4303,6 +4459,13 @@ def build_action_batch(
         ),
     )
 
+    set_off_actions = build_set_off_actions(
+        company_slug=company_slug,
+        period=period,
+        normalized_path_display=normalized_path_display,
+        set_off_evidence=set_off_evidence,
+    )
+
     actions = (
         sales_actions
         + fee_actions
@@ -4311,6 +4474,7 @@ def build_action_batch(
         + direct_sale_actions
         + processor_settlement_actions
         + cash_actions
+        + set_off_actions
     )
     unresolved_dependencies = apply_posting_policy(actions, posting_policy=posting_policy, entity_map=entity_map)
     unresolved_dependencies.extend(
@@ -4474,6 +4638,37 @@ def load_inventory_transfer_evidence(path: Path | None) -> list[dict[str, Any]]:
     return entries
 
 
+def resolve_set_off_evidence_path(
+    *, company_dir: Path | None, normalized_path: Path, period: str, override: str | None
+) -> Path | None:
+    if override:
+        return Path(override)
+    filename = f"{period[:4]}-setoffs.json"
+    if company_dir is not None:
+        return company_dir / "artifacts" / "actions" / filename
+    artifacts_dir = inferred_artifacts_dir(normalized_path)
+    return (artifacts_dir / "actions" / filename) if artifacts_dir is not None else None
+
+
+def load_set_off_evidence(path: Path | None) -> list[dict[str, Any]]:
+    """Load reviewed cashless set-offs, treating absence as no evidence rather than an error.
+
+    Most companies never net a receivable against a payable, and must still be able to
+    build. A company that does is stopped by the balance check in build_set_off_actions
+    instead, which says exactly which set-off does not balance.
+    """
+    if path is None or not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SimplbooksError(f"Reviewed set-off evidence {path} is unreadable: {exc}") from exc
+    entries = payload if isinstance(payload, list) else [payload]
+    if not all(isinstance(entry, dict) for entry in entries):
+        raise SimplbooksError(f"Reviewed set-off evidence {path} must contain objects.")
+    return entries
+
+
 def resolve_statement_import_plan_path(
     *, company_dir: Path | None, normalized_path: Path, period: str, override: str | None
 ) -> Path | None:
@@ -4523,6 +4718,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bank-allocations", help="Reviewed annual bank allocation artifact")
     parser.add_argument("--statement-import-plan", help="Annual statement-import plan artifact")
     parser.add_argument("--inventory-transfers", help="Reviewed warehouse transfer evidence JSON")
+    parser.add_argument("--setoffs", help="Reviewed cashless set-off evidence JSON")
     parser.add_argument("--output", help="Optional output path for actions YAML")
     parser.add_argument("--force", action="store_true", help="Allow draft generation even when recon does not approve the month")
     return parser
@@ -4576,6 +4772,12 @@ def main() -> int:
         normalized_path=normalized_path,
         period=args.period,
         override=args.inventory_transfers,
+    )
+    set_off_evidence_path = resolve_set_off_evidence_path(
+        company_dir=company_dir,
+        normalized_path=normalized_path,
+        period=args.period,
+        override=args.setoffs,
     )
     statement_import_plan_path = resolve_statement_import_plan_path(
         company_dir=company_dir,
@@ -4658,6 +4860,7 @@ def main() -> int:
         discovery_overviews=discovery_overviews,
         bank_allocations=bank_allocations,
         inventory_transfer_evidence=load_inventory_transfer_evidence(inventory_transfer_evidence_path),
+        set_off_evidence=load_set_off_evidence(set_off_evidence_path),
         force=args.force,
     )
     bound_paths = [

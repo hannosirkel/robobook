@@ -490,6 +490,14 @@ def summarize_action_artifacts(
         for value in ((posting_policy.get("cash_posting") or {}).get("processor_income_account_ids") or {}).values()
         if str(value)
     }
+    # A cashless set-off has no bank row at all, so both its legs clear through the
+    # reviewed set-off account. It is an explicit policy value like the processor
+    # accounts above, not an unreviewed cash target.
+    set_off_account = str(
+        ((posting_policy.get("cash_posting") or {}).get("financial_accounts") or {}).get("set_off") or ""
+    )
+    if set_off_account:
+        allowed_bank_accounts.add(set_off_account)
 
     actions_dir = company_dir / "artifacts" / "actions"
     manual_action_path = actions_dir / f"{year}-inventory-manual.json"

@@ -41,7 +41,7 @@ REQUIRED_FINANCIAL_ACCOUNT_ROLES = frozenset(
     }
 )
 
-OPTIONAL_FINANCIAL_ACCOUNT_ROLES = frozenset({"inventory_change"})
+OPTIONAL_FINANCIAL_ACCOUNT_ROLES = frozenset({"inventory_change", "set_off"})
 
 KNOWN_FINANCIAL_ACCOUNT_ROLES = REQUIRED_FINANCIAL_ACCOUNT_ROLES | OPTIONAL_FINANCIAL_ACCOUNT_ROLES
 
@@ -755,9 +755,13 @@ def action_policy_errors(action: dict[str, Any], policy: dict[str, Any]) -> list
     if action_type in {"create_incoming_summary", "create_payment_summary"}:
         # Reviewed processor settlement accounts are explicit policy values too, and in
         # statement-import mode they are the only cash accounts the API may still touch.
+        cash_posting = validated_cash_posting(policy)
         allowed = configured_bank_account_ids(policy) | set(
-            validated_cash_posting(policy)["processor_income_account_ids"].values()
+            cash_posting["processor_income_account_ids"].values()
         )
+        set_off_account = cash_posting["financial_accounts"].get("set_off")
+        if set_off_account:
+            allowed.add(set_off_account)
         if str(payload.get("bank_account_id") or "") not in allowed:
             errors.append("Cash action bank_account_id is not one of the explicit posting-policy accounts.")
 

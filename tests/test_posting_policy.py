@@ -831,3 +831,72 @@ class AcceptedCheckerWarningTests(unittest.TestCase):
     def test_a_non_list_is_rejected(self) -> None:
         with self.assertRaises(posting_policy.PostingPolicyError):
             posting_policy.validate_posting_policy(self._policy("Recon still carries"))
+
+
+def setoff_policy_fixture() -> dict:
+    return {
+        "schema_version": "1.0",
+        "company_slug": "example",
+        "bank_accounts": {"EE00": {"EUR": "2"}},
+        "contacts": {"sales": {"supplier": "62"}, "suppliers": {"supplier": "62"}, "processors": {}},
+        "mappings": {},
+        "supplier_aliases": {},
+        "cash_posting": {
+            "mode": "statement_import",
+            "bank_income_account_ids": ["3"],
+            "processor_income_account_ids": {},
+            "bank_financial_accounts": {"EE00": {"EUR": "2"}},
+            "clearing_provider_roles": {"paypal": "paypal", "stripe": "stripe_clearing"},
+            "financial_accounts": {
+                "bank": "2", "bank_fees": "141", "customer_receivable": "5",
+                "fx_gain": "300", "fx_loss": "301", "paypal": "260",
+                "platform_prepayment": "256", "reporting_person_payable": "232",
+                "stripe_clearing": "263", "supplier_payable": "52", "set_off": "206",
+            },
+        },
+    }
+
+
+def setoff_cash_action(account_id: str = "206") -> dict:
+    return {
+        "action_type": "create_payment_summary",
+        "payload": {
+            "draft_schema": "cash_settlement_v1",
+            "document_type": "payment",
+            "settlement_family": "cashless-set-off",
+            "vendor_hint": "supplier",
+            "counterparty_hint": "supplier",
+            "counterparty": {"contact_id": "62"},
+            "bank_account_id": account_id,
+            "amount": 9.26,
+        },
+    }
+
+
+class SetOffAccountPolicyTests(unittest.TestCase):
+    """The set-off account is an explicit reviewed policy value, like a processor account."""
+
+    def test_a_cash_action_against_the_reviewed_setoff_account_is_accepted(self) -> None:
+        errors = posting_policy.action_policy_errors(
+            setoff_cash_action(), setoff_policy_fixture()
+        )
+
+        self.assertEqual(
+            [e for e in errors if "explicit posting-policy accounts" in e], []
+        )
+
+    def test_a_cash_action_against_an_undeclared_account_is_still_refused(self) -> None:
+        errors = posting_policy.action_policy_errors(
+            setoff_cash_action("999"), setoff_policy_fixture()
+        )
+
+        self.assertTrue(
+            any("explicit posting-policy accounts" in e for e in errors), errors
+        )
+
+    def test_a_setoff_leg_is_not_a_bank_cash_action_so_statement_import_permits_it(self) -> None:
+        self.assertFalse(
+            posting_policy.prohibited_bank_cash_action(
+                setoff_cash_action(), setoff_policy_fixture()
+            )
+        )

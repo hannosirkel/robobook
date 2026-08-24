@@ -3672,3 +3672,36 @@ class MergeRefusesUnfaithfulRoundingTests(unittest.TestCase):
         lines = action["payload"]["line_items"]
         self.assertEqual(len(lines), 1)
         self.assertEqual(lines[0]["vat_amount_hint"], 21.64)
+
+
+class PrintfulVatFollowsShippingOriginTests(unittest.TestCase):
+    """VAT jurisdiction follows where a shipment left from, not where stock sits.
+
+    Printful fulfils from Latvia, so `warehouse_id` is always LV. But a shipment
+    routed through GB carries UK VAT that this company expenses rather than
+    reclaims, and the policy expresses that on a per-origin line key. Bucketing
+    on the warehouse collapsed every origin onto `-lv`, so the GB line lost its
+    `vat_deductible: false` and the UK VAT tripped the zero-rated guard.
+    """
+
+    def _record(self, *, warehouse: str, shipped_from: str | None) -> dict:
+        return {
+            "record_id": "r1",
+            "warehouse_id": warehouse,
+            "attributes": {"shipped_from": shipped_from},
+        }
+
+    def test_the_reported_origin_decides_the_vat_bucket(self) -> None:
+        record = self._record(warehouse="LV", shipped_from="GB")
+
+        self.assertEqual(bookbuilder.printful_vat_origin(record), "GB")
+
+    def test_it_falls_back_to_the_warehouse_when_no_origin_is_reported(self) -> None:
+        record = self._record(warehouse="LV", shipped_from=None)
+
+        self.assertEqual(bookbuilder.printful_vat_origin(record), "LV")
+
+    def test_the_origin_is_upper_cased(self) -> None:
+        record = self._record(warehouse="LV", shipped_from="gb")
+
+        self.assertEqual(bookbuilder.printful_vat_origin(record), "GB")

@@ -1234,7 +1234,10 @@ class BooksendTests(unittest.TestCase):
                 {"order_id": "EXAMPLE-2", "gross_amount": 0.03, "vat_amount": 0.01},
             ],
         }]
-        with self.assertRaisesRegex(SimplbooksError, "one order component"):
+        # Merging is allowed where rounding survives it, but not here: two components
+        # carry 0.02 of VAT between them while the rate on the merged 0.06 yields 0.01,
+        # so the posted row would contradict its own evidence.
+        with self.assertRaisesRegex(SimplbooksError, "rounding does not survive"):
             booksend.translate_action_for_api(action, lookup={})
 
     def test_write_reference_verification_requires_woo_tax_bindings(self) -> None:

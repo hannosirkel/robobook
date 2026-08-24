@@ -271,9 +271,9 @@ def reviewed_allocated_rate(
     line: dict[str, Any], *, gross_amount: Decimal, vat_amount: Decimal | None
 ) -> float:
     evidence = line.get("vat_allocation_component_evidence")
-    if not isinstance(evidence, list) or len(evidence) != 1:
+    if not isinstance(evidence, list) or not evidence:
         raise SimplbooksError(
-            "Woo VAT API line must represent exactly one order component so reviewed rounding can be preserved."
+            "Woo VAT API line must carry per-order component evidence so reviewed rounding can be preserved."
         )
     if vat_amount is None:
         raise SimplbooksError("Woo VAT API line requires a reviewed vat_amount_hint.")
@@ -301,10 +301,26 @@ def reviewed_allocated_rate(
     )
     if not valid_binding:
         raise SimplbooksError("Woo VAT API line lacks a usable allocation and tax-source evidence binding.")
-    evidence_gross = abs(decimal_value(item.get("gross_amount")))
-    evidence_vat = abs(decimal_value(item.get("vat_amount")))
+    # Several orders of one product share a row, because Simplbooks refuses an invoice
+    # that repeats an article. The row must still reconcile to the sum of the components
+    # it represents; per-component provenance is verified by the full checker that this
+    # sender runs before any API call.
+    evidence_gross = sum(
+        abs(decimal_value((part or {}).get("gross_amount"))) for part in evidence
+    )
+    evidence_vat = sum(abs(decimal_value((part or {}).get("vat_amount"))) for part in evidence)
     if evidence_gross != gross_amount or evidence_vat != vat_amount:
         raise SimplbooksError("Woo VAT API line does not match its reviewed per-order component evidence.")
+    if len(evidence) != 1:
+        merged_rate = decimal_value(line.get("vat_profile_rate"))
+        aggregate_vat = (
+            gross_amount * merged_rate / (Decimal(100) + merged_rate)
+        ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        if aggregate_vat != vat_amount:
+            raise SimplbooksError(
+                "Woo VAT API line merges order components whose reviewed rounding does not survive "
+                "the rate applied to the merged gross."
+            )
     rate = decimal_value(line.get("vat_profile_rate"))
     if rate < 0:
         raise SimplbooksError("Woo VAT API line has an invalid reviewed VAT profile rate.")

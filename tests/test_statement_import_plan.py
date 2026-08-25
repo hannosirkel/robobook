@@ -485,6 +485,33 @@ class PlanRenderingTests(unittest.TestCase):
         self.assertIn("invoice generated for archive:d", markdown)
         self.assertNotIn("match invoice \n", markdown)
 
+    def split_plan_with_targets(self) -> dict[str, Any]:
+        return PlanSplitTests().split_plan(["-10.00", "-90.00"])
+
+    def test_markdown_names_the_document_each_split_part_settles(self) -> None:
+        """Two parts can share an account pair and still settle different documents.
+
+        A split that pays several purchases renders every part as "debit 38 credit 10",
+        so the accounts alone cannot say which invoice a part belongs to. Assigning the
+        wrong one silently breaks the settlement chain.
+        """
+        markdown = statement_import_plan.render_markdown(self.split_plan_with_targets())
+
+        self.assertIn("purchase 77", markdown)
+
+    def test_markdown_still_names_the_accounts_of_each_split_part(self) -> None:
+        markdown = statement_import_plan.render_markdown(self.split_plan_with_targets())
+
+        self.assertIn("debit 38", markdown)
+        self.assertIn("credit 10", markdown)
+
+    def test_a_split_part_with_no_document_stays_account_only(self) -> None:
+        # A bank fee settles no document; inventing a target for it would be noise.
+        markdown = statement_import_plan.render_markdown(self.split_plan_with_targets())
+
+        fee_line = next(line for line in markdown.splitlines() if "part 1" in line)
+        self.assertIn("part 1 -10.00 debit 32 credit 10", fee_line)
+
     def test_csv_names_the_row_a_generated_direct_sale_invoice_belongs_to(self) -> None:
         csv_text = statement_import_plan.render_csv(self.direct_sale_plan())
 

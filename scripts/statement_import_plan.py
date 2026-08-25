@@ -577,13 +577,25 @@ def render_csv(plan: dict[str, Any]) -> str:
     return buffer.getvalue()
 
 
+def _markdown_part(part: dict[str, Any]) -> str:
+    """One split part, named by the document it settles when it settles one.
+
+    Parts that pay different documents can share an account pair, so the accounts alone
+    cannot say which document a part belongs to. A part that settles nothing -- a bank fee
+    -- stays account-only rather than gaining an invented target.
+    """
+    accounts = part.get("financial_accounts") or {}
+    text = (
+        f"part {part['part_number']} {part['signed_amount']} "
+        f"debit {accounts.get('debit')} credit {accounts.get('credit')}"
+    )
+    target = _document_ref_text(part)
+    return f"{text} → {target}" if target else text
+
+
 def _markdown_instruction(row: dict[str, Any]) -> str:
     if row.get("family") == "reviewed_split":
-        parts = "; ".join(
-            f"part {part['part_number']} {part['signed_amount']} "
-            f"debit {part['financial_accounts']['debit']} credit {part['financial_accounts']['credit']}"
-            for part in row.get("parts") or []
-        )
+        parts = "; ".join(_markdown_part(part) for part in row.get("parts") or [])
         return f"split `{row.get('split_equation')}` — {parts}"
     if row.get("family") == "document_settlement":
         return f"match {_document_ref_text(row)}"

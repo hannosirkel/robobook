@@ -41,7 +41,7 @@ REQUIRED_FINANCIAL_ACCOUNT_ROLES = frozenset(
     }
 )
 
-OPTIONAL_FINANCIAL_ACCOUNT_ROLES = frozenset({"inventory_change", "set_off"})
+OPTIONAL_FINANCIAL_ACCOUNT_ROLES = frozenset({"inventory_change", "set_off", "set_off_ledger"})
 
 KNOWN_FINANCIAL_ACCOUNT_ROLES = REQUIRED_FINANCIAL_ACCOUNT_ROLES | OPTIONAL_FINANCIAL_ACCOUNT_ROLES
 

@@ -460,6 +460,7 @@ def build_statement_import_plan(
     policy: dict[str, Any],
     rate_bindings: list[dict[str, Any]],
     account_labels: dict[str, str] | None = None,
+    clearing_ledger_account: str | None = None,
 ) -> dict[str, Any]:
     """Derive one reviewed instruction per physical statement row, or refuse to plan at all.
 
@@ -495,6 +496,7 @@ def build_statement_import_plan(
         ],
         "coverage": _coverage(rows, physical_count=len(physical)),
         "financial_account_labels": dict(account_labels or {}),
+        "clearing_ledger_account": str(clearing_ledger_account or ""),
         "rows": rows,
     }
 
@@ -636,8 +638,36 @@ def _markdown_part(part: dict[str, Any], plan: dict[str, Any]) -> str:
     return f"{text} → {target}" if target else text
 
 
+def _clearing_instruction(row: dict[str, Any], plan: dict[str, Any]) -> str:
+    """Render a document-settling split as a ledger entry plus a separate settlement.
+
+    The import distributes the actual bank row, so a receivable line larger than the row has
+    no source. Post the document side to a clearing account instead: the ledger entry then
+    balances against real cash, and the documents are settled through the same account
+    afterwards, which nets it to zero without booking the movement twice.
+    """
+    account = str(plan.get("clearing_ledger_account") or "")
+    parts = row.get("parts") or []
+    documents = [part for part in parts if part.get("document_refs")]
+    if not account or not documents:
+        return ""
+    ledger = [_markdown_part(part, plan) for part in parts if not part.get("document_refs")]
+    total = sum(Decimal(str(part["signed_amount"])) for part in documents)
+    ledger.append(f"clearing {total} to {_account(plan, account)}")
+    settlements = "; ".join(
+        f"{part['signed_amount']} {_document_ref_text(part)}" for part in documents
+    )
+    return (
+        f"split `{row.get('split_equation')}` — ledger: {'; '.join(ledger)}"
+        f" — then settle through {_account(plan, account)}: {settlements}"
+    )
+
+
 def _markdown_instruction(row: dict[str, Any], plan: dict[str, Any]) -> str:
     if row.get("family") == "reviewed_split":
+        clearing = _clearing_instruction(row, plan)
+        if clearing:
+            return clearing
         parts = "; ".join(_markdown_part(part, plan) for part in row.get("parts") or [])
         return f"split `{row.get('split_equation')}` — {parts}"
     if row.get("family") == "document_settlement":
@@ -773,6 +803,10 @@ def main(argv: list[str] | None = None) -> int:
                 resolve_rate_paths(company_dir=company_dir, year=args.year, override=args.rates)
             ),
             account_labels=load_account_labels(company_dir, args.financial_accounts),
+            clearing_ledger_account=(
+                ((_load_json(policy_path).get("cash_posting") or {}).get("financial_accounts") or {})
+                .get("set_off_ledger")
+            ),
         )
         result = write_plan_artifacts(plan, output_dir=output_dir)
     except (BankAllocationError, StatementImportPlanError, PostingPolicyError) as exc:

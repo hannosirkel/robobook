@@ -2393,7 +2393,7 @@ class WalletPrintoutTests(unittest.TestCase):
             company = [row for row in rows if row["attributes"].get("card_last4") == "2222"]
             self.assertEqual({row["attributes"]["funding_owner"] for row in personal}, {"reporting_person"})
             self.assertEqual({row["attributes"]["funding_owner"] for row in company}, {"company"})
-            self.assertEqual(len(rows), 5)
+            self.assertEqual(len(rows), 4)
 
     def test_a_deposit_raises_and_a_withdrawal_lowers_the_wallet_balance(self) -> None:
         """Printful's own export signs a deposit + and a withdrawal -, and so does PayPal
@@ -2435,13 +2435,38 @@ class WalletPrintoutTests(unittest.TestCase):
             self.assertNotIn("card_last4", order["attributes"])
             self.assertEqual(order["attributes"]["payment_instrument"], "wallet")
 
-    def test_a_card_charged_fee_keeps_its_funding_owner(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            fee = next(row for row in self.rows(Path(tmp)) if "Warehousing" in row["description"])
+    def test_a_fee_charged_to_a_card_is_not_a_wallet_movement(self) -> None:
+        """Money charged to a card never entered the wallet, so it cannot leave it.
 
-            self.assertEqual(fee["attributes"]["funding_owner"], "company")
-            self.assertEqual(fee["event_type"], "printful_wallet_consumption")
-            self.assertLess(fee["gross_amount"], 0)
+        Only a deposit or a withdrawal moves money between a card and the wallet. Any other
+        card-funded row is a direct charge, already booked from its own billing export.
+        Defaulting it to consumption charged the wallet for money it never held.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            rows, exceptions = parse_wallet(Path(tmp))
+
+            self.assertEqual([r for r in rows["clearing_transactions"] if "Warehousing" in r["description"]], [])
+            self.assertTrue(any("Warehousing" in str(e.get("reason")) for e in exceptions), exceptions)
+
+    def test_an_unclassified_card_row_is_reported_rather_than_dropped_silently(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _rows, exceptions = parse_wallet(Path(tmp))
+
+            fee = next(e for e in exceptions if "Warehousing" in str(e.get("reason")))
+            self.assertEqual(fee["severity"], "warn")
+            self.assertIs(fee["blocking"], False)
+
+    def test_a_wallet_funded_charge_is_still_consumption(self) -> None:
+        text = WALLET_PRINTOUT.replace(
+            '"Warehousing storage fee, Riga\n000000********2222"',
+            '"Printful Warehousing & Fulfillment Stock Removal\nwallet"',
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = self.rows(Path(tmp), text=text)
+
+            removal = next(r for r in rows if "Stock Removal" in r["description"])
+            self.assertEqual(removal["event_type"], "printful_wallet_consumption")
+            self.assertLess(removal["gross_amount"], 0)
 
     def test_an_unreviewed_card_suffix_is_rejected(self) -> None:
         text = WALLET_PRINTOUT.replace("1111", "9999")
@@ -2458,8 +2483,8 @@ class WalletPrintoutTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             rows = self.rows(Path(tmp))
 
-            self.assertEqual(sorted(row["external_ref"] for row in rows), ["101", "102", "103", "104", "105"])
-            self.assertEqual(len({row["record_id"] for row in rows}), 5)
+            self.assertEqual(sorted(row["external_ref"] for row in rows), ["101", "102", "103", "104"])
+            self.assertEqual(len({row["record_id"] for row in rows}), 4)
 
     def test_an_unreadable_date_is_rejected(self) -> None:
         text = WALLET_PRINTOUT.replace("Apr 10, 2024", "10/04/2024")

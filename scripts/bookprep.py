@@ -2549,8 +2549,34 @@ def parse_printful_wallet_printout(
             # A refund returns an order's money to the wallet. Letting it fall through to
             # the consumption default charged the wallet a second time for the same order.
             event_type, sign = "printful_wallet_refund", 1
+        elif normalized_action in WALLET_ACTIONS:
+            event_type, sign = WALLET_ACTIONS[normalized_action]
+        elif card_last4 is None:
+            # Funded by the wallet, so it spends the wallet: an order, a service charge.
+            event_type, sign = "printful_wallet_consumption", -1
         else:
-            event_type, sign = WALLET_ACTIONS.get(normalized_action, ("printful_wallet_consumption", -1))
+            # Charged to a card. Only a deposit or a withdrawal moves money between a card
+            # and the wallet, so this is a direct charge that the billing exports already
+            # book on their own. Treating it as consumption charged the wallet for money it
+            # never held, and the wallet could then never balance.
+            exceptions.append(
+                make_exception(
+                    source=source,
+                    exception_id=f"{source.source_id}:card-charge:{external_ref or line_no}",
+                    severity="warn",
+                    reason=(
+                        f"Skipped card-funded Printful row {action!r}: a charge to card "
+                        f"{card_last4} never entered the wallet."
+                    ),
+                    blocking=False,
+                    row_ref=f"line:{line_no}",
+                    suggested_follow_up=(
+                        "Confirm the charge is booked from the Printful billing export; extend "
+                        "the parser only if it genuinely moves the wallet balance."
+                    ),
+                )
+            )
+            continue
 
         attributes: dict[str, Any] = {
             "action": action,

@@ -4145,3 +4145,48 @@ class SetOffForeignCurrencyTests(unittest.TestCase):
         )
 
         self.assertEqual(found, {"USD"})
+
+
+class RefundShippingPerOrderTests(unittest.TestCase):
+    """An order ships once, however many refund records it produces.
+
+    A processor reports a chargeback and its dispute fee as separate records, each carrying
+    the same order's shipping_amount as an attribute of the order rather than of the record.
+    Summing them charged the shipping twice and, because the revenue line is the remainder,
+    made both lines of the credit note wrong.
+    """
+
+    @staticmethod
+    def _refund(record_id: str, gross: float, shipping: float, order: str | None) -> dict:
+        row = record(record_id=record_id, source_system="paypal", event_type="refund",
+                     gross_amount=gross, vat_amount=0.0, channel="woo")
+        row["shipping_amount"] = shipping
+        if order is not None:
+            row["attributes"]["order_id"] = order
+        return row
+
+    def test_one_order_ships_once_across_several_records(self) -> None:
+        rows = [self._refund("r:1", -32.85, 7.85, "901"),
+                self._refund("r:2", -14.00, 7.85, "901")]
+
+        self.assertEqual(bookbuilder.refund_shipping_total(rows), Decimal("7.85"))
+
+    def test_separate_orders_each_carry_their_own_shipping(self) -> None:
+        rows = [self._refund("r:1", -32.85, 7.85, "901"),
+                self._refund("r:2", -20.00, 4.50, "902")]
+
+        self.assertEqual(bookbuilder.refund_shipping_total(rows), Decimal("12.35"))
+
+    def test_records_without_an_order_are_summed_individually(self) -> None:
+        rows = [self._refund("r:1", -10.00, 2.00, None),
+                self._refund("r:2", -10.00, 3.00, None)]
+
+        self.assertEqual(bookbuilder.refund_shipping_total(rows), Decimal("5.00"))
+
+    def test_the_largest_shipping_seen_for_an_order_is_the_one_taken(self) -> None:
+        # Records disagreeing on an order's shipping means one is partial; the full amount
+        # is the order's, and taking less would understate the shipping refunded.
+        rows = [self._refund("r:1", -32.85, 7.85, "901"),
+                self._refund("r:2", -14.00, 0.00, "901")]
+
+        self.assertEqual(bookbuilder.refund_shipping_total(rows), Decimal("7.85"))

@@ -23,7 +23,7 @@ from bank_allocations import (
     statement_identity,
     validate_reviewed_amounts,
 )
-from document_identity import document_identity, match_existing
+from document_identity import document_identity, match_existing, normalize_external_number
 from exchange_rates import ExchangeRateError, lookup_rate
 from posting_policy import (
     PostingPolicyError,
@@ -3585,6 +3585,102 @@ def summarize_actions(actions: list[dict[str, Any]], *, period: str) -> str:
     return f"Draft batch for {period}: " + ", ".join(parts) + "."
 
 
+# The sender posts these under a generated number when the source has none, so the
+# same key is what proves the document already exists.
+GENERATED_NUMBER_SCHEMAS = frozenset({"purchase_summary_v1", "purchase_credit_summary_v1"})
+
+
+def suppress_existing_summary_actions(
+    actions: list[dict[str, Any]],
+    *,
+    discovery_overviews: list[dict[str, Any]] | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Drop a summary Simplbooks already holds under this batch's own key.
+
+    A summary aggregates many source records, so it carries no supplier invoice number and
+    booksend posts it under the action key instead. Record-level suppression matches on
+    external_ref and therefore cannot see it: a partially submitted month would resend the
+    summary, Simplbooks would refuse the duplicate number, and the period would wedge with
+    no way forward but deleting a live document.
+
+    Only schemas that actually post under the generated key are eligible. An invoice is
+    numbered by Simplbooks, and a summary carrying a real external_ref is posted under that
+    number instead, so both are left to record-level matching.
+    """
+    index: dict[str, str] = {}
+    for overview in discovery_overviews or []:
+        for item in (overview or {}).get("document_index") or []:
+            if not isinstance(item, dict):
+                continue
+            number = normalize_external_number(item.get("external_number"))
+            if number and number not in index:
+                index[number] = str(item.get("simplbooks_id") or "")
+    if not index:
+        return list(actions), []
+
+    kept: list[dict[str, Any]] = []
+    already_present: list[dict[str, Any]] = []
+    suppressed: dict[str, str] = {}
+    for action in actions:
+        payload = action.get("payload") or {}
+        if str(payload.get("draft_schema") or "") not in GENERATED_NUMBER_SCHEMAS:
+            kept.append(action)
+            continue
+        if str(payload.get("external_ref") or "").strip():
+            kept.append(action)
+            continue
+        key = str(action.get("idempotency_key") or "")
+        matched = index.get(normalize_external_number(key) or "")
+        if matched is None:
+            kept.append(action)
+            continue
+        if not matched.strip():
+            # Without an id a dependent cannot address the live document, and dropping the
+            # summary anyway would orphan it. Refuse instead of posting a broken batch.
+            raise SimplbooksError(
+                f"Simplbooks already holds {key} but discovery carries no id for it, so a "
+                "dependent settlement could not be repointed."
+            )
+        suppressed[key] = matched
+        already_present.append(
+            {
+                "record_ref": key,
+                "external_ref": key,
+                "document_type": str(payload.get("document_type") or "purchase"),
+                "simplbooks_id": matched,
+                "reason": (
+                    "Simplbooks already holds this summary under the batch key it is posted "
+                    "with; resending it would be refused as a duplicate number."
+                ),
+            }
+        )
+    return _repoint_suppressed_dependents(kept, suppressed), already_present
+
+
+def _repoint_suppressed_dependents(
+    actions: list[dict[str, Any]], suppressed: dict[str, str]
+) -> list[dict[str, Any]]:
+    """Address a suppressed summary by its live id instead of an action that is gone."""
+    if not suppressed:
+        return actions
+    repointed: list[dict[str, Any]] = []
+    for action in actions:
+        depends_on = [str(dep) for dep in action.get("depends_on") or []]
+        payload = action.get("payload") or {}
+        linked = str(payload.get("linked_purchase_action") or "")
+        if not (set(depends_on) & set(suppressed)) and linked not in suppressed:
+            repointed.append(action)
+            continue
+        updated = copy.deepcopy(action)
+        updated["depends_on"] = [dep for dep in depends_on if dep not in suppressed]
+        if linked in suppressed:
+            updated_payload = updated.get("payload") or {}
+            updated_payload.pop("linked_purchase_action", None)
+            updated_payload["linked_purchase_id"] = suppressed[linked]
+        repointed.append(updated)
+    return repointed
+
+
 def suppress_existing_purchase_records(
     records: dict[str, list[dict[str, Any]]],
     discovery_overview: dict[str, Any] | None,
@@ -4476,6 +4572,12 @@ def build_action_batch(
         + cash_actions
         + set_off_actions
     )
+    actions, suppressed_summaries = suppress_existing_summary_actions(
+        actions,
+        discovery_overviews=discovery_overviews
+        or ([discovery_overview] if discovery_overview else []),
+    )
+    already_present = list(already_present) + suppressed_summaries
     unresolved_dependencies = apply_posting_policy(actions, posting_policy=posting_policy, entity_map=entity_map)
     unresolved_dependencies.extend(
         build_manual_financial_dependencies(

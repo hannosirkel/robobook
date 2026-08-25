@@ -1172,10 +1172,15 @@ class BooksendTests(unittest.TestCase):
 
         self.assertEqual(client.calls, [])
 
-    def test_sender_copies_reviewed_rate_and_translates_supplier_credit(self) -> None:
+    def test_sender_inverts_reviewed_rate_and_translates_supplier_credit(self) -> None:
+        """Simplbooks means foreign-per-euro by currency_rate; the evidence means the inverse.
+
+        Copying the reviewed 0.9241 verbatim made Simplbooks divide by it, valuing the
+        document at 1/0.9241 squared of its worth.
+        """
         translated = booksend.translate_action_for_api(purchase_credit_action(), lookup={})
 
-        self.assertEqual(translated["payload"]["Purchase"]["currency_rate"], 0.9241)
+        self.assertAlmostEqual(translated["payload"]["Purchase"]["currency_rate"], 1 / 0.9241, places=5)
         self.assertEqual(translated["payload"]["PurchaseRows"][0]["PurchaseRow"]["sum"], -113.12)
 
     def test_sender_preserves_reviewed_rate_and_per_order_rounding_lines(self) -> None:
@@ -1954,3 +1959,39 @@ class CrossPeriodDependencyOrderingTests(unittest.TestCase):
         ordered = booksend.stable_execution_order(actions, external_keys={"x-other"})
 
         self.assertEqual([a["idempotency_key"] for a in ordered], ["a-first", "b-second"])
+
+
+class SimplbooksCurrencyRateDirectionTests(unittest.TestCase):
+    """Simplbooks reads currency_rate as "1 EUR = X foreign"; our evidence is the inverse.
+
+    The ECB cache is quoted base=USD quote=EUR, so a reviewed rate of 0.96219 means
+    1 USD = 0.96219 EUR. Simplbooks converts with `EUR = foreign / rate`, so sending that
+    number unchanged valued a 306.32 USD purchase at 331.16 EUR instead of 283.34 -- it
+    divided where we meant to multiply, and the document displayed "1 EUR = 0.9622 USD"
+    when a euro was really worth about 1.04 dollars.
+    """
+
+    def payload(self, rate: str = "0.96219", currency: str = "USD") -> dict:
+        return {"currency": currency, "currency_rate": rate}
+
+    def test_a_foreign_rate_is_sent_as_foreign_units_per_euro(self) -> None:
+        sent = booksend.reviewed_currency_rate(self.payload())
+
+        self.assertAlmostEqual(sent, 1.03930, places=5)
+
+    def test_the_sent_rate_reproduces_the_reviewed_conversion(self) -> None:
+        # 306.32 USD at 1 USD = 0.92498 EUR is 283.34 EUR, and Simplbooks divides.
+        sent = booksend.reviewed_currency_rate(self.payload(rate="0.92498"))
+
+        self.assertAlmostEqual(306.32 / sent, 283.34, places=2)
+
+    def test_the_base_currency_is_still_exactly_one(self) -> None:
+        self.assertEqual(booksend.reviewed_currency_rate(self.payload(currency="EUR")), 1.0)
+
+    def test_a_missing_rate_is_still_refused(self) -> None:
+        with self.assertRaises(booksend.SimplbooksError):
+            booksend.reviewed_currency_rate({"currency": "USD"})
+
+    def test_a_non_positive_rate_is_still_refused(self) -> None:
+        with self.assertRaises(booksend.SimplbooksError):
+            booksend.reviewed_currency_rate(self.payload(rate="0"))

@@ -658,3 +658,47 @@ class RatePathResolutionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+ACCOUNT_LABELS = {"10": "1020 Pangakonto", "32": "5350 Pangateenused", "37": "1210 Noeuded", "38": "2310 Volad"}
+
+
+class PlanAccountLabelTests(unittest.TestCase):
+    """The plan speaks internal IDs; the Simplbooks UI shows codes and names.
+
+    An instruction reading "debit 2 credit 260" cannot be followed against a UI that only
+    ever shows "1020 Pangakonto" and "1021 PayPal", so the checklist must carry both.
+    """
+
+    def labelled(self) -> dict[str, Any]:
+        return build(account_labels=ACCOUNT_LABELS)
+
+    def test_a_plan_records_the_labels_it_was_built_with(self) -> None:
+        self.assertEqual(self.labelled()["financial_account_labels"], ACCOUNT_LABELS)
+
+    def test_markdown_names_the_account_beside_its_id(self) -> None:
+        markdown = statement_import_plan.render_markdown(self.labelled())
+
+        self.assertIn("debit 32 (5350 Pangateenused)", markdown)
+        self.assertIn("credit 10 (1020 Pangakonto)", markdown)
+
+    def test_split_parts_are_labelled_too(self) -> None:
+        plan = PlanSplitTests().split_plan(["-10.00", "-90.00"])
+        plan["financial_account_labels"] = ACCOUNT_LABELS
+
+        markdown = statement_import_plan.render_markdown(plan)
+
+        self.assertIn("debit 38 (2310 Volad)", markdown)
+
+    def test_an_unlabelled_account_still_renders_its_id(self) -> None:
+        plan = build(account_labels={"10": "1020 Pangakonto"})
+
+        markdown = statement_import_plan.render_markdown(plan)
+
+        self.assertIn("debit 32 ", markdown)
+        self.assertNotIn("debit 32 (", markdown)
+
+    def test_a_plan_built_without_labels_is_unchanged(self) -> None:
+        markdown = statement_import_plan.render_markdown(build())
+
+        self.assertIn("debit 32 credit 10", markdown)

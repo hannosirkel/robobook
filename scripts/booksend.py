@@ -629,7 +629,12 @@ def reviewed_currency_rate(payload: dict[str, Any], *, base_currency: str = "EUR
     rate = decimal_value(raw_rate)
     if rate <= 0:
         raise SimplbooksError(f"Foreign-currency action has invalid reviewed currency_rate {raw_rate!r} for {currency}.")
-    return decimal_number(rate)
+    # The reviewed cache is quoted base=foreign quote=EUR, so the rate means
+    # "1 foreign = rate EUR". Simplbooks means the opposite by currency_rate and converts
+    # with EUR = foreign / rate, so it needs foreign units per euro. Sending our number
+    # unchanged divided where the evidence multiplies and overstated every foreign
+    # document by 1/rate squared.
+    return decimal_number(Decimal(1) / rate)
 
 
 def translate_purchase_payload(action: dict[str, Any], *, credit: bool = False) -> dict[str, Any]:

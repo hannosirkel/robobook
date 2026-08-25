@@ -638,6 +638,23 @@ def _markdown_part(part: dict[str, Any], plan: dict[str, Any]) -> str:
     return f"{text} → {target}" if target else text
 
 
+def _is_plain_distribution(row: dict[str, Any]) -> bool:
+    """Whether the split merely divides the row, which the import UI can do directly.
+
+    It can when every part moves the same way as the row and none exceeds it. A part
+    pointing the other way, or larger than the row, has no source inside the row and needs
+    a clearing account to stand behind it.
+    """
+    total = Decimal(str(row.get("signed_amount") or 0))
+    for part in row.get("parts") or []:
+        amount = Decimal(str(part.get("signed_amount") or 0))
+        if amount and (amount > 0) != (total > 0):
+            return False
+        if abs(amount) > abs(total):
+            return False
+    return True
+
+
 def _clearing_instruction(row: dict[str, Any], plan: dict[str, Any]) -> str:
     """Render a document-settling split as a ledger entry plus a separate settlement.
 
@@ -650,6 +667,10 @@ def _clearing_instruction(row: dict[str, Any], plan: dict[str, Any]) -> str:
     parts = row.get("parts") or []
     documents = [part for part in parts if part.get("document_refs")]
     if not account or not documents:
+        return ""
+    if _is_plain_distribution(row):
+        # The import can express this itself: divide the row, match each piece. Clearing
+        # would add two entries and an account to reconcile for nothing.
         return ""
     ledger = [_markdown_part(part, plan) for part in parts if not part.get("document_refs")]
     total = sum(Decimal(str(part["signed_amount"])) for part in documents)

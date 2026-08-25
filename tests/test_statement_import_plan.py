@@ -714,7 +714,15 @@ class ClearingSplitRenderingTests(unittest.TestCase):
     """
 
     def plan(self) -> dict[str, Any]:
+        # A receivable larger than the row, offset by a payment: the shape the import
+        # cannot express, and the only one clearing is for.
         p = PlanSplitTests().split_plan(["-10.00", "-90.00"])
+        row = p["rows"][0]
+        row["signed_amount"] = "43.88"
+        row["split_equation"] = "43.88 = 64.76 + -20.88"
+        for part, amount in zip(row["parts"], ["64.76", "-20.88"]):
+            part["signed_amount"] = amount
+        row["parts"][1]["document_refs"] = [{"document_type": "purchase", "simplbooks_id": "77"}]
         p["financial_account_labels"] = {"10": "1020 Pangakonto", "32": "5350 Pangateenused",
                                          "38": "2310 Volad", "99": "9999 Tasaarveldused"}
         p["clearing_ledger_account"] = "99"
@@ -746,3 +754,47 @@ class ClearingSplitRenderingTests(unittest.TestCase):
         markdown = statement_import_plan.render_markdown(p)
 
         self.assertNotIn("Tasaarveldused", markdown)
+
+
+class ClearingOnlyWhenNeededTests(unittest.TestCase):
+    """Clearing exists to express what the import cannot, not to replace what it can.
+
+    A split whose parts all move the same way as the row, none larger than it, is exactly
+    what the import UI does natively: divide the row and match each piece to its document.
+    Routing that through a clearing account adds two entries and an account to reconcile
+    for no gain.
+    """
+
+    def plan(self, part_amounts: list[str], row_amount: str) -> dict[str, Any]:
+        p = PlanSplitTests().split_plan(part_amounts)
+        row = p["rows"][0]
+        row["signed_amount"] = row_amount
+        row["split_equation"] = f"{row_amount} = " + " + ".join(part_amounts)
+        for part, amount in zip(row["parts"], part_amounts):
+            part["signed_amount"] = amount
+            part["document_refs"] = [{"document_type": "purchase", "simplbooks_id": "77"}]
+        p["financial_account_labels"] = {"99": "9999 Tasaarveldused"}
+        p["clearing_ledger_account"] = "99"
+        return p
+
+    def test_a_split_that_only_divides_the_row_is_matched_directly(self) -> None:
+        markdown = statement_import_plan.render_markdown(
+            self.plan(["-11.93", "-14.01"], "-25.94")
+        )
+
+        self.assertNotIn("Tasaarveldused", markdown)
+        self.assertIn("purchase 77", markdown)
+
+    def test_a_part_opposite_to_the_row_still_needs_clearing(self) -> None:
+        markdown = statement_import_plan.render_markdown(
+            self.plan(["64.76", "-20.88"], "43.88")
+        )
+
+        self.assertIn("Tasaarveldused", markdown)
+
+    def test_a_part_larger_than_the_row_still_needs_clearing(self) -> None:
+        markdown = statement_import_plan.render_markdown(
+            self.plan(["55.56", "-21.00"], "34.56")
+        )
+
+        self.assertIn("Tasaarveldused", markdown)

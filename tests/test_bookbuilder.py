@@ -3886,3 +3886,215 @@ class SetOffContactHintTests(unittest.TestCase):
         self.assertEqual(
             {p["payload"]["vendor_hint"] for p in payments}, {"example supplier"}
         )
+
+
+def summary_action(key: str, *, schema: str = "purchase_summary_v1", external_ref: str | None = None) -> dict:
+    payload: dict = {"draft_schema": schema, "document_type": "purchase"}
+    if external_ref is not None:
+        payload["external_ref"] = external_ref
+    return {"idempotency_key": key, "action_type": "create_purchase_summary", "payload": payload}
+
+
+def discovery_with(*numbers: str) -> dict:
+    return {
+        "document_index": [
+            {"document_type": "purchase", "external_number": number, "simplbooks_id": str(900 + i)}
+            for i, number in enumerate(numbers)
+        ]
+    }
+
+
+class SummarySuppressionTests(unittest.TestCase):
+    """A summary posts under its own action key, so that key is what proves it exists.
+
+    Record-level suppression matches a supplier's external_ref, which a monthly aggregate
+    never has. Without this, a partially submitted month resends the summary and Simplbooks
+    refuses the duplicate number, wedging the period.
+    """
+
+    def test_a_summary_already_posted_under_its_own_key_is_suppressed(self) -> None:
+        actions = [summary_action("example-2025-08-purchase-supplier")]
+
+        kept, present = bookbuilder.suppress_existing_summary_actions(
+            actions, discovery_overviews=[discovery_with("example-2025-08-purchase-supplier")]
+        )
+
+        self.assertEqual(kept, [])
+        self.assertEqual(len(present), 1)
+        self.assertEqual(present[0]["external_ref"], "example-2025-08-purchase-supplier")
+        self.assertEqual(present[0]["simplbooks_id"], "900")
+
+    def test_matching_ignores_the_casing_simplbooks_applies(self) -> None:
+        actions = [summary_action("example-2025-08-purchase-supplier")]
+
+        kept, present = bookbuilder.suppress_existing_summary_actions(
+            actions, discovery_overviews=[discovery_with("EXAMPLE-2025-08-PURCHASE-SUPPLIER")]
+        )
+
+        self.assertEqual(kept, [])
+        self.assertEqual(len(present), 1)
+
+    def test_an_unposted_summary_is_kept(self) -> None:
+        actions = [summary_action("example-2025-08-purchase-supplier")]
+
+        kept, present = bookbuilder.suppress_existing_summary_actions(
+            actions, discovery_overviews=[discovery_with("something-else")]
+        )
+
+        self.assertEqual([a["idempotency_key"] for a in kept], ["example-2025-08-purchase-supplier"])
+        self.assertEqual(present, [])
+
+    def test_a_summary_carrying_a_real_supplier_number_is_left_to_record_matching(self) -> None:
+        # The sender posts external_ref when present, so the action key is not its number.
+        actions = [summary_action("example-2025-08-purchase-supplier", external_ref="00635-00011")]
+
+        kept, present = bookbuilder.suppress_existing_summary_actions(
+            actions, discovery_overviews=[discovery_with("example-2025-08-purchase-supplier")]
+        )
+
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(present, [])
+
+    def test_an_invoice_summary_is_not_suppressed_because_simplbooks_numbers_it(self) -> None:
+        actions = [summary_action("example-2025-08-sales-woo", schema="invoice_summary_v1")]
+
+        kept, present = bookbuilder.suppress_existing_summary_actions(
+            actions, discovery_overviews=[discovery_with("example-2025-08-sales-woo")]
+        )
+
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(present, [])
+
+    def test_no_discovery_evidence_suppresses_nothing(self) -> None:
+        actions = [summary_action("example-2025-08-purchase-supplier")]
+
+        kept, present = bookbuilder.suppress_existing_summary_actions(
+            actions, discovery_overviews=[]
+        )
+
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(present, [])
+
+
+class SuppressedSummaryDependentsTests(unittest.TestCase):
+    """Suppressing a summary must re-point whatever depended on it, or the wedge just moves.
+
+    This is the real 2025-08 shape: a purchase posted, then a set-off payment against it
+    failed. On retry the purchase is suppressed, so the payment can no longer resolve it
+    inside the batch and must address the live document by id instead.
+    """
+
+    @staticmethod
+    def _batch() -> list[dict]:
+        return [
+            summary_action("example-2025-08-purchase-supplier"),
+            {
+                "idempotency_key": "example-2025-08-setoff-payment-1",
+                "action_type": "create_payment_summary",
+                "depends_on": ["example-2025-08-purchase-supplier"],
+                "payload": {
+                    "draft_schema": "cash_settlement_v1",
+                    "document_type": "payment",
+                    "linked_purchase_action": "example-2025-08-purchase-supplier",
+                    "amount": 9.26,
+                },
+            },
+        ]
+
+    def test_a_dependent_is_repointed_at_the_live_document_id(self) -> None:
+        kept, present = bookbuilder.suppress_existing_summary_actions(
+            self._batch(),
+            discovery_overviews=[discovery_with("example-2025-08-purchase-supplier")],
+        )
+
+        self.assertEqual([a["idempotency_key"] for a in kept], ["example-2025-08-setoff-payment-1"])
+        payment = kept[0]
+        self.assertEqual(payment["payload"]["linked_purchase_id"], "900")
+        self.assertNotIn("linked_purchase_action", payment["payload"])
+        self.assertEqual(payment["depends_on"], [])
+        self.assertEqual(len(present), 1)
+
+    def test_a_dependent_of_a_kept_summary_is_untouched(self) -> None:
+        kept, _ = bookbuilder.suppress_existing_summary_actions(
+            self._batch(), discovery_overviews=[discovery_with("unrelated")]
+        )
+
+        payment = next(a for a in kept if a["action_type"] == "create_payment_summary")
+        self.assertEqual(
+            payment["payload"]["linked_purchase_action"], "example-2025-08-purchase-supplier"
+        )
+        self.assertEqual(payment["depends_on"], ["example-2025-08-purchase-supplier"])
+
+    def test_suppression_without_a_usable_id_is_refused_rather_than_orphaning(self) -> None:
+        overview = {
+            "document_index": [
+                {"document_type": "purchase",
+                 "external_number": "example-2025-08-purchase-supplier",
+                 "simplbooks_id": ""}
+            ]
+        }
+
+        with self.assertRaises(bookbuilder.SimplbooksError) as caught:
+            bookbuilder.suppress_existing_summary_actions(
+                self._batch(), discovery_overviews=[overview]
+            )
+
+        self.assertIn("example-2025-08-purchase-supplier", str(caught.exception))
+
+
+class SummarySuppressionEndToEndTests(unittest.TestCase):
+    """The whole point: a partially submitted month must rebuild into a sendable batch."""
+
+    @staticmethod
+    def _normalized() -> dict:
+        n = base_normalized("2025-08")
+        n["records"]["purchase_expenses"] = [
+            record(record_id="pf:1", source_system="supplier", event_type="supplier_invoice",
+                   gross_amount=21.0, vat_amount=0.0, channel="supplier"),
+        ]
+        n["records"]["purchase_expenses"][0]["event_date"] = "2025-08-31"
+        return n
+
+    def _build(self, overview: dict | None, *, singular: bool) -> dict:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            kwargs: dict = {}
+            if overview is not None:
+                kwargs["discovery_overview" if singular else "discovery_overviews"] = (
+                    overview if singular else [overview]
+                )
+            return bookbuilder.build_action_batch(
+                normalized_payload=self._normalized(),
+                recon_payload=base_recon("2025-08"),
+                normalized_path=root / "normalized.json",
+                recon_path=root / "recon.json",
+                repo_root=root,
+                **kwargs,
+            )
+
+    def _purchase_keys(self, batch: dict) -> list[str]:
+        return [
+            a["idempotency_key"] for a in batch["actions"]
+            if (a.get("payload") or {}).get("draft_schema") == "purchase_summary_v1"
+        ]
+
+    def test_a_summary_is_built_when_simplbooks_does_not_have_it(self) -> None:
+        batch = self._build(discovery_with("unrelated-number"), singular=False)
+
+        self.assertEqual(len(self._purchase_keys(batch)), 1)
+        self.assertEqual(batch["already_present"], [])
+
+    def test_the_same_summary_is_suppressed_once_simplbooks_has_it(self) -> None:
+        key = self._purchase_keys(self._build(discovery_with("unrelated-number"), singular=False))[0]
+
+        batch = self._build(discovery_with(key), singular=False)
+
+        self.assertEqual(self._purchase_keys(batch), [])
+        self.assertEqual([p["external_ref"] for p in batch["already_present"]], [key])
+
+    def test_a_singular_discovery_overview_suppresses_too(self) -> None:
+        key = self._purchase_keys(self._build(discovery_with("unrelated-number"), singular=False))[0]
+
+        batch = self._build(discovery_with(key), singular=True)
+
+        self.assertEqual(self._purchase_keys(batch), [])

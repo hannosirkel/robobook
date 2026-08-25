@@ -702,3 +702,47 @@ class PlanAccountLabelTests(unittest.TestCase):
         markdown = statement_import_plan.render_markdown(build())
 
         self.assertIn("debit 32 credit 10", markdown)
+
+
+class ClearingSplitRenderingTests(unittest.TestCase):
+    """A row whose parts settle documents cannot be entered as a plain ledger split.
+
+    The import distributes the actual row, so a receivable line larger than the row has
+    nowhere to come from. Routing the document side through a clearing account keeps the
+    ledger entry balanced against the real cash, and lets the documents be settled
+    separately without booking the same movement twice.
+    """
+
+    def plan(self) -> dict[str, Any]:
+        p = PlanSplitTests().split_plan(["-10.00", "-90.00"])
+        p["financial_account_labels"] = {"10": "1020 Pangakonto", "32": "5350 Pangateenused",
+                                         "38": "2310 Volad", "99": "9999 Tasaarveldused"}
+        p["clearing_ledger_account"] = "99"
+        return p
+
+    def test_the_clearing_account_carries_the_document_side(self) -> None:
+        markdown = statement_import_plan.render_markdown(self.plan())
+
+        self.assertIn("9999 Tasaarveldused", markdown)
+
+    def test_a_part_settling_no_document_stays_a_plain_ledger_line(self) -> None:
+        markdown = statement_import_plan.render_markdown(self.plan())
+
+        self.assertIn("5350 Pangateenused", markdown)
+
+    def test_without_a_clearing_account_the_row_renders_as_before(self) -> None:
+        p = PlanSplitTests().split_plan(["-10.00", "-90.00"])
+
+        markdown = statement_import_plan.render_markdown(p)
+
+        self.assertNotIn("Tasaarveldused", markdown)
+        self.assertIn("part 1 -10.00 debit 32 credit 10", markdown)
+
+    def test_a_split_with_no_document_parts_is_left_alone(self) -> None:
+        p = self.plan()
+        for part in p["rows"][0]["parts"]:
+            part["document_refs"] = []
+
+        markdown = statement_import_plan.render_markdown(p)
+
+        self.assertNotIn("Tasaarveldused", markdown)

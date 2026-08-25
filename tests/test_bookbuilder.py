@@ -4098,3 +4098,50 @@ class SummarySuppressionEndToEndTests(unittest.TestCase):
         batch = self._build(discovery_with(key), singular=True)
 
         self.assertEqual(self._purchase_keys(batch), [])
+
+
+class SetOffForeignCurrencyTests(unittest.TestCase):
+    """A corrections batch has no records of its own, only reviewed set-offs.
+
+    Foreign currency was read from the normalized records alone, so a USD set-off in a batch
+    whose records are empty never required an ECB cache and never bound one. The checker then
+    refused the batch, correctly, for evidence the builder should have supplied.
+    """
+
+    @staticmethod
+    def _normalized() -> dict:
+        return base_normalized("2026-01")
+
+    def test_a_foreign_setoff_makes_the_batch_foreign(self) -> None:
+        found = bookbuilder.foreign_currencies_for_build(
+            self._normalized(), [setoff_fixture(currency="USD")]
+        )
+
+        self.assertEqual(found, {"USD"})
+
+    def test_a_base_currency_setoff_does_not(self) -> None:
+        found = bookbuilder.foreign_currencies_for_build(
+            self._normalized(), [setoff_fixture(currency="EUR")]
+        )
+
+        self.assertEqual(found, set())
+
+    def test_record_currencies_are_still_counted(self) -> None:
+        normalized = self._normalized()
+        row = record(record_id="p:1", source_system="s", event_type="e",
+                     gross_amount=1.0, vat_amount=0.0, channel="c")
+        row["currency"] = "SEK"
+        normalized["records"]["purchase_expenses"] = [row]
+
+        found = bookbuilder.foreign_currencies_for_build(normalized, [])
+
+        self.assertEqual(found, {"SEK"})
+
+    def test_a_setoff_for_another_period_still_counts_for_the_cache(self) -> None:
+        # The cache is bound per batch, before any period filtering, so evidence for a
+        # sibling period must not silently drop the requirement.
+        found = bookbuilder.foreign_currencies_for_build(
+            self._normalized(), [setoff_fixture(currency="USD", period="2026-02")]
+        )
+
+        self.assertEqual(found, {"USD"})

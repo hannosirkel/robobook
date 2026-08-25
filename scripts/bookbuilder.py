@@ -4381,6 +4381,31 @@ def build_set_off_actions(
     return actions
 
 
+def foreign_currencies_for_build(
+    normalized_payload: dict[str, Any],
+    set_off_evidence: list[dict[str, Any]] | None,
+) -> set[str]:
+    """Every non-base currency this batch will post, from records and reviewed set-offs.
+
+    A corrections batch carries no records of its own: its documents come entirely from
+    reviewed set-off evidence. Reading currency from the records alone let a foreign set-off
+    through with no ECB cache bound, which the checker then refused.
+    """
+    base = str(normalized_payload.get("base_currency") or "EUR").upper()
+    found = {
+        str(record.get("currency") or base).upper()
+        for category_records in (normalized_payload.get("records") or {}).values()
+        for record in category_records
+        if isinstance(record, dict)
+    }
+    found |= {
+        str(entry.get("currency") or base).upper()
+        for entry in set_off_evidence or []
+        if isinstance(entry, dict)
+    }
+    return {currency for currency in found if currency != base}
+
+
 def build_action_batch(
     *,
     normalized_payload: dict[str, Any],
@@ -4901,14 +4926,15 @@ def main() -> int:
         raise SimplbooksError(f"Required posting policy not found: {posting_policy_path}")
     if reference_artifacts_required and (discovery_overview_path is None or not discovery_overview_path.exists()):
         raise SimplbooksError(f"Required discovery overview not found: {discovery_overview_path}")
-    foreign_currencies = {
-        str(record.get("currency") or normalized_payload.get("base_currency") or "EUR").upper()
-        for category_records in (normalized_payload.get("records") or {}).values()
-        for record in category_records
-        if isinstance(record, dict)
-        and str(record.get("currency") or normalized_payload.get("base_currency") or "EUR").upper()
-        != str(normalized_payload.get("base_currency") or "EUR").upper()
-    }
+    set_off_evidence = load_set_off_evidence(
+        resolve_set_off_evidence_path(
+            company_dir=company_dir,
+            normalized_path=normalized_path,
+            period=args.period,
+            override=args.setoffs,
+        )
+    )
+    foreign_currencies = foreign_currencies_for_build(normalized_payload, set_off_evidence)
     if foreign_currencies and (exchange_rates_path is None or not exchange_rates_path.exists()):
         raise SimplbooksError(f"Required annual ECB exchange-rate cache not found: {exchange_rates_path}")
 

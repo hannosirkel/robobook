@@ -422,6 +422,36 @@ def _coverage(rows: list[dict[str, Any]], *, physical_count: int) -> dict[str, A
     }
 
 
+def load_account_labels(company_dir: Path | None, override: Path | None) -> dict[str, str]:
+    """Map account id to the "code name" the Simplbooks UI shows, if discovery captured it.
+
+    Absent evidence renders bare ids, exactly as before, rather than failing the plan: the
+    labels make an instruction easier to follow but are not part of what it means.
+    """
+    if override:
+        path = Path(override)
+    elif company_dir is not None:
+        path = Path(company_dir) / "artifacts" / "discovery" / "financial-accounts.json"
+    else:
+        return {}
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise StatementImportPlanError(f"Financial account evidence {path} is unreadable: {exc}") from exc
+    labels: dict[str, str] = {}
+    for entry in payload.get("accounts") or []:
+        if not isinstance(entry, dict):
+            continue
+        account_id = str(entry.get("id") or "").strip()
+        code = str(entry.get("code") or "").strip()
+        name = str(entry.get("name") or "").strip()
+        if account_id and (code or name):
+            labels[account_id] = " ".join(part for part in (code, name) if part)
+    return labels
+
+
 def build_statement_import_plan(
     *,
     year: int,
@@ -429,6 +459,7 @@ def build_statement_import_plan(
     allocation_payload: dict[str, Any],
     policy: dict[str, Any],
     rate_bindings: list[dict[str, Any]],
+    account_labels: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Derive one reviewed instruction per physical statement row, or refuse to plan at all.
 
@@ -463,6 +494,7 @@ def build_statement_import_plan(
             for binding in rate_bindings
         ],
         "coverage": _coverage(rows, physical_count=len(physical)),
+        "financial_account_labels": dict(account_labels or {}),
         "rows": rows,
     }
 
@@ -577,7 +609,18 @@ def render_csv(plan: dict[str, Any]) -> str:
     return buffer.getvalue()
 
 
-def _markdown_part(part: dict[str, Any]) -> str:
+def _account(plan: dict[str, Any], account_id: Any) -> str:
+    """An account as the UI shows it, falling back to the bare id when unlabelled.
+
+    The plan works in internal ids; Simplbooks only ever displays a code and name, so an
+    instruction naming one but not the other cannot be followed without a lookup.
+    """
+    text = str(account_id)
+    label = (plan.get("financial_account_labels") or {}).get(text)
+    return f"{text} ({label})" if label else text
+
+
+def _markdown_part(part: dict[str, Any], plan: dict[str, Any]) -> str:
     """One split part, named by the document it settles when it settles one.
 
     Parts that pay different documents can share an account pair, so the accounts alone
@@ -587,20 +630,23 @@ def _markdown_part(part: dict[str, Any]) -> str:
     accounts = part.get("financial_accounts") or {}
     text = (
         f"part {part['part_number']} {part['signed_amount']} "
-        f"debit {accounts.get('debit')} credit {accounts.get('credit')}"
+        f"debit {_account(plan, accounts.get('debit'))} credit {_account(plan, accounts.get('credit'))}"
     )
     target = _document_ref_text(part)
     return f"{text} → {target}" if target else text
 
 
-def _markdown_instruction(row: dict[str, Any]) -> str:
+def _markdown_instruction(row: dict[str, Any], plan: dict[str, Any]) -> str:
     if row.get("family") == "reviewed_split":
-        parts = "; ".join(_markdown_part(part) for part in row.get("parts") or [])
+        parts = "; ".join(_markdown_part(part, plan) for part in row.get("parts") or [])
         return f"split `{row.get('split_equation')}` — {parts}"
     if row.get("family") == "document_settlement":
         return f"match {_document_ref_text(row)}"
     accounts = row.get("financial_accounts") or {}
-    return f"debit {accounts.get('debit')} credit {accounts.get('credit')}"
+    return (
+        f"debit {_account(plan, accounts.get('debit'))} "
+        f"credit {_account(plan, accounts.get('credit'))}"
+    )
 
 
 def render_markdown(plan: dict[str, Any]) -> str:
@@ -624,7 +670,7 @@ def render_markdown(plan: dict[str, Any]) -> str:
         suffix = f" (ECB {rate})" if rate else ""
         lines.append(
             f"- [ ] `{row.get('statement_id')}` {row.get('date')} {row.get('signed_amount')} "
-            f"{row.get('currency')}{suffix} — {row.get('ui_action')}: {_markdown_instruction(row)}"
+            f"{row.get('currency')}{suffix} — {row.get('ui_action')}: {_markdown_instruction(row, plan)}"
         )
     return "\n".join(lines) + "\n"
 
@@ -697,6 +743,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--normalized", nargs="*", type=Path, default=None)
     parser.add_argument("--allocations", type=Path, default=None)
     parser.add_argument("--policy", type=Path, default=None)
+    parser.add_argument("--financial-accounts", type=Path, default=None,
+                        help="Discovery evidence mapping account ids to code and name")
     parser.add_argument("--rates", nargs="*", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     return parser
@@ -724,6 +772,7 @@ def main(argv: list[str] | None = None) -> int:
             rate_bindings=_rate_bindings(
                 resolve_rate_paths(company_dir=company_dir, year=args.year, override=args.rates)
             ),
+            account_labels=load_account_labels(company_dir, args.financial_accounts),
         )
         result = write_plan_artifacts(plan, output_dir=output_dir)
     except (BankAllocationError, StatementImportPlanError, PostingPolicyError) as exc:

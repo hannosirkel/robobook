@@ -317,6 +317,20 @@ def _verify_builder_output(
     return batch
 
 
+def resolve_exchange_rates_path(
+    company_dir: Path, period: str, override: str | None = None
+) -> str:
+    """Name the ECB cache this batch needs, defaulting to its own year.
+
+    A corrections batch settles documents from an earlier year, and the cache is validated
+    against the document's year rather than the batch period, so the period alone cannot
+    name it. The alternative was a cache named for a year whose rates it does not hold.
+    """
+    if override:
+        return str(Path(override))
+    return str(company_dir / "artifacts" / "reference" / f"ecb-rates-{period[:4]}.json")
+
+
 def run_live_month(
     *,
     company_dir: Path,
@@ -324,6 +338,7 @@ def run_live_month(
     python_executable: str,
     cwd: Path,
     confirm_write: bool,
+    exchange_rates: str | None = None,
     run_command: CommandRunner | None = None,
     approval_checkpoint: ApprovalCheckpoint | None = None,
 ) -> dict[str, Any]:
@@ -334,6 +349,7 @@ def run_live_month(
 
     runner = run_command or subprocess.run
     checkpoint = approval_checkpoint or _interactive_approval_checkpoint
+    rates_path = resolve_exchange_rates_path(company_dir, period, exchange_rates)
     action_path = company_dir / "artifacts" / "actions" / f"{period}.yaml"
     check_path = company_dir / "artifacts" / "actions" / f"{period}.check.md"
     allocation_path = company_dir / "artifacts" / "bank" / f"{period[:4]}-allocations.json"
@@ -378,7 +394,7 @@ def run_live_month(
         python_executable, "scripts/bookbuilder.py", "--company-dir", str(company_dir),
         "--period", period,
         "--posting-policy", str(company_dir / "artifacts" / "posting_policy.json"),
-        "--exchange-rates", str(company_dir / "artifacts" / "reference" / f"ecb-rates-{period[:4]}.json"),
+        "--exchange-rates", rates_path,
         "--bank-allocations", str(allocation_path),
     ]
     for discovery_path in discovery_paths:
@@ -401,7 +417,7 @@ def run_live_month(
         python_executable, "scripts/bookchecker.py", "--company-dir", str(company_dir),
         "--period", period,
         "--posting-policy", str(company_dir / "artifacts" / "posting_policy.json"),
-        "--exchange-rates", str(company_dir / "artifacts" / "reference" / f"ecb-rates-{period[:4]}.json"),
+        "--exchange-rates", rates_path,
         "--bank-allocations", str(allocation_path),
     ]
     commands.append(checker_command)

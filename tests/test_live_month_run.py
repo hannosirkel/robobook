@@ -819,3 +819,31 @@ class CheckerWarningGateTests(unittest.TestCase):
                 label="Initial checker",
                 accepted=["Recon still carries"],
             )
+
+
+class ExchangeRateOverrideTests(unittest.TestCase):
+    """A corrections batch carries documents from an earlier year than its own period.
+
+    The cache is validated against the document's year, so a batch dated 2026 that settles
+    2024 documents needs the 2024 cache. Deriving the path from the period alone made that
+    batch unbuildable, and the only alternative was a cache named for a year whose rates it
+    does not hold.
+    """
+
+    def test_the_cache_defaults_to_the_period_year(self) -> None:
+        resolved = live_month_run.resolve_exchange_rates_path(Path("/c/example"), "2026-01")
+
+        self.assertTrue(resolved.endswith("ecb-rates-2026.json"))
+
+    def test_a_reviewed_override_names_the_document_year_instead(self) -> None:
+        resolved = live_month_run.resolve_exchange_rates_path(
+            Path("/c/example"), "2026-01", "/c/example/artifacts/reference/ecb-rates-2024.json"
+        )
+
+        self.assertTrue(resolved.endswith("ecb-rates-2024.json"))
+        self.assertNotIn("2026", resolved)
+
+    def test_an_empty_override_falls_back_to_the_period(self) -> None:
+        resolved = live_month_run.resolve_exchange_rates_path(Path("/c/example"), "2025-03", "")
+
+        self.assertTrue(resolved.endswith("ecb-rates-2025.json"))

@@ -1679,6 +1679,39 @@ def refund_shipping_total(records: list[dict[str, Any]]) -> Decimal:
     return loose + sum(by_order.values(), Decimal(0))
 
 
+# Simplbooks derives a line's net from its VAT type's rate, so a line whose declared VAT
+# implies a different rate posts at the wrong amount. Only the standard Estonian bands carry
+# a rate this can assert; zero-rated and exempt types are checked by other rules.
+STANDARD_VAT_TYPE_RATES = {"3": Decimal(20), "26": Decimal(22), "35": Decimal(24)}
+
+
+def verify_line_vat_rate(
+    *, gross: Decimal, vat: Decimal, vat_type_id: str, label: str, tolerance: Decimal = Decimal("0.02")
+) -> None:
+    """Refuse a line whose VAT contradicts the rate its VAT type declares.
+
+    A mixed-rate invoice collapsed into one line keeps a correct gross and a correct VAT,
+    so every total reconciles and nothing downstream can see the error. What disagrees is
+    the rate the two imply together. Simplbooks then derives the net from the type's rate
+    and the document posts short by the difference.
+    """
+    rate = STANDARD_VAT_TYPE_RATES.get(str(vat_type_id))
+    if rate is None or vat == 0:
+        # A zero-VAT line under a standard type understates the same way, but a bucket
+        # reaches that state only when the chart offers no zero-rate type to fall back to,
+        # which this check cannot repair.
+        return
+    expected = (gross * rate / (Decimal(100) + rate)).quantize(Decimal("0.01"), ROUND_HALF_UP)
+    if abs(expected - vat) <= tolerance:
+        return
+    raise SimplbooksError(
+        f"{label}: VAT {vat} on a gross of {gross} implies "
+        f"{(vat * 100 / (gross - vat)).quantize(Decimal('0.01'), ROUND_HALF_UP)}%, "
+        f"but vat_type {vat_type_id} declares {rate}% (expected {expected}). "
+        "A mixed-rate invoice must be split into one line per rate."
+    )
+
+
 def build_sales_actions(
     *,
     company_slug: str,
@@ -2461,6 +2494,10 @@ def build_purchase_actions(
             vat_total = sum_amount(bucket_records, "vat_amount")
             if gross_total == 0 and vat_total == 0:
                 continue
+            verify_line_vat_rate(
+                gross=gross_total, vat=vat_total,
+                vat_type_id=str(bucket_vat_type_id or ""), label=description,
+            )
             lines.append(
                 {
                     "line_role": "purchase_expense",

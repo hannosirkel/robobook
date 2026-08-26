@@ -37,6 +37,82 @@ These stop a run. They are not advisory.
 - Keep a rerun idempotent. `booksend` skips an already successful action.
 - Preserve a reversible audit trail.
 
+## Cash posting modes
+
+A company declares `cash_posting.mode` in its posting policy, and a batch carries
+the mode it was built under.
+
+| Mode | Cash comes from |
+| --- | --- |
+| `api` | the batch posts receipts and payments itself |
+| `statement_import` | the bank statement is imported in the Simplbooks UI, and the batch posts no cash for an imported account |
+
+Under `statement_import` a plan row is the terminal coverage item for a physical
+bank row. A batch declaring one mode may not be written under a policy declaring
+the other, and an API bank-cash action is refused outright.
+
+Processor accounts have no import queue, so a payment against one *is* the
+settlement. Bank accounts do have one, so a bank settlement is made by matching
+the statement row, never by posting a payment through the API.
+
+## Bank statement completeness
+
+**Every canonical physical statement row has exactly one reviewed disposition**,
+leading to an exact receipt, an exact payment, a verified match to an existing
+Simplbooks cash transaction, or a reviewed transfer identified on both sides. An
+unresolved, ignored, or merely inferred row blocks the month. A row referenced by
+more than one settlement group also blocks it, unless a split allocation proves
+the parts sum to the row.
+
+**Processor balances and supplier wallets are not physical bank accounts.** They
+normalize separately and reconcile to card charges, payouts, expenses, refunds
+and opening/closing balances. A clearing movement may support a physical-bank
+disposition, but never counts as an extra statement row.
+
+**A physical bank ledger is identified by `(IBAN, currency)`, not IBAN alone.**
+One IBAN may hold EUR and USD sub-ledgers. Posting policy resolves
+`<IBAN>|<ISO-4217 currency>`; an IBAN-only mapping is valid for base currency
+only and never silently authorizes a foreign-currency row.
+
+Cash actions take the statement row's own business date, currency, amount and
+source reference. A month-end date is not permitted for a physical cash row.
+
+## Evidence binding and ordering
+
+A batch records each input it was built from as a `reference_artifacts` entry
+with a sha256. `booksend` re-verifies every one before writing, so a rebuilt
+input invalidates the batch rather than being silently accepted.
+
+Write eligibility requires all of: recon approves the month; physical bank
+coverage is complete and arithmetically exact; clearing reconciles with no
+unexplained movement; `bookchecker` reports no errors and no unreviewed
+warnings; the batch is approved and bound to the current check report; discovery
+is fresh; no earlier required month is unsubmitted; and **a submitted action YAML
+is never regenerated or mutated**.
+
+Periods are written in order. Each configured period requires the immediately
+preceding one to carry a successful, immutable write log.
+
+## Annual evidence and effective-dated VAT
+
+Some evidence is annual rather than monthly, and is reviewed once for the year:
+
+```text
+artifacts/bank/<year>-allocations.json          reviewed disposition per physical row
+artifacts/vat/<year>-woo-tax-allocation.json    reported taxable order → monthly sale
+artifacts/reference/ecb-rates-<year>.json       reviewed rate cache
+artifacts/statement-import/<year>-plan.json     physical rows to match in the UI
+```
+
+A Woo tax summary is parsed as supporting evidence, then a reviewed annual
+allocation links every reported taxable order to a monthly sale. That boundary
+between source fact and accounting policy is what keeps a rerun deterministic.
+The allocation requires annual coverage, which comes from the source-pack
+directory name or the filename.
+
+A VAT rate that changes mid-year is expressed as **dated bands**, not a single
+value. Customer-paid gross is preserved; the VAT split is derived from it.
+
 ## Evidence roles
 
 - Woo sales are the recurring monthly sales-invoice basis.

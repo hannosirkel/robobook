@@ -4190,3 +4190,55 @@ class RefundShippingPerOrderTests(unittest.TestCase):
                 self._refund("r:2", -14.00, 0.00, "901")]
 
         self.assertEqual(bookbuilder.refund_shipping_total(rows), Decimal("7.85"))
+
+
+class MixedVatCollapseTests(unittest.TestCase):
+    """A line's VAT must match the rate its VAT type declares.
+
+    A logistics invoice of 852.00 net plus 9.24 VAT -- 42.00 taxable at 22% and 810.00
+    zero-rated export transport -- was collapsed into one 861.24 line at 22%. Simplbooks
+    then derived the net from that rate, 861.24/1.22 = 705.93, and the document posted
+    146.07 short while the payment left the difference stranded as a prepayment.
+
+    Nothing downstream could see it: the totals were internally consistent and the VAT
+    amount was right. Only the rate implied by gross and VAT together disagreed.
+    """
+
+    def test_a_line_whose_vat_contradicts_its_rate_is_refused(self) -> None:
+        with self.assertRaises(bookbuilder.SimplbooksError) as caught:
+            bookbuilder.verify_line_vat_rate(
+                gross=Decimal("861.24"), vat=Decimal("9.24"), vat_type_id="26",
+                label="freight-vendor-ou taxable cost summary")
+        message = str(caught.exception)
+        self.assertIn("freight-vendor-ou", message)
+        self.assertIn("22", message)
+
+    def test_a_line_matching_its_rate_passes(self) -> None:
+        bookbuilder.verify_line_vat_rate(
+            gross=Decimal("122.00"), vat=Decimal("22.00"), vat_type_id="26", label="ok")
+
+    def test_a_cent_of_rounding_is_tolerated(self) -> None:
+        bookbuilder.verify_line_vat_rate(
+            gross=Decimal("100.00"), vat=Decimal("18.03"), vat_type_id="26", label="rounded")
+
+    def test_the_20_and_24_percent_bands_are_checked_too(self) -> None:
+        bookbuilder.verify_line_vat_rate(
+            gross=Decimal("120.00"), vat=Decimal("20.00"), vat_type_id="3", label="20%")
+        bookbuilder.verify_line_vat_rate(
+            gross=Decimal("124.00"), vat=Decimal("24.00"), vat_type_id="35", label="24%")
+
+    def test_a_zero_rated_type_is_not_rate_checked(self) -> None:
+        # Types outside the standard bands carry no rate this check could assert.
+        bookbuilder.verify_line_vat_rate(
+            gross=Decimal("775.00"), vat=Decimal(0), vat_type_id="15", label="exempt")
+
+    def test_a_line_declaring_no_vat_is_left_alone(self) -> None:
+        """A zero-VAT line under a standard type is a different fault, not asserted here.
+
+        Simplbooks would derive its net from the type's rate and understate it the same
+        way, but a bucket reaches that state only when the chart offers no zero-rate type
+        to fall back to. No line in the posted 2024-2025 data does. Refusing it here would
+        block builds on charts this check cannot repair.
+        """
+        bookbuilder.verify_line_vat_rate(
+            gross=Decimal("26.00"), vat=Decimal(0), vat_type_id="3", label="no vat declared")

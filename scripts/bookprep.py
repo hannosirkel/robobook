@@ -1443,10 +1443,12 @@ def paypal_category(
         return "other"
     if "transfer" in type_value:
         return "payouts"
+    # A fee is the processor charging this company, whatever its sign. Deciding it after
+    # the negative-amount fallback filed every deducted fee as a customer refund.
+    if "fee" in type_value:
+        return "fees"
     if "refund" in type_value or "reversal" in type_value or "chargeback" in type_value or gross_amount < 0:
         return "refunds"
-    if "fee" in type_value and gross_amount == 0:
-        return "fees"
     return "sales"
 
 
@@ -1617,10 +1619,10 @@ def stripe_category(row: dict[str, str], amount: Decimal) -> str:
     type_value = row.get("Type", "").strip().lower()
     if "payout" in type_value or "transfer" in type_value:
         return "payouts"
-    if "refund" in type_value or "reversal" in type_value or "dispute" in type_value or "chargeback" in type_value:
-        return "refunds"
     if "fee" in type_value:
         return "fees"
+    if "refund" in type_value or "reversal" in type_value or "dispute" in type_value or "chargeback" in type_value:
+        return "refunds"
     if amount < 0:
         return "refunds"
     return "sales"

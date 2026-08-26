@@ -2827,3 +2827,33 @@ class PaypalCarriesWooOrderIdentityTests(unittest.TestCase):
         record = self._sale("", "")
 
         self.assertIsNone(record["attributes"].get("order_id"))
+
+
+class ProcessorFeeIsNotARefundTests(unittest.TestCase):
+    """A dispute fee is the processor charging the company, not money returned to a customer.
+
+    Both categorisers reached their negative-amount fallback before the fee branch, so every
+    fee deducted from the balance was filed as a refund. Inside a credit note it reduces
+    sales revenue instead of raising a processor cost.
+    """
+
+    def paypal(self, type_value: str, amount: str) -> str:
+        return bookprep.paypal_category(
+            {"Type": type_value}, Decimal(amount),
+            supplier_payment_parties={}, customer_receipt_parties={},
+        )
+
+    def test_a_paypal_dispute_fee_is_a_fee(self) -> None:
+        self.assertEqual(self.paypal("PayPal Dispute Fee", "-14.00"), "fees")
+
+    def test_a_paypal_chargeback_is_still_a_refund(self) -> None:
+        self.assertEqual(self.paypal("PayPal Chargeback", "-32.85"), "refunds")
+
+    def test_a_plain_negative_paypal_row_is_still_a_refund(self) -> None:
+        self.assertEqual(self.paypal("Payment", "-10.00"), "refunds")
+
+    def test_a_stripe_dispute_fee_is_a_fee(self) -> None:
+        self.assertEqual(bookprep.stripe_category({"Type": "dispute fee"}, Decimal("-15.00")), "fees")
+
+    def test_a_stripe_dispute_is_still_a_refund(self) -> None:
+        self.assertEqual(bookprep.stripe_category({"Type": "dispute"}, Decimal("-25.00")), "refunds")

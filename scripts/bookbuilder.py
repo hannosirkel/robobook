@@ -1656,6 +1656,29 @@ def make_action(
     return action
 
 
+def refund_shipping_total(records: list[dict[str, Any]]) -> Decimal:
+    """Total shipping refunded, counting each order's shipping once.
+
+    A processor reports a chargeback and its dispute fee as separate records, each carrying
+    the same order's shipping as an attribute of the order rather than of the record.
+    Summing per record charged it twice, and because the revenue line is the remainder both
+    lines of the credit note came out wrong.
+
+    Records disagreeing on an order's shipping means one of them is partial, so the largest
+    is the order's. Records naming no order keep the per-record sum: nothing groups them.
+    """
+    by_order: dict[str, Decimal] = {}
+    loose = Decimal(0)
+    for record in records:
+        amount = abs(decimal_value(record.get("shipping_amount")))
+        order = str((record.get("attributes") or {}).get("order_id") or "").strip()
+        if not order:
+            loose += amount
+            continue
+        by_order[order] = max(by_order.get(order, Decimal(0)), amount)
+    return loose + sum(by_order.values(), Decimal(0))
+
+
 def build_sales_actions(
     *,
     company_slug: str,
@@ -1847,7 +1870,7 @@ def build_sales_actions(
     }
 
     for (group_label, currency), group_records in sorted(grouped_refunds.items()):
-        shipping_total = sum_abs_amount(group_records, "shipping_amount")
+        shipping_total = refund_shipping_total(group_records)
         refund_mapping_hints = mapping_hints
         online_sales_override_applied = False
         if slugify(group_label) in ONLINE_SALES_CHANNELS:

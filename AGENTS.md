@@ -148,4 +148,4 @@ Add or rename all three together, or a runtime loses the skill.
 | How does a run work? | [`docs/current/bookkeeping-run.md`](docs/current/bookkeeping-run.md) |
 | What is where? | [`docs/current/repository-layout.md`](docs/current/repository-layout.md) |
 | What does the API do? | [`docs/current/simplbooks-api.md`](docs/current/simplbooks-api.md) |
-| What is being built? | `docs/working/`, including `SKILLPLAN.md` |
+| What is being built? | `docs/working/` |

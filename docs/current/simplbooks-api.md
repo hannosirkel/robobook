@@ -32,6 +32,20 @@ The public documentation and local validation have shown these. Do not
 generalise past them.
 
 - Some list endpoints are documented as `GET` with a request body.
+- Published date formats are inconsistent — the reference says `yyyy-MM-dd`, several
+  list examples show `01-01-2021`. Verify what an endpoint accepts; do not assume.
+- **The endpoint names do not mean what they look like**, and two of them are
+  separate ID spaces that are easy to confuse:
+
+  | Endpoint | Actually holds |
+  | --- | --- |
+  | `financial_accounts` | the chart of accounts (ledger codes) |
+  | `income_accounts` | bank accounts and cash registers (payment accounts) |
+  | `incomings` | receipts |
+
+  A payment carries an `income_account_id`, which is a *payment* account — not a
+  ledger account id. Passing a ledger id there resolves to the wrong account or
+  fails obscurely.
 - The wrapper names are inconsistent by document type:
 
   | Document | Wrapper key |

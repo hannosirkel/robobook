@@ -41,14 +41,14 @@ class LoadSecretKey(unittest.TestCase):
             return Path(handle.name)
 
     def test_reads_the_secret_key_and_ignores_the_publishable_one(self) -> None:
-        path = self._write("stripePublishableKey=pk_live_EXAMPLE\nstripeSecretKey=sk_live_EXAMPLE\n")
-        self.assertEqual(stripe_api.load_stripe_secret_key(path), "sk_live_EXAMPLE")
+        path = self._write("stripePublishableKey=pk_live_\nstripeSecretKey=sk_live_\n")
+        self.assertEqual(stripe_api.load_stripe_secret_key(path), "sk_live_")
 
     def test_a_bare_key_on_its_own_line_is_accepted(self) -> None:
-        self.assertEqual(stripe_api.load_stripe_secret_key(self._write("sk_live_EXAMPLE\n")), "sk_live_EXAMPLE")
+        self.assertEqual(stripe_api.load_stripe_secret_key(self._write("sk_live_\n")), "sk_live_")
 
     def test_a_file_without_a_secret_key_is_refused(self) -> None:
-        path = self._write("stripePublishableKey=pk_live_EXAMPLE\n")
+        path = self._write("stripePublishableKey=pk_live_\n")
         with self.assertRaises(stripe_api.StripeError):
             stripe_api.load_stripe_secret_key(path)
 

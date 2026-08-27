@@ -1706,6 +1706,56 @@ class BookprepTests(unittest.TestCase):
             self.assertFalse(exceptions)
             self.assertFalse(any(records.values()))
 
+    def test_a_zero_sales_report_is_nil_whatever_the_note_says(self) -> None:
+        """The vendor words the nil note differently every month, and a nil report has no
+        picking-fee line to parse. Matching its prose is whack-a-mole; zero quantity is not."""
+        for note in (
+            "NOTE: No sales this period.",
+            "NOTE: No paid sales for this month.",
+            "",  # June 2026 carried no note at all, only zero quantities
+        ):
+            with self.subTest(note=note or "<no note>"), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = pdf_source(root, "qm_2026_04.pdf", source_system="quartermaster")
+                pages = [
+                    "Sales Report\nDate\n4/30/2026\nS.R. No.\n3471\n"  # noqa: ISC004
+                    "Vendor\nExample Company LLC\nQuartermaster Direct\n"
+                    f"This represents your Sales Report for April 2026. {note}\n"
+                    "Lunar Base demo - Sold Copies\n0 5.00 0.00\n"
+                    "Lunar Base - Sold Copies\n0 9.66 0.00\n"
+                    "Picking Fee QML Picking Fee - $.40 per unit\n"
+                ]
+                with mock.patch.object(bookprep, "extract_pdf_pages", return_value=pages):
+                    records, exceptions = bookprep.parse_quartermaster_pdf(
+                        source,
+                        period_start=date(2026, 4, 1),
+                        period_end=date(2026, 4, 30),
+                        base_currency="EUR",
+                    )
+                self.assertFalse(exceptions, f"nil report blocked with note {note!r}")
+                self.assertFalse(any(records.values()))
+
+    def test_a_report_with_real_sales_still_needs_its_picking_fee_line(self) -> None:
+        """Do not let the nil path swallow a report that sold something but parsed badly."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = pdf_source(root, "qm_2026_05.pdf", source_system="quartermaster")
+            pages = [
+                "Sales Report\nDate\n5/31/2026\nS.R. No.\n3600\n"  # noqa: ISC004
+                "Vendor\nExample Company LLC\nQuartermaster Direct\n"
+                "This represents your Sales Report for May 2026.\n"
+                "Lunar Base - Sold Copies\n3 9.66 28.98\n"
+            ]
+            with mock.patch.object(bookprep, "extract_pdf_pages", return_value=pages):
+                _records, exceptions = bookprep.parse_quartermaster_pdf(
+                    source,
+                    period_start=date(2026, 5, 1),
+                    period_end=date(2026, 5, 31),
+                    base_currency="EUR",
+                )
+            self.assertTrue(exceptions)
+            self.assertTrue(exceptions[0].get("blocking"))
+
     def test_parse_quartermaster_invoice_pdf_creates_usd_purchase_record(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

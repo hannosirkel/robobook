@@ -3229,7 +3229,19 @@ def parse_quartermaster_pdf(
             flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
         )
         report_total_matches = re.findall(r"\$\s*([0-9,]+\.\d{2})", full_text)
-        if report_date_text is not None and "no sales for this pay period" in normalized:
+        # A month with nothing sold still gets a report, and it carries no picking-fee line
+        # to parse. The vendor words the note differently every time -- "No sales for this
+        # pay period", "No sales this period", "No paid sales for this month" -- and
+        # sometimes omits it. Matching that prose is whack-a-mole; zero quantity is not, so
+        # the structural signal decides and the phrase is only a fallback for a report whose
+        # product lines will not parse at all.
+        sold_quantity_total = (
+            sum(parse_decimal(match[0]) for match in sold_matches) if sold_matches else None
+        )
+        is_nil_report = report_date_text is not None and (
+            sold_quantity_total == 0 or "no sales for this pay period" in normalized
+        )
+        if is_nil_report:
             report_date = parse_quartermaster_date_value(report_date_text)
             if period_start <= report_date <= period_end:
                 update_coverage_from_dates(source, [report_date])

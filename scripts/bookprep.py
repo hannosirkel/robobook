@@ -1479,6 +1479,21 @@ def paypal_woo_order_identity(row: dict[str, Any]) -> dict[str, Any]:
     return identity
 
 
+def stripe_woo_order_id(row: dict[str, Any]) -> str | None:
+    """Recover the WooCommerce order number a Stripe row carries.
+
+    Dashboard exports name it in `order_id (metadata)`. The balance-transaction
+    API has no metadata column at all, so the number survives only in the
+    description Woo wrote there ("... - Order 820"). Absent stays absent: a
+    defaulted order number would bind a sale to stock it never moved.
+    """
+    metadata = str(row.get("order_id (metadata)") or "").strip()
+    if metadata:
+        return metadata
+    match = re.search(r"\border\s*#?\s*(\d+)\b", str(row.get("Description") or ""), re.IGNORECASE)
+    return match.group(1) if match else None
+
+
 def parse_paypal_csv(
     source: SourceDescriptor,
     *,
@@ -1868,7 +1883,7 @@ def parse_stripe_balance_csv(
                 "status": row.get("Status"),
                 "payment_type": row.get("payment_type (metadata)"),
                 "site_url": row.get("site_url (metadata)"),
-                "order_id": row.get("order_id (metadata)"),
+                "order_id": stripe_woo_order_id(row),
                 "order_key": row.get("order_key (metadata)"),
                 "customer_email": row.get("customer_email (metadata)"),
                 "customer_name": row.get("customer_name (metadata)"),
@@ -1988,7 +2003,7 @@ def parse_stripe_balance_csv(
                     "stripe_balance_transaction_id": transaction_id,
                     "stripe_source_id": row.get("Source"),
                     "stripe_export_type": "balance_history",
-                    "order_id": row.get("order_id (metadata)"),
+                    "order_id": stripe_woo_order_id(row),
                 },
                 row_ref=f"csv:{line_no}",
             )
@@ -2017,7 +2032,7 @@ def parse_stripe_balance_csv(
                     "stripe_balance_transaction_id": transaction_id,
                     "stripe_source_id": row.get("Source"),
                     "stripe_export_type": "balance_history",
-                    "order_id": row.get("order_id (metadata)"),
+                    "order_id": stripe_woo_order_id(row),
                 },
                 row_ref=f"csv:{line_no}",
             )
@@ -2051,7 +2066,7 @@ def parse_stripe_balance_csv(
                 "reason": row.get("reason (metadata)"),
                 "payment_type": row.get("payment_type (metadata)"),
                 "site_url": row.get("site_url (metadata)"),
-                "order_id": row.get("order_id (metadata)"),
+                "order_id": stripe_woo_order_id(row),
                 "order_key": row.get("order_key (metadata)"),
                 "customer_email": row.get("customer_email (metadata)"),
                 "customer_name": row.get("customer_name (metadata)"),

@@ -354,6 +354,70 @@ def bank_coverage_batch(*, period: str, allocation_path: Path, actions: list[dic
     }
 
 
+class WooOrderEvidenceInventoryTests(unittest.TestCase):
+    """The checker must re-derive a Woo-order-evidence proof, not merely accept it."""
+
+    @staticmethod
+    def sale(order_id: str, record_id: str) -> dict:
+        return {
+            "record_id": record_id, "quantity": None, "gross_amount": 29.85,
+            "event_date": "2026-01-09", "currency": "EUR", "channel": "stripe",
+            "vat_amount": 0.0, "event_type": "stripe_payment",
+            "attributes": {"order_id": order_id},
+        }
+
+    @staticmethod
+    def evidence(order_id: str) -> dict:
+        return {
+            "record_id": f"woo:woo-order:{order_id}", "event_type": "woo_order_summary",
+            "external_ref": order_id, "event_date": "2026-01-09",
+            "attributes": {"order_id": order_id, "items_sold": 1.0},
+        }
+
+    def build(self, sales: list[dict], evidence: list[dict]) -> tuple[dict, list[dict]]:
+        proof = bookbuilder.woo_order_evidence_quantity_proof(
+            sales, {str(item["attributes"]["order_id"]): item for item in evidence},
+            group_label="stripe", direction="sales",
+        )
+        action = {
+            "idempotency_key": "example-2026-01-sales-stripe",
+            "action_type": "create_invoice_summary",
+            "payload": {"document_type": "invoice", "line_items": [{
+                "line_role": "sales_revenue", "article_id_hint": "3",
+                "quantity": proof["quantity"] if proof else None,
+                "inventory_quantity_proof": proof,
+            }]},
+        }
+        normalized = base_normalized("2026-01")
+        normalized["records"]["sales"] = sales
+        normalized["records"]["other"] = evidence
+        resolved = [
+            {"record_ref": record["record_id"], "record": record, "payload": normalized}
+            for record in sales + evidence
+        ]
+        return action, resolved
+
+    def test_a_complete_woo_order_evidence_proof_is_accepted(self) -> None:
+        sales = [self.sale("820", "stripe:sales:3"), self.sale("822", "stripe:sales:4")]
+        action, resolved = self.build(sales, [self.evidence("820"), self.evidence("822")])
+        findings = bookchecker.evaluate_inventory_quantities(
+            action=action, resolved_sources=resolved, reviewed_allocations={},
+        )
+        self.assertEqual([f["summary"] for f in findings], [])
+
+    def test_a_proof_missing_one_contributing_order_is_refused(self) -> None:
+        """Dropping an order would understate the stock the line moves."""
+        sales = [self.sale("820", "stripe:sales:3"), self.sale("822", "stripe:sales:4")]
+        action, resolved = self.build(sales, [self.evidence("820"), self.evidence("822")])
+        proof = action["payload"]["line_items"][0]["inventory_quantity_proof"]
+        proof["contributors"] = proof["contributors"][:1]
+        proof["contributor_count"] = 1
+        findings = bookchecker.evaluate_inventory_quantities(
+            action=action, resolved_sources=resolved, reviewed_allocations={},
+        )
+        self.assertTrue(findings, "a truncated contributor set must be refused")
+
+
 class BookcheckerTests(unittest.TestCase):
     def test_inventory_quantity_checker_rejects_invoice_with_refund_scope(self) -> None:
         record = {

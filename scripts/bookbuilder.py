@@ -226,6 +226,58 @@ def allocated_order_quantity_proof(
     return inventory_proof_envelope(scope=scope, contributors=[contributor], quantity=quantity)
 
 
+def woo_order_evidence_quantity_proof(
+    records: list[dict[str, Any]],
+    order_evidence: dict[str, dict[str, Any]],
+    *,
+    group_label: str,
+    direction: str,
+) -> dict[str, Any] | None:
+    """Prove a processor sale's quantity from the Woo order summary that names it.
+
+    A processor row states money, never units, so a sale no VAT allocation names
+    has no quantity of its own. A zero-rated export never appears in a VAT
+    allocation at all - it has no tax row to be allocated against - so the Woo
+    order summary is the only reviewed statement of its units.
+
+    Every contributing sale must resolve to a positive quantity or nothing is
+    proved: one unmatched order would silently understate the stock moved.
+    """
+    if not records or not order_evidence:
+        return None
+    contributors: list[dict[str, Any]] = []
+    total = Decimal("0")  # noqa: FURB157
+    for record in records:
+        order_id = str((record.get("attributes") or {}).get("order_id") or "").strip()
+        if not order_id:
+            return None
+        evidence = order_evidence.get(order_id)
+        if not isinstance(evidence, dict):
+            return None
+        quantity = decimal_value((evidence.get("attributes") or {}).get("items_sold") or 0)
+        if quantity <= 0:
+            return None
+        total += quantity
+        contributors.append({
+            "record_id": str(evidence.get("record_id") or ""),
+            "quantity": decimal_number(quantity),
+            "quantity_source": "woo_order_summary_evidence",
+            "record_sha256": canonical_record_sha256(evidence),
+        })
+    if not contributors or total <= 0:
+        return None
+    first = records[0]
+    scope = {
+        "kind": "woo_order_summary_evidence",
+        "period": str(first.get("event_date") or "")[:7],
+        "record_category": "sales" if direction == "sales" else "refunds",
+        "group_label": group_label,
+        "currency": record_currency(first, "EUR"),
+        "tax_profile": taxable_profile(first),
+    }
+    return inventory_proof_envelope(scope=scope, contributors=contributors, quantity=total)
+
+
 def contributor_event_types(records: list[dict[str, Any]]) -> list[str]:
     """Report the event types a line was built from, so policy can judge them."""
     return sorted({str(record.get("event_type") or "") for record in records if record.get("event_type")})
@@ -784,6 +836,36 @@ def record_group_label(record: dict[str, Any], *, default: str) -> str:
 def record_currency(record: dict[str, Any], default_currency: str) -> str:
     currency = str(record.get("currency") or "").strip().upper()
     return currency or default_currency
+
+
+def cited_order_evidence_records(
+    lines: list[dict[str, Any]], order_quantity_evidence: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Return the Woo order-summary records a line's inventory proof actually cites.
+
+    A proof may name evidence that is not itself a sales record. The action has to
+    declare that evidence as a source, or the checker cannot resolve it and re-hash
+    it to re-derive the proof independently.
+    """
+    by_id = {
+        str(record.get("record_id") or ""): record
+        for record in order_quantity_evidence.values()
+        if isinstance(record, dict)
+    }
+    cited: dict[str, dict[str, Any]] = {}
+    for line in lines:
+        proof = line.get("inventory_quantity_proof")
+        if not isinstance(proof, dict):
+            continue
+        for contributor in proof.get("contributors") or []:
+            if not isinstance(contributor, dict):
+                continue
+            if contributor.get("quantity_source") != "woo_order_summary_evidence":
+                continue
+            record = by_id.get(str(contributor.get("record_id") or ""))
+            if record is not None:
+                cited[str(record.get("record_id") or "")] = record
+    return [cited[key] for key in sorted(cited)]
 
 
 def source_refs_for_records(
@@ -1411,6 +1493,7 @@ def build_sales_lines(
     direction: str,
     shipping_split: bool,
     mapping_hints: dict[str, tuple[str | None, list[str]]],
+    order_quantity_evidence: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     review_notes: list[str] = []
     lines: list[dict[str, Any]] = []
@@ -1429,6 +1512,23 @@ def build_sales_lines(
         mapping_hints["zero_vat_type"],
     )
     default_warehouse_id, default_warehouse_notes = mapping_hints.get("default_warehouse", (None, []))
+
+    def inventory_proof_for(group_records: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """Prefer the records' own units; fall back to the Woo order summary naming them."""
+        return normalized_inventory_quantity_proof(
+            group_records, group_label=group_label, direction=direction,
+        ) or woo_order_evidence_quantity_proof(
+            group_records, order_quantity_evidence or {},
+            group_label=group_label, direction=direction,
+        )
+
+    def line_quantity(
+        group_records: list[dict[str, Any]], proof: dict[str, Any] | None
+    ) -> float | None:
+        summed = decimal_number(
+            sum((decimal_value(record.get("quantity") or 0) for record in group_records), Decimal("0"))  # noqa: FURB157
+        )
+        return summed or (proof or {}).get("quantity") or None
     review_notes.extend(
         revenue_notes
         + shipping_notes
@@ -1556,9 +1656,7 @@ def build_sales_lines(
         total_vat = sum_abs_amount(records, "vat_amount")
         revenue_gross = total_gross - total_shipping
         shipping_vat_type_id = shipping_standard_vat_id if total_vat != 0 else shipping_zero_vat_id
-        inventory_proof = normalized_inventory_quantity_proof(
-            records, group_label=group_label, direction=direction,
-        )
+        inventory_proof = inventory_proof_for(records)
         lines.append(
             {
                 "line_role": f"{direction}_revenue",
@@ -1569,7 +1667,7 @@ def build_sales_lines(
                 "suggested_income_account_id": revenue_account_id,
                 "suggested_vat_type_id": standard_vat_id if total_vat != 0 else zero_vat_id,
                 "warehouse_id_hint": maybe_single_warehouse(records) or default_warehouse_id,
-                "quantity": decimal_number(sum((decimal_value(record.get("quantity") or 0) for record in records), Decimal("0"))) or None,  # noqa: FURB157
+                "quantity": line_quantity(records, inventory_proof),
                 "inventory_quantity_proof": inventory_proof,
                 "contributor_event_types": contributor_event_types(records),
                 "record_count": len(records),
@@ -1597,9 +1695,7 @@ def build_sales_lines(
             gross_amount = sum_abs_amount(profile_records, "gross_amount")
             vat_amount = sum_abs_amount(profile_records, "vat_amount")
             shipping_amount = sum_abs_amount(profile_records, "shipping_amount")
-            inventory_proof = normalized_inventory_quantity_proof(
-                profile_records, group_label=group_label, direction=direction,
-            )
+            inventory_proof = inventory_proof_for(profile_records)
             lines.append(
                 {
                     "line_role": f"{direction}_revenue",
@@ -1610,7 +1706,7 @@ def build_sales_lines(
                     "suggested_income_account_id": revenue_account_id,
                     "suggested_vat_type_id": standard_vat_id if profile_name == "taxable" else zero_vat_id,
                     "warehouse_id_hint": maybe_single_warehouse(profile_records) or default_warehouse_id,
-                    "quantity": decimal_number(sum((decimal_value(record.get("quantity") or 0) for record in profile_records), Decimal("0"))) or None,  # noqa: FURB157
+                    "quantity": line_quantity(profile_records, inventory_proof),
                     "inventory_quantity_proof": inventory_proof,
                     "contributor_event_types": contributor_event_types(profile_records),
                     "record_count": len(profile_records),
@@ -1735,6 +1831,14 @@ def build_sales_actions(
         base_currency=base_currency,
     )
     known_order_numbers = period_order_numbers(records)
+    # A processor row states money, never units. The Woo order summary is the only
+    # reviewed statement of units for an order no VAT allocation names.
+    order_quantity_evidence = {
+        str((record.get("attributes") or {}).get("order_id") or "").strip(): record
+        for record in records.get("other") or []
+        if str(record.get("event_type") or "") == "woo_order_summary"
+        and str((record.get("attributes") or {}).get("order_id") or "").strip()
+    }
     repeated_sales_labels = {
         label
         for label, count in Counter(group_label for group_label, _currency in grouped_sales).items()
@@ -1800,6 +1904,7 @@ def build_sales_actions(
                 or (online_sales_override_applied and shipping_total != 0)
                 or (has_explicit_zero_rated_residual and shipping_total != 0),
                 mapping_hints=profile_mapping_hints,
+                order_quantity_evidence=order_quantity_evidence,
             )
             review_notes.extend(planned_notes.get((group_label, currency), []))
             contact_id, contact_notes = resolve_sales_contact_id(
@@ -1874,7 +1979,10 @@ def build_sales_actions(
                 action_type="create_invoice_summary",
                 endpoint="invoices/create",
                 payload=payload,
-                source_refs=source_refs_for_records(normalized_path_display, profile_records),
+                source_refs=source_refs_for_records(
+                    normalized_path_display,
+                    profile_records + cited_order_evidence_records(lines, order_quantity_evidence),
+                ),
                 reason=f"Aggregate {len(profile_records)} normalized {group_label} sales record(s) into a month-level draft invoice summary.",
                 confidence=confidence,
                 depends_on=[],
@@ -1926,6 +2034,7 @@ def build_sales_actions(
             shipping_split=policy_prefers_shipping_split(policy_text, shipping_total)
             or (online_sales_override_applied and shipping_total != 0),
             mapping_hints=refund_mapping_hints,
+            order_quantity_evidence=order_quantity_evidence,
         )
         evidence_labels = sorted(refund_evidence_labels.get((group_label, currency), set()))
         if evidence_labels:
@@ -1987,7 +2096,10 @@ def build_sales_actions(
                 action_type="create_credit_invoice_summary",
                 endpoint="invoices/create",
                 payload=payload,
-                source_refs=source_refs_for_records(normalized_path_display, group_records),
+                source_refs=source_refs_for_records(
+                    normalized_path_display,
+                    group_records + cited_order_evidence_records(lines, order_quantity_evidence),
+                ),
                 reason=f"Aggregate {len(group_records)} normalized {group_label} refund record(s) into a draft credit-note summary.",
                 confidence=confidence,
                 depends_on=depends_on,

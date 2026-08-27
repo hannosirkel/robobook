@@ -5,6 +5,7 @@ import json
 import tempfile
 import hashlib
 import sys
+import typing
 import unittest
 from decimal import Decimal
 from pathlib import Path
@@ -397,6 +398,127 @@ def printful_policy(*, vat_type_id: str, vat_deductible: bool | None = None) -> 
             "lines": {"storage-fee-for-warehoused-products": line},
         }},
     }
+
+
+class WooOrderEvidenceQuantityTests(unittest.TestCase):
+    """A processor row states money, never units; the Woo order summary states the units."""
+
+    @staticmethod
+    def sale(order_id: str | None, record_id: str) -> dict:
+        return {
+            "record_id": record_id, "quantity": None, "gross_amount": 29.85,
+            "event_date": "2026-01-09", "currency": "EUR", "channel": "stripe",
+            "vat_amount": 0.0, "attributes": {"order_id": order_id},
+        }
+
+    @staticmethod
+    def evidence(order_id: str, items_sold: float) -> dict:
+        return {
+            "record_id": f"woo:woo-order:{order_id}", "event_type": "woo_order_summary",
+            "external_ref": order_id, "event_date": "2026-01-09",
+            "attributes": {"order_id": order_id, "items_sold": items_sold},
+        }
+
+    def test_quantity_comes_from_the_woo_order_summary_that_names_the_order(self) -> None:
+        proof = bookbuilder.woo_order_evidence_quantity_proof(
+            [self.sale("820", "stripe:sales:3"), self.sale("822", "stripe:sales:4")],
+            {"820": self.evidence("820", 1.0), "822": self.evidence("822", 1.0)},
+            group_label="stripe", direction="sales",
+        )
+        self.assertIsNotNone(proof)
+        self.assertEqual(proof["quantity"], 2.0)
+        self.assertEqual(proof["contributor_count"], 2)
+        self.assertEqual(
+            {c["quantity_source"] for c in proof["contributors"]},
+            {"woo_order_summary_evidence"},
+        )
+        self.assertEqual(proof["scope"]["kind"], "woo_order_summary_evidence")
+
+    def test_one_unmatched_sale_withholds_the_whole_proof(self) -> None:
+        """Understating stock is worse than proving nothing: refuse rather than partially count."""
+        proof = bookbuilder.woo_order_evidence_quantity_proof(
+            [self.sale("820", "stripe:sales:3"), self.sale("899", "stripe:sales:4")],
+            {"820": self.evidence("820", 1.0)},
+            group_label="stripe", direction="sales",
+        )
+        self.assertIsNone(proof)
+
+    def test_a_sale_without_an_order_number_withholds_the_proof(self) -> None:
+        proof = bookbuilder.woo_order_evidence_quantity_proof(
+            [self.sale(None, "stripe:sales:3")],
+            {"820": self.evidence("820", 1.0)},
+            group_label="stripe", direction="sales",
+        )
+        self.assertIsNone(proof)
+
+    def test_a_non_positive_evidence_quantity_withholds_the_proof(self) -> None:
+        proof = bookbuilder.woo_order_evidence_quantity_proof(
+            [self.sale("820", "stripe:sales:3")],
+            {"820": self.evidence("820", 0.0)},
+            group_label="stripe", direction="sales",
+        )
+        self.assertIsNone(proof)
+
+
+class WooOrderEvidenceLineTests(unittest.TestCase):
+    """The residual sales line must carry the units the Woo order summary proves."""
+
+    HINTS: typing.ClassVar[dict] = {
+        "revenue_account": ("109", []),
+        "shipping_account": ("255", []),
+        "standard_vat_type": ("34", []),
+        "zero_vat_type": ("12", []),
+        "default_warehouse": ("6", []),
+    }
+
+    def sales(self) -> list[dict]:
+        return [
+            {
+                "record_id": "stripe:sales:3", "quantity": None, "gross_amount": 29.85,
+                "event_date": "2026-01-09", "currency": "EUR", "channel": "stripe",
+                "vat_amount": 0.0, "shipping_amount": 0.0, "event_type": "stripe_payment",
+                "attributes": {"order_id": "820"},
+            },
+            {
+                "record_id": "stripe:sales:4", "quantity": None, "gross_amount": 32.85,
+                "event_date": "2026-01-15", "currency": "EUR", "channel": "stripe",
+                "vat_amount": 0.0, "shipping_amount": 0.0, "event_type": "stripe_payment",
+                "attributes": {"order_id": "822"},
+            },
+        ]
+
+    def evidence(self) -> dict:
+        return {
+            order: {
+                "record_id": f"woo:woo-order:{order}", "event_type": "woo_order_summary",
+                "external_ref": order, "event_date": "2026-01-09",
+                "attributes": {"order_id": order, "items_sold": 1.0},
+            }
+            for order in ("820", "822")
+        }
+
+    def test_line_takes_its_quantity_from_the_woo_order_evidence(self) -> None:
+        lines, _ = bookbuilder.build_sales_lines(
+            records=self.sales(), group_label="stripe", direction="sales",
+            shipping_split=False, mapping_hints=self.HINTS,
+            order_quantity_evidence=self.evidence(),
+        )
+        revenue = [line for line in lines if line["line_role"] == "sales_revenue"]
+        self.assertEqual(len(revenue), 1)
+        self.assertEqual(revenue[0]["quantity"], 2.0)
+        self.assertEqual(
+            revenue[0]["inventory_quantity_proof"]["scope"]["kind"], "woo_order_summary_evidence"
+        )
+
+    def test_without_evidence_the_line_still_proves_nothing(self) -> None:
+        """Absent evidence must not become a defaulted quantity."""
+        lines, _ = bookbuilder.build_sales_lines(
+            records=self.sales(), group_label="stripe", direction="sales",
+            shipping_split=False, mapping_hints=self.HINTS,
+        )
+        revenue = [line for line in lines if line["line_role"] == "sales_revenue"]
+        self.assertIsNone(revenue[0]["quantity"])
+        self.assertIsNone(revenue[0]["inventory_quantity_proof"])
 
 
 class NonDeductibleVatTests(unittest.TestCase):

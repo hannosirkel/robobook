@@ -567,6 +567,7 @@ def inventory_quantity_proof_errors(action: dict[str, Any], line: dict[str, Any]
         seen.add(record_id)
         if contributor.get("quantity_source") not in {
             "normalized_record", "reviewed_allocation_target", "reviewed_woo_tax_allocation",
+            "woo_order_summary_evidence",
         }:
             return ["contributor quantity_source is invalid"]
         if not re.fullmatch(r"[a-f0-9]{64}", str(contributor.get("record_sha256") or "")):
@@ -583,7 +584,7 @@ def inventory_quantity_proof_errors(action: dict[str, Any], line: dict[str, Any]
     scope_kind = scope.get("kind")
     expected_scope_fields = (
         {"kind", "period", "record_category", "group_label", "currency", "tax_profile"}
-        if scope_kind == "normalized_sales_group"
+        if scope_kind in {"normalized_sales_group", "woo_order_summary_evidence"}
         else {"kind", "period", "record_category", "statement_id"}
         if scope_kind == "reviewed_direct_sale_allocation"
         else {"kind", "period", "record_category", "group_label", "order_id"}
@@ -610,6 +611,7 @@ def inventory_quantity_proof_errors(action: dict[str, Any], line: dict[str, Any]
         "normalized_sales_group": "normalized_record",
         "reviewed_direct_sale_allocation": "reviewed_allocation_target",
         "reviewed_allocated_order": "reviewed_woo_tax_allocation",
+        "woo_order_summary_evidence": "woo_order_summary_evidence",
     }.get(str(scope_kind or ""), "reviewed_allocation_target")
     if any(item.get("quantity_source") != required_source for item in contributors):
         return ["contributor quantity source does not match semantic scope"]

@@ -20,6 +20,7 @@ governs.
 - [Code quality](https://github.com/hannosirkel/architecture/blob/main/standards/code-quality.md) — gates, coaching, testing, review cutoff
 - [Repository contract](https://github.com/hannosirkel/architecture/blob/main/standards/repository-contract.md) — required files, profiles, skills
 - [Work routing](https://github.com/hannosirkel/architecture/blob/main/standards/work-routing.md) — where a change starts, and where a working plan belongs
+- [Planning](https://github.com/hannosirkel/architecture/blob/main/standards/planning.md) — how a plan row is sized, the pull-request size gate
 - Language standards: [python](https://github.com/hannosirkel/architecture/blob/main/standards/languages/python.md)
 
 **Never commit to a default branch.** Work in `~/app/.worktrees/robobook/<task>`.

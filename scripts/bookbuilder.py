@@ -786,13 +786,29 @@ def processor_purchase_mapping(
 
 def generic_purchase_mapping(
     entity_map: dict[str, Any] | None,
+    *,
+    standard_rate: int | None,
 ) -> tuple[str | None, str | None, str | None]:
+    """Map a purchase with no supplier-specific rule, at the rate in force that period.
+
+    Estonia moved to 22% on 2024-01-01 and to 24% on 2025-07-01, and the rate belongs
+    to the period, not to this function. `verify_line_vat_rate` checks a purchase line
+    against the type chosen here, so pinning one rate rejects correctly-taxed invoices
+    in every later year. No matching type yields None rather than a near miss.
+    """
     entity_map = entity_map or {}
     financial_accounts = list(entity_map.get("financial_accounts") or [])
     vat_types = list(entity_map.get("vat_types") or [])
     return (
         find_entity_id(financial_accounts, code="5200"),
-        find_entity_id(vat_types, include_keywords=("20%", "eesti"), is_purchase=True, vat_percent=20),
+        None
+        if standard_rate is None
+        else find_entity_id(
+            vat_types,
+            include_keywords=(f"{standard_rate}%", "eesti"),
+            is_purchase=True,
+            vat_percent=standard_rate,
+        ),
         find_entity_id(vat_types, include_keywords=("mitte", "km")),
     )
 
@@ -2513,6 +2529,7 @@ def build_purchase_actions(
     entity_map: dict[str, Any] | None,
     mapping_hints: dict[str, tuple[str | None, list[str]]],
     forced_note: str | None,
+    posting_policy: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[tuple[str, str], str]]:
     actions: list[dict[str, Any]] = []
     action_ids: dict[tuple[str, str], str] = {}
@@ -2529,7 +2546,18 @@ def build_purchase_actions(
     expense_account_id, expense_account_notes = mapping_hints["fulfillment_account"]
     standard_vat_type_id, standard_vat_notes = mapping_hints["standard_vat_type"]
     zero_vat_type_id, zero_vat_notes = mapping_hints["zero_vat_type"]
-    generic_expense_account_id, domestic_purchase_vat_type_id, no_vat_purchase_vat_type_id = generic_purchase_mapping(entity_map)
+    # The standard rate belongs to the period. The policy already states the Estonian
+    # timeline for sales; the same bands govern a domestic purchase.
+    standard_rate: int | None = None
+    if posting_policy is not None:
+        try:
+            standard_rate = int(resolve_sales_vat_profile(posting_policy, event_date=period_end)["rate"])
+        except PostingPolicyError:
+            # A policy that does not state the period's rate cannot be used to assert one.
+            standard_rate = None
+    generic_expense_account_id, domestic_purchase_vat_type_id, no_vat_purchase_vat_type_id = generic_purchase_mapping(
+        entity_map, standard_rate=standard_rate
+    )
     printful_expense_account_id, printful_vat_type_id = printful_purchase_mapping(entity_map)
     printful_storage_account_id, printful_storage_vat_type_id = printful_storage_mapping(entity_map)
 
@@ -4696,6 +4724,7 @@ def build_action_batch(
         entity_map=entity_map,
         mapping_hints=mapping_hints,
         forced_note=forced_note,
+        posting_policy=posting_policy,
     )
     purchase_credit_actions = build_purchase_credit_actions(
         company_slug=company_slug,

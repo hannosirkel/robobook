@@ -400,6 +400,64 @@ def printful_policy(*, vat_type_id: str, vat_deductible: bool | None = None) -> 
     }
 
 
+def vat_type_entity(entity_id: str, name: str, percent: int | None) -> dict:
+    return {
+        "code": None, "id": entity_id, "name": name, "status": "True",
+        "extra": {"is_purchase": True, "is_sales": False, "reverse_vat_percent": 0, "vat_percent": percent},
+    }
+
+
+ENTITY_MAP_WITH_RATE_TIMELINE = {
+    "financial_accounts": [{"code": "5200", "id": "126", "name": "Muud kulud", "extra": {}}],
+    "vat_types": [
+        vat_type_entity("3", "20% Eesti", 20),
+        vat_type_entity("26", "22% Eesti", 22),
+        vat_type_entity("35", "24% Eesti", 24),
+        {"code": None, "id": "19", "name": "Mitte KM-kohustuslane", "status": "True",
+         "extra": {"is_purchase": True, "is_sales": True, "vat_percent": None}},
+    ],
+}
+
+
+class GenericPurchaseRateTests(unittest.TestCase):
+    """The fallback purchase VAT type must follow the rate in force, not a fixed 20%.
+
+    Estonia moved to 22% on 2024-01-01 and 24% on 2025-07-01. A purchase with no
+    supplier-specific mapping is checked against this type by verify_line_vat_rate,
+    so a stale rate rejects a correctly-taxed invoice.
+    """
+
+    def test_the_rate_in_force_selects_the_matching_purchase_vat_type(self) -> None:
+        for rate, expected in ((20, "3"), (22, "26"), (24, "35")):
+            with self.subTest(rate=rate):
+                _account, domestic, _no_vat = bookbuilder.generic_purchase_mapping(
+                    ENTITY_MAP_WITH_RATE_TIMELINE, standard_rate=rate
+                )
+                self.assertEqual(domestic, expected)
+
+    def test_the_non_taxable_type_is_unaffected_by_the_rate(self) -> None:
+        for rate in (20, 22, 24):
+            _account, _domestic, no_vat = bookbuilder.generic_purchase_mapping(
+                ENTITY_MAP_WITH_RATE_TIMELINE, standard_rate=rate
+            )
+            self.assertEqual(no_vat, "19")
+
+    def test_a_rate_with_no_matching_vat_type_yields_none_rather_than_a_wrong_one(self) -> None:
+        """Absent must stay absent: falling back to another rate would misdeclare VAT."""
+        _account, domestic, _no_vat = bookbuilder.generic_purchase_mapping(
+            ENTITY_MAP_WITH_RATE_TIMELINE, standard_rate=19
+        )
+        self.assertIsNone(domestic)
+
+
+    def test_an_unknown_rate_asserts_nothing(self) -> None:
+        """A policy that never states the period's rate must not have one inferred."""
+        _account, domestic, _no_vat = bookbuilder.generic_purchase_mapping(
+            ENTITY_MAP_WITH_RATE_TIMELINE, standard_rate=None
+        )
+        self.assertIsNone(domestic)
+
+
 class WooOrderEvidenceQuantityTests(unittest.TestCase):
     """A processor row states money, never units; the Woo order summary states the units."""
 

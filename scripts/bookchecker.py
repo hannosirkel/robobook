@@ -2023,6 +2023,32 @@ def _inventory_scope_records(
             == str(scope.get("tax_profile") or "")
         ]
         return selected, "normalized_record"
+    if scope.get("kind") == "woo_order_summary_evidence":
+        # Re-derive the same join the builder made: the sales in scope, then the Woo
+        # order summary naming each one. A sale whose evidence is absent contributes
+        # nothing, so the recomputed set differs and the proof is refused.
+        evidence_by_order = {
+            str((record.get("attributes") or {}).get("order_id") or ""): record
+            for payload in normalized_payloads
+            for record in ((payload.get("records") or {}).get("other") or [])
+            if isinstance(record, dict)
+            and str(record.get("event_type") or "") == "woo_order_summary"
+            and str((record.get("attributes") or {}).get("order_id") or "")
+        }
+        selected = []
+        for record in candidates:
+            if (
+                str(record.get("event_date") or "")[:7] != str(scope.get("period") or "")
+                or str(record.get("currency") or "EUR").upper() != str(scope.get("currency") or "").upper()
+                or _inventory_group_label(record) != str(scope.get("group_label") or "")
+                or ("taxable" if abs(decimal_value(record.get("vat_amount"))) > 0 else "non_taxable")
+                != str(scope.get("tax_profile") or "")
+            ):
+                continue
+            evidence = evidence_by_order.get(str((record.get("attributes") or {}).get("order_id") or ""))
+            if evidence is not None:
+                selected.append(evidence)
+        return selected, "woo_order_summary_evidence"
     if scope.get("kind") == "reviewed_direct_sale_allocation":
         matches = [
             (record, allocation)
@@ -2137,6 +2163,17 @@ def evaluate_inventory_quantities(
                 if source_quantity <= 0 or source_quantity != quantity:
                     problems.append(f"Inventory quantity contributor {record_id} does not match normalized quantity.")
                 problems.extend(residual_quantity_derivation_errors(record))
+            elif source == "woo_order_summary_evidence":
+                # A processor row states money, never units; the Woo order summary
+                # states the units. Re-read them rather than trust the proof.
+                try:
+                    evidence_quantity = decimal_value((record.get("attributes") or {}).get("items_sold"))
+                except SimplbooksError:
+                    evidence_quantity = Decimal("0")  # noqa: FURB157
+                if evidence_quantity <= 0 or evidence_quantity != quantity:
+                    problems.append(
+                        f"Inventory quantity contributor {record_id} does not match the Woo order summary units."
+                    )
             elif source == "reviewed_allocation_target":
                 allocation = reviewed_allocations.get(record_id)
                 target = allocation.get("target") if isinstance(allocation, dict) else None
@@ -2192,6 +2229,8 @@ def evaluate_inventory_quantities(
                 if quantity_source == "reviewed_allocation_target":
                     target = (reviewed_allocations.get(str(record.get("record_id") or "")) or {}).get("target") or {}
                     quantity_value = target.get("quantity")
+                elif quantity_source == "woo_order_summary_evidence":
+                    quantity_value = (record.get("attributes") or {}).get("items_sold")
                 else:
                     quantity_value = record.get("quantity")
                 try:

@@ -1231,6 +1231,51 @@ class BookprepTests(unittest.TestCase):
             self.assertEqual(sum(bool(item["blocking"]) for item in exceptions), 3)
             self.assertEqual(sum("skipped-status" in item["exception_id"] for item in exceptions), 2)
 
+    def test_balance_history_recovers_the_woo_order_id_from_the_description(self) -> None:
+        """The API balance export carries no metadata column; the order number is in the description.
+
+        Without it a zero-rated order has no reviewed quantity anywhere, and the
+        sales line cannot prove the stock it moves.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "stripe_balance_history.csv"
+            csv_path.write_text(
+                '"id","Type","Source","Amount","Fee","Net","Currency","Created (UTC)","Available On (UTC)","Description"\n'
+                '"txn_order","payment","py_order","29.85","0.70","29.15","EUR","2026-01-09 17:31:59","2026-01-14 00:00:00","Example Company - Order 820"\n',
+                encoding="utf-8",
+            )
+            period_start, period_end = bookprep.parse_period("2026-01")
+            source = bookprep.inspect_source_file(path=csv_path, root_dir=root, period_start=period_start, period_end=period_end)
+            assert source is not None
+
+            records, exceptions = bookprep.parse_stripe_balance_csv(
+                source, period_start=period_start, period_end=period_end, base_currency="EUR",
+            )
+
+            self.assertFalse([item for item in exceptions if item["blocking"]])
+            self.assertEqual(records["sales"][0]["attributes"]["order_id"], "820")
+
+    def test_balance_history_without_an_order_in_the_description_reports_no_order_id(self) -> None:
+        """Absent must stay absent: a defaulted order number would bind a sale to the wrong order."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "stripe_balance_history.csv"
+            csv_path.write_text(
+                '"id","Type","Source","Amount","Fee","Net","Currency","Created (UTC)","Available On (UTC)","Description"\n'
+                '"txn_plain","payment","py_plain","10.00","0.30","9.70","EUR","2026-01-09 17:31:59","2026-01-14 00:00:00","Subscription renewal"\n',
+                encoding="utf-8",
+            )
+            period_start, period_end = bookprep.parse_period("2026-01")
+            source = bookprep.inspect_source_file(path=csv_path, root_dir=root, period_start=period_start, period_end=period_end)
+            assert source is not None
+
+            records, _exceptions = bookprep.parse_stripe_balance_csv(
+                source, period_start=period_start, period_end=period_end, base_currency="EUR",
+            )
+
+            self.assertIsNone(records["sales"][0]["attributes"]["order_id"])
+
     def test_parse_stripe_charges_csv_maps_needed_columns_and_emits_refund(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

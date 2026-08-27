@@ -1231,6 +1231,50 @@ class BookprepTests(unittest.TestCase):
             self.assertEqual(sum(bool(item["blocking"]) for item in exceptions), 3)
             self.assertEqual(sum("skipped-status" in item["exception_id"] for item in exceptions), 2)
 
+    def test_a_purchase_note_line_list_splits_one_invoice_by_rate(self) -> None:
+        """One document, several VAT treatments: the guard refuses to collapse them.
+
+        A postal invoice mixes a domestic-rate service, a zero-rated export and a
+        customs duty outside the scope of VAT. Each needs its own record so the
+        builder can put each on its own line.
+        """
+        note = (
+            "28,33\u20ac total. Lines:\n"
+            "- 10,67\u20ac + 2,56\u20ac (VAT) = 13,23\u20ac; Estonian VAT 24%\n"
+            "- 15,10\u20ac; VAT 0%\n"
+        )
+        parsed = bookprep.parse_purchase_note_amounts(note)
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed["gross_amount"], Decimal("28.33"))
+        self.assertEqual(parsed["vat_amount"], Decimal("2.56"))
+        segments = parsed["segments"]
+        self.assertEqual(len(segments), 2)
+        self.assertEqual(
+            [(seg["gross_amount"], seg["vat_amount"]) for seg in segments],
+            [(Decimal("13.23"), Decimal("2.56")), (Decimal("15.10"), Decimal(0))],
+        )
+
+    def test_a_line_list_that_does_not_sum_to_the_stated_total_is_refused(self) -> None:
+        """Silently trusting a mismatch would post an invoice that does not exist."""
+        note = (
+            "28,33\u20ac total. Lines:\n"
+            "- 10,67\u20ac + 2,56\u20ac (VAT) = 13,23\u20ac; Estonian VAT 24%\n"
+            "- 10,10\u20ac; VAT 0%\n"
+        )
+        with self.assertRaises(bookprep.PurchaseNoteError):
+            bookprep.parse_purchase_note_amounts(note)
+
+    def test_a_note_without_a_line_list_is_unchanged(self) -> None:
+        """The existing single-rate notes must keep parsing exactly as before."""
+        parsed = bookprep.parse_purchase_note_amounts(
+            "12,46\u20ac + 2,99\u20ac (VAT) = 15,45\u20ac; domain registration"
+        )
+        self.assertEqual(parsed["gross_amount"], Decimal("15.45"))
+        self.assertEqual(parsed["vat_amount"], Decimal("2.99"))
+        self.assertEqual(parsed["net_amount"], Decimal("12.46"))
+        self.assertNotIn("segments", parsed)
+
     def test_balance_history_recovers_the_woo_order_id_from_the_description(self) -> None:
         """The API balance export carries no metadata column; the order number is in the description.
 
@@ -1972,6 +2016,44 @@ class BookprepTests(unittest.TestCase):
             self.assertEqual(expense["gross_amount"], 14.01)
             self.assertEqual(expense["net_amount"], 11.3)
             self.assertEqual(expense["vat_amount"], 2.71)
+
+    def test_a_mixed_rate_note_becomes_one_record_per_rate(self) -> None:
+        """The builder buckets purchases by VAT treatment, so the split must reach it as records."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ostuarved = root / "Ostuarved"
+            ostuarved.mkdir()
+            (ostuarved / "2026.02.28_Postal.pdf").write_bytes(b"pdf")
+            (ostuarved / "README.md").write_text(
+                "2026.02.28 Postal:\n"
+                "28,33\u20ac total. Lines:\n"
+                "- 10,67\u20ac + 2,56\u20ac (VAT) = 13,23\u20ac; Estonian VAT 24%\n"
+                "- 15,10\u20ac; VAT 0% (export parcel and a duty outside the scope of VAT)\n",
+                encoding="utf-8",
+            )
+
+            period_start, period_end = bookprep.parse_period("2026-02")
+            sources = bookprep.inspect_sources(
+                source_dir=root, root_dir=root,
+                period_start=period_start, period_end=period_end,
+            )
+            records, exceptions = bookprep.aggregate_results(
+                sources=sources, period_start=period_start,
+                period_end=period_end, base_currency="EUR",
+            )
+
+            self.assertFalse([item for item in exceptions if item.get("blocking")])
+            expenses = sorted(records["purchase_expenses"], key=lambda item: -item["vat_amount"])
+            self.assertEqual(len(expenses), 2)
+            self.assertEqual((expenses[0]["gross_amount"], expenses[0]["vat_amount"]), (13.23, 2.56))
+            self.assertEqual((expenses[1]["gross_amount"], expenses[1]["vat_amount"]), (15.1, 0.0))
+            self.assertEqual(
+                len({expense["record_id"] for expense in expenses}), 2,
+                "each rate needs its own record id",
+            )
+            self.assertEqual(
+                round(sum(expense["gross_amount"] for expense in expenses), 2), 28.33
+            )
 
     def test_employee_paid_ostuarved_note_becomes_expense_report_evidence_not_supplier_payable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

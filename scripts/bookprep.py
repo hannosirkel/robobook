@@ -712,8 +712,13 @@ def match_purchase_note_target(readme_path: Path, event_date: date, label: str) 
     return best_path if best_score >= 10 else None
 
 
-def parse_purchase_note_amounts(note_text: str) -> dict[str, Any] | None:
-    normalized = re.sub(r"\s+", " ", note_text.strip())
+class PurchaseNoteError(RuntimeError):
+    """A reviewed purchase note that cannot be trusted as written."""
+
+
+def _parse_note_amount_fragment(fragment: str) -> dict[str, Any] | None:
+    """Read one amount phrase: an optional net, an optional VAT, and a total."""
+    normalized = re.sub(r"\s+", " ", fragment.strip())
     lower = normalize_ascii(normalized).lower()
     amounts = [parse_decimal(value) for value in re.findall(r"([0-9]+(?:[.,][0-9]+)?)\s*€", normalized)]
     if not amounts:
@@ -741,12 +746,66 @@ def parse_purchase_note_amounts(note_text: str) -> dict[str, Any] | None:
         else:
             gross_amount = amounts[-1]
 
-    net_amount = gross_amount - vat_amount
     return {
         "gross_amount": gross_amount,
-        "net_amount": net_amount,
+        "net_amount": gross_amount - vat_amount,
         "vat_amount": vat_amount,
         "reverse_charge": reverse_charge,
+    }
+
+
+def parse_purchase_note_amounts(note_text: str) -> dict[str, Any] | None:
+    """Read a reviewed purchase note, splitting it by VAT rate when it says so.
+
+    One supplier document can carry several VAT treatments at once - a domestic-rate
+    service, a zero-rated export, a duty outside the scope of VAT. A single total
+    cannot express that, and `verify_line_vat_rate` refuses to collapse them, so a
+    note may instead list its lines:
+
+        28,33€ total. Lines:
+        - 10,67€ + 2,56€ (VAT) = 13,23€; Estonian VAT 24%
+        - 15,10€; VAT 0%
+
+    Each listed line becomes its own record. A stated total that disagrees with the
+    lines is refused rather than reconciled: the note describes a real document, and
+    guessing which half is right would post an invoice nobody issued.
+    """
+    # The entry reader collapses a note onto one line, so the list cannot be found by
+    # line starts. An explicit "Lines:" marker introduces it, which also keeps a stray
+    # hyphen in prose from being read as a line.
+    marker = re.search(r"lines\s*:", note_text, flags=re.IGNORECASE)
+    segment_texts: list[str] = []
+    if marker:
+        tail = note_text[marker.end() :]
+        segment_texts = [
+            match.group(1).strip()
+            for match in re.finditer(r"[-*]\s+(.+?)(?=\s+[-*]\s+|$)", tail, flags=re.DOTALL)
+        ]
+    if len(segment_texts) < 2:
+        return _parse_note_amount_fragment(note_text)
+
+    segments = [_parse_note_amount_fragment(text) for text in segment_texts]
+    if any(segment is None for segment in segments):
+        raise PurchaseNoteError("Every listed purchase-note line must state an amount.")
+
+    gross_total = sum((segment["gross_amount"] for segment in segments), Decimal(0))
+    vat_total = sum((segment["vat_amount"] for segment in segments), Decimal(0))
+
+    heading = note_text[: marker.start()]
+    stated = re.search(r"([0-9]+(?:[.,][0-9]+)?)\s*€\s*total", heading, flags=re.IGNORECASE)
+    if stated:
+        stated_total = parse_decimal(stated.group(1))
+        if stated_total != gross_total:
+            raise PurchaseNoteError(
+                f"Purchase note lines total {gross_total} € but the note states {stated_total} €."
+            )
+
+    return {
+        "gross_amount": gross_total,
+        "net_amount": gross_total - vat_total,
+        "vat_amount": vat_total,
+        "reverse_charge": all(segment["reverse_charge"] for segment in segments),
+        "segments": segments,
     }
 
 
@@ -3794,30 +3853,52 @@ def parse_purchase_note_markdown(
     expense_report_payee = payer_match.group(1).strip() if payer_match else None
     category_name = "manual_adjustments" if expense_report_payee else "purchase_expenses"
 
-    category, record = make_record(
-        source=source,
-        category=category_name,
-        record_id=f"{source.source_id}:{'expense-report' if expense_report_payee else 'purchase'}:{slugify(target_source_id or vendor_name)}",
-        event_type="expense_report_evidence" if expense_report_payee else "purchase_note_markdown",
-        event_date=event_date,
-        description=note_body or f"{vendor_name} manual purchase note",
-        currency=base_currency,
-        gross_amount=gross_amount,
-        net_amount=net_amount,
-        vat_amount=vat_amount,
-        external_ref=target_source_id or None,
-        channel=slugify(vendor_name),
-        attributes={
-            "invoice_number": None,
-            "vendor_name": vendor_name,
-            "manual_note": True,
-            "reverse_charge": bool(context.get("reverse_charge")),
-            "target_source_id": target_source_id or None,
-            "target_path": context.get("target_path"),
-            "expense_report_payee": expense_report_payee,
-        },
-    )
-    result[category].append(record)
+    kind = "expense-report" if expense_report_payee else "purchase"
+    base_record_id = f"{source.source_id}:{kind}:{slugify(target_source_id or vendor_name)}"
+
+    # A note that lists its lines describes one document carrying several VAT
+    # treatments. The builder buckets purchases by treatment, so each must arrive
+    # as its own record or they collapse back into a single mixed-rate line.
+    segments = context.get("segments")
+    if isinstance(segments, list) and segments:
+        parts = [
+            (
+                f"{base_record_id}:line-{index}",
+                parse_decimal(segment.get("gross_amount")),
+                parse_decimal(segment.get("net_amount")),
+                parse_decimal(segment.get("vat_amount")),
+                bool(segment.get("reverse_charge")),
+            )
+            for index, segment in enumerate(segments, start=1)
+        ]
+    else:
+        parts = [(base_record_id, gross_amount, net_amount, vat_amount, bool(context.get("reverse_charge")))]
+
+    for record_id, part_gross, part_net, part_vat, part_reverse_charge in parts:
+        category, record = make_record(
+            source=source,
+            category=category_name,
+            record_id=record_id,
+            event_type="expense_report_evidence" if expense_report_payee else "purchase_note_markdown",
+            event_date=event_date,
+            description=note_body or f"{vendor_name} manual purchase note",
+            currency=base_currency,
+            gross_amount=part_gross,
+            net_amount=part_net,
+            vat_amount=part_vat,
+            external_ref=target_source_id or None,
+            channel=slugify(vendor_name),
+            attributes={
+                "invoice_number": None,
+                "vendor_name": vendor_name,
+                "manual_note": True,
+                "reverse_charge": part_reverse_charge,
+                "target_source_id": target_source_id or None,
+                "target_path": context.get("target_path"),
+                "expense_report_payee": expense_report_payee,
+            },
+        )
+        result[category].append(record)
     update_coverage_from_dates(source, [event_date])
     return result, []
 

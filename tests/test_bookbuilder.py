@@ -419,6 +419,108 @@ ENTITY_MAP_WITH_RATE_TIMELINE = {
 }
 
 
+class RecordExclusionTests(unittest.TestCase):
+    """A reviewed exclusion keeps a non-transaction out of the books without hiding it.
+
+    A test order placed on a live platform and refunded the same day moves no goods
+    and earns no revenue, but it is real evidence and must stay in the normalized
+    record. The exclusion names it, says why, and removes it from posting only.
+    """
+
+    @staticmethod
+    def records() -> dict:
+        return {
+            "sales": [
+                {"record_id": "stripe:sales:12", "gross_amount": 39.68, "event_date": "2026-08-23"},
+                {"record_id": "stripe:sales:13", "gross_amount": 20.0, "event_date": "2026-08-24"},
+            ],
+            "refunds": [
+                {"record_id": "stripe:refunds:1", "gross_amount": -39.68, "event_date": "2026-08-23"},
+            ],
+        }
+
+    @staticmethod
+    def exclusion(period: str = "2026-08") -> list[dict]:
+        return [{
+            "exclusion_id": "example-2026-08-stripe-test-order",
+            "period": period,
+            "record_ids": ["stripe:sales:12", "stripe:refunds:1"],
+            "reason": "Test order refunded in full the same day; no goods moved.",
+        }]
+
+    def test_named_records_are_removed_from_posting(self) -> None:
+        kept, notes = bookbuilder.apply_record_exclusions(
+            self.records(), self.exclusion(), period="2026-08"
+        )
+        self.assertEqual([r["record_id"] for r in kept["sales"]], ["stripe:sales:13"])
+        self.assertEqual(kept["refunds"], [])
+        self.assertTrue(any("test-order" in note or "Test order" in note for note in notes))
+
+    def test_an_exclusion_for_another_period_changes_nothing(self) -> None:
+        kept, notes = bookbuilder.apply_record_exclusions(
+            self.records(), self.exclusion("2026-07"), period="2026-08"
+        )
+        self.assertEqual(len(kept["sales"]), 2)
+        self.assertEqual(len(kept["refunds"]), 1)
+        self.assertEqual(notes, [])
+
+    def test_an_exclusion_naming_an_absent_record_is_refused(self) -> None:
+        """A stale exclusion must surface, not silently pass: it may be masking real trade."""
+        stale = self.exclusion()
+        stale[0]["record_ids"] = ["stripe:sales:12", "stripe:sales:999"]
+        with self.assertRaises(bookbuilder.SimplbooksError):
+            bookbuilder.apply_record_exclusions(self.records(), stale, period="2026-08")
+
+    def test_an_exclusion_without_a_reason_is_refused(self) -> None:
+        bare = self.exclusion()
+        del bare[0]["reason"]
+        with self.assertRaises(bookbuilder.SimplbooksError):
+            bookbuilder.apply_record_exclusions(self.records(), bare, period="2026-08")
+
+    def test_no_exclusions_leaves_the_records_untouched(self) -> None:
+        kept, notes = bookbuilder.apply_record_exclusions(self.records(), [], period="2026-08")
+        self.assertEqual(len(kept["sales"]), 2)
+        self.assertEqual(notes, [])
+
+
+class ZeroValueSalesTests(unittest.TestCase):
+    """A line worth nothing is not a document. Purchases already skip these."""
+
+    HINTS: typing.ClassVar[dict] = {
+        "revenue_account": ("109", []),
+        "shipping_account": ("255", []),
+        "standard_vat_type": ("34", []),
+        "zero_vat_type": ("12", []),
+        "default_warehouse": ("1", []),
+    }
+
+    def test_a_group_worth_nothing_produces_no_revenue_line(self) -> None:
+        records = [{
+            "record_id": "stripe:sales:12", "gross_amount": 0.0, "net_amount": 0.0,
+            "vat_amount": 0.0, "shipping_amount": 0.0, "fee_amount": 0.85,
+            "event_date": "2026-08-23", "currency": "EUR", "channel": "stripe",
+            "quantity": None, "attributes": {},
+        }]
+        lines, _notes = bookbuilder.build_sales_lines(
+            records=records, group_label="stripe", direction="sales",
+            shipping_split=False, mapping_hints=self.HINTS,
+        )
+        self.assertEqual([line for line in lines if line["line_role"] == "sales_revenue"], [])
+
+    def test_a_group_with_value_still_produces_a_line(self) -> None:
+        records = [{
+            "record_id": "stripe:sales:13", "gross_amount": 20.0, "net_amount": 20.0,
+            "vat_amount": 0.0, "shipping_amount": 0.0, "fee_amount": 0.0,
+            "event_date": "2026-08-24", "currency": "EUR", "channel": "stripe",
+            "quantity": 1, "attributes": {},
+        }]
+        lines, _notes = bookbuilder.build_sales_lines(
+            records=records, group_label="stripe", direction="sales",
+            shipping_split=False, mapping_hints=self.HINTS,
+        )
+        self.assertTrue([line for line in lines if line["line_role"] == "sales_revenue"])
+
+
 class GenericPurchaseRateTests(unittest.TestCase):
     """The fallback purchase VAT type must follow the rate in force, not a fixed 20%.
 

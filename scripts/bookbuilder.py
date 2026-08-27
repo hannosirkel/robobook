@@ -1711,6 +1711,10 @@ def build_sales_lines(
             gross_amount = sum_abs_amount(profile_records, "gross_amount")
             vat_amount = sum_abs_amount(profile_records, "vat_amount")
             shipping_amount = sum_abs_amount(profile_records, "shipping_amount")
+            if gross_amount == 0 and vat_amount == 0 and shipping_amount == 0:
+                # Nothing was sold. A zero line is not a document, and raising one would
+                # ask the warehouse to move stock that never moved.
+                continue
             inventory_proof = inventory_proof_for(profile_records)
             lines.append(
                 {
@@ -4624,6 +4628,7 @@ def build_action_batch(
     bank_allocations: dict[tuple[str, str, str], dict[str, Any]] | None = None,
     inventory_transfer_evidence: list[dict[str, Any]] | None = None,
     set_off_evidence: list[dict[str, Any]] | None = None,
+    record_exclusions: list[dict[str, Any]] | None = None,
     force: bool = False,
 ) -> dict[str, Any]:
     if normalized_payload.get("period") != recon_payload.get("period"):
@@ -4654,6 +4659,7 @@ def build_action_batch(
         normalized_payload.get("records") or {},
         discovery_overview,
     )
+    records, exclusion_notes = apply_record_exclusions(records, record_exclusions, period=period)
     bank_account_id, bank_account_notes = preferred_bank_account_id(company_profile, entity_map)
     if posting_policy is not None and records.get("bank_transactions"):
         source_bank_records = [
@@ -4835,6 +4841,7 @@ def build_action_batch(
         warn_count = sum(1 for check in recon_payload["checks"] if check.get("status") == "warn")
         if warn_count:
             summary_parts.append(f"Recon still carries {warn_count} warning check(s).")
+    summary_parts.extend(exclusion_notes)
     source_summary = " ".join(summary_parts)
 
     return {
@@ -4966,6 +4973,96 @@ def load_inventory_transfer_evidence(path: Path | None) -> list[dict[str, Any]]:
     return entries
 
 
+def resolve_exclusion_evidence_path(
+    *, company_dir: Path | None, normalized_path: Path, period: str, override: str | None
+) -> Path | None:
+    if override:
+        return Path(override)
+    filename = f"{period[:4]}-exclusions.json"
+    if company_dir is not None:
+        return company_dir / "artifacts" / "actions" / filename
+    artifacts_dir = inferred_artifacts_dir(normalized_path)
+    return (artifacts_dir / "actions" / filename) if artifacts_dir is not None else None
+
+
+def load_record_exclusions(path: Path | None) -> list[dict[str, Any]]:
+    """Load reviewed record exclusions, treating absence as nothing excluded."""
+    if path is None or not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SimplbooksError(f"Reviewed record exclusions {path} are unreadable: {exc}") from exc
+    entries = payload if isinstance(payload, list) else [payload]
+    if not all(isinstance(entry, dict) for entry in entries):
+        raise SimplbooksError(f"Reviewed record exclusions {path} must contain objects.")
+    return entries
+
+
+def apply_record_exclusions(
+    records: dict[str, list[dict[str, Any]]],
+    exclusions: list[dict[str, Any]] | None,
+    *,
+    period: str,
+) -> tuple[dict[str, list[dict[str, Any]]], list[str]]:
+    """Drop reviewed non-transactions from posting while leaving the evidence intact.
+
+    Some traffic on a live platform is not trade: a test order refunded the same day
+    moves no goods and earns no revenue, yet it is real evidence and belongs in the
+    normalized record. An exclusion names such records, says why, and removes them
+    from the batch only.
+
+    A record named but not present stops the build. A stale exclusion is indistinguishable
+    from one that has started masking real trade, and silence would let it do so.
+    """
+    notes: list[str] = []
+    excluded: dict[str, str] = {}
+    for entry in exclusions or []:
+        if str(entry.get("period") or "") != period:
+            continue
+        exclusion_id = str(entry.get("exclusion_id") or "").strip()
+        if not exclusion_id:
+            raise SimplbooksError("Reviewed record exclusion requires an exclusion_id.")
+        reason = str(entry.get("reason") or "").strip()
+        if not reason:
+            raise SimplbooksError(f"Record exclusion {exclusion_id} requires a reason.")
+        record_ids = entry.get("record_ids")
+        if not isinstance(record_ids, list) or not record_ids:
+            raise SimplbooksError(f"Record exclusion {exclusion_id} requires record_ids.")
+        for record_id in record_ids:
+            text = str(record_id or "").strip()
+            if not text:
+                raise SimplbooksError(f"Record exclusion {exclusion_id} has an empty record id.")
+            excluded[text] = exclusion_id
+        notes.append(f"Excluded from posting by {exclusion_id}: {reason}")
+
+    if not excluded:
+        return records, notes
+
+    seen: set[str] = set()
+    kept: dict[str, list[dict[str, Any]]] = {}
+    for category, entries in records.items():
+        if not isinstance(entries, list):
+            kept[category] = entries
+            continue
+        remaining = []
+        for record in entries:
+            record_id = str((record or {}).get("record_id") or "")
+            if record_id in excluded:
+                seen.add(record_id)
+                continue
+            remaining.append(record)
+        kept[category] = remaining
+
+    missing = sorted(set(excluded) - seen)
+    if missing:
+        raise SimplbooksError(
+            "Reviewed record exclusion names records that are not in this period: "
+            + ", ".join(missing)
+        )
+    return kept, notes
+
+
 def resolve_set_off_evidence_path(
     *, company_dir: Path | None, normalized_path: Path, period: str, override: str | None
 ) -> Path | None:
@@ -5047,6 +5144,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--statement-import-plan", help="Annual statement-import plan artifact")
     parser.add_argument("--inventory-transfers", help="Reviewed warehouse transfer evidence JSON")
     parser.add_argument("--setoffs", help="Reviewed cashless set-off evidence JSON")
+    parser.add_argument("--exclusions", help="Reviewed record-exclusion evidence JSON")
     parser.add_argument("--output", help="Optional output path for actions YAML")
     parser.add_argument("--force", action="store_true", help="Allow draft generation even when recon does not approve the month")
     return parser
@@ -5100,6 +5198,12 @@ def main() -> int:
         normalized_path=normalized_path,
         period=args.period,
         override=args.inventory_transfers,
+    )
+    exclusion_evidence_path = resolve_exclusion_evidence_path(
+        company_dir=company_dir,
+        normalized_path=normalized_path,
+        period=args.period,
+        override=args.exclusions,
     )
     set_off_evidence_path = resolve_set_off_evidence_path(
         company_dir=company_dir,
@@ -5190,6 +5294,7 @@ def main() -> int:
         bank_allocations=bank_allocations,
         inventory_transfer_evidence=load_inventory_transfer_evidence(inventory_transfer_evidence_path),
         set_off_evidence=load_set_off_evidence(set_off_evidence_path),
+        record_exclusions=load_record_exclusions(exclusion_evidence_path),
         force=args.force,
     )
     bound_paths = [

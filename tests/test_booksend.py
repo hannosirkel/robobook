@@ -789,6 +789,70 @@ class BooksendTests(unittest.TestCase):
         with self.assertRaisesRegex(SimplbooksError, "action contract"):
             booksend.translate_action_for_api(action, lookup={})
 
+    def test_sender_accepts_a_woo_order_summary_evidence_proof(self) -> None:
+        """The sender validates the proof independently and must know this scope too.
+
+        A zero-rated export carries its units only in the Woo order summary; refusing
+        that scope here would make such a month unsendable after it passed the checker.
+        """
+        action = invoice_action(key="example-2026-01-sales-stripe")
+        sales = [
+            {
+                "record_id": "stripe:sales:3", "quantity": None, "gross_amount": 29.85,
+                "event_date": "2026-01-09", "currency": "EUR", "channel": "stripe",
+                "vat_amount": 0.0, "attributes": {"order_id": "820"},
+            },
+        ]
+        evidence = {
+            "820": {
+                "record_id": "woo:woo-order:6", "event_type": "woo_order_summary",
+                "external_ref": "820", "event_date": "2026-01-09",
+                "attributes": {"order_id": "820", "items_sold": 1.0},
+            }
+        }
+        proof = bookbuilder.woo_order_evidence_quantity_proof(
+            sales, evidence, group_label="stripe", direction="sales"
+        )
+        action["payload"]["line_items"] = [{
+            "line_role": "sales_revenue", "description": "stripe non taxable sales summary",
+            "gross_amount": 29.85, "vat_amount_hint": 0, "suggested_income_account_id": "3000",
+            "suggested_vat_type_id": "22", "article_id_hint": "3", "quantity": 1.0,
+            "inventory_quantity_proof": proof,
+        }]
+
+        self.assertEqual(
+            booksend.inventory_quantity_proof_errors(action, action["payload"]["line_items"][0]),
+            [],
+        )
+
+    def test_sender_rejects_a_woo_order_scope_whose_contributors_claim_another_source(self) -> None:
+        """The scope and the contributor source must agree, or the proof proves nothing."""
+        action = invoice_action(key="example-2026-01-mismatched-source")
+        sales = [{
+            "record_id": "stripe:sales:3", "quantity": None, "gross_amount": 29.85,
+            "event_date": "2026-01-09", "currency": "EUR", "channel": "stripe",
+            "vat_amount": 0.0, "attributes": {"order_id": "820"},
+        }]
+        evidence = {"820": {
+            "record_id": "woo:woo-order:6", "event_type": "woo_order_summary",
+            "external_ref": "820", "event_date": "2026-01-09",
+            "attributes": {"order_id": "820", "items_sold": 1.0},
+        }}
+        proof = bookbuilder.woo_order_evidence_quantity_proof(
+            sales, evidence, group_label="stripe", direction="sales"
+        )
+        proof["contributors"][0]["quantity_source"] = "normalized_record"
+        action["payload"]["line_items"] = [{
+            "line_role": "sales_revenue", "description": "stripe non taxable sales summary",
+            "gross_amount": 29.85, "vat_amount_hint": 0, "suggested_income_account_id": "3000",
+            "suggested_vat_type_id": "22", "article_id_hint": "3", "quantity": 1.0,
+            "inventory_quantity_proof": proof,
+        }]
+
+        self.assertTrue(
+            booksend.inventory_quantity_proof_errors(action, action["payload"]["line_items"][0])
+        )
+
     def test_sender_rejects_credit_note_with_sales_inventory_scope(self) -> None:
         action = invoice_action(key="example-2024-01-wrong-sales-scope")
         action["action_type"] = "create_credit_invoice_summary"

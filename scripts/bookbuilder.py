@@ -4659,7 +4659,17 @@ def build_action_batch(
         normalized_payload.get("records") or {},
         discovery_overview,
     )
-    records, exclusion_notes = apply_record_exclusions(records, record_exclusions, period=period)
+    records, exclusion_notes, fee_only_records = apply_record_exclusions(
+        records, record_exclusions, period=period
+    )
+    # An excluded record asserts no revenue, but the processor still kept its fee.
+    # Only the fee summary sees these; every other builder works from `records`.
+    records_for_fees = records
+    if fee_only_records:
+        records_for_fees = {
+            category: [*(records.get(category) or []), *fee_only_records.get(category, [])]
+            for category in {*records, *fee_only_records}
+        }
     bank_account_id, bank_account_notes = preferred_bank_account_id(company_profile, entity_map)
     if posting_policy is not None and records.get("bank_transactions"):
         source_bank_records = [
@@ -4714,7 +4724,7 @@ def build_action_batch(
         period=period,
         period_end=period_end,
         normalized_path_display=normalized_path_display,
-        records=records,
+        records=records_for_fees,
         base_currency=base_currency,
         entity_map=entity_map,
         mapping_hints=mapping_hints,
@@ -5004,7 +5014,7 @@ def apply_record_exclusions(
     exclusions: list[dict[str, Any]] | None,
     *,
     period: str,
-) -> tuple[dict[str, list[dict[str, Any]]], list[str]]:
+) -> tuple[dict[str, list[dict[str, Any]]], list[str], dict[str, list[dict[str, Any]]]]:
     """Drop reviewed non-transactions from posting while leaving the evidence intact.
 
     Some traffic on a live platform is not trade: a test order refunded the same day
@@ -5012,11 +5022,17 @@ def apply_record_exclusions(
     normalized record. An exclusion names such records, says why, and removes them
     from the batch only.
 
+    A processor keeps its fee even when it refunds the charge in full, so an exclusion
+    may retain that fee. The fee summary is built from `fee_amount` and never from
+    `gross_amount`, so the record can carry its fee without asserting revenue that did
+    not arise. Those records come back separately, for the fee summary alone.
+
     A record named but not present stops the build. A stale exclusion is indistinguishable
     from one that has started masking real trade, and silence would let it do so.
     """
     notes: list[str] = []
     excluded: dict[str, str] = {}
+    fee_retained: set[str] = set()
     for entry in exclusions or []:
         if str(entry.get("period") or "") != period:
             continue
@@ -5029,17 +5045,21 @@ def apply_record_exclusions(
         record_ids = entry.get("record_ids")
         if not isinstance(record_ids, list) or not record_ids:
             raise SimplbooksError(f"Record exclusion {exclusion_id} requires record_ids.")
+        retain_fee = bool(entry.get("retain_processor_fee"))
         for record_id in record_ids:
             text = str(record_id or "").strip()
             if not text:
                 raise SimplbooksError(f"Record exclusion {exclusion_id} has an empty record id.")
             excluded[text] = exclusion_id
+            if retain_fee:
+                fee_retained.add(text)
         notes.append(f"Excluded from posting by {exclusion_id}: {reason}")
 
     if not excluded:
-        return records, notes
+        return records, notes, {}
 
     seen: set[str] = set()
+    fee_only: dict[str, list[dict[str, Any]]] = {}
     kept: dict[str, list[dict[str, Any]]] = {}
     for category, entries in records.items():
         if not isinstance(entries, list):
@@ -5050,6 +5070,8 @@ def apply_record_exclusions(
             record_id = str((record or {}).get("record_id") or "")
             if record_id in excluded:
                 seen.add(record_id)
+                if record_id in fee_retained:
+                    fee_only.setdefault(category, []).append(record)
                 continue
             remaining.append(record)
         kept[category] = remaining
@@ -5060,7 +5082,7 @@ def apply_record_exclusions(
             "Reviewed record exclusion names records that are not in this period: "
             + ", ".join(missing)
         )
-    return kept, notes
+    return kept, notes, fee_only
 
 
 def resolve_set_off_evidence_path(

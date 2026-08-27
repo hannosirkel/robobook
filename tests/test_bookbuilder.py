@@ -449,7 +449,7 @@ class RecordExclusionTests(unittest.TestCase):
         }]
 
     def test_named_records_are_removed_from_posting(self) -> None:
-        kept, notes = bookbuilder.apply_record_exclusions(
+        kept, notes, _fees = bookbuilder.apply_record_exclusions(
             self.records(), self.exclusion(), period="2026-08"
         )
         self.assertEqual([r["record_id"] for r in kept["sales"]], ["stripe:sales:13"])
@@ -457,12 +457,59 @@ class RecordExclusionTests(unittest.TestCase):
         self.assertTrue(any("test-order" in note or "Test order" in note for note in notes))
 
     def test_an_exclusion_for_another_period_changes_nothing(self) -> None:
-        kept, notes = bookbuilder.apply_record_exclusions(
+        kept, notes, _fees = bookbuilder.apply_record_exclusions(
             self.records(), self.exclusion("2026-07"), period="2026-08"
         )
         self.assertEqual(len(kept["sales"]), 2)
         self.assertEqual(len(kept["refunds"]), 1)
         self.assertEqual(notes, [])
+
+    def test_a_retained_processor_fee_still_reaches_the_fee_summary(self) -> None:
+        """The processor keeps its fee even when it refunds the charge in full.
+
+        The fee summary is built from fee_amount, never from gross_amount, so an
+        excluded record can still carry its fee without asserting revenue that did
+        not arise. Dropping it wholesale would leave the clearing account short by
+        exactly the fee.
+        """
+        records = {
+            "sales": [{
+                "record_id": "stripe:sales:12", "gross_amount": 39.68, "net_amount": 38.83,
+                "vat_amount": 0.0, "fee_amount": 0.85, "event_date": "2026-08-23",
+            }],
+            "refunds": [{
+                "record_id": "stripe:refunds:1", "gross_amount": -39.68, "net_amount": -39.68,
+                "vat_amount": 0.0, "fee_amount": 0.0, "event_date": "2026-08-23",
+            }],
+        }
+        exclusion = [{
+            "exclusion_id": "example-2026-08-test-order",
+            "period": "2026-08",
+            "record_ids": ["stripe:sales:12", "stripe:refunds:1"],
+            "reason": "Test order refunded in full the same day; the processor kept its fee.",
+            "retain_processor_fee": True,
+        }]
+
+        kept, _notes, fee_only = bookbuilder.apply_record_exclusions(
+            records, exclusion, period="2026-08"
+        )
+
+        self.assertEqual(kept["sales"], [], "no revenue is asserted")
+        self.assertEqual(kept["refunds"], [])
+        carried = fee_only["sales"] + fee_only["refunds"]
+        self.assertEqual(len(carried), 2)
+        self.assertEqual(sum(r["fee_amount"] for r in carried), 0.85)
+        for record in carried:
+            self.assertEqual(record["gross_amount"], 39.68 if record["fee_amount"] else -39.68)
+
+    def test_an_exclusion_without_the_flag_carries_no_fee(self) -> None:
+        kept, _notes, fee_only = bookbuilder.apply_record_exclusions(
+            {"sales": [{"record_id": "s:1", "gross_amount": 5.0, "fee_amount": 0.2}]},
+            [{"exclusion_id": "x", "period": "2026-08", "record_ids": ["s:1"], "reason": "why"}],
+            period="2026-08",
+        )
+        self.assertEqual(kept["sales"], [])
+        self.assertEqual(fee_only, {})
 
     def test_an_exclusion_naming_an_absent_record_is_refused(self) -> None:
         """A stale exclusion must surface, not silently pass: it may be masking real trade."""
@@ -478,7 +525,7 @@ class RecordExclusionTests(unittest.TestCase):
             bookbuilder.apply_record_exclusions(self.records(), bare, period="2026-08")
 
     def test_no_exclusions_leaves_the_records_untouched(self) -> None:
-        kept, notes = bookbuilder.apply_record_exclusions(self.records(), [], period="2026-08")
+        kept, notes, _fees = bookbuilder.apply_record_exclusions(self.records(), [], period="2026-08")
         self.assertEqual(len(kept["sales"]), 2)
         self.assertEqual(notes, [])
 

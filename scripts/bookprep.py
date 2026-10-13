@@ -325,7 +325,7 @@ def parse_date_value(value: str) -> date:
         "%B %d, %Y",
     ):
         try:
-            return datetime.strptime(text, fmt).date()  # noqa: DTZ007
+            return datetime.strptime(text, fmt).date()
         except ValueError:
             continue
     raise SimplbooksError(f"Unsupported date format: {value!r}")
@@ -514,7 +514,7 @@ def infer_pdf_coverage(text: str, source_system: str) -> tuple[date, date] | Non
     if not match:
         return None
     try:
-        report_date = datetime.strptime(match.group(1), "%m/%d/%Y").date()  # noqa: DTZ007
+        report_date = datetime.strptime(match.group(1), "%m/%d/%Y").date()
     except ValueError:
         return None
     return report_date, report_date
@@ -2146,7 +2146,7 @@ def parse_quartermaster_date_value(value: str) -> date:
         "%m/%d/%Y %H:%M",
     ):
         try:
-            return datetime.strptime(text, fmt).date()  # noqa: DTZ007
+            return datetime.strptime(text, fmt).date()
         except ValueError:
             continue
     raise SimplbooksError(f"Unsupported Quartermaster date format: {value!r}")
@@ -2571,7 +2571,7 @@ def is_wallet_printout(path: Path) -> bool:
 def parse_wallet_printout_date(value: str) -> date:
     """Parse the printout's `Mon D, YYYY` date, refusing anything else."""
     try:
-        return datetime.strptime(normalize_ascii(value).strip(), "%b %d, %Y").date()  # noqa: DTZ007
+        return datetime.strptime(normalize_ascii(value).strip(), "%b %d, %Y").date()
     except ValueError as exc:
         raise SimplbooksError(f"Wallet printout date {value!r} is not in 'Mon D, YYYY' form.") from exc
 
@@ -2995,7 +2995,7 @@ def parse_month_label_period(value: str) -> tuple[date, date]:
     text = re.sub(r"\s+", " ", value.strip())
     for fmt in ("%b %Y", "%B %Y"):
         try:
-            parsed = datetime.strptime(text, fmt).date()  # noqa: DTZ007
+            parsed = datetime.strptime(text, fmt).date()
             return date(parsed.year, parsed.month, 1), month_end(parsed.year, parsed.month)
         except ValueError:
             continue

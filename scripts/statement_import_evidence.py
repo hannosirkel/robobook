@@ -72,7 +72,7 @@ def validate_evidence_shape(payload: Any) -> dict[str, Any]:
     if not re.fullmatch(r"\d{4}-\d{2}", _text(payload.get("period"))):
         raise StatementImportEvidenceError("Statement-import evidence period is invalid.")
     try:
-        datetime.strptime(_text(payload.get("transaction_date")), "%Y-%m-%d")  # noqa: DTZ007
+        datetime.strptime(_text(payload.get("transaction_date")), "%Y-%m-%d")
         datetime.fromisoformat(_text(payload.get("captured_at")).replace("Z", "+00:00"))  # noqa: FURB162
     except ValueError as exc:
         raise StatementImportEvidenceError("Statement-import evidence date/timestamp is invalid.") from exc

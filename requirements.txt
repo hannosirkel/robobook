@@ -1,2 +1,2 @@
-pypdf==6.20.1
+pypdf==7.1.0
 PyYAML==6.0.3
